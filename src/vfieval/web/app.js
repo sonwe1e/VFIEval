@@ -1092,7 +1092,7 @@ function renderMetricPoints(videoName, samples, metricName, min, max) {
     const value = metric?.value;
     const normalized = status === "completed" && value !== null && max !== min ? (Number(value) - min) / (max - min) : 0.5;
     const y = status === "completed" ? 34 - normalized * 28 : 36;
-    return `<circle class="metric-point ${escapeHtml(status)}" data-chart-video="${escapeHtml(videoName)}" data-chart-sample="${index}" cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="1.4"><title>${escapeHtml(status)} ${escapeHtml(value ?? metricReason(metric))}</title></circle>`;
+    return `<circle class="metric-point ${escapeHtml(status)}" data-chart-video="${escapeHtml(videoName)}" data-chart-sample="${index}" data-frame-index="${escapeHtml(sample.frame_index)}" cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="1.4"><title>${escapeHtml(status)} ${escapeHtml(value ?? metricReason(metric))}</title></circle>`;
   }).join("");
 }
 
@@ -1102,7 +1102,7 @@ function renderStatusStrip(samples, metricName, selectedIndex) {
       ${samples.map((sample, index) => {
         const metric = sample.metrics?.[metricName];
         const status = metric?.status || "missing";
-        return `<button class="status-dot ${escapeHtml(status)} ${index === selectedIndex ? "active" : ""}" data-sample-jump="${index}" type="button" title="${escapeHtml(status)} ${escapeHtml(metricReason(metric))}"></button>`;
+        return `<button class="status-dot ${escapeHtml(status)} ${index === selectedIndex ? "active" : ""}" data-sample-jump="${index}" data-frame-index="${escapeHtml(sample.frame_index)}" type="button" title="${escapeHtml(status)} ${escapeHtml(metricReason(metric))}"></button>`;
       }).join("")}
     </div>
   `;
@@ -1390,6 +1390,14 @@ function syncActiveVideos(action) {
     if (action === "play") video.play().catch(() => {});
     if (action === "pause") video.pause();
   }
+}
+
+function highlightTimelineFrame(frameIndex) {
+  document.querySelectorAll(".timeline-hover").forEach((item) => item.classList.remove("timeline-hover"));
+  if (frameIndex === null || frameIndex === undefined || frameIndex === "") return;
+  document.querySelectorAll(`[data-frame-index="${CSS.escape(String(frameIndex))}"]`).forEach((item) => {
+    item.classList.add("timeline-hover");
+  });
 }
 
 async function setSampleByFrame(videoName, frameIndex) {
@@ -1730,6 +1738,19 @@ document.addEventListener("click", async (event) => {
     const rect = chart.getBoundingClientRect();
     const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
     setSampleIndex(chart.dataset.chartVideo, Math.round(ratio * (video.samples.length - 1)));
+  }
+});
+
+document.addEventListener("mouseover", (event) => {
+  const layerTile = event.target.closest("[data-layer-frame]");
+  if (layerTile) {
+    highlightTimelineFrame(layerTile.dataset.layerFrame);
+  }
+});
+
+document.addEventListener("mouseout", (event) => {
+  if (event.target.closest("[data-layer-frame]")) {
+    highlightTimelineFrame(null);
   }
 });
 

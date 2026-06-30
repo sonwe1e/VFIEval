@@ -17,8 +17,11 @@ class CompareUiHookTests(unittest.TestCase):
         self.assertIn("data-compare-layer-kind", app_js)
         self.assertIn("data-compare-grid-columns", app_js)
         self.assertIn("data-master-video-play", app_js)
+        self.assertIn("data-layer-frame", app_js)
+        self.assertIn("highlightTimelineFrame", app_js)
         self.assertIn("syncActiveVideos", app_js)
         self.assertIn("compare-layer-grid", styles)
+        self.assertIn("timeline-hover", styles)
         self.assertIn("--compare-grid-columns", styles)
         self.assertIn("grid-auto-flow: column", styles)
 
