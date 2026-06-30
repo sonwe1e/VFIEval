@@ -1822,6 +1822,94 @@ class V3FileFlowTests(unittest.TestCase):
             self.assertEqual(result["model"]["tested_devices"], [])
             dry_run.assert_not_called()
 
+    def test_single_npu_preflight_reports_output_validation_stage_details(self) -> None:
+        import torch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            fake_npus = [{"id": "npu:0", "name": "Ascend 0", "index": 0}]
+
+            class FakeModel:
+                def predict(self, img0, img1, _t):
+                    return {
+                        "flowt_0": torch.zeros((1, 2, 8, 8), dtype=img0.dtype, device=img0.device),
+                        "flowt_1": torch.zeros((1, 2, 8, 8), dtype=img0.dtype, device=img0.device),
+                        "mask0": torch.zeros((1, 1, 8, 8), dtype=img0.dtype, device=img0.device),
+                        "mask1": torch.zeros((1, 1, 8, 8), dtype=img0.dtype, device=img0.device),
+                    }
+
+            with (
+                patch("vfieval.file_inputs.list_npu_devices", return_value=fake_npus),
+                patch("vfieval.file_inputs.resolve_torch_device", return_value=torch.device("cpu")),
+                patch("vfieval.file_inputs.load_flow_mask_model", return_value=FakeModel()),
+                patch(
+                    "vfieval.file_inputs.validate_model_outputs",
+                    side_effect=ValueError("Model output field flowt_0 is on CPU, expected npu:0"),
+                ),
+            ):
+                result = preflight_run(
+                    db,
+                    workspace,
+                    {
+                        "model_file": "test_average.py",
+                        "video_group": "test_style",
+                        "selected_videos": ["blocks_motion.avi"],
+                        "device": "npu:0",
+                        "precision": "fp32",
+                        "max_frames": 4,
+                    },
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["model"]["tested_devices"], [])
+            self.assertIn("model dry-run failed on npu:0", result["errors"][0]["message"])
+            self.assertIn("output_validation", result["errors"][0]["message"])
+            self.assertIn("Model output field flowt_0 is on CPU, expected npu:0", result["errors"][0]["message"])
+
+    def test_single_npu_preflight_reports_model_init_guidance_for_checkpoint_device_errors(self) -> None:
+        import torch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            fake_npus = [{"id": "npu:0", "name": "Ascend 0", "index": 0}]
+
+            with (
+                patch("vfieval.file_inputs.list_npu_devices", return_value=fake_npus),
+                patch("vfieval.file_inputs.resolve_torch_device", return_value=torch.device("cpu")),
+                patch(
+                    "vfieval.file_inputs.load_flow_mask_model",
+                    side_effect=RuntimeError("Expected all tensors to be on the same device"),
+                ),
+            ):
+                result = preflight_run(
+                    db,
+                    workspace,
+                    {
+                        "model_file": "test_checkpoint.py",
+                        "checkpoint": "auto",
+                        "video_group": "test_style",
+                        "selected_videos": ["blocks_motion.avi"],
+                        "device": "npu:0",
+                        "precision": "fp32",
+                        "max_frames": 4,
+                    },
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["model"]["tested_devices"], [])
+            self.assertIn("model dry-run failed on npu:0", result["errors"][0]["message"])
+            self.assertIn("model_init/checkpoint_load", result["errors"][0]["message"])
+            self.assertIn("Expected all tensors to be on the same device", result["errors"][0]["message"])
+            self.assertIn("map_location=device", result["errors"][0]["message"])
+            self.assertIn("model.to(device)", result["errors"][0]["message"])
+            self.assertIn("Model(..., device=...)", result["errors"][0]["message"])
+
     def test_api_multi_npu_run_exposes_shard_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")

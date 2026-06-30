@@ -688,18 +688,55 @@ def _dry_run_model_file(
         dtype = torch.float16
     elif precision == "bf16":
         dtype = torch.bfloat16
-    model = load_flow_mask_model(
-        f"file:{model_path}",
-        checkpoint_path=str(checkpoint_path) if checkpoint_path else None,
-        device=str(device),
-        metadata={},
-    )
-    img0 = torch.zeros((1, 3, 8, 8), dtype=dtype, device=device)
-    img1 = torch.ones((1, 3, 8, 8), dtype=dtype, device=device)
-    with torch.no_grad():
-        outputs = model.predict(img0, img1, 0.5)
-    validate_model_outputs(outputs, img0)
-    compose_interpolated(img0, img1, outputs)
+    try:
+        model = load_flow_mask_model(
+            f"file:{model_path}",
+            checkpoint_path=str(checkpoint_path) if checkpoint_path else None,
+            device=str(device),
+            metadata={},
+        )
+    except Exception as exc:
+        raise RuntimeError(_describe_dry_run_failure("model_init/checkpoint_load", exc)) from exc
+
+    try:
+        img0 = torch.zeros((1, 3, 8, 8), dtype=dtype, device=device)
+        img1 = torch.ones((1, 3, 8, 8), dtype=dtype, device=device)
+        with torch.no_grad():
+            outputs = model.predict(img0, img1, 0.5)
+    except Exception as exc:
+        raise RuntimeError(_describe_dry_run_failure("predict", exc)) from exc
+
+    try:
+        validate_model_outputs(outputs, img0)
+    except Exception as exc:
+        raise RuntimeError(_describe_dry_run_failure("output_validation", exc)) from exc
+
+    try:
+        compose_interpolated(img0, img1, outputs)
+    except Exception as exc:
+        raise RuntimeError(_describe_dry_run_failure("postprocess", exc)) from exc
+
+
+def _describe_dry_run_failure(stage: str, exc: Exception) -> str:
+    message = f"{stage}: {exc}"
+    hint = _dry_run_failure_hint(stage, str(exc))
+    if hint:
+        return f"{message}. Hint: {hint}"
+    return message
+
+
+def _dry_run_failure_hint(stage: str, detail: str) -> str | None:
+    if stage == "model_init/checkpoint_load":
+        return (
+            "Ensure Model(..., device=...) uses the requested device, checkpoint restore uses "
+            "torch.load(..., map_location=device), and the network is moved with model.to(device)."
+        )
+    if stage in {"predict", "postprocess"} and "Expected all tensors to be on the same device" in detail:
+        return (
+            "Model infer likely created tensors on a fixed device or dtype. Create tensors and "
+            "buffers from img0.device and img0.dtype instead of hard-coded .cuda(), .to('npu'), or .cpu()."
+        )
+    return None
 
 
 def _dry_run_device(device_info: dict[str, Any]) -> str:
