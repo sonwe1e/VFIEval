@@ -103,9 +103,9 @@ def load_model_file(
     if hasattr(module, "Model"):
         model_class = getattr(module, "Model")
         try:
-            model = model_class()
-        except TypeError:
             model = model_class(checkpoint_path=checkpoint_path, device=device, metadata=metadata or {})
+        except TypeError:
+            model = model_class()
         if not hasattr(model, "infer"):
             raise TypeError(f"{path.name} 的 Model 类缺少 infer(img0, img1)")
         return InferModelAdapter(model.infer)

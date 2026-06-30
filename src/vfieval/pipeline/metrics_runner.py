@@ -16,7 +16,10 @@ METRIC_CACHE_VERSION = "metric-cache-v2"
 def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dict[str, Any]:
     job = db.get_job(job_id)
     payload = job["payload"]
-    inference_job_id = int(payload["inference_job_id"])
+    inference_job_ids = [int(value) for value in payload.get("inference_job_ids", [])]
+    if not inference_job_ids:
+        inference_job_ids = [int(payload["inference_job_id"])]
+    inference_job_id = inference_job_ids[0]
     metric_names = list(payload.get("metric_names", []))
     run_id = int(payload["run_id"]) if payload.get("run_id") is not None else None
     if not metric_names:
@@ -25,8 +28,11 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
     if unsupported:
         raise ValueError(f"unsupported metrics: {', '.join(unsupported)}")
 
-    artifacts = db.list_artifacts(job_id=inference_job_id, kind="pred")
-    pred_videos = db.list_artifacts(job_id=inference_job_id, kind="pred_video")
+    artifacts = []
+    pred_videos = []
+    for current_job_id in inference_job_ids:
+        artifacts.extend(db.list_artifacts(job_id=current_job_id, kind="pred"))
+        pred_videos.extend(db.list_artifacts(job_id=current_job_id, kind="pred_video"))
     if not artifacts and not pred_videos:
         raise ValueError(f"inference job {inference_job_id} has no pred artifacts")
 
@@ -73,7 +79,7 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
 
             db.add_metric_result(
                 job_id=job_id,
-                inference_job_id=inference_job_id,
+                inference_job_id=int(artifact["job_id"]),
                 sample_id=int(sample_id) if sample_id is not None else None,
                 metric_name=metric_name,
                 status=status,
@@ -89,7 +95,9 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                 db.update_run_progress(run_id, current)
 
     if use_video_vmaf:
-        gt_videos = db.list_artifacts(job_id=inference_job_id, kind="gt_video")
+        gt_videos = []
+        for current_job_id in inference_job_ids:
+            gt_videos.extend(db.list_artifacts(job_id=current_job_id, kind="gt_video"))
         gt_by_name = {
             artifact.get("metadata", {}).get("video_name"): artifact
             for artifact in gt_videos
@@ -114,7 +122,7 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                 details = {"video_name": video_name, **details}
             db.add_metric_result(
                 job_id=job_id,
-                inference_job_id=inference_job_id,
+                inference_job_id=int(artifact["job_id"]),
                 sample_id=None,
                 metric_name="vmaf",
                 status=status,

@@ -31,6 +31,15 @@ models/
   my_model.py
 ```
 
+权重文件放在项目根目录的 `checkpoints/{model_stem}/`：
+
+```text
+checkpoints/
+  my_model/
+    latest.pth
+    epoch_001.pth
+```
+
 视频按风格、作品或测试集放在 `videos/{视频集}/`：
 
 ```text
@@ -46,7 +55,9 @@ videos/
 Web UI 会自动扫描：
 
 - `models/*.py` 作为模型下拉框。
+- `checkpoints/{model_stem}/*` 作为权重下拉框，可选择不加载、自动最新或具体文件。
 - `videos/*/` 作为视频集下拉框。
+- 点击 `刷新文件列表` 后会重新扫描模型、权重、视频集和设备，不需要刷新浏览器页面。
 - 选择后自动预检查模型接口、已选视频、真实帧数、triplets、缓存状态和设备/精度。
 - 视频列表默认全选，支持服务端分页、按文件名搜索、排序和缩略图，也可以只勾选本次要推理的视频。
 
@@ -83,7 +94,8 @@ Contract：
 - 输入张量已经在实际推理 device 上，dtype 为 `fp32/fp16/bf16`。
 - `flowt_0/flowt_1` 是 resized 像素坐标系下的 backward flow，平台使用 `target_pixel + flow` 采样。
 - `mask0/mask1` 是 logits，不能提前 sigmoid，不需要归一化。
-- 输出必须与输入同 batch、同 H/W、同 device、同 dtype。
+- 输出必须与输入同 batch、同 device、同 dtype；`flow` 必须是 `[B,2,h,w]`，`mask` 必须是 `[B,1,h,w]`。
+- `flow/mask` 可以低于输入分辨率，平台会先 resize 到推理分辨率。`flow_x` 按 `W / w` 缩放，`flow_y` 按 `H / h` 缩放；`mask` 作为 logits resize 后再 sigmoid。
 - 模型可以额外返回可视化 tensor；平台会保存为 `extra_*` 图像，但核心对比只使用 flow、mask、warp、blend、pred、diff。
 
 ## 后处理
@@ -152,12 +164,15 @@ python -m vfieval.cli --workspace .vfieval prepare-metrics
 主流程端点：
 
 - `GET /api/model-files`
+- `GET /api/checkpoints?model_file=...`
+- `GET /api/devices`
 - `GET /api/video-groups`
 - `GET /api/video-groups/{name}/videos?page=&page_size=&q=&sort=`
 - `GET /api/video-thumbnails/{key}`
 - `GET /api/metrics/health`
 - `POST /api/preflight`
 - `POST /api/runs`，支持 `model_file + video_group`
+- `POST /api/runs` 支持 `checkpoint`、`execution_mode=single|multi_cuda`、`devices=["cuda:0"]`、`batch_size_per_device`
 - `POST /api/runs/{id}/cancel`
 - `POST /api/runs/{id}/retry`
 - `GET /api/runs`

@@ -8,13 +8,13 @@ VFIEval is a local inference, post-processing, artifact viewing, evaluation, and
 
 ## Hard UI Rules
 
-Primary UI must not contain model registration or dataset registration forms. Primary UI must use files and folders as entry points. Models are discovered from `models/*.py`. Video groups are discovered from `videos/*/`. The first successful user flow must require no manual IDs.
+Primary UI must not contain model registration or dataset registration forms. Primary UI must use files and folders as entry points. Models are discovered from `models/*.py`. Checkpoints are discovered from `checkpoints/{model_stem}/`. Video groups are discovered from `videos/*/`. The first successful user flow must require no manual IDs.
 
 ## Core Contracts
 
 Models receive resized RGB `img0` and `img1` tensors in `BCHW`, value range `[0, 1]`, fixed `t=0.5`, on the inference device and dtype. Model files should expose `class Model: infer(self, img0, img1)`. They must return at least `flowt_0`, `flowt_1`, `mask0`, and `mask1`; tuple return `(flowt_0, flowt_1, mask0, mask1)` is allowed.
 
-`flowt_0` and `flowt_1` are backward flow in resized pixel coordinates. `mask0` and `mask1` are logits, not probabilities. Extra visualization tensors are allowed and may be saved as `extra_*`, but comparison must focus on flow, mask, warp, blend, pred, and diff artifacts.
+`flowt_0` and `flowt_1` are backward flow in resized pixel coordinates. `mask0` and `mask1` are logits, not probabilities. Core outputs must match input batch/device/dtype and channel count, but may use lower spatial resolution; the platform must resize flow/mask to the inference resolution before warp/compose, scaling flow x/y magnitudes with width/height. Extra visualization tensors are allowed and may be saved as `extra_*`, but comparison must focus on flow, mask, warp, blend, pred, and diff artifacts.
 
 ## Post-Processing
 
@@ -34,7 +34,7 @@ Run Detail must stay timeline-centered and lazy-loaded. Do not render every vide
 
 ## Architecture
 
-Keep SQLite as metadata/index storage and artifacts on disk. Preserve legacy `models/datasets/jobs/experiments` APIs for compatibility, but do not let those concepts pollute the primary UI. Future remote workers should use HTTP registration, claim, heartbeat, progress, complete, and fail APIs rather than direct SQLite access. Prefer dependency-light changes unless a dependency materially improves video decoding, worker reliability, or metric correctness.
+Keep SQLite as metadata/index storage and artifacts on disk. Preserve legacy `models/datasets/jobs/experiments` APIs for compatibility, but do not let those concepts pollute the primary UI. Multi-GPU inference should use video-level shard jobs mapped through `run_jobs`, not DDP. Future remote workers should use HTTP registration, claim, heartbeat, progress, complete, and fail APIs rather than direct SQLite access. Prefer dependency-light changes unless a dependency materially improves video decoding, worker reliability, or metric correctness.
 
 ## Testing
 

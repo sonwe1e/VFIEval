@@ -15,11 +15,13 @@ from vfieval.config import WorkspaceConfig
 from vfieval.datasets import scan_dataset
 from vfieval.db import Database
 from vfieval.file_inputs import (
+    list_checkpoints,
     list_video_group_videos,
     list_model_files,
     list_video_groups,
     normalize_device_precision,
     preflight_run,
+    resolve_checkpoint,
     resolve_model_file,
     resolve_run_dimensions,
     resolve_video_group,
@@ -27,7 +29,7 @@ from vfieval.file_inputs import (
 )
 from vfieval.metrics import METRIC_NAMES
 from vfieval.metrics.health import metrics_health
-from vfieval.worker import WorkerOptions, run_worker
+from vfieval.worker import WorkerOptions, detect_capabilities, run_worker
 
 
 def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -> None:
@@ -59,6 +61,10 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     return self._json(_dashboard(db))
                 if path == "/api/model-files":
                     return self._json(list_model_files(workspace))
+                if path == "/api/checkpoints":
+                    return self._json(list_checkpoints(workspace, query.get("model_file", [None])[0]))
+                if path == "/api/devices":
+                    return self._json(detect_capabilities())
                 if path == "/api/video-groups":
                     return self._json(list_video_groups(workspace))
                 match = re.fullmatch(r"/api/video-groups/([^/]+)/videos", path)
@@ -135,7 +141,7 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                         return self._json(_run_timeline(db, run_id))
                     if section == "metric-summary":
                         return self._json(_run_metric_summary(db, run_id))
-                    return self._json(db.get_run(run_id))
+                    return self._json(_run_detail(db, run_id))
                 if path == "/api/jobs":
                     return self._json(db.list_jobs(limit=int(query.get("limit", ["100"])[0])))
                 if path == "/api/workers":
@@ -440,19 +446,26 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
     video_infos = preflight.get("video_group", {}).get("videos", [])
     selected_videos = [str(name) for name in preflight.get("video_group", {}).get("selected_videos", [])]
     height, width = resolve_run_dimensions(body, video_infos)
-    device, precision = normalize_device_precision(str(body.get("device") or "auto"), str(body.get("precision") or "auto"))
+    execution_mode = str(body.get("execution_mode") or "single")
+    devices = _resolve_execution_devices(body, execution_mode)
+    requested_device = str(body.get("device") or "auto")
+    device, precision = normalize_device_precision(devices[0] if execution_mode == "multi_cuda" else requested_device, str(body.get("precision") or "auto"))
+    checkpoint_path = resolve_checkpoint(workspace, body.get("checkpoint"), model_path.name)
+    checkpoint_relative = _checkpoint_relative(workspace, checkpoint_path)
     selection_hash = _selection_hash(selected_videos, frame_step, max_frames)
+    model_record_name = model_path.name if checkpoint_relative is None else f"{model_path.name} [{checkpoint_relative}]"
 
     model_id = db.upsert_model(
-        name=model_path.name,
+        name=model_record_name,
         adapter=f"file:{model_path}",
-        checkpoint_path=None,
+        checkpoint_path=str(checkpoint_path) if checkpoint_path else None,
         input_height=height,
         input_width=width,
         metadata={
             "source": "file",
             "model_file": model_path.name,
             "model_path": str(model_path),
+            "checkpoint": checkpoint_relative,
             "contract": "Model.infer(img0, img1)",
         },
     )
@@ -484,15 +497,22 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
             "height": height,
             "width": width,
             "batch_size": int(body.get("batch_size") or 1),
+            "batch_size_per_device": int(body.get("batch_size_per_device") or body.get("batch_size") or 1),
             "device": body.get("device") or "auto",
+            "devices": devices,
+            "execution_mode": execution_mode,
             "precision": body.get("precision") or "auto",
+            "checkpoint": body.get("checkpoint") or "none",
             "frame_step": frame_step,
             "max_frames": max_frames,
             "selected_videos": selected_videos,
             "metrics": metrics,
         },
         "model_file": model_path.name,
+        "checkpoint": checkpoint_relative,
         "video_group": video_folder.name,
+        "execution_mode": execution_mode,
+        "devices": devices,
         "selected_videos": selected_videos,
         "preflight": preflight,
     }
@@ -505,13 +525,18 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         dataset_id=dataset_id,
         height=height,
         width=width,
-        batch_size=int(body.get("batch_size") or 1),
-        device=device,
+        batch_size=int(body.get("batch_size_per_device") or body.get("batch_size") or 1),
+        device="multi_cuda" if execution_mode == "multi_cuda" else device,
         precision=precision,
         metrics=metrics,
         metadata={**metadata, "output_dir": str(workspace.runs_dir / str(db.next_run_id()))},
+        create_inference_job=execution_mode != "multi_cuda",
     )
-    _start_local_inference_worker(db, workspace)
+    if execution_mode == "multi_cuda":
+        _create_inference_shards(db, run_id, model_id, dataset_id, height, width, precision, metrics, devices, int(body.get("batch_size_per_device") or body.get("batch_size") or 1))
+        _start_local_inference_worker(db, workspace, count=len(devices))
+    else:
+        _start_local_inference_worker(db, workspace)
     return {"run_id": run_id, "run": db.get_run(run_id), "preflight": preflight}
 
 
@@ -525,20 +550,103 @@ def _retry_run(db: Database, workspace: WorkspaceConfig, run_id: int) -> dict:
     return _create_run_from_files(db, workspace, request)
 
 
+def _checkpoint_relative(workspace: WorkspaceConfig, checkpoint_path: Path | None) -> str | None:
+    if checkpoint_path is None:
+        return None
+    from vfieval.file_inputs import checkpoints_dir
+
+    return checkpoint_path.resolve().relative_to(checkpoints_dir(workspace)).as_posix()
+
+
+def _resolve_execution_devices(body: dict, execution_mode: str) -> list[str]:
+    if execution_mode == "single":
+        return [str(body.get("device") or "auto")]
+    if execution_mode != "multi_cuda":
+        raise ValueError("execution_mode must be single or multi_cuda")
+    raw_devices = body.get("devices") or []
+    devices = [str(device) for device in raw_devices if str(device).startswith("cuda:")]
+    if not devices:
+        capabilities = detect_capabilities()
+        devices = [str(row["id"]) for row in capabilities.get("cuda", [])]
+    if not devices:
+        raise ValueError("multi_cuda requires at least one CUDA device")
+    return devices
+
+
+def _create_inference_shards(
+    db: Database,
+    run_id: int,
+    model_id: int,
+    dataset_id: int,
+    height: int,
+    width: int,
+    precision: str,
+    metrics: list[str],
+    devices: list[str],
+    batch_size_per_device: int,
+) -> None:
+    samples = db.list_samples(dataset_id)
+    partitions = _partition_samples_by_video(samples, devices)
+    for shard_index, device in enumerate(devices):
+        sample_ids = partitions[shard_index]
+        if not sample_ids:
+            continue
+        payload = {
+            "run_id": run_id,
+            "model_id": model_id,
+            "dataset_id": dataset_id,
+            "height": height,
+            "width": width,
+            "batch_size": batch_size_per_device,
+            "device": device,
+            "precision": precision,
+            "metrics": [],
+            "sample_ids": sample_ids,
+            "shard_index": shard_index,
+            "shard_count": len(devices),
+        }
+        db.add_run_job(
+            run_id,
+            "inference",
+            payload,
+            progress_total=len(sample_ids),
+            shard_index=shard_index,
+            device=device,
+            metadata={"metrics_after_all_shards": metrics},
+        )
+    db.update_run_progress_from_jobs(run_id, "queued")
+
+
+def _partition_samples_by_video(samples: list[dict], devices: list[str]) -> list[list[int]]:
+    grouped: dict[str, list[int]] = {}
+    for sample in samples:
+        metadata = sample.get("metadata") or {}
+        key = str(metadata.get("video_file") or metadata.get("video_name") or sample.get("name"))
+        grouped.setdefault(key, []).append(int(sample["id"]))
+    partitions: list[list[int]] = [[] for _ in devices]
+    loads = [0 for _ in devices]
+    for _key, sample_ids in sorted(grouped.items(), key=lambda item: len(item[1]), reverse=True):
+        shard_index = min(range(len(devices)), key=lambda index: loads[index])
+        partitions[shard_index].extend(sample_ids)
+        loads[shard_index] += len(sample_ids)
+    return partitions
+
+
 def _preflight_error_message(preflight: dict) -> str:
     messages = [f"{item.get('title')}: {item.get('message')}" for item in preflight.get("errors", [])]
     return "；".join(messages) or "预检查失败"
 
 
-def _start_local_inference_worker(db: Database, workspace: WorkspaceConfig) -> None:
-    def _target() -> None:
+def _start_local_inference_worker(db: Database, workspace: WorkspaceConfig, count: int = 1) -> None:
+    def _target(index: int) -> None:
         run_worker(
             db,
             workspace,
-            WorkerOptions(role="all", once=True, worker_id="local-ui-worker"),
+            WorkerOptions(role="all", once=True, worker_id=f"local-ui-worker-{index}"),
         )
 
-    threading.Thread(target=_target, daemon=True).start()
+    for index in range(max(1, int(count))):
+        threading.Thread(target=_target, args=(index,), daemon=True).start()
 
 
 def _selection_hash(selected_videos: list[str], frame_step: int, max_frames: int | None) -> str:
@@ -570,6 +678,12 @@ METRIC_DIRECTIONS = {
     "cgvqm": "lower_is_better",
 }
 METRIC_STATUSES = ("completed", "unavailable", "failed", "skipped")
+
+
+def _run_detail(db: Database, run_id: int) -> dict:
+    run = db.get_run(run_id)
+    run["jobs"] = db.list_run_jobs(run_id)
+    return run
 
 
 def _run_timeline(db: Database, run_id: int) -> dict:

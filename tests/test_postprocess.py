@@ -9,7 +9,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from vfieval.pipeline.postprocess import backward_warp, compose_interpolated, validate_model_outputs
+from vfieval.pipeline.postprocess import backward_warp, compose_interpolated, normalize_model_outputs, validate_model_outputs
 
 
 class PostprocessTests(unittest.TestCase):
@@ -34,6 +34,35 @@ class PostprocessTests(unittest.TestCase):
         img0 = torch.zeros((1, 3, 4, 4), dtype=torch.float32)
         with self.assertRaisesRegex(ValueError, "missing required fields"):
             validate_model_outputs({"flowt_0": torch.zeros((1, 2, 4, 4))}, img0)
+
+    def test_low_resolution_outputs_are_resized_and_flow_scaled(self) -> None:
+        img0 = torch.zeros((1, 3, 4, 6), dtype=torch.float32)
+        outputs = {
+            "flowt_0": torch.ones((1, 2, 2, 2), dtype=torch.float32),
+            "flowt_1": torch.ones((1, 2, 2, 2), dtype=torch.float32),
+            "mask0": torch.zeros((1, 1, 2, 2), dtype=torch.float32),
+            "mask1": torch.zeros((1, 1, 2, 2), dtype=torch.float32),
+        }
+
+        normalized = normalize_model_outputs(outputs, img0)
+
+        self.assertEqual(tuple(normalized["flowt_0"].shape), (1, 2, 4, 6))
+        self.assertTrue(torch.allclose(normalized["flowt_0"][:, 0], torch.full((1, 4, 6), 3.0)))
+        self.assertTrue(torch.allclose(normalized["flowt_0"][:, 1], torch.full((1, 4, 6), 2.0)))
+        self.assertEqual(tuple(normalized["mask0"].shape), (1, 1, 4, 6))
+
+    def test_validate_rejects_wrong_channels_not_spatial_scale(self) -> None:
+        img0 = torch.zeros((1, 3, 8, 8), dtype=torch.float32)
+        outputs = {
+            "flowt_0": torch.zeros((1, 2, 4, 4), dtype=torch.float32),
+            "flowt_1": torch.zeros((1, 2, 4, 4), dtype=torch.float32),
+            "mask0": torch.zeros((1, 1, 4, 4), dtype=torch.float32),
+            "mask1": torch.zeros((1, 1, 4, 4), dtype=torch.float32),
+        }
+        validate_model_outputs(outputs, img0)
+        outputs["flowt_0"] = torch.zeros((1, 1, 4, 4), dtype=torch.float32)
+        with self.assertRaisesRegex(ValueError, "flowt_0"):
+            validate_model_outputs(outputs, img0)
 
     def test_backward_warp_identity_for_zero_flow(self) -> None:
         image = torch.rand((2, 3, 5, 7), dtype=torch.float32)

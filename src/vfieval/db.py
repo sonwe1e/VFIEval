@@ -162,6 +162,20 @@ CREATE TABLE IF NOT EXISTS runs (
 
 CREATE INDEX IF NOT EXISTS idx_runs_status_created ON runs(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_jobs ON runs(inference_job_id, metric_job_id);
+
+CREATE TABLE IF NOT EXISTS run_jobs (
+    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    role TEXT NOT NULL,
+    shard_index INTEGER NOT NULL DEFAULT 0,
+    device TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    PRIMARY KEY(run_id, job_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_jobs_run_role ON run_jobs(run_id, role, shard_index);
+CREATE INDEX IF NOT EXISTS idx_run_jobs_job ON run_jobs(job_id);
 """
 
 
@@ -200,6 +214,22 @@ class Database:
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS run_jobs (
+                run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                role TEXT NOT NULL,
+                shard_index INTEGER NOT NULL DEFAULT 0,
+                device TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                PRIMARY KEY(run_id, job_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_run_jobs_run_role ON run_jobs(run_id, role, shard_index);
+            CREATE INDEX IF NOT EXISTS idx_run_jobs_job ON run_jobs(job_id);
+            """
+        )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(datasets)").fetchall()}
         dataset_columns = {
             "source_type": "TEXT NOT NULL DEFAULT 'frames'",
@@ -256,7 +286,7 @@ class Database:
             model_id = int(existing["id"])
             with self.connection() as conn:
                 conn.execute(
-                    """
+                    f"""
                     UPDATE models
                     SET adapter = ?,
                         checkpoint_path = ?,
@@ -511,6 +541,7 @@ class Database:
         metrics: list[str],
         experiment_id: int | None = None,
         metadata: dict[str, Any] | None = None,
+        create_inference_job: bool = True,
     ) -> int:
         experiment_id = experiment_id or self.get_default_experiment_id()
         now = utc_ts()
@@ -543,6 +574,8 @@ class Database:
                 ),
             )
             run_id = int(run_cur.lastrowid)
+            if not create_inference_job:
+                return run_id
             payload = {
                 "run_id": run_id,
                 "model_id": model_id,
@@ -570,7 +603,86 @@ class Database:
                 """,
                 (inference_job_id, now, run_id),
             )
+            conn.execute(
+                """
+                INSERT INTO run_jobs(run_id, job_id, role, shard_index, device, metadata_json, created_at)
+                VALUES (?, ?, 'inference', 0, ?, '{}', ?)
+                """,
+                (run_id, inference_job_id, device, now),
+            )
             return run_id
+
+    def add_run_job(
+        self,
+        run_id: int,
+        role: str,
+        payload: dict[str, Any],
+        progress_total: int = 0,
+        shard_index: int = 0,
+        device: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        now = utc_ts()
+        with self.connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO jobs(kind, status, payload_json, progress_total, created_at)
+                VALUES (?, 'queued', ?, ?, ?)
+                """,
+                (role, _json(payload), int(progress_total), now),
+            )
+            job_id = int(cur.lastrowid)
+            conn.execute(
+                """
+                INSERT INTO run_jobs(run_id, job_id, role, shard_index, device, metadata_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (run_id, job_id, role, int(shard_index), device, _json(metadata), now),
+            )
+            if role == "inference":
+                conn.execute(
+                    """
+                    UPDATE runs
+                    SET inference_job_id = COALESCE(inference_job_id, ?), updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (job_id, now, run_id),
+                )
+            elif role == "metric":
+                conn.execute(
+                    """
+                    UPDATE runs
+                    SET metric_job_id = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (job_id, now, run_id),
+                )
+            return job_id
+
+    def list_run_jobs(self, run_id: int, role: str | None = None) -> list[dict[str, Any]]:
+        params: list[Any] = [run_id]
+        clause = ""
+        if role is not None:
+            clause = " AND rj.role = ?"
+            params.append(role)
+        rows = self.query(
+            f"""
+            SELECT rj.*, j.kind, j.status, j.payload_json, j.worker_id,
+                   j.progress_current, j.progress_total, j.result_json, j.error_json,
+                   j.started_at, j.finished_at
+            FROM run_jobs rj
+            JOIN jobs j ON j.id = rj.job_id
+            WHERE rj.run_id = ?{clause}
+            ORDER BY rj.role, rj.shard_index, rj.job_id
+            """,
+            params,
+        )
+        for row in rows:
+            row["metadata"] = _loads(row.pop("metadata_json"))
+            row["payload"] = _loads(row.pop("payload_json"))
+            row["result"] = _loads(row.pop("result_json"))
+            row["error"] = _loads(row.pop("error_json"))
+        return rows
 
     def next_run_id(self) -> int:
         row = self.get("SELECT seq FROM sqlite_sequence WHERE name = 'runs'")
@@ -634,9 +746,11 @@ class Database:
             LEFT JOIN experiments e ON e.id = r.experiment_id
             JOIN models m ON m.id = r.model_id
             JOIN datasets d ON d.id = r.dataset_id
+            LEFT JOIN run_jobs rj ON rj.run_id = r.id
             WHERE r.inference_job_id = ? OR r.metric_job_id = ?
+               OR rj.job_id = ?
             """,
-            (job_id, job_id),
+            (job_id, job_id, job_id),
         )
         if row is None:
             return None
@@ -758,17 +872,20 @@ class Database:
         now = utc_ts()
         run = self.get_run(run_id)
         inference_job_id = run.get("inference_job_id")
+        run_job_ids = [int(row["job_id"]) for row in self.list_run_jobs(run_id)]
         with self.connection() as conn:
-            if run["status"] == "queued" and inference_job_id is not None:
+            if run["status"] == "queued" and (inference_job_id is not None or run_job_ids):
+                target_ids = run_job_ids or [int(inference_job_id)]
+                placeholders = ",".join("?" for _ in target_ids)
                 conn.execute(
-                    """
+                    f"""
                     UPDATE jobs
                     SET status = 'canceled',
                         error_json = ?,
                         finished_at = ?
-                    WHERE id = ? AND status = 'queued'
+                    WHERE id IN ({placeholders}) AND status = 'queued'
                     """,
-                    (_json({"message": "用户取消了排队中的 Run"}), now, int(inference_job_id)),
+                    (_json({"message": "用户取消了排队中的 Run"}), now, *target_ids),
                 )
                 conn.execute(
                     """
@@ -835,19 +952,92 @@ class Database:
         by_kind = {row["kind"]: int(row["count"]) for row in rows}
         return {"total": sum(by_kind.values()), "by_kind": by_kind}
 
-    def list_run_artifacts(self, run_id: int, kind: str | None = None) -> list[dict[str, Any]]:
+    def run_inference_job_ids(self, run_id: int) -> list[int]:
+        job_ids = [int(row["job_id"]) for row in self.list_run_jobs(run_id, "inference")]
+        if job_ids:
+            return job_ids
         run = self.get_run(run_id)
-        inference_job_id = run.get("inference_job_id")
-        if inference_job_id is None:
-            return []
-        return self.list_artifacts(job_id=int(inference_job_id), kind=kind)
+        return [int(run["inference_job_id"])] if run.get("inference_job_id") is not None else []
+
+    def update_run_progress_from_jobs(self, run_id: int, status: str | None = None) -> None:
+        rows = self.list_run_jobs(run_id, "inference")
+        current = sum(int(row.get("progress_current") or 0) for row in rows)
+        total = sum(int(row.get("progress_total") or 0) for row in rows)
+        self.update_run_progress(run_id, current, total, status)
+
+    def summarize_run_artifacts(self, run_id: int) -> dict[str, Any]:
+        by_kind: dict[str, int] = {}
+        for job_id in self.run_inference_job_ids(run_id):
+            summary = self.summarize_artifacts(job_id)
+            for kind, count in (summary.get("by_kind") or {}).items():
+                by_kind[kind] = by_kind.get(kind, 0) + int(count)
+        return {"total": sum(by_kind.values()), "by_kind": by_kind}
+
+    def maybe_complete_multi_run_inference(self, run_id: int) -> bool:
+        jobs = self.list_run_jobs(run_id, "inference")
+        if not jobs:
+            return False
+        if any(job["status"] == "failed" for job in jobs):
+            failed = next(job for job in jobs if job["status"] == "failed")
+            self.fail_run(run_id, {"message": failed.get("error", {}).get("message") or "inference shard failed", "device": failed.get("device")})
+            return True
+        if any(job["status"] == "canceled" for job in jobs):
+            self.cancel_run(run_id, {"message": "inference shard canceled"})
+            return True
+        if any(job["status"] != "completed" for job in jobs):
+            self.update_run_progress_from_jobs(run_id, "running")
+            return False
+
+        run = self.get_run(run_id)
+        result = {
+            "samples": sum(int(job.get("result", {}).get("samples") or 0) for job in jobs),
+            "output_dir": (run.get("metadata") or {}).get("output_dir"),
+            "shards": [
+                {
+                    "job_id": int(job["job_id"]),
+                    "device": job.get("device"),
+                    "status": job["status"],
+                    "result": job.get("result") or {},
+                }
+                for job in jobs
+            ],
+        }
+        artifact_summary = self.summarize_run_artifacts(run_id)
+        metrics = list(run.get("metrics") or [])
+        if metrics:
+            metric_payload = {
+                "run_id": run_id,
+                "dataset_id": int(run["dataset_id"]),
+                "inference_job_ids": [int(job["job_id"]) for job in jobs],
+                "inference_job_id": int(jobs[0]["job_id"]),
+                "metric_names": metrics,
+            }
+            metric_job_id = self.add_run_job(
+                run_id,
+                "metric",
+                metric_payload,
+                progress_total=0,
+                shard_index=0,
+                device=None,
+                metadata={"source": "multi_cuda"},
+            )
+            self.complete_run_inference(run_id, result, artifact_summary, "metric_queued")
+            self.set_run_metric_job(run_id, metric_job_id)
+        else:
+            self.complete_run_inference(run_id, result, artifact_summary, "completed")
+        return True
+
+    def list_run_artifacts(self, run_id: int, kind: str | None = None) -> list[dict[str, Any]]:
+        artifacts: list[dict[str, Any]] = []
+        for job_id in self.run_inference_job_ids(run_id):
+            artifacts.extend(self.list_artifacts(job_id=int(job_id), kind=kind))
+        return artifacts
 
     def list_run_metrics(self, run_id: int) -> list[dict[str, Any]]:
-        run = self.get_run(run_id)
-        inference_job_id = run.get("inference_job_id")
-        if inference_job_id is None:
-            return []
-        return self.list_metric_results(inference_job_id=int(inference_job_id))
+        metrics: list[dict[str, Any]] = []
+        for job_id in self.run_inference_job_ids(run_id):
+            metrics.extend(self.list_metric_results(inference_job_id=int(job_id)))
+        return metrics
 
     def list_run_samples(self, run_id: int) -> list[dict[str, Any]]:
         run = self.get_run(run_id)

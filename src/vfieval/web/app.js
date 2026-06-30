@@ -27,6 +27,8 @@ const CORE_PREVIEW = [
 const state = {
   modelFiles: [],
   videoGroups: [],
+  checkpoints: [],
+  devices: null,
   runs: [],
   metricHealth: null,
   selectedRun: null,
@@ -47,6 +49,8 @@ const state = {
   videoPages: {},
   sampleDetails: {},
   sampleDetailLoading: {},
+  selectedCudaDevices: new Set(),
+  lastCatalogRefresh: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -95,15 +99,19 @@ function switchView(view) {
 }
 
 async function refreshCatalog() {
-  const [modelFiles, videoGroups, runs, metricHealth] = await Promise.all([
+  const [modelFiles, videoGroups, runs, metricHealth, checkpoints, devices] = await Promise.all([
     api("/api/model-files"),
     api("/api/video-groups"),
     api("/api/runs"),
     api("/api/metrics/health"),
+    api("/api/checkpoints"),
+    api("/api/devices"),
   ]);
-  Object.assign(state, { modelFiles, videoGroups, runs, metricHealth });
+  Object.assign(state, { modelFiles, videoGroups, runs, metricHealth, checkpoints, devices, lastCatalogRefresh: new Date() });
   renderMetricOptions();
   renderOptions();
+  renderCheckpointOptions();
+  renderDeviceOptions();
   await loadVideoGroupPage($("infer-form").elements.video_group.value);
   renderRuns();
   schedulePreflight(0);
@@ -166,6 +174,7 @@ function renderOptions() {
   const form = $("infer-form");
   const previousModel = form.elements.model_file.value;
   const previousGroup = form.elements.video_group.value;
+  const previousCheckpoint = form.elements.checkpoint?.value || "none";
   form.elements.model_file.innerHTML = state.modelFiles
     .map((item) => `<option value="${escapeHtml(item.name)}">${escapeHtml(item.name)}</option>`)
     .join("");
@@ -178,8 +187,49 @@ function renderOptions() {
   form.elements.video_group.value = state.videoGroups.some((item) => item.name === previousGroup)
     ? previousGroup
     : (state.videoGroups.some((item) => item.name === "test_style") ? "test_style" : state.videoGroups[0]?.name || "");
+  renderCheckpointOptions(previousCheckpoint);
+  renderDeviceOptions();
   ensureVideoSelection(form.elements.video_group.value);
   renderCustomSizeVisibility();
+}
+
+function renderCheckpointOptions(previousValue = null) {
+  const form = $("infer-form");
+  if (!form.elements.checkpoint) return;
+  const modelFile = form.elements.model_file.value;
+  const modelStem = modelFile.replace(/\.py$/i, "");
+  const rows = (state.checkpoints || []).filter((item) => !modelFile || item.model === modelStem);
+  const options = [
+    `<option value="none">不加载权重</option>`,
+    `<option value="auto">自动选择最新权重</option>`,
+    ...rows.map((item) => `<option value="${escapeHtml(item.relative_path)}">${escapeHtml(item.relative_path)}</option>`),
+  ];
+  form.elements.checkpoint.innerHTML = options.join("");
+  const desired = previousValue ?? form.elements.checkpoint.value;
+  form.elements.checkpoint.value = rows.some((item) => item.relative_path === desired) || ["none", "auto"].includes(desired)
+    ? desired
+    : "none";
+}
+
+function renderDeviceOptions() {
+  const container = $("device-options");
+  if (!container) return;
+  const cuda = state.devices?.cuda || [];
+  if (!state.selectedCudaDevices.size) {
+    state.selectedCudaDevices = new Set(cuda.map((item) => item.id));
+  }
+  const executionMode = $("infer-form").elements.execution_mode?.value || "single";
+  container.innerHTML = `
+    <div class="device-panel ${executionMode === "multi_cuda" ? "visible" : ""}">
+      <span>CUDA 多卡</span>
+      ${cuda.length ? cuda.map((item) => `
+        <label class="check-item">
+          <input type="checkbox" data-cuda-device="${escapeHtml(item.id)}" ${state.selectedCudaDevices.has(item.id) ? "checked" : ""}>
+          <span>${escapeHtml(item.id)} ${escapeHtml(item.name || "")}</span>
+        </label>
+      `).join("") : "<p class=\"muted\">当前没有检测到可用 CUDA 设备。</p>"}
+    </div>
+  `;
 }
 
 function renderCustomSizeVisibility() {
@@ -191,18 +241,26 @@ function selectedMetrics() {
   return Array.from(document.querySelectorAll("input[name='metrics']:checked")).map((item) => item.value);
 }
 
+function selectedCudaDevices() {
+  return Array.from(state.selectedCudaDevices || []);
+}
+
 function payloadFromForm() {
   const data = formData($("infer-form"));
   return {
     model_file: data.model_file,
+    checkpoint: data.checkpoint || "none",
     video_group: data.video_group,
     selected_videos: selectedVideoNames(),
     resolution_mode: data.resolution_mode || "original",
     height: data.height ? Number(data.height) : null,
     width: data.width ? Number(data.width) : null,
     device: data.device || "auto",
+    execution_mode: data.execution_mode || "single",
+    devices: selectedCudaDevices(),
     precision: data.precision || "auto",
     batch_size: Number(data.batch_size || 1),
+    batch_size_per_device: Number(data.batch_size_per_device || data.batch_size || 1),
     frame_step: Number(data.frame_step || 1),
     max_frames: data.max_frames ? Number(data.max_frames) : null,
     metrics: selectedMetrics(),
@@ -451,6 +509,7 @@ function renderRunDetail() {
       <div><span>推理 FPS</span><strong>${formatNumber(run.result?.model_fps)}</strong></div>
       <div><span>产物</span><strong>${escapeHtml(run.artifact_summary?.total || 0)}</strong></div>
     </div>
+    ${renderShardJobs(run)}
     ${renderRunError(run)}
     <div class="run-workspace">
       <aside class="video-tabs">
@@ -484,6 +543,24 @@ function renderInferencePhase(run) {
   if (run.status === "failed") return "失败";
   if (run.status === "canceled" || run.status === "cancel_requested") return "已取消";
   return run.inference_job_id ? "已完成" : "未开始";
+}
+
+function renderShardJobs(run) {
+  const jobs = (run.jobs || []).filter((job) => job.role === "inference");
+  if (jobs.length <= 1) return "";
+  return `
+    <section class="shard-panel">
+      <h3>多卡分片</h3>
+      <div class="table compact-table">${table(jobs, [
+        { label: "Shard", render: (job) => `#${escapeHtml(job.shard_index)}` },
+        { label: "设备", render: (job) => escapeHtml(job.device || job.payload?.device || "-") },
+        { label: "状态", render: (job) => statusBadge(job.status) },
+        { label: "进度", render: (job) => `${escapeHtml(job.progress_current || 0)}/${escapeHtml(job.progress_total || 0)}` },
+        { label: "样本", render: (job) => escapeHtml((job.payload?.sample_ids || []).length || "-") },
+        { label: "错误", render: (job) => escapeHtml(job.error?.message || "-") },
+      ])}</div>
+    </section>
+  `;
 }
 
 function renderMetricPhase(run) {
@@ -857,8 +934,15 @@ function formatDuration(value) {
 document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => switchView(item.dataset.view)));
 $("infer-form").addEventListener("submit", (event) => startRun(event).catch((error) => toast(error.message)));
 $("refresh").addEventListener("click", () => refreshRunsOnly().catch((error) => toast(error.message)));
+$("refresh-files").addEventListener("click", () => refreshCatalog().then(() => toast("文件列表已刷新")).catch((error) => toast(error.message)));
 $("infer-form").addEventListener("change", (event) => {
   renderCustomSizeVisibility();
+  if (event.target.name === "model_file") {
+    renderCheckpointOptions();
+  }
+  if (event.target.name === "execution_mode") {
+    renderDeviceOptions();
+  }
   if (event.target.name === "video_group") {
     ensureVideoSelection(event.target.value);
     loadVideoGroupPage(event.target.value, 1).catch((error) => toast(error.message));
@@ -893,6 +977,13 @@ document.addEventListener("change", (event) => {
   if (videoSort) {
     state.videoSortByGroup[videoSort.dataset.videoSort] = videoSort.value;
     loadVideoGroupPage(videoSort.dataset.videoSort, 1).then(() => schedulePreflight(0)).catch((error) => toast(error.message));
+  }
+  const cudaDevice = event.target.closest("[data-cuda-device]");
+  if (cudaDevice) {
+    if (cudaDevice.checked) state.selectedCudaDevices.add(cudaDevice.dataset.cudaDevice);
+    else state.selectedCudaDevices.delete(cudaDevice.dataset.cudaDevice);
+    renderDeviceOptions();
+    schedulePreflight(0);
   }
 });
 

@@ -222,6 +222,21 @@ summary {
   margin-top: 12px;
 }
 
+.device-options {
+  margin-top: 12px;
+}
+
+.device-panel {
+  display: none;
+  gap: 8px;
+}
+
+.device-panel.visible {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
 .metric-hint {
   flex-basis: 100%;
 }
@@ -407,6 +422,10 @@ th {
   grid-template-columns: minmax(190px, 260px) minmax(0, 1fr);
   gap: 14px;
   margin-top: 14px;
+}
+
+.shard-panel {
+  margin-top: 12px;
 }
 
 .video-tabs {

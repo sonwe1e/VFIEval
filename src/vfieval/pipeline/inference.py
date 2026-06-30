@@ -14,7 +14,7 @@ from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
 from vfieval.models import load_flow_mask_model
 from vfieval.pipeline.io import batch_tensors, load_rgb_tensor, resize_batch
-from vfieval.pipeline.postprocess import compose_interpolated, validate_model_outputs
+from vfieval.pipeline.postprocess import compose_interpolated, normalize_model_outputs
 from vfieval.pipeline.visualize import save_difference, save_extra_tensor, save_visual_bundle
 
 
@@ -77,6 +77,8 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
     precision = str(payload.get("precision", "fp32"))
     metric_names = list(payload.get("metrics", []))
     run_id = int(payload["run_id"]) if payload.get("run_id") is not None else None
+    shard_count = int(payload.get("shard_count") or 1)
+    is_shard = shard_count > 1
 
     if precision == "auto":
         precision = "fp16" if device.type == "cuda" else "fp32"
@@ -91,13 +93,20 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
 
     model_row = db.get_model(model_id)
     samples = db.list_samples(dataset_id)
+    sample_ids = payload.get("sample_ids")
+    if sample_ids is not None:
+        allowed = {int(sample_id) for sample_id in sample_ids}
+        samples = [sample for sample in samples if int(sample["id"]) in allowed]
     if not samples:
         raise ValueError(f"dataset {dataset_id} has no samples")
 
     db.update_job_progress(job_id, 0, len(samples))
     if run_id is not None:
         db.mark_run_started(run_id, "running")
-        db.update_run_progress(run_id, 0, len(samples), "running")
+        if is_shard:
+            db.update_run_progress_from_jobs(run_id, "running")
+        else:
+            db.update_run_progress(run_id, 0, len(samples), "running")
     model = load_flow_mask_model(
         adapter=model_row["adapter"],
         checkpoint_path=model_row.get("checkpoint_path"),
@@ -125,12 +134,12 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
         t1 = time.perf_counter()
         with torch.no_grad(), _autocast_context(device, precision):
             outputs = model.predict(img0, img1, 0.5)
-        validate_model_outputs(outputs, img0)
+        normalized_outputs = normalize_model_outputs(outputs, img0)
         timing["model"] += time.perf_counter() - t1
 
         t2 = time.perf_counter()
-        composed = compose_interpolated(img0, img1, outputs)
-        bundle = {**composed, "flowt_0": outputs["flowt_0"], "flowt_1": outputs["flowt_1"]}
+        composed = compose_interpolated(img0, img1, normalized_outputs)
+        bundle = {**composed, "flowt_0": normalized_outputs["flowt_0"], "flowt_1": normalized_outputs["flowt_1"]}
         timing["post"] += time.perf_counter() - t2
 
         t3 = time.perf_counter()
@@ -156,7 +165,10 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
             processed += 1
             db.update_job_progress(job_id, processed)
             if run_id is not None:
-                db.update_run_progress(run_id, processed)
+                if is_shard:
+                    db.update_run_progress_from_jobs(run_id, "running")
+                else:
+                    db.update_run_progress(run_id, processed)
         timing["save"] += time.perf_counter() - t3
 
     if video_groups:
@@ -173,6 +185,9 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
 
     result_dict = result.__dict__
     artifact_summary = db.summarize_artifacts(job_id)
+
+    if is_shard:
+        return result
 
     if metric_names:
         metric_payload = {

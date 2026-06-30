@@ -12,24 +12,57 @@ def validate_model_outputs(outputs: dict[str, torch.Tensor], img0: torch.Tensor)
     if missing:
         raise ValueError(f"model output missing required fields: {', '.join(missing)}")
 
-    batch, _channels, height, width = img0.shape
-    flow_shape = (batch, 2, height, width)
-    mask_shape = (batch, 1, height, width)
+    batch, _channels, _height, _width = img0.shape
     for name in ("flowt_0", "flowt_1"):
         if not isinstance(outputs[name], torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor")
-        if tuple(outputs[name].shape) != flow_shape:
-            raise ValueError(f"{name} must have shape {flow_shape}, got {tuple(outputs[name].shape)}")
+        if outputs[name].ndim != 4:
+            raise ValueError(f"{name} must be a BCHW tensor, got {tuple(outputs[name].shape)}")
+        if outputs[name].shape[0] != batch or outputs[name].shape[1] != 2:
+            raise ValueError(f"{name} must have shape [B,2,h,w] with B={batch}, got {tuple(outputs[name].shape)}")
+        if outputs[name].shape[-2] <= 0 or outputs[name].shape[-1] <= 0:
+            raise ValueError(f"{name} spatial size must be positive, got {tuple(outputs[name].shape)}")
     for name in ("mask0", "mask1"):
         if not isinstance(outputs[name], torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor")
-        if tuple(outputs[name].shape) != mask_shape:
-            raise ValueError(f"{name} must have shape {mask_shape}, got {tuple(outputs[name].shape)}")
+        if outputs[name].ndim != 4:
+            raise ValueError(f"{name} must be a BCHW tensor, got {tuple(outputs[name].shape)}")
+        if outputs[name].shape[0] != batch or outputs[name].shape[1] != 1:
+            raise ValueError(f"{name} must have shape [B,1,h,w] with B={batch}, got {tuple(outputs[name].shape)}")
+        if outputs[name].shape[-2] <= 0 or outputs[name].shape[-1] <= 0:
+            raise ValueError(f"{name} spatial size must be positive, got {tuple(outputs[name].shape)}")
     for name in REQUIRED_OUTPUTS:
         if outputs[name].device != img0.device:
             raise ValueError(f"{name} must stay on device {img0.device}, got {outputs[name].device}")
         if outputs[name].dtype != img0.dtype:
             raise ValueError(f"{name} must keep dtype {img0.dtype}, got {outputs[name].dtype}")
+
+
+def normalize_model_outputs(outputs: dict[str, torch.Tensor], img0: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Resize core model outputs to the inference resolution.
+
+    Flow is in pixel units, so resizing from h/w to H/W also scales x/y
+    displacement magnitudes. Mask tensors remain logits and are only resized.
+    """
+    validate_model_outputs(outputs, img0)
+    _batch, _channels, height, width = img0.shape
+    normalized = dict(outputs)
+    for name in ("flowt_0", "flowt_1"):
+        flow = outputs[name]
+        src_h, src_w = int(flow.shape[-2]), int(flow.shape[-1])
+        if (src_h, src_w) != (height, width):
+            flow = F.interpolate(flow, size=(height, width), mode="bilinear", align_corners=True)
+            scale_x = float(width) / float(src_w)
+            scale_y = float(height) / float(src_h)
+            scale = flow.new_tensor([scale_x, scale_y]).view(1, 2, 1, 1)
+            flow = flow * scale
+        normalized[name] = flow
+    for name in ("mask0", "mask1"):
+        mask = outputs[name]
+        if tuple(mask.shape[-2:]) != (height, width):
+            mask = F.interpolate(mask, size=(height, width), mode="bilinear", align_corners=True)
+        normalized[name] = mask
+    return normalized
 
 
 def _pixel_grid(batch: int, height: int, width: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -75,11 +108,11 @@ def compose_interpolated(
     img1: torch.Tensor,
     outputs: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    validate_model_outputs(outputs, img0)
-    warp0 = backward_warp(img0, outputs["flowt_0"])
-    warp1 = backward_warp(img1, outputs["flowt_1"])
-    mask0 = torch.sigmoid(outputs["mask0"])
-    mask1 = torch.sigmoid(outputs["mask1"])
+    normalized = normalize_model_outputs(outputs, img0)
+    warp0 = backward_warp(img0, normalized["flowt_0"])
+    warp1 = backward_warp(img1, normalized["flowt_1"])
+    mask0 = torch.sigmoid(normalized["mask0"])
+    mask1 = torch.sigmoid(normalized["mask1"])
     blended = mask0 * warp0 + (1.0 - mask0) * warp1
     pred = mask1 * img1 + (1.0 - mask1) * blended
     return {

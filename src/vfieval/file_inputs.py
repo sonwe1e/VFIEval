@@ -17,6 +17,7 @@ from vfieval.pipeline.postprocess import validate_model_outputs
 
 
 VIDEO_SUFFIXES = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
+CHECKPOINT_SUFFIXES = {".bin", ".ckpt", ".pth", ".pt", ".safetensors"}
 DECODE_STRATEGY_VERSION = "opencv-rgb-v1"
 VIDEO_INSPECT_VERSION = "ffprobe-opencv-v3"
 
@@ -31,6 +32,10 @@ def models_dir(workspace: WorkspaceConfig) -> Path:
 
 def videos_dir(workspace: WorkspaceConfig) -> Path:
     return Path(os.getenv("VFIEVAL_VIDEOS_DIR") or project_root(workspace) / "videos").resolve()
+
+
+def checkpoints_dir(workspace: WorkspaceConfig) -> Path:
+    return Path(os.getenv("VFIEVAL_CHECKPOINTS_DIR") or project_root(workspace) / "checkpoints").resolve()
 
 
 def list_model_files(workspace: WorkspaceConfig) -> list[dict[str, Any]]:
@@ -52,6 +57,34 @@ def list_model_files(workspace: WorkspaceConfig) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def list_checkpoints(workspace: WorkspaceConfig, model_file: str | None = None) -> list[dict[str, Any]]:
+    root = checkpoints_dir(workspace)
+    if not root.exists():
+        return []
+    model_stem = Path(model_file).stem if model_file else None
+    search_roots = [root / model_stem] if model_stem else [path for path in sorted(root.iterdir()) if path.is_dir()]
+    rows: list[dict[str, Any]] = []
+    for folder in search_roots:
+        if not folder.exists() or not folder.is_dir():
+            continue
+        for path in sorted(folder.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in CHECKPOINT_SUFFIXES:
+                continue
+            stat = path.stat()
+            rows.append(
+                {
+                    "name": path.name,
+                    "model": folder.name,
+                    "relative_path": path.relative_to(root).as_posix(),
+                    "path": str(path),
+                    "size": stat.st_size,
+                    "mtime": stat.st_mtime,
+                    "mtime_ns": stat.st_mtime_ns,
+                }
+            )
+    return sorted(rows, key=lambda item: (str(item["model"]), -int(item["mtime_ns"]), str(item["relative_path"])))
 
 
 def list_video_groups(workspace: WorkspaceConfig) -> list[dict[str, Any]]:
@@ -125,6 +158,29 @@ def resolve_model_file(workspace: WorkspaceConfig, model_file: str) -> Path:
     return path
 
 
+def resolve_checkpoint(workspace: WorkspaceConfig, checkpoint: str | None, model_file: str | None = None) -> Path | None:
+    if checkpoint in {None, "", "none"}:
+        return None
+    root = checkpoints_dir(workspace)
+    if checkpoint == "auto":
+        candidates = list_checkpoints(workspace, model_file)
+        return Path(candidates[0]["path"]) if candidates else None
+    checkpoint_path = Path(str(checkpoint))
+    if checkpoint_path.is_absolute() or ".." in checkpoint_path.parts:
+        raise ValueError("checkpoint must be a relative path under checkpoints/")
+    path = (root / checkpoint_path).resolve()
+    _ensure_child(path, root, "checkpoint is outside checkpoints/")
+    if not path.is_file():
+        raise FileNotFoundError(f"checkpoint not found: {checkpoint}")
+    if path.suffix.lower() not in CHECKPOINT_SUFFIXES:
+        raise ValueError(f"unsupported checkpoint file type: {path.name}")
+    if model_file:
+        model_root = (root / Path(model_file).stem).resolve()
+        if model_root.exists():
+            _ensure_child(path, model_root, f"checkpoint must be under checkpoints/{Path(model_file).stem}/")
+    return path
+
+
 def resolve_video_group(workspace: WorkspaceConfig, video_group: str) -> Path:
     if Path(video_group).name != video_group:
         raise ValueError("视频集必须是 videos/ 下的一级文件夹")
@@ -166,6 +222,7 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
     max_frames = _optional_positive_int(payload.get("max_frames"))
     device_request = str(payload.get("device") or "auto")
     precision_request = str(payload.get("precision") or "auto")
+    checkpoint_request = payload.get("checkpoint")
 
     result: dict[str, Any] = {
         "ok": True,
@@ -182,8 +239,14 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
     model_path: Path | None = None
     try:
         model_path = resolve_model_file(workspace, model_file)
-        _dry_run_model_file(model_path)
-        result["model"] = {"name": model_path.name, "path": str(model_path), "interface_ok": True}
+        checkpoint_path = resolve_checkpoint(workspace, checkpoint_request, model_path.name)
+        _dry_run_model_file(model_path, checkpoint_path)
+        result["model"] = {
+            "name": model_path.name,
+            "path": str(model_path),
+            "checkpoint": str(checkpoint_path) if checkpoint_path else None,
+            "interface_ok": True,
+        }
     except Exception as exc:
         result["ok"] = False
         result["model"] = {"name": model_file, "interface_ok": False}
@@ -226,7 +289,10 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
         result["video_group"] = {"name": video_group, "videos": video_infos}
         result["errors"].append(_error("视频集检查失败", exc))
 
-    device_info = _check_device(device_request, precision_request)
+    if str(payload.get("execution_mode") or "single") == "multi_cuda":
+        device_info = _check_multi_cuda(payload, precision_request)
+    else:
+        device_info = _check_device(device_request, precision_request)
     result["device"] = device_info
     if device_info["status"] == "error":
         result["ok"] = False
@@ -492,8 +558,13 @@ def resolve_run_dimensions(payload: dict[str, Any], video_infos: list[dict[str, 
     return int(first["height"]), int(first["width"])
 
 
-def _dry_run_model_file(model_path: Path) -> None:
-    model = load_flow_mask_model(f"file:{model_path}", device="cpu", metadata={})
+def _dry_run_model_file(model_path: Path, checkpoint_path: Path | None = None) -> None:
+    model = load_flow_mask_model(
+        f"file:{model_path}",
+        checkpoint_path=str(checkpoint_path) if checkpoint_path else None,
+        device="cpu",
+        metadata={},
+    )
     img0 = torch.zeros((1, 3, 8, 8), dtype=torch.float32)
     img1 = torch.ones((1, 3, 8, 8), dtype=torch.float32)
     with torch.no_grad():
@@ -536,6 +607,34 @@ def _check_device(device: str, precision: str) -> dict[str, Any]:
         "requested_device": requested_device,
         "requested_precision": requested_precision,
         "effective_device": effective_device,
+        "effective_precision": effective_precision,
+        "warning": warning,
+    }
+
+
+def _check_multi_cuda(payload: dict[str, Any], precision: str) -> dict[str, Any]:
+    requested = [str(device) for device in (payload.get("devices") or []) if str(device).startswith("cuda:")]
+    if not torch.cuda.is_available():
+        return {"status": "error", "message": "CUDA 不可用，无法启用多卡 CUDA", "effective_device": "multi_cuda"}
+    available = [f"cuda:{index}" for index in range(torch.cuda.device_count())]
+    devices = requested or available
+    invalid = [device for device in devices if device not in available]
+    if invalid:
+        return {"status": "error", "message": f"CUDA 设备不存在: {', '.join(invalid)}", "effective_device": "multi_cuda"}
+    requested_precision = precision or "auto"
+    effective_precision = requested_precision
+    warning = None
+    if requested_precision == "auto":
+        effective_precision = "fp16"
+    if effective_precision == "bf16" and hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
+        warning = "当前 CUDA 设备不支持 bf16，已回退 fp32"
+        effective_precision = "fp32"
+    return {
+        "status": "ok",
+        "requested_device": "multi_cuda",
+        "requested_precision": requested_precision,
+        "effective_device": "multi_cuda",
+        "effective_devices": devices,
         "effective_precision": effective_precision,
         "warning": warning,
     }

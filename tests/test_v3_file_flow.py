@@ -18,10 +18,10 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
-from vfieval.file_inputs import decode_cache_dir, list_model_files, list_video_group_videos, list_video_groups, preflight_run
+from vfieval.file_inputs import decode_cache_dir, list_checkpoints, list_model_files, list_video_group_videos, list_video_groups, preflight_run
 from vfieval.models import load_flow_mask_model
 from vfieval.pipeline.postprocess import validate_model_outputs
-from vfieval.server import _make_handler
+from vfieval.server import _make_handler, _partition_samples_by_video
 
 
 class V3FileFlowTests(unittest.TestCase):
@@ -61,6 +61,8 @@ class V3FileFlowTests(unittest.TestCase):
             db.init()
 
             self.assertIn("test_average.py", [row["name"] for row in list_model_files(workspace)])
+            checkpoints = list_checkpoints(workspace, "test_checkpoint.py")
+            self.assertIn("test_checkpoint/latest.pth", [row["relative_path"] for row in checkpoints])
             video_groups = list_video_groups(workspace)
             self.assertIn("test_style", [row["name"] for row in video_groups])
             test_style = next(row for row in video_groups if row["name"] == "test_style")
@@ -86,6 +88,21 @@ class V3FileFlowTests(unittest.TestCase):
             )
             self.assertTrue(ok["ok"], ok)
             self.assertGreater(ok["video_group"]["triplets"], 0)
+
+            checkpoint_ok = preflight_run(
+                db,
+                workspace,
+                {
+                    "model_file": "test_checkpoint.py",
+                    "checkpoint": "auto",
+                    "video_group": "test_style",
+                    "device": "cpu",
+                    "precision": "fp32",
+                    "max_frames": 4,
+                },
+            )
+            self.assertTrue(checkpoint_ok["ok"], checkpoint_ok)
+            self.assertTrue(checkpoint_ok["model"]["checkpoint"].endswith("latest.pth"))
 
             selected = preflight_run(
                 db,
@@ -166,6 +183,10 @@ class V3FileFlowTests(unittest.TestCase):
                 paged = _get(base_url, "/api/video-groups/test_style/videos?page=1&page_size=2&q=motion")
                 self.assertLessEqual(len(paged["videos"]), 2)
                 self.assertIn("all_video_names", paged)
+                checkpoint_payload = _get(base_url, "/api/checkpoints?model_file=test_checkpoint.py")
+                self.assertIn("test_checkpoint/latest.pth", [row["relative_path"] for row in checkpoint_payload])
+                devices_payload = _get(base_url, "/api/devices")
+                self.assertIn("cpu", devices_payload)
                 preflight = _post(
                     base_url,
                     "/api/preflight",
@@ -203,6 +224,7 @@ class V3FileFlowTests(unittest.TestCase):
                 self.assertEqual(kinds.count("pred_video"), 1)
                 self.assertTrue(Path(run["metadata"]["output_dir"]).exists())
                 self.assertEqual(run["metadata"]["selected_videos"], [selected_video])
+                self.assertIn("jobs", _get(base_url, f"/api/runs/{run_id}"))
 
                 metric_job_id = db.create_job("metric", {"test": True})
                 samples = db.list_samples(int(run["dataset_id"]))
@@ -349,6 +371,19 @@ class V3FileFlowTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=5)
+
+    def test_partition_samples_keeps_video_groups_together(self) -> None:
+        samples = [
+            {"id": 1, "metadata": {"video_file": "a.mp4"}},
+            {"id": 2, "metadata": {"video_file": "a.mp4"}},
+            {"id": 3, "metadata": {"video_file": "b.mp4"}},
+            {"id": 4, "metadata": {"video_file": "c.mp4"}},
+        ]
+        partitions = _partition_samples_by_video(samples, ["cuda:0", "cuda:1"])
+        flattened = sorted(sample_id for shard in partitions for sample_id in shard)
+        self.assertEqual(flattened, [1, 2, 3, 4])
+        shard_by_sample = {sample_id: index for index, shard in enumerate(partitions) for sample_id in shard}
+        self.assertEqual(shard_by_sample[1], shard_by_sample[2])
 
 
 def _post(base_url: str, path: str, payload: dict) -> dict:

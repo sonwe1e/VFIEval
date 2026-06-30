@@ -99,6 +99,9 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
                 result = run_inference_job(db, workspace, int(job["id"]))
                 if db.get_job(int(job["id"]))["status"] != "canceled":
                     db.complete_job(int(job["id"]), result.__dict__)
+                    run_id = job.get("payload", {}).get("run_id")
+                    if run_id is not None and int(job.get("payload", {}).get("shard_count") or 1) > 1:
+                        db.maybe_complete_multi_run_inference(int(run_id))
             elif job["kind"] == "metric":
                 result = run_metric_job(db, workspace, int(job["id"]))
                 db.complete_job(int(job["id"]), result)
