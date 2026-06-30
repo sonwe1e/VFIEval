@@ -33,9 +33,21 @@ def validate_model_outputs(outputs: dict[str, torch.Tensor], img0: torch.Tensor)
             raise ValueError(f"{name} spatial size must be positive, got {tuple(outputs[name].shape)}")
     for name in REQUIRED_OUTPUTS:
         if outputs[name].device != img0.device:
-            raise ValueError(f"{name} must stay on device {img0.device}, got {outputs[name].device}")
+            raise ValueError(
+                f"Model output field {name} is on {_device_label(outputs[name].device)}, "
+                f"expected {_device_label(img0.device)}"
+            )
         if outputs[name].dtype != img0.dtype:
-            raise ValueError(f"{name} must keep dtype {img0.dtype}, got {outputs[name].dtype}")
+            raise ValueError(
+                f"Model output field {name} has dtype {outputs[name].dtype}, expected {img0.dtype}"
+            )
+
+
+def _device_label(device: torch.device) -> str:
+    text = str(device)
+    if text == "cpu":
+        return "CPU"
+    return text
 
 
 def normalize_model_outputs(outputs: dict[str, torch.Tensor], img0: torch.Tensor) -> dict[str, torch.Tensor]:

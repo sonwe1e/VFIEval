@@ -9,13 +9,15 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from PIL import Image
 
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
+from vfieval.devices import autocast_context, resolve_torch_device
 from vfieval.models import load_flow_mask_model
 from vfieval.pipeline.io import batch_tensors, load_rgb_tensor, resize_batch
 from vfieval.pipeline.postprocess import compose_interpolated, normalize_model_outputs
-from vfieval.pipeline.visualize import save_difference, save_extra_tensor, save_visual_bundle
+from vfieval.pipeline.visualize import save_difference, save_extra_tensor, save_preview_image, save_visual_bundle
 
 
 VALID_PRECISIONS = {"fp32", "fp16", "bf16"}
@@ -42,21 +44,11 @@ def sanitize_name(name: str) -> str:
 
 
 def resolve_device(device_name: str) -> torch.device:
-    if device_name == "auto":
-        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    if device_name.startswith("npu"):
-        try:
-            import torch_npu  # noqa: F401
-        except ImportError as exc:
-            raise RuntimeError("NPU device requested but torch_npu is not installed") from exc
-    return torch.device(device_name)
+    return resolve_torch_device(device_name)
 
 
 def _autocast_context(device: torch.device, precision: str):
-    if precision == "fp32" or device.type not in {"cuda"}:
-        return torch.amp.autocast(device_type=device.type, enabled=False)
-    dtype = torch.float16 if precision == "fp16" else torch.bfloat16
-    return torch.amp.autocast(device_type=device.type, dtype=dtype, enabled=True)
+    return autocast_context(device, precision)
 
 
 def _artifact_mime(kind: str) -> str:
@@ -79,10 +71,12 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
     run_id = int(payload["run_id"]) if payload.get("run_id") is not None else None
     shard_count = int(payload.get("shard_count") or 1)
     is_shard = shard_count > 1
+    run = db.get_run(run_id) if run_id is not None else None
+    run_metadata = dict((run or {}).get("metadata") or {})
 
     if precision == "auto":
-        precision = "fp16" if device.type == "cuda" else "fp32"
-    if precision in {"fp16", "bf16"} and device.type != "cuda":
+        precision = "fp16" if device.type in {"cuda", "npu"} else "fp32"
+    if precision in {"fp16", "bf16"} and device.type not in {"cuda", "npu"}:
         precision = "fp32"
     if precision not in VALID_PRECISIONS:
         raise ValueError(f"precision must be one of {sorted(VALID_PRECISIONS)}, got {precision}")
@@ -91,7 +85,6 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
 
-    model_row = db.get_model(model_id)
     samples = db.list_samples(dataset_id)
     sample_ids = payload.get("sample_ids")
     if sample_ids is not None:
@@ -100,6 +93,20 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
     if not samples:
         raise ValueError(f"dataset {dataset_id} has no samples")
 
+    if str(run_metadata.get("run_type") or payload.get("run_type") or "model_inference") == "video_compare":
+        return _run_video_compare_job(
+            db=db,
+            workspace=workspace,
+            job_id=job_id,
+            run_id=run_id,
+            job=job,
+            run=run,
+            samples=samples,
+            metric_names=metric_names,
+            is_shard=is_shard,
+            dataset_id=dataset_id,
+        )
+
     db.update_job_progress(job_id, 0, len(samples))
     if run_id is not None:
         db.mark_run_started(run_id, "running")
@@ -107,6 +114,7 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
             db.update_run_progress_from_jobs(run_id, "running")
         else:
             db.update_run_progress(run_id, 0, len(samples), "running")
+    model_row = db.get_model(model_id)
     model = load_flow_mask_model(
         adapter=model_row["adapter"],
         checkpoint_path=model_row.get("checkpoint_path"),
@@ -148,18 +156,19 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
             sample_dir = run_dir / sanitize_name(row["name"])
             paths = save_visual_bundle(bundle, sample_dir, idx)
             for kind, path in paths.items():
-                db.add_artifact(job_id, int(row["id"]), kind, str(path), _artifact_mime(kind), {"sample": row["name"]})
+                _add_image_artifact_with_preview(db, job_id, int(row["id"]), kind, path, {"sample": row["name"]})
             extra_paths = _save_extra_outputs(outputs, sample_dir, idx)
             for kind, path in extra_paths.items():
-                db.add_artifact(job_id, int(row["id"]), kind, str(path), "image/png", {"sample": row["name"]})
+                _add_image_artifact_with_preview(db, job_id, int(row["id"]), kind, path, {"sample": row["name"]})
 
             diff_path = None
             if row.get("gt_path"):
                 gt = load_rgb_tensor(row["gt_path"], device).unsqueeze(0)
                 gt = resize_batch(gt, height, width)[0]
+                _add_image_artifact_with_preview(db, job_id, int(row["id"]), "gt", Path(row["gt_path"]), {"sample": row["name"]})
                 diff_path = sample_dir / "difference.png"
                 save_difference(composed["pred"][idx], gt, diff_path)
-                db.add_artifact(job_id, int(row["id"]), "difference", str(diff_path), "image/png", {"sample": row["name"]})
+                _add_image_artifact_with_preview(db, job_id, int(row["id"]), "difference", diff_path, {"sample": row["name"]})
             _collect_video_frame(video_groups, row, paths["pred"], diff_path)
 
             processed += 1
@@ -210,6 +219,88 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
     return result
 
 
+def _run_video_compare_job(
+    db: Database,
+    workspace: WorkspaceConfig,
+    job_id: int,
+    run_id: int | None,
+    job: dict[str, Any],
+    run: dict[str, Any] | None,
+    samples: list[dict[str, Any]],
+    metric_names: list[str],
+    is_shard: bool,
+    dataset_id: int,
+) -> InferenceJobResult:
+    db.update_job_progress(job_id, 0, len(samples))
+    if run_id is not None:
+        db.mark_run_started(run_id, "running")
+        if is_shard:
+            db.update_run_progress_from_jobs(run_id, "running")
+        else:
+            db.update_run_progress(run_id, 0, len(samples), "running")
+
+    run_dir = workspace.runs_dir / (str(run_id) if run_id is not None else f"inference_{job_id:06d}")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_run_metadata(run_dir, job, db.get_model(int(job["payload"]["model_id"])), db.get_dataset(dataset_id) if dataset_id else None)
+
+    processed = 0
+    video_groups: dict[str, dict[str, Any]] = {}
+    save_seconds = 0.0
+    for row in samples:
+        _raise_if_canceled(db, run_id, job_id)
+        t0 = time.perf_counter()
+        sample_dir = run_dir / sanitize_name(row["name"])
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        gt_output_path = _copy_compare_image(Path(row["gt_path"]), sample_dir / "gt.png")
+        pred_output_path = _copy_compare_image(Path(row["img1_path"]), sample_dir / "pred.png")
+        diff_output_path = sample_dir / "difference.png"
+        save_difference(load_rgb_tensor(pred_output_path), load_rgb_tensor(gt_output_path), diff_output_path)
+
+        _add_image_artifact_with_preview(db, job_id, int(row["id"]), "gt", gt_output_path, {"sample": row["name"]})
+        _add_image_artifact_with_preview(db, job_id, int(row["id"]), "pred", pred_output_path, {"sample": row["name"]})
+        _add_image_artifact_with_preview(db, job_id, int(row["id"]), "difference", diff_output_path, {"sample": row["name"]})
+        _collect_compare_frame(video_groups, row, gt_output_path, pred_output_path, diff_output_path)
+
+        processed += 1
+        db.update_job_progress(job_id, processed)
+        if run_id is not None:
+            if is_shard:
+                db.update_run_progress_from_jobs(run_id, "running")
+            else:
+                db.update_run_progress(run_id, processed)
+        save_seconds += time.perf_counter() - t0
+
+    if video_groups:
+        _write_video_artifacts(db, job_id, run_dir, video_groups)
+
+    result = InferenceJobResult(
+        samples=processed,
+        output_dir=str(run_dir),
+        decode_fps=0.0,
+        model_fps=0.0,
+        postprocess_fps=0.0,
+        save_fps=_fps(processed, save_seconds),
+    )
+    artifact_summary = db.summarize_artifacts(job_id)
+    if is_shard:
+        return result
+    if metric_names:
+        metric_payload = {
+            "inference_job_id": job_id,
+            "dataset_id": dataset_id,
+            "metric_names": metric_names,
+        }
+        if run_id is not None:
+            metric_payload["run_id"] = run_id
+        metric_job_id = db.create_job("metric", metric_payload)
+        if run_id is not None:
+            db.complete_run_inference(run_id, result.__dict__, artifact_summary, "metric_queued")
+            db.set_run_metric_job(run_id, metric_job_id)
+    elif run_id is not None:
+        db.complete_run_inference(run_id, result.__dict__, artifact_summary, "completed")
+    return result
+
+
 def _fps(count: int, seconds: float) -> float:
     if seconds <= 0:
         return 0.0
@@ -222,6 +313,31 @@ def _load_resized_batch(paths: list[str], device: torch.device, height: int, wid
         tensor = load_rgb_tensor(path, device).unsqueeze(0)
         tensors.append(resize_batch(tensor, height, width)[0])
     return batch_tensors(tensors)
+
+
+def _add_image_artifact_with_preview(
+    db: Database,
+    job_id: int,
+    sample_id: int,
+    kind: str,
+    path: Path,
+    metadata: dict[str, Any],
+) -> int:
+    preview_path = path.parent / "preview" / path.name
+    preview_metadata = dict(metadata)
+    try:
+        preview = save_preview_image(path, preview_path)
+        preview_metadata.update({"preview_path": str(preview), "preview_max_edge": 512})
+    except Exception:
+        pass
+    return db.add_artifact(job_id, sample_id, kind, str(path), "image/png", preview_metadata)
+
+
+def _copy_compare_image(source_path: Path, output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(source_path).convert("RGB") as image:
+        image.save(output_path)
+    return output_path
 
 
 def _write_run_metadata(run_dir: Path, job: dict[str, Any], model: dict[str, Any], dataset: dict[str, Any] | None) -> None:
@@ -286,6 +402,35 @@ def _collect_video_frame(
             "pred_path": Path(pred_path),
             "gt_path": Path(sample["gt_path"]) if sample.get("gt_path") else None,
             "diff_path": Path(diff_path) if diff_path else None,
+        }
+    )
+
+
+def _collect_compare_frame(
+    video_groups: dict[str, dict[str, Any]],
+    sample: dict[str, Any],
+    gt_path: Path,
+    pred_path: Path,
+    diff_path: Path,
+) -> None:
+    metadata = sample.get("metadata") or {}
+    video_key = str(metadata.get("compare_group") or metadata.get("video_name") or "compare")
+    group = video_groups.setdefault(
+        video_key,
+        {
+            "video_name": metadata.get("video_name") or video_key,
+            "fps": float(metadata.get("fps") or 24.0),
+            "frames": [],
+        },
+    )
+    frame_order = int(metadata.get("frame_index") or metadata.get("sample_index") or len(group["frames"]))
+    group["frames"].append(
+        {
+            "order": frame_order,
+            "sample_name": sample["name"],
+            "pred_path": Path(pred_path),
+            "gt_path": Path(gt_path),
+            "diff_path": Path(diff_path),
         }
     )
 

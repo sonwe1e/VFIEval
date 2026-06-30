@@ -70,6 +70,8 @@ def main(argv: list[str] | None = None) -> int:
     worker.add_argument("--once", action="store_true")
     worker.add_argument("--poll-interval", type=float, default=5.0)
     worker.add_argument("--worker-id")
+    worker.add_argument("--device-filter")
+    worker.add_argument("--idle-timeout", type=float)
 
     jobs = sub.add_parser("jobs")
     jobs.add_argument("--limit", type=int, default=50)
@@ -166,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
                 once=args.once,
                 poll_interval=args.poll_interval,
                 worker_id=args.worker_id,
+                device_filter=args.device_filter,
+                idle_timeout=args.idle_timeout,
             ),
         )
         return 0

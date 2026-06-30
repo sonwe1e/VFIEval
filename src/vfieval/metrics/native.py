@@ -14,7 +14,7 @@ class NativeMetric:
 
     def evaluate(self, reference: Path, distorted: Path, work_dir: Path) -> MetricResult:
         health = metric_health(self.workspace, self.name)
-        if health["status"] != "ready":
+        if not health.get("available"):
             raise MetricUnavailable(f"{self.name} native adapter is {health['status']}: {health['reason']}")
         raise MetricUnavailable(
             f"{self.name} native evaluator assets are present, but the official evaluator binding "

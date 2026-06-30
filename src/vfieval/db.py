@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+from vfieval.job_errors import enrich_job_error
+
 
 def utc_ts() -> float:
     return time.time()
@@ -154,6 +156,8 @@ CREATE TABLE IF NOT EXISTS runs (
     result_json TEXT NOT NULL DEFAULT '{}',
     error_json TEXT NOT NULL DEFAULT '{}',
     metadata_json TEXT NOT NULL DEFAULT '{}',
+    deleted_at REAL,
+    artifact_cleaned_at REAL,
     created_at REAL NOT NULL,
     started_at REAL,
     finished_at REAL,
@@ -241,6 +245,13 @@ class Database:
         for name, definition in dataset_columns.items():
             if name not in columns:
                 conn.execute(f"ALTER TABLE datasets ADD COLUMN {name} {definition}")
+        run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+        for name, definition in {
+            "deleted_at": "REAL",
+            "artifact_cleaned_at": "REAL",
+        }.items():
+            if name not in run_columns:
+                conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
 
     def query(self, sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
         with self.connection() as conn:
@@ -692,9 +703,10 @@ class Database:
         max_id = int(row["max_id"] or 0) if row else 0
         return max_id + 1
 
-    def list_runs(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list_runs(self, limit: int = 100, include_deleted: bool = False) -> list[dict[str, Any]]:
+        deleted_clause = "" if include_deleted else "WHERE r.deleted_at IS NULL"
         rows = self.query(
-            """
+            f"""
             SELECT
                 r.*,
                 e.name AS experiment_name,
@@ -704,6 +716,7 @@ class Database:
             LEFT JOIN experiments e ON e.id = r.experiment_id
             JOIN models m ON m.id = r.model_id
             JOIN datasets d ON d.id = r.dataset_id
+            {deleted_clause}
             ORDER BY r.id DESC
             LIMIT ?
             """,
@@ -808,6 +821,13 @@ class Database:
         with self.connection() as conn:
             conn.execute(
                 """
+                INSERT OR IGNORE INTO run_jobs(run_id, job_id, role, shard_index, device, metadata_json, created_at)
+                VALUES (?, ?, 'metric', 0, NULL, '{}', ?)
+                """,
+                (run_id, metric_job_id, now),
+            )
+            conn.execute(
+                """
                 UPDATE runs
                 SET metric_job_id = ?, status = 'metric_queued', updated_at = ?
                 WHERE id = ?
@@ -872,10 +892,17 @@ class Database:
         now = utc_ts()
         run = self.get_run(run_id)
         inference_job_id = run.get("inference_job_id")
+        metric_job_id = run.get("metric_job_id")
         run_job_ids = [int(row["job_id"]) for row in self.list_run_jobs(run_id)]
         with self.connection() as conn:
-            if run["status"] == "queued" and (inference_job_id is not None or run_job_ids):
-                target_ids = run_job_ids or [int(inference_job_id)]
+            if run["status"] in {"queued", "metric_queued"} and (inference_job_id is not None or metric_job_id is not None or run_job_ids):
+                target_ids = list(dict.fromkeys(
+                    [
+                        *run_job_ids,
+                        *([int(inference_job_id)] if inference_job_id is not None else []),
+                        *([int(metric_job_id)] if metric_job_id is not None else []),
+                    ]
+                ))
                 placeholders = ",".join("?" for _ in target_ids)
                 conn.execute(
                     f"""
@@ -938,6 +965,37 @@ class Database:
                 (_json(error or {"message": "Job 已取消"}), now, job_id),
             )
 
+    def soft_delete_run(self, run_id: int) -> None:
+        now = utc_ts()
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE runs
+                SET deleted_at = COALESCE(deleted_at, ?),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, run_id),
+            )
+
+    def mark_run_artifacts_cleaned(self, run_id: int) -> None:
+        now = utc_ts()
+        job_ids = self.run_inference_job_ids(run_id)
+        with self.connection() as conn:
+            if job_ids:
+                placeholders = ",".join("?" for _ in job_ids)
+                conn.execute(f"DELETE FROM artifacts WHERE job_id IN ({placeholders})", tuple(job_ids))
+            conn.execute(
+                """
+                UPDATE runs
+                SET artifact_cleaned_at = ?,
+                    artifact_summary_json = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, _json({"total": 0, "by_kind": {}}), now, run_id),
+            )
+
     def summarize_artifacts(self, job_id: int) -> dict[str, Any]:
         rows = self.query(
             """
@@ -979,7 +1037,7 @@ class Database:
             return False
         if any(job["status"] == "failed" for job in jobs):
             failed = next(job for job in jobs if job["status"] == "failed")
-            self.fail_run(run_id, {"message": failed.get("error", {}).get("message") or "inference shard failed", "device": failed.get("device")})
+            self.fail_run(run_id, enrich_job_error(failed, failed.get("error") or {}))
             return True
         if any(job["status"] == "canceled" for job in jobs):
             self.cancel_run(run_id, {"message": "inference shard canceled"})
@@ -1019,7 +1077,7 @@ class Database:
                 progress_total=0,
                 shard_index=0,
                 device=None,
-                metadata={"source": "multi_cuda"},
+                metadata={"source": (run.get("metadata") or {}).get("execution_mode") or "multi"},
             )
             self.complete_run_inference(run_id, result, artifact_summary, "metric_queued")
             self.set_run_metric_job(run_id, metric_job_id)
@@ -1119,22 +1177,37 @@ class Database:
         self._decode_job(row)
         return row
 
-    def claim_next_job(self, worker_id: str, kinds: list[str]) -> dict[str, Any] | None:
+    def claim_next_job(self, worker_id: str, kinds: list[str], device_filter: str | None = None) -> dict[str, Any] | None:
         if not kinds:
             return None
         placeholders = ",".join("?" for _ in kinds)
         now = utc_ts()
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                f"""
-                SELECT * FROM jobs
-                WHERE status = 'queued' AND kind IN ({placeholders})
-                ORDER BY created_at, id
-                LIMIT 1
-                """,
-                tuple(kinds),
-            ).fetchone()
+            if device_filter:
+                row = conn.execute(
+                    f"""
+                    SELECT j.*
+                    FROM jobs j
+                    JOIN run_jobs rj ON rj.job_id = j.id
+                    WHERE j.status = 'queued'
+                      AND j.kind IN ({placeholders})
+                      AND rj.device = ?
+                    ORDER BY j.created_at, j.id
+                    LIMIT 1
+                    """,
+                    (*tuple(kinds), device_filter),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    f"""
+                    SELECT * FROM jobs
+                    WHERE status = 'queued' AND kind IN ({placeholders})
+                    ORDER BY created_at, id
+                    LIMIT 1
+                    """,
+                    tuple(kinds),
+                ).fetchone()
             if row is None:
                 conn.commit()
                 return None

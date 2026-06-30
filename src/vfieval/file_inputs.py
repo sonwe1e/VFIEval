@@ -12,8 +12,10 @@ import torch
 
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
+from vfieval.devices import device_type_name, list_npu_devices, normalize_device_name, npu_unavailable_reason, resolve_torch_device, supported_precisions
+from vfieval.metrics.health import metrics_health
 from vfieval.models import load_flow_mask_model
-from vfieval.pipeline.postprocess import validate_model_outputs
+from vfieval.pipeline.postprocess import compose_interpolated, validate_model_outputs
 
 
 VIDEO_SUFFIXES = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
@@ -216,6 +218,83 @@ def resolve_selected_videos(workspace: WorkspaceConfig, video_group: str, select
 
 
 def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, Any]) -> dict[str, Any]:
+    if str(payload.get("run_type") or "model_inference") == "video_compare":
+        from vfieval.compare_inputs import (
+            inspect_compare_source,
+            validate_strict_alignment,
+            validate_strict_decoded_alignment,
+        )
+        from vfieval.datasets import _load_compare_source_frames
+
+        health = metrics_health(workspace)
+        selected_metrics = [str(name) for name in (payload.get("metrics") or [])]
+        result: dict[str, Any] = {
+            "ok": True,
+            "run_type": "video_compare",
+            "errors": [],
+            "warnings": [],
+            "reference": {},
+            "distorted": {},
+            "alignment": {"mode": str(payload.get("align_mode") or "strict")},
+            "metrics": {
+                "requested": selected_metrics,
+                "health": {
+                    name: health["metrics"][name]
+                    for name in selected_metrics
+                    if name in health["metrics"]
+                },
+            },
+            "output_dir": str(workspace.runs_dir / str(db.next_run_id())),
+        }
+        try:
+            reference = inspect_compare_source(workspace, str(payload.get("reference") or ""))
+            distorted = inspect_compare_source(workspace, str(payload.get("distorted") or ""))
+            align_mode = str(payload.get("align_mode") or "strict")
+            if align_mode != "strict":
+                raise ValueError("video_compare currently only supports strict alignment for external inputs")
+            validate_strict_alignment(reference, distorted)
+            reference_frames, reference_fps, reference_timestamps = _load_compare_source_frames(
+                workspace,
+                Path(str(reference["path"])),
+                "compare_reference",
+            )
+            distorted_frames, distorted_fps, distorted_timestamps = _load_compare_source_frames(
+                workspace,
+                Path(str(distorted["path"])),
+                "compare_distorted",
+            )
+            validate_strict_decoded_alignment(
+                reference_frames=reference_frames,
+                distorted_frames=distorted_frames,
+                reference_fps=reference_fps,
+                distorted_fps=distorted_fps,
+                reference_timestamps=reference_timestamps,
+                distorted_timestamps=distorted_timestamps,
+            )
+            result["reference"] = reference
+            result["distorted"] = distorted
+            result["alignment"] = {
+                "mode": "strict",
+                "frame_count": len(reference_frames),
+                "width": int(reference["width"]),
+                "height": int(reference["height"]),
+                "fps": reference_fps if reference_fps is not None else distorted_fps,
+                "verified_with": "decoded_frames",
+            }
+        except Exception as exc:
+            result["ok"] = False
+            result["errors"].append({"title": "对比输入检查失败", "message": str(exc), "type": type(exc).__name__})
+        for name, row in result["metrics"]["health"].items():
+            if not row.get("available"):
+                result["warnings"].append(
+                    {
+                        "title": f"metric {name}",
+                        "message": row.get("reason") or row.get("status") or "metric is unavailable",
+                        "type": "MetricUnavailable",
+                    }
+                )
+        return result
+
     model_file = str(payload.get("model_file") or "")
     video_group = str(payload.get("video_group") or "")
     frame_step = max(1, int(payload.get("frame_step") or 1))
@@ -223,9 +302,11 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
     device_request = str(payload.get("device") or "auto")
     precision_request = str(payload.get("precision") or "auto")
     checkpoint_request = payload.get("checkpoint")
+    execution_mode = str(payload.get("execution_mode") or "single")
 
     result: dict[str, Any] = {
         "ok": True,
+        "run_type": "model_inference",
         "errors": [],
         "warnings": [],
         "model": {},
@@ -233,23 +314,49 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
         "device": {},
         "resolution": {},
         "cache": {},
+        "metrics": {},
         "output_dir": str(workspace.runs_dir / str(db.next_run_id())),
     }
 
+    if execution_mode == "multi_cuda":
+        device_info = _check_multi_accelerator(payload, precision_request, "cuda")
+    elif execution_mode == "multi_npu":
+        device_info = _check_multi_accelerator(payload, precision_request, "npu")
+    else:
+        device_info = _check_device(device_request, precision_request)
+    result["device"] = device_info
+    if device_info["status"] == "error":
+        result["ok"] = False
+        result["errors"].append({"title": "设备检查失败", "message": device_info["message"], "type": "DeviceError"})
+    if device_info.get("warning"):
+        result["warnings"].append(device_info["warning"])
+
     model_path: Path | None = None
+    tested_devices: list[str] = []
     try:
         model_path = resolve_model_file(workspace, model_file)
         checkpoint_path = resolve_checkpoint(workspace, checkpoint_request, model_path.name)
-        _dry_run_model_file(model_path, checkpoint_path)
+        for dry_run_device in _dry_run_devices(device_info):
+            try:
+                _dry_run_model_file(
+                    model_path,
+                    checkpoint_path,
+                    dry_run_device,
+                    str(device_info.get("effective_precision") or "fp32"),
+                )
+            except Exception as exc:
+                raise RuntimeError(f"model dry-run failed on {dry_run_device}: {exc}") from exc
+            tested_devices.append(dry_run_device)
         result["model"] = {
             "name": model_path.name,
             "path": str(model_path),
             "checkpoint": str(checkpoint_path) if checkpoint_path else None,
             "interface_ok": True,
+            "tested_devices": tested_devices,
         }
     except Exception as exc:
         result["ok"] = False
-        result["model"] = {"name": model_file, "interface_ok": False}
+        result["model"] = {"name": model_file, "interface_ok": False, "tested_devices": tested_devices}
         result["errors"].append(_error("模型检查失败", exc))
 
     video_folder: Path | None = None
@@ -289,18 +396,27 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
         result["video_group"] = {"name": video_group, "videos": video_infos}
         result["errors"].append(_error("视频集检查失败", exc))
 
-    if str(payload.get("execution_mode") or "single") == "multi_cuda":
-        device_info = _check_multi_cuda(payload, precision_request)
-    else:
-        device_info = _check_device(device_request, precision_request)
-    result["device"] = device_info
-    if device_info["status"] == "error":
-        result["ok"] = False
-        result["errors"].append({"title": "设备检查失败", "message": device_info["message"], "type": "DeviceError"})
-    if device_info.get("warning"):
-        result["warnings"].append(device_info["warning"])
-
     result["resolution"] = _resolve_preflight_resolution(payload, video_infos)
+    health = metrics_health(workspace)
+    selected_metrics = [str(name) for name in (payload.get("metrics") or [])]
+    metric_rows = {
+        name: health["metrics"][name]
+        for name in selected_metrics
+        if name in health["metrics"]
+    }
+    result["metrics"] = {
+        "requested": selected_metrics,
+        "health": metric_rows,
+    }
+    for name, row in metric_rows.items():
+        if not row.get("available"):
+            result["warnings"].append(
+                {
+                    "title": f"metric {name}",
+                    "message": row.get("reason") or row.get("status") or "metric is unavailable",
+                    "type": "MetricUnavailable",
+                }
+            )
     return result
 
 
@@ -558,84 +674,153 @@ def resolve_run_dimensions(payload: dict[str, Any], video_infos: list[dict[str, 
     return int(first["height"]), int(first["width"])
 
 
-def _dry_run_model_file(model_path: Path, checkpoint_path: Path | None = None) -> None:
+def _dry_run_model_file(
+    model_path: Path,
+    checkpoint_path: Path | None = None,
+    device_name: str = "cpu",
+    precision: str = "fp32",
+) -> None:
+    if device_name.startswith("multi_"):
+        device_name = "cpu"
+    device = resolve_torch_device(device_name)
+    dtype = torch.float32
+    if precision == "fp16":
+        dtype = torch.float16
+    elif precision == "bf16":
+        dtype = torch.bfloat16
     model = load_flow_mask_model(
         f"file:{model_path}",
         checkpoint_path=str(checkpoint_path) if checkpoint_path else None,
-        device="cpu",
+        device=str(device),
         metadata={},
     )
-    img0 = torch.zeros((1, 3, 8, 8), dtype=torch.float32)
-    img1 = torch.ones((1, 3, 8, 8), dtype=torch.float32)
+    img0 = torch.zeros((1, 3, 8, 8), dtype=dtype, device=device)
+    img1 = torch.ones((1, 3, 8, 8), dtype=dtype, device=device)
     with torch.no_grad():
         outputs = model.predict(img0, img1, 0.5)
     validate_model_outputs(outputs, img0)
+    compose_interpolated(img0, img1, outputs)
+
+
+def _dry_run_device(device_info: dict[str, Any]) -> str:
+    if device_info.get("status") != "ok":
+        return "cpu"
+    devices = device_info.get("effective_devices")
+    if isinstance(devices, list) and devices:
+        return str(devices[0])
+    return str(device_info.get("effective_device") or "cpu")
+
+
+def _dry_run_devices(device_info: dict[str, Any]) -> list[str]:
+    if device_info.get("status") != "ok":
+        return []
+    devices = device_info.get("effective_devices")
+    if isinstance(devices, list) and devices:
+        return [str(device) for device in devices]
+    return [str(device_info.get("effective_device") or "cpu")]
 
 
 def _check_device(device: str, precision: str) -> dict[str, Any]:
     requested_device = device or "auto"
     requested_precision = precision or "auto"
-    effective_device = requested_device
-    if requested_device == "auto":
-        effective_device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    if requested_device == "cuda":
-        effective_device = "cuda:0"
-    if requested_device == "npu":
-        effective_device = "npu:0"
+    effective_device = normalize_device_name(requested_device)
 
     if str(effective_device).startswith("cuda") and not torch.cuda.is_available():
         return {"status": "error", "message": "CUDA 不可用", "effective_device": effective_device}
     if str(effective_device).startswith("npu"):
-        try:
-            import torch_npu  # noqa: F401
-        except ImportError:
-            return {"status": "error", "message": "NPU 不可用：未安装 torch_npu", "effective_device": effective_device}
+        available = [device["id"] for device in list_npu_devices()]
+        reason = None if available else npu_unavailable_reason()
+        if reason is not None:
+            return {"status": "error", "message": f"NPU unavailable: {reason}", "effective_device": effective_device}
+            return {"status": "error", "message": "NPU 不可用：未安装 torch_npu 或未检测到 NPU", "effective_device": effective_device}
+        if effective_device not in available:
+            return {"status": "error", "message": f"NPU device does not exist: {effective_device}", "effective_device": effective_device}
+            return {"status": "error", "message": f"NPU 设备不存在: {effective_device}", "effective_device": effective_device}
 
+    kind = device_type_name(effective_device)
+    supported = supported_precisions(kind, available=kind == "cpu" or str(effective_device).startswith(("cuda", "npu")))
     effective_precision = requested_precision
     warning = None
     if requested_precision == "auto":
-        effective_precision = "fp16" if str(effective_device).startswith("cuda") else "fp32"
-    if effective_precision in {"fp16", "bf16"} and not str(effective_device).startswith("cuda"):
+        effective_precision = "fp16" if str(effective_device).startswith(("cuda", "npu")) else "fp32"
+    if effective_precision in {"fp16", "bf16"} and not str(effective_device).startswith(("cuda", "npu")):
         warning = f"{effective_device} 不支持 {effective_precision} autocast，已回退 fp32"
         effective_precision = "fp32"
     if effective_precision == "bf16" and str(effective_device).startswith("cuda"):
         if hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
             warning = "当前 CUDA 设备不支持 bf16，已回退 fp32"
             effective_precision = "fp32"
+    if str(effective_device).startswith(("cuda", "npu")) and effective_precision not in supported:
+        warning = f"{kind.upper()} does not support {effective_precision}; falling back to fp32"
+        warning = f"{kind.upper()} 不支持 {effective_precision}，已回退 fp32"
+        warning = f"{kind.upper()} 涓嶆敮鎸?{effective_precision}锛屽凡鍥為€€ fp32"
+        effective_precision = "fp32"
+    if str(effective_device).startswith(("cuda", "npu")) and requested_precision not in {"auto", "fp32"} and requested_precision not in supported and effective_precision == "fp32":
+        warning = f"{kind.upper()} does not support {requested_precision}; falling back to fp32"
+        warning = f"{kind.upper()} 不支持 {requested_precision}，已回退 fp32"
+    if warning and str(effective_device).startswith(("cuda", "npu")) and effective_precision == "fp32" and requested_precision != "fp32":
+        unsupported_precision = requested_precision if requested_precision != "auto" else "fp16"
+        warning = f"{kind.upper()} does not support {unsupported_precision}; falling back to fp32"
     return {
         "status": "ok",
         "requested_device": requested_device,
         "requested_precision": requested_precision,
         "effective_device": effective_device,
         "effective_precision": effective_precision,
+        "supported_precisions": supported,
         "warning": warning,
     }
 
 
 def _check_multi_cuda(payload: dict[str, Any], precision: str) -> dict[str, Any]:
-    requested = [str(device) for device in (payload.get("devices") or []) if str(device).startswith("cuda:")]
-    if not torch.cuda.is_available():
-        return {"status": "error", "message": "CUDA 不可用，无法启用多卡 CUDA", "effective_device": "multi_cuda"}
-    available = [f"cuda:{index}" for index in range(torch.cuda.device_count())]
+    return _check_multi_accelerator(payload, precision, "cuda")
+
+
+def _check_multi_accelerator(payload: dict[str, Any], precision: str, kind: str) -> dict[str, Any]:
+    requested = [str(device) for device in (payload.get("devices") or []) if str(device).startswith(f"{kind}:")]
+    unavailable_reason = None
+    if kind == "cuda":
+        available = [f"cuda:{index}" for index in range(torch.cuda.device_count())] if torch.cuda.is_available() else []
+        if not available:
+            unavailable_reason = "CUDA is not available"
+    elif kind == "npu":
+        available = [str(device["id"]) for device in list_npu_devices()]
+        unavailable_reason = None if available else npu_unavailable_reason()
+    else:
+        raise ValueError("kind must be cuda or npu")
+    mode = f"multi_{kind}"
+    if unavailable_reason is not None:
+        return {"status": "error", "message": f"{kind.upper()} unavailable: {unavailable_reason}", "effective_device": mode}
+    if not available:
+        return {"status": "error", "message": f"{kind.upper()} 不可用，无法启用 {mode}", "effective_device": mode}
     devices = requested or available
     invalid = [device for device in devices if device not in available]
     if invalid:
-        return {"status": "error", "message": f"CUDA 设备不存在: {', '.join(invalid)}", "effective_device": "multi_cuda"}
+        return {"status": "error", "message": f"{kind.upper()} device does not exist: {', '.join(invalid)}", "effective_device": mode}
+        return {"status": "error", "message": f"{kind.upper()} 设备不存在: {', '.join(invalid)}", "effective_device": mode}
     requested_precision = precision or "auto"
     effective_precision = requested_precision
     warning = None
+    supported = supported_precisions(kind, available=bool(available))
     if requested_precision == "auto":
         effective_precision = "fp16"
-    if effective_precision == "bf16" and hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
+    if kind == "cuda" and effective_precision == "bf16" and hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
         warning = "当前 CUDA 设备不支持 bf16，已回退 fp32"
         effective_precision = "fp32"
+    if effective_precision not in supported:
+        warning = f"{kind.upper()} 不支持 {effective_precision}，已回退 fp32"
+        effective_precision = "fp32"
+    if warning and effective_precision == "fp32" and requested_precision != "fp32":
+        unsupported_precision = requested_precision if requested_precision != "auto" else "fp16"
+        warning = f"{kind.upper()} does not support {unsupported_precision}; falling back to fp32"
     return {
         "status": "ok",
-        "requested_device": "multi_cuda",
+        "requested_device": mode,
         "requested_precision": requested_precision,
-        "effective_device": "multi_cuda",
+        "effective_device": mode,
         "effective_devices": devices,
         "effective_precision": effective_precision,
+        "supported_precisions": supported,
         "warning": warning,
     }
 

@@ -10,10 +10,10 @@
     <header class="app-header">
       <div>
         <h1>VFIEval</h1>
-        <p>放模型文件，选视频文件夹，直接推理。</p>
+        <p>以模型文件、视频文件夹或现有 GT/Pred 输入为入口，完成本地评测闭环。</p>
       </div>
       <nav class="nav" aria-label="主导航">
-        <button class="nav-item active" data-view="create" type="button">新建推理</button>
+        <button class="nav-item active" data-view="create" type="button">新建任务</button>
         <button class="nav-item" data-view="runs" type="button">运行记录</button>
       </nav>
     </header>
@@ -21,62 +21,91 @@
     <main class="shell">
       <section id="view-create" class="view active">
         <form id="infer-form" class="panel infer-grid">
-          <label>
-            <span>模型文件</span>
-            <select name="model_file" required></select>
-          </label>
-          <label>
-            <span>权重</span>
-            <select name="checkpoint"></select>
-          </label>
-          <label>
-            <span>视频集</span>
-            <select name="video_group" required></select>
-          </label>
-          <label>
-            <span>输出分辨率</span>
-            <select name="resolution_mode">
-              <option value="original">原始</option>
-              <option value="720p">720p</option>
-              <option value="custom">自定义</option>
+          <label class="wide-field">
+            <span>Run 类型</span>
+            <select name="run_type">
+              <option value="model_inference">模型推理</option>
+              <option value="video_compare">双视频对比</option>
             </select>
           </label>
-          <label class="custom-size">
-            <span>高度</span>
-            <input name="height" type="number" min="1" placeholder="H">
-          </label>
-          <label class="custom-size">
-            <span>宽度</span>
-            <input name="width" type="number" min="1" placeholder="W">
-          </label>
-          <label>
-            <span>设备</span>
-            <select name="device">
-              <option value="auto">auto</option>
-              <option value="cuda">cuda</option>
-              <option value="npu">npu</option>
-              <option value="cpu">cpu</option>
-            </select>
-          </label>
-          <label>
-            <span>执行模式</span>
-            <select name="execution_mode">
-              <option value="single">单设备</option>
-              <option value="multi_cuda">多卡 CUDA</option>
-            </select>
-          </label>
-          <label>
-            <span>精度</span>
-            <select name="precision">
-              <option value="auto">auto</option>
-              <option value="fp32">fp32</option>
-              <option value="fp16">fp16</option>
-              <option value="bf16">bf16</option>
-            </select>
-          </label>
+
+          <div class="mode-section" data-mode-section="model_inference">
+            <label>
+              <span>模型文件</span>
+              <select name="model_file"></select>
+            </label>
+            <label>
+              <span>权重</span>
+              <select name="checkpoint"></select>
+            </label>
+            <label>
+              <span>视频集</span>
+              <select name="video_group"></select>
+            </label>
+            <label>
+              <span>输出分辨率</span>
+              <select name="resolution_mode">
+                <option value="original">原始</option>
+                <option value="720p">720p</option>
+                <option value="custom">自定义</option>
+              </select>
+            </label>
+            <label class="custom-size">
+              <span>高度</span>
+              <input name="height" type="number" min="1" placeholder="H">
+            </label>
+            <label class="custom-size">
+              <span>宽度</span>
+              <input name="width" type="number" min="1" placeholder="W">
+            </label>
+            <label>
+              <span>设备</span>
+              <select name="device">
+                <option value="auto">auto</option>
+                <option value="cuda">cuda</option>
+                <option value="npu">npu</option>
+                <option value="cpu">cpu</option>
+              </select>
+            </label>
+            <label>
+              <span>执行模式</span>
+              <select name="execution_mode">
+                <option value="single">单设备</option>
+                <option value="multi_cuda">多卡 CUDA</option>
+                <option value="multi_npu">多卡 NPU</option>
+              </select>
+            </label>
+            <label>
+              <span>精度</span>
+              <select name="precision">
+                <option value="auto">auto</option>
+                <option value="fp32">fp32</option>
+                <option value="fp16">fp16</option>
+                <option value="bf16">bf16</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="mode-section mode-compare" data-mode-section="video_compare" hidden>
+            <label class="wide-field">
+              <span>GT 视频/帧目录</span>
+              <input name="reference" type="text" placeholder="D:\path\to\gt.mp4 或 gt_frames\">
+            </label>
+            <label class="wide-field">
+              <span>Pred 视频/帧目录</span>
+              <input name="distorted" type="text" placeholder="D:\path\to\pred.mp4 或 pred_frames\">
+            </label>
+            <label>
+              <span>对齐方式</span>
+              <select name="align_mode">
+                <option value="strict">strict</option>
+              </select>
+            </label>
+          </div>
+
           <details class="advanced">
             <summary>高级设置</summary>
-            <div class="advanced-grid">
+            <div class="advanced-grid" data-mode-section="model_inference">
               <label>
                 <span>Batch Size</span>
                 <input name="batch_size" type="number" min="1" value="1">
@@ -91,20 +120,22 @@
               </label>
               <label>
                 <span>max_frames</span>
-                <input name="max_frames" type="number" min="1" placeholder="不限制">
+                <input name="max_frames" type="number" min="1" placeholder="不限">
               </label>
             </div>
-            <div id="device-options" class="device-options"></div>
+            <div id="device-options" class="device-options" data-mode-section="model_inference"></div>
             <div class="metric-options">
               <span>可选指标</span>
               <div id="metrics-options" class="checkbox-row"></div>
             </div>
           </details>
+
           <button id="refresh-files" class="secondary" type="button">刷新文件列表</button>
-          <button id="start-run" type="submit" disabled>开始推理</button>
+          <button id="start-run" type="submit" disabled>开始任务</button>
         </form>
 
         <section id="video-selection" class="panel video-selection"></section>
+        <section id="metric-environment" class="panel"></section>
         <section id="preflight" class="panel preflight"></section>
       </section>
 

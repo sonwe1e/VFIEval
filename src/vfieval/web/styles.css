@@ -197,6 +197,18 @@ label span,
   display: grid;
 }
 
+.wide-field {
+  grid-column: 1 / -2;
+}
+
+.mode-section {
+  display: contents;
+}
+
+.mode-section[hidden] {
+  display: none;
+}
+
 .advanced {
   grid-column: 1 / -2;
   border: 1px solid var(--line);
@@ -220,6 +232,43 @@ summary {
   display: grid;
   gap: 8px;
   margin-top: 12px;
+}
+
+.metric-health-table {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.metric-setup-list {
+  display: grid;
+  gap: 10px;
+}
+
+.metric-setup-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fff;
+}
+
+.metric-setup-card h4 {
+  margin: 0 0 8px;
+}
+
+.metric-setup p {
+  margin: 0;
+  color: var(--text);
+}
+
+.metric-setup ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--muted);
+}
+
+.metric-setup li + li {
+  margin-top: 4px;
 }
 
 .device-options {
@@ -514,6 +563,10 @@ th {
   fill: var(--accent);
 }
 
+.metric-point {
+  cursor: pointer;
+}
+
 .metric-point.unavailable,
 .metric-point.skipped,
 .status-dot.unavailable,
@@ -638,6 +691,19 @@ th {
 
 .sample-loading {
   margin-bottom: 10px;
+}
+
+.artifact-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.artifact-tabs .active,
+.secondary.danger {
+  border-color: var(--bad);
+  color: var(--bad);
 }
 
 .preview-grid {

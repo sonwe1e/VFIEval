@@ -171,11 +171,12 @@ class V2RunTests(unittest.TestCase):
                 after_inference = _get(base_url, f"/api/runs/{run_id}")
                 self.assertEqual(after_inference["status"], "metric_queued")
                 self.assertEqual(after_inference["artifact_summary"]["by_kind"]["pred"], 2)
+                self.assertTrue(any(job["role"] == "metric" and job["job_id"] == after_inference["metric_job_id"] for job in after_inference["jobs"]))
 
                 run_worker(db, workspace, WorkerOptions(role="metric", once=True, worker_id="v2-metric"))
                 completed = _get(base_url, f"/api/runs/{run_id}")
                 self.assertEqual(completed["status"], "completed")
-                self.assertEqual(completed["metric_summary"]["cgvqm"]["unavailable"], 2)
+                self.assertEqual(completed["metric_summary"]["cgvqm"]["unavailable"], 1)
 
                 samples = _get(base_url, f"/api/runs/{run_id}/samples")
                 self.assertEqual(len(samples), 2)
@@ -190,6 +191,107 @@ class V2RunTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=5)
+
+    def test_cancel_metric_queued_run_cancels_metric_job_immediately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_root = _make_dataset(root)
+            workspace = WorkspaceConfig.from_root(root / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(db, workspace))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                model = _post(
+                    base_url,
+                    "/api/models",
+                    {"name": "dummy", "adapter": "dummy", "input_height": 4, "input_width": 4},
+                )
+                dataset = _post(
+                    base_url,
+                    "/api/datasets",
+                    {"name": "demo", "root_path": str(dataset_root), "has_gt": True},
+                )
+                _post(base_url, f"/api/datasets/{dataset['dataset_id']}/scan", {})
+                created = _post(
+                    base_url,
+                    "/api/runs",
+                    {
+                        "name": "cancel-metric-queued",
+                        "model_id": model["model_id"],
+                        "dataset_id": dataset["dataset_id"],
+                        "height": 4,
+                        "width": 4,
+                        "batch_size": 2,
+                        "device": "cpu",
+                        "precision": "fp32",
+                        "metrics": ["cgvqm"],
+                    },
+                )
+                run_id = created["run_id"]
+                run_worker(db, workspace, WorkerOptions(role="inference", once=True, worker_id="v2-inference"))
+                after_inference = _get(base_url, f"/api/runs/{run_id}")
+                metric_job_id = int(after_inference["metric_job_id"])
+                self.assertEqual(after_inference["status"], "metric_queued")
+
+                canceled = _post(base_url, f"/api/runs/{run_id}/cancel", {})
+                self.assertEqual(canceled["run"]["status"], "canceled")
+                self.assertEqual(db.get_job(metric_job_id)["status"], "canceled")
+
+                run_worker(db, workspace, WorkerOptions(role="metric", once=True, worker_id="v2-metric"))
+                final_run = _get(base_url, f"/api/runs/{run_id}")
+                self.assertEqual(final_run["status"], "canceled")
+                self.assertEqual(db.get_job(metric_job_id)["status"], "canceled")
+                self.assertEqual(db.list_metric_results(inference_job_id=int(after_inference["inference_job_id"])), [])
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_metric_worker_stops_when_run_was_already_cancel_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_root = _make_dataset(root)
+            workspace = WorkspaceConfig.from_root(root / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("dummy", "dummy", None, 4, 4, {})
+            dataset_id = db.create_dataset("demo", str(dataset_root), True)
+            for idx in range(2):
+                name = f"sample{idx:03d}.png"
+                db.add_sample(
+                    dataset_id,
+                    f"sample{idx:03d}",
+                    str(dataset_root / "img0" / name),
+                    str(dataset_root / "img1" / name),
+                    str(dataset_root / "gt" / name),
+                    {},
+                )
+            run_id = db.create_run("metric-cancel-requested", model_id, dataset_id, 4, 4, 2, "cpu", "fp32", ["cgvqm"])
+            run = db.get_run(run_id)
+            metric_job_id = db.create_job(
+                "metric",
+                {
+                    "run_id": run_id,
+                    "inference_job_id": int(run["inference_job_id"]),
+                    "dataset_id": dataset_id,
+                    "metric_names": ["cgvqm"],
+                },
+            )
+            db.set_run_metric_job(run_id, metric_job_id)
+            db.mark_run_started(run_id, "metric_running")
+            db.request_run_cancel(run_id)
+
+            run_worker(db, workspace, WorkerOptions(role="metric", once=True, worker_id="v2-metric"))
+
+            canceled_run = db.get_run(run_id)
+            self.assertEqual(canceled_run["status"], "canceled")
+            self.assertEqual(canceled_run["error"]["type"], "RunCanceled")
+            self.assertEqual(db.get_job(metric_job_id)["status"], "canceled")
 
 
 def _make_dataset(root: Path) -> Path:

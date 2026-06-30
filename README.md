@@ -159,6 +159,37 @@ python -m vfieval.cli --workspace .vfieval prepare-metrics --check-only
 python -m vfieval.cli --workspace .vfieval prepare-metrics
 ```
 
+### Metric setup details
+
+`prepare-metrics` only creates placeholder manifests under `set/metrics/`. It does not download weights, install evaluator bindings, or modify system binaries. `GET /api/metrics/health` reports the exact status, reason, evaluator type, input mode, timeline support, and expected project-local paths.
+
+Current metric setup contract:
+
+```text
+set/
+  metrics/
+    lpips_vit_patch/
+      manifest.json
+    lpips_convnext/
+      manifest.json
+    cgvqm/
+      manifest.json
+```
+
+- `lpips_vit_patch`: place the official LPIPS ViT Patch manifest at `set/metrics/lpips_vit_patch/manifest.json`. This build also requires the official native evaluator binding in the active Python environment.
+- `lpips_convnext`: place the official LPIPS ConvNeXt manifest at `set/metrics/lpips_convnext/manifest.json`. This build also requires the official native evaluator binding in the active Python environment.
+- `cgvqm`: place the official CGVQM manifest at `set/metrics/cgvqm/manifest.json`. This build also requires the official native evaluator binding in the active Python environment.
+- `vmaf`: no project-local weights are used in the current build. Install `ffmpeg` on `PATH` and make sure the `libvmaf` filter is available.
+
+Status interpretation:
+
+- `missing_weights`: the expected manifest or referenced project-local assets are not present yet.
+- `missing_evaluator`: the manifest may exist, but the required evaluator binding or system executable is still unavailable.
+- `missing_dependency`: the Python package dependency for that metric is missing from the current environment.
+- `available`: the current build can attempt to execute that metric without substituting another score.
+
+指标资产默认放在项目根目录的 `set/metrics/`，也可以用 `VFIEVAL_METRIC_ASSETS_DIR` 指向其它可迁移目录。缺少依赖、权重或 evaluator 时，指标会记录为 `unavailable` 并显示原因，不会自动下载，也不会替换成其它分数。
+
 ## API
 
 主流程端点：
@@ -172,9 +203,11 @@ python -m vfieval.cli --workspace .vfieval prepare-metrics
 - `GET /api/metrics/health`
 - `POST /api/preflight`
 - `POST /api/runs`，支持 `model_file + video_group`
-- `POST /api/runs` 支持 `checkpoint`、`execution_mode=single|multi_cuda`、`devices=["cuda:0"]`、`batch_size_per_device`
+- `POST /api/runs` 支持 `checkpoint`、`execution_mode=single|multi_cuda|multi_npu`、`devices=["cuda:0"]` / `devices=["npu:0"]`、`batch_size_per_device`
 - `POST /api/runs/{id}/cancel`
 - `POST /api/runs/{id}/retry`
+- `DELETE /api/runs/{id}` 软删除 Run，默认运行记录不再显示
+- `POST /api/runs/{id}/cleanup-artifacts` 清理 `.vfieval/runs/{run_id}` 产物，仅允许在 `completed / failed / canceled` 后执行
 - `GET /api/runs`
 - `GET /api/runs/{id}`
 - `GET /api/runs/{id}/videos?page=&page_size=&q=`
@@ -190,6 +223,19 @@ python -m vfieval.cli --workspace .vfieval prepare-metrics
 - `POST /api/jobs/{id}/heartbeat`
 
 旧的 `models/datasets/jobs/experiments` API 仍保留用于兼容和调试，但不属于主 UI 流程。
+
+## NPU、多卡与大图预览
+
+- 多卡 NPU 使用 `torch_npu`，设备名为 `npu:0`、`npu:1` 等；`/api/devices` 会返回检测到的 NPU 列表。
+- `execution_mode=multi_npu` 会按视频粒度拆分为多个 inference shard job，每个 shard 绑定一个 NPU，并由本地 UI 自动启动独立 worker 进程领取对应设备的任务。
+- 手动启动 worker 时可以使用 `python -m vfieval.cli --workspace .vfieval worker --role inference --device-filter npu:0 --idle-timeout 120`，绑定后的 worker 只领取对应 NPU 的 shard。
+- 预检查会在最终 device/dtype 上执行模型 dry-run，能提前暴露 CPU/NPU tensor 不匹配。
+- 新建任务页默认只读取文件目录、预检查和 `GET /api/runs` 轮询；不会在后台自动加载 Run Detail、timeline、sample detail 或预览图。
+- Run Detail 默认加载 `512px` 预览图，原图只在点击预览时打开；核心产物按 `图像 / Flow / Mask / Warp` 分组，避免一次性加载十张 4K 图。
+- 失败或不想看的 Run 可以删除记录；产物清理需要单独点击，避免误删结果。
+- 指标缓存 key 会绑定 metric 名称、适配器/资产版本、当前 evaluator 环境以及 GT/Pred 文件身份；更换 manifest、权重或可执行环境后不会继续复用旧的 `unavailable` 缓存结果。
+
+每个推理 Run 会写入 `reference_key` 和 `reference_config`，用于后续确认多个模型或不同权重是否基于同一组 GT、同一视频子集、同一 frame step 和同一输出分辨率。未来 Compare 只比较相同 `reference_key` 的结果，默认最多展示 `GT + Pred A + Pred B`。
 
 ## 验收流程
 

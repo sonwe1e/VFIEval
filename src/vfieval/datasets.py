@@ -7,6 +7,13 @@ from typing import Any
 
 from PIL import Image
 
+from vfieval.compare_inputs import (
+    compare_video_name,
+    image_size,
+    list_frame_images,
+    resolve_compare_source_path,
+    validate_strict_decoded_alignment,
+)
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
 from vfieval.file_inputs import VIDEO_SUFFIXES, decode_cache_dir, decode_cache_key
@@ -25,6 +32,8 @@ def scan_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: int) -> i
         return count
     if source_type == "video":
         return scan_video_dataset(db, workspace, dataset_id)
+    if source_type == "compare":
+        return scan_compare_dataset(db, workspace, dataset_id)
     raise ValueError(f"unsupported dataset source_type: {source_type}")
 
 
@@ -127,6 +136,79 @@ def scan_video_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: int
             "video_glob": video_glob,
             "selected_videos": [path.name for path in videos],
             "decode_mode": decode_mode,
+        },
+    )
+    return added
+
+
+def scan_compare_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: int) -> int:
+    dataset = db.get_dataset(dataset_id)
+    metadata = dataset.get("metadata") or {}
+    reference_path = resolve_compare_source_path(workspace, str(metadata.get("reference_path") or ""))
+    distorted_path = resolve_compare_source_path(workspace, str(metadata.get("distorted_path") or ""))
+    align_mode = str(metadata.get("align_mode") or "strict")
+    if align_mode != "strict":
+        raise ValueError("compare datasets currently only support strict alignment")
+
+    reference_frames, reference_fps, reference_timestamps = _load_compare_source_frames(workspace, reference_path, "compare_reference")
+    distorted_frames, distorted_fps, distorted_timestamps = _load_compare_source_frames(workspace, distorted_path, "compare_distorted")
+    validate_strict_decoded_alignment(
+        reference_frames=reference_frames,
+        distorted_frames=distorted_frames,
+        reference_fps=reference_fps,
+        distorted_fps=distorted_fps,
+        reference_timestamps=reference_timestamps,
+        distorted_timestamps=distorted_timestamps,
+    )
+
+    compare_name = compare_video_name(reference_path, distorted_path)
+    added = 0
+    for frame_index, (reference_frame, distorted_frame) in enumerate(zip(reference_frames, distorted_frames)):
+        reference_size = image_size(reference_frame)
+        distorted_size = image_size(distorted_frame)
+        if reference_size != distorted_size:
+            raise ValueError(
+                "strict compare requires matching frame dimensions: "
+                f"{reference_frame.name}={reference_size[0]}x{reference_size[1]} vs "
+                f"{distorted_frame.name}={distorted_size[0]}x{distorted_size[1]}"
+            )
+        name = f"compare_{compare_name}_{frame_index:06d}"
+        db.add_sample(
+            dataset_id=dataset_id,
+            name=name,
+            img0_path=str(reference_frame.resolve()),
+            img1_path=str(distorted_frame.resolve()),
+            gt_path=str(reference_frame.resolve()),
+            metadata={
+                "source_type": "compare",
+                "compare_group": compare_name,
+                "video_name": compare_name,
+                "video_file": distorted_path.name,
+                "reference_path": str(reference_path),
+                "distorted_path": str(distorted_path),
+                "frame_index": frame_index,
+                "sample_index": frame_index,
+                "fps": reference_fps or distorted_fps or 24.0,
+                "timestamps": {
+                    "gt": reference_timestamps[frame_index] if frame_index < len(reference_timestamps) else None,
+                    "pred": distorted_timestamps[frame_index] if frame_index < len(distorted_timestamps) else None,
+                },
+            },
+        )
+        added += 1
+
+    db.update_dataset_scan_info(
+        dataset_id,
+        None,
+        video_count=1 if added else 0,
+        frame_count=added,
+        metadata={
+            "reference_path": str(reference_path),
+            "distorted_path": str(distorted_path),
+            "align_mode": align_mode,
+            "video_name": compare_name,
+            "reference_frame_count": len(reference_frames),
+            "distorted_frame_count": len(distorted_frames),
         },
     )
     return added
@@ -238,6 +320,30 @@ def _find_videos(root: Path, video_glob: str, selected_videos: Any = None) -> li
             raise FileNotFoundError(f"selected video not found: {name}")
         resolved.append(path)
     return resolved
+
+
+def _load_compare_source_frames(
+    workspace: WorkspaceConfig,
+    source_path: Path,
+    cache_prefix: str,
+) -> tuple[list[Path], float | None, list[float | None]]:
+    if source_path.is_file() and source_path.suffix.lower() in VIDEO_SUFFIXES:
+        cache_key = decode_cache_key(source_path, cache_prefix, 1, None)
+        frames, fps, timestamps = _decode_video_cached(
+            workspace,
+            source_path,
+            cache_key,
+            None,
+            cache_prefix,
+            1,
+        )
+        return frames, fps, list(timestamps)
+    if source_path.is_dir():
+        frames = list_frame_images(source_path)
+        if not frames:
+            raise FileNotFoundError(f"frame directory has no supported images: {source_path}")
+        return frames, None, [None for _ in frames]
+    raise ValueError(f"unsupported compare source: {source_path}")
 
 
 def _decode_video_cached(

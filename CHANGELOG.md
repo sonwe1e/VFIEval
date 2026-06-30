@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## V11 - 多卡 NPU、Run 删除与轻量预览
+
+- 新增 `multi_npu` 执行模式，使用 `torch_npu` 检测 `npu:0`、`npu:1` 等设备，并沿用 `run_jobs` 按视频粒度拆分 inference shard。
+- 预检查 dry-run 改为使用最终 device/dtype，NPU 不可用或模型返回 CPU tensor 时能提前暴露设备不匹配。
+- 新增 Run 软删除和产物清理接口：`DELETE /api/runs/{id}`、`POST /api/runs/{id}/cleanup-artifacts`，运行记录默认隐藏已删除 Run。
+- 核心图片 artifact 生成 `512px` preview，Run Detail 默认只加载当前样本、当前分组的预览图，点击才打开原图。
+- Run Detail 将核心产物分为 `图像 / Flow / Mask / Warp`，避免一次性加载十张 4K 图片。
+- API、README、AGENTS 和测试同步更新，继续保持不训练、不实现 PSNR。
+
 ## V10 - 低分辨率输出、Checkpoint 与单机多卡推理
 
 - 支持模型返回低于输入分辨率的 `flowt_0`、`flowt_1`、`mask0`、`mask1`；平台会统一 resize 到推理分辨率，并按空间比例缩放 flow 后再执行 warp/blend/compose。

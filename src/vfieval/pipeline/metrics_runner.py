@@ -9,8 +9,10 @@ from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
 from vfieval.metrics import METRIC_NAMES, create_metric
 from vfieval.metrics.base import MetricUnavailable
+from vfieval.metrics.health import metric_cache_config, metric_requires_video_input
+from vfieval.pipeline.inference import RunCanceled
 
-METRIC_CACHE_VERSION = "metric-cache-v2"
+METRIC_CACHE_VERSION = "metric-cache-v3"
 
 
 def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dict[str, Any]:
@@ -27,6 +29,7 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
     unsupported = [name for name in metric_names if name not in METRIC_NAMES]
     if unsupported:
         raise ValueError(f"unsupported metrics: {', '.join(unsupported)}")
+    _raise_if_canceled(db, run_id, job_id)
 
     artifacts = []
     pred_videos = []
@@ -39,11 +42,14 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
     inference_job = db.get_job(inference_job_id)
     dataset_id = int(inference_job["payload"]["dataset_id"])
     samples = {int(row["id"]): row for row in db.list_samples(dataset_id)}
-    use_video_vmaf = "vmaf" in metric_names and bool(pred_videos)
-    frame_metric_names = [name for name in metric_names if name != "vmaf" or not use_video_vmaf]
-    total = len(artifacts) * len(frame_metric_names) + (len(pred_videos) if use_video_vmaf else 0)
+    video_metric_names = [name for name in metric_names if metric_requires_video_input(name)]
+    frame_metric_names = [name for name in metric_names if name not in video_metric_names]
+    metric_cache_configs = {name: metric_cache_config(workspace, name) for name in metric_names}
+    video_metric_units = len(pred_videos) if pred_videos else 1
+    total = len(artifacts) * len(frame_metric_names) + (video_metric_units * len(video_metric_names))
     db.update_job_progress(job_id, 0, total)
     if run_id is not None:
+        _raise_if_canceled(db, run_id, job_id)
         db.mark_run_started(run_id, "metric_running")
         db.update_run_progress(run_id, 0, total, "metric_running")
 
@@ -55,12 +61,14 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
     values: dict[str, list[float]] = {name: [] for name in metric_names}
 
     for artifact in artifacts:
+        _raise_if_canceled(db, run_id, job_id)
         sample_id = artifact.get("sample_id")
         sample = samples.get(int(sample_id)) if sample_id is not None else None
         reference_path = Path(sample["gt_path"]) if sample and sample.get("gt_path") else None
         distorted_path = Path(artifact["path"])
 
         for metric_name in frame_metric_names:
+            _raise_if_canceled(db, run_id, job_id)
             details: dict[str, Any]
             value: float | None
             if reference_path is None:
@@ -75,6 +83,7 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                     reference_path=reference_path,
                     distorted_path=distorted_path,
                     sample_id=sample_id,
+                    cache_config=metric_cache_configs[metric_name],
                 )
 
             db.add_metric_result(
@@ -94,7 +103,7 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
             if run_id is not None:
                 db.update_run_progress(run_id, current)
 
-    if use_video_vmaf:
+    if video_metric_names:
         gt_videos = []
         for current_job_id in inference_job_ids:
             gt_videos.extend(db.list_artifacts(job_id=current_job_id, kind="gt_video"))
@@ -103,39 +112,62 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
             for artifact in gt_videos
             if artifact.get("metadata", {}).get("video_name")
         }
-        for artifact in pred_videos:
-            video_name = artifact.get("metadata", {}).get("video_name")
-            reference_artifact = gt_by_name.get(video_name)
-            if reference_artifact is None:
-                status = "skipped"
+        if not pred_videos:
+            for metric_name in video_metric_names:
+                status = "unavailable"
                 value = None
-                details = {"reason": "video has no ground-truth reference", "video_name": video_name}
-            else:
-                status, value, details = _evaluate_with_cache(
-                    db=db,
-                    workspace=workspace,
-                    metric_name="vmaf",
-                    reference_path=Path(reference_artifact["path"]),
-                    distorted_path=Path(artifact["path"]),
+                details = {"reason": "metric requires video artifacts but run has no pred_video outputs"}
+                db.add_metric_result(
+                    job_id=job_id,
+                    inference_job_id=inference_job_id,
                     sample_id=None,
+                    metric_name=metric_name,
+                    status=status,
+                    value=value,
+                    details=details,
                 )
-                details = {"video_name": video_name, **details}
-            db.add_metric_result(
-                job_id=job_id,
-                inference_job_id=int(artifact["job_id"]),
-                sample_id=None,
-                metric_name="vmaf",
-                status=status,
-                value=value,
-                details=details,
-            )
-            summary["vmaf"][status] = int(summary["vmaf"].get(status, 0)) + 1
-            if status == "completed" and value is not None:
-                values["vmaf"].append(float(value))
-            current += 1
-            db.update_job_progress(job_id, current)
-            if run_id is not None:
-                db.update_run_progress(run_id, current)
+                summary[metric_name][status] = int(summary[metric_name].get(status, 0)) + 1
+                current += 1
+                db.update_job_progress(job_id, current)
+                if run_id is not None:
+                    db.update_run_progress(run_id, current)
+        else:
+            for metric_name in video_metric_names:
+                for artifact in pred_videos:
+                    _raise_if_canceled(db, run_id, job_id)
+                    video_name = artifact.get("metadata", {}).get("video_name")
+                    reference_artifact = gt_by_name.get(video_name)
+                    if reference_artifact is None:
+                        status = "skipped"
+                        value = None
+                        details = {"reason": "video has no ground-truth reference", "video_name": video_name}
+                    else:
+                        status, value, details = _evaluate_with_cache(
+                            db=db,
+                            workspace=workspace,
+                            metric_name=metric_name,
+                            reference_path=Path(reference_artifact["path"]),
+                            distorted_path=Path(artifact["path"]),
+                            sample_id=None,
+                            cache_config=metric_cache_configs[metric_name],
+                        )
+                        details = {"video_name": video_name, **details}
+                    db.add_metric_result(
+                        job_id=job_id,
+                        inference_job_id=int(artifact["job_id"]),
+                        sample_id=None,
+                        metric_name=metric_name,
+                        status=status,
+                        value=value,
+                        details=details,
+                    )
+                    summary[metric_name][status] = int(summary[metric_name].get(status, 0)) + 1
+                    if status == "completed" and value is not None:
+                        values[metric_name].append(float(value))
+                    current += 1
+                    db.update_job_progress(job_id, current)
+                    if run_id is not None:
+                        db.update_run_progress(run_id, current)
 
     for metric_name, metric_values in values.items():
         if metric_values:
@@ -147,6 +179,17 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
     return result
 
 
+def _raise_if_canceled(db: Database, run_id: int | None, job_id: int) -> None:
+    if run_id is None:
+        return
+    run = db.get_run(run_id)
+    if run["status"] == "cancel_requested":
+        error = {"message": "用户取消了 Run", "type": "RunCanceled"}
+        db.cancel_job(job_id, error)
+        db.cancel_run(run_id, error)
+        raise RunCanceled("用户取消了 Run")
+
+
 def _evaluate_with_cache(
     db: Database,
     workspace: WorkspaceConfig,
@@ -154,8 +197,12 @@ def _evaluate_with_cache(
     reference_path: Path,
     distorted_path: Path,
     sample_id: int | None,
+    cache_config: dict[str, Any],
 ) -> tuple[str, float | None, dict[str, Any]]:
-    config = {"adapter_version": METRIC_CACHE_VERSION}
+    config = {
+        "cache_version": METRIC_CACHE_VERSION,
+        "metric": cache_config,
+    }
     cache_key = metric_cache_key(metric_name, reference_path, distorted_path, config)
     cached = db.get_metric_cache(cache_key)
     if cached:

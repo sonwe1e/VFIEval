@@ -107,6 +107,16 @@ def save_extra_tensor(tensor: torch.Tensor, path: str | Path, index: int = 0) ->
     return path
 
 
+def save_preview_image(source_path: str | Path, preview_path: str | Path, max_edge: int = 512) -> Path:
+    source_path = Path(source_path)
+    preview_path = Path(preview_path)
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    with Image.open(source_path).convert("RGB") as image:
+        image.thumbnail((max_edge, max_edge))
+        image.save(preview_path)
+    return preview_path
+
+
 def _normalize_extra_rgb(tensor: torch.Tensor) -> torch.Tensor:
     tensor = tensor.detach().float()
     if float(tensor.min()) >= 0.0 and float(tensor.max()) <= 1.0:

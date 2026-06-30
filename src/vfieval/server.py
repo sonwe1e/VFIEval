@@ -3,7 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
+import os
 import re
+import shutil
+import subprocess
+import sys
 import threading
 import time
 from http import HTTPStatus
@@ -15,6 +19,7 @@ from vfieval.config import WorkspaceConfig
 from vfieval.datasets import scan_dataset
 from vfieval.db import Database
 from vfieval.file_inputs import (
+    DECODE_STRATEGY_VERSION,
     list_checkpoints,
     list_video_group_videos,
     list_model_files,
@@ -30,6 +35,9 @@ from vfieval.file_inputs import (
 from vfieval.metrics import METRIC_NAMES
 from vfieval.metrics.health import metrics_health
 from vfieval.worker import WorkerOptions, detect_capabilities, run_worker
+
+
+TERMINAL_RUN_STATUSES = {"completed", "failed", "canceled"}
 
 
 def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -> None:
@@ -98,7 +106,12 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                 if path == "/api/experiments":
                     return self._json(db.list_experiments())
                 if path == "/api/runs":
-                    return self._json(db.list_runs(limit=int(query.get("limit", ["100"])[0])))
+                    return self._json(
+                        db.list_runs(
+                            limit=int(query.get("limit", ["100"])[0]),
+                            include_deleted=query.get("include_deleted", ["0"])[0] in {"1", "true", "yes"},
+                        )
+                    )
                 match = re.fullmatch(r"/api/runs/(\d+)/samples/(\d+)", path)
                 if match:
                     return self._json(_run_sample_payload(db, int(match.group(1)), int(match.group(2))))
@@ -159,7 +172,7 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     return self._json(_compare_samples(db, query))
                 if path.startswith("/api/files/"):
                     artifact_id = int(path.rsplit("/", 1)[-1])
-                    return self._send_artifact(artifact_id)
+                    return self._send_artifact(artifact_id, query.get("variant", ["original"])[0])
                 match = re.fullmatch(r"/api/sample-files/(\d+)/(img0|img1|gt)", path)
                 if match:
                     return self._send_sample_file(int(match.group(1)), match.group(2))
@@ -213,6 +226,10 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                 if path == "/api/preflight":
                     return self._json(preflight_run(db, workspace, body))
                 if path == "/api/runs":
+                    run_type = str(body.get("run_type") or "")
+                    if run_type == "video_compare" or body.get("reference") or body.get("distorted"):
+                        created = _create_video_compare_run(db, workspace, body)
+                        return self._json(created, status=HTTPStatus.CREATED)
                     if body.get("model_file") or body.get("video_group"):
                         created = _create_run_from_files(db, workspace, body)
                         return self._json(created, status=HTTPStatus.CREATED)
@@ -251,6 +268,20 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                         return self._json({"run_id": run_id, "run": db.get_run(run_id)})
                     retry = _retry_run(db, workspace, run_id)
                     return self._json(retry, status=HTTPStatus.CREATED)
+                match = re.fullmatch(r"/api/runs/(\d+)/(hide|cleanup-artifacts)", path)
+                if match:
+                    run_id = int(match.group(1))
+                    action = match.group(2)
+                    if action == "hide":
+                        if db.get_run(run_id)["status"] not in TERMINAL_RUN_STATUSES:
+                            db.request_run_cancel(run_id)
+                        db.soft_delete_run(run_id)
+                        return self._json({"run_id": run_id, "deleted": True})
+                    try:
+                        cleaned = _cleanup_run_artifacts(db, workspace, run_id)
+                    except ValueError as exc:
+                        return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
+                    return self._json(cleaned)
                 match = re.fullmatch(r"/api/runs/(\d+)/metrics/retry", path)
                 if match:
                     run_id = int(match.group(1))
@@ -294,6 +325,20 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
             except Exception as exc:
                 self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc), type(exc).__name__)
 
+        def do_DELETE(self) -> None:
+            try:
+                parsed = urlparse(self.path)
+                match = re.fullmatch(r"/api/runs/(\d+)", parsed.path)
+                if not match:
+                    return self._error(HTTPStatus.NOT_FOUND, "not found")
+                run_id = int(match.group(1))
+                if db.get_run(run_id)["status"] not in TERMINAL_RUN_STATUSES:
+                    db.request_run_cancel(run_id)
+                db.soft_delete_run(run_id)
+                return self._json({"run_id": run_id, "deleted": True})
+            except Exception as exc:
+                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc), type(exc).__name__)
+
         def log_message(self, fmt: str, *args) -> None:
             print(f"{self.address_string()} - {fmt % args}")
 
@@ -308,6 +353,7 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
             self.send_response(int(status))
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(payload)
 
@@ -318,13 +364,17 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
             path = Path(__file__).parent / "web" / name
             if not path.exists():
                 return self._error(HTTPStatus.NOT_FOUND, f"static file {name} not found")
-            self._send_file(path)
+            self._send_file(path, cache_control="no-store")
 
-        def _send_artifact(self, artifact_id: int) -> None:
+        def _send_artifact(self, artifact_id: int, variant: str = "original") -> None:
             artifact = db.get("SELECT * FROM artifacts WHERE id = ?", (artifact_id,))
             if artifact is None:
                 return self._error(HTTPStatus.NOT_FOUND, "artifact not found")
-            path = Path(artifact["path"]).resolve()
+            metadata = json.loads(artifact.get("metadata_json") or "{}")
+            if variant == "preview" and metadata.get("preview_path"):
+                path = Path(metadata["preview_path"]).resolve()
+            else:
+                path = Path(artifact["path"]).resolve()
             workspace_root = workspace.root.resolve()
             if not _is_relative_to(path, workspace_root):
                 return self._error(HTTPStatus.FORBIDDEN, "artifact path is outside workspace")
@@ -338,7 +388,7 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                 return self._error(HTTPStatus.NOT_FOUND, f"sample has no {slot} file")
             self._send_file(Path(path_text).resolve())
 
-        def _send_file(self, path: Path) -> None:
+        def _send_file(self, path: Path, cache_control: str | None = None) -> None:
             if not path.exists() or not path.is_file():
                 return self._error(HTTPStatus.NOT_FOUND, f"file not found: {path}")
             content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
@@ -346,6 +396,8 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
+            if cache_control:
+                self.send_header("Cache-Control", cache_control)
             self.end_headers()
             self.wfile.write(data)
 
@@ -449,11 +501,22 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
     execution_mode = str(body.get("execution_mode") or "single")
     devices = _resolve_execution_devices(body, execution_mode)
     requested_device = str(body.get("device") or "auto")
-    device, precision = normalize_device_precision(devices[0] if execution_mode == "multi_cuda" else requested_device, str(body.get("precision") or "auto"))
+    is_multi = execution_mode in {"multi_cuda", "multi_npu"}
+    device, precision = normalize_device_precision(devices[0] if is_multi else requested_device, str(body.get("precision") or "auto"))
     checkpoint_path = resolve_checkpoint(workspace, body.get("checkpoint"), model_path.name)
     checkpoint_relative = _checkpoint_relative(workspace, checkpoint_path)
     selection_hash = _selection_hash(selected_videos, frame_step, max_frames)
     model_record_name = model_path.name if checkpoint_relative is None else f"{model_path.name} [{checkpoint_relative}]"
+    reference_config = _reference_config(
+        video_group=video_folder.name,
+        selected_videos=selected_videos,
+        frame_step=frame_step,
+        max_frames=max_frames,
+        resolution_mode=str(body.get("resolution_mode") or "original"),
+        height=height,
+        width=width,
+    )
+    reference_key = _reference_key(reference_config)
 
     model_id = db.upsert_model(
         name=model_record_name,
@@ -489,8 +552,10 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         raise ValueError("视频集没有生成可推理 triplets")
 
     metadata = {
+        "run_type": "model_inference",
         "source": "folder_flow",
         "request": {
+            "run_type": "model_inference",
             "model_file": model_path.name,
             "video_group": video_folder.name,
             "resolution_mode": body.get("resolution_mode") or "original",
@@ -513,7 +578,12 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         "video_group": video_folder.name,
         "execution_mode": execution_mode,
         "devices": devices,
+        "npu_devices": devices if execution_mode == "multi_npu" else [],
+        "reference_key": reference_key,
+        "reference_config": reference_config,
+        "worker_launch": _worker_launch_metadata(execution_mode, devices, bool(metrics)),
         "selected_videos": selected_videos,
+        "metric_health": preflight.get("metrics", {}).get("health", {}),
         "preflight": preflight,
     }
     if body.get("retry_of_run_id") is not None:
@@ -526,17 +596,107 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         height=height,
         width=width,
         batch_size=int(body.get("batch_size_per_device") or body.get("batch_size") or 1),
-        device="multi_cuda" if execution_mode == "multi_cuda" else device,
+        device=execution_mode if is_multi else device,
         precision=precision,
         metrics=metrics,
         metadata={**metadata, "output_dir": str(workspace.runs_dir / str(db.next_run_id()))},
-        create_inference_job=execution_mode != "multi_cuda",
+        create_inference_job=not is_multi,
     )
-    if execution_mode == "multi_cuda":
+    if is_multi:
         _create_inference_shards(db, run_id, model_id, dataset_id, height, width, precision, metrics, devices, int(body.get("batch_size_per_device") or body.get("batch_size") or 1))
-        _start_local_inference_worker(db, workspace, count=len(devices))
+        if execution_mode == "multi_npu":
+            _start_local_npu_worker_processes(workspace, run_id, devices, start_metric_worker=bool(metrics))
+        else:
+            _start_local_inference_worker(db, workspace, count=len(devices))
     else:
         _start_local_inference_worker(db, workspace)
+    return {"run_id": run_id, "run": db.get_run(run_id), "preflight": preflight}
+
+
+def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: dict) -> dict:
+    payload = dict(body)
+    payload["run_type"] = "video_compare"
+    preflight = preflight_run(db, workspace, payload)
+    if not preflight["ok"]:
+        raise ValueError(_preflight_error_message(preflight))
+    metrics = list(body.get("metrics") or [])
+    unsupported = [name for name in metrics if name not in METRIC_NAMES]
+    if unsupported:
+        raise ValueError(f"unsupported metrics: {', '.join(unsupported)}")
+
+    reference_path = str(preflight.get("reference", {}).get("path") or "")
+    distorted_path = str(preflight.get("distorted", {}).get("path") or "")
+    width = int(preflight.get("alignment", {}).get("width") or 0)
+    height = int(preflight.get("alignment", {}).get("height") or 0)
+    reference_config = {
+        "run_type": "video_compare",
+        "reference_path": reference_path,
+        "distorted_path": distorted_path,
+        "align_mode": "strict",
+        "frame_count": int(preflight.get("alignment", {}).get("frame_count") or 0),
+        "width": width,
+        "height": height,
+    }
+    reference_key = _reference_key(reference_config)
+    compare_tag = reference_key[:12]
+    model_id = db.upsert_model(
+        name="video_compare",
+        adapter="dummy",
+        checkpoint_path=None,
+        input_height=height,
+        input_width=width,
+        metadata={"source": "compare", "run_type": "video_compare"},
+    )
+    dataset_id = db.upsert_dataset(
+        name=f"compare:{compare_tag}",
+        root_path=reference_path,
+        has_gt=True,
+        source_type="compare",
+        decode_mode="compare",
+        metadata={
+            "reference_path": reference_path,
+            "distorted_path": distorted_path,
+            "align_mode": "strict",
+            "compare_tag": compare_tag,
+        },
+    )
+    samples = scan_dataset(db, workspace, dataset_id)
+    if samples <= 0:
+        raise ValueError("compare inputs did not produce any aligned frames")
+
+    metadata = {
+        "run_type": "video_compare",
+        "source": "direct_compare",
+        "reference_path": reference_path,
+        "distorted_path": distorted_path,
+        "align_mode": "strict",
+        "reference_key": reference_key,
+        "reference_config": reference_config,
+        "metric_health": preflight.get("metrics", {}).get("health", {}),
+        "request": {
+            "run_type": "video_compare",
+            "reference": body.get("reference"),
+            "distorted": body.get("distorted"),
+            "align_mode": "strict",
+            "metrics": metrics,
+        },
+        "preflight": preflight,
+    }
+    if body.get("retry_of_run_id") is not None:
+        metadata["retry_of_run_id"] = int(body["retry_of_run_id"])
+    run_id = db.create_run(
+        name=body.get("name") or f"compare / {Path(reference_path).stem}",
+        model_id=model_id,
+        dataset_id=dataset_id,
+        height=height,
+        width=width,
+        batch_size=1,
+        device="cpu",
+        precision="fp32",
+        metrics=metrics,
+        metadata={**metadata, "output_dir": str(workspace.runs_dir / str(db.next_run_id()))},
+    )
+    _start_local_inference_worker(db, workspace)
     return {"run_id": run_id, "run": db.get_run(run_id), "preflight": preflight}
 
 
@@ -547,7 +707,64 @@ def _retry_run(db: Database, workspace: WorkspaceConfig, run_id: int) -> dict:
         raise ValueError("这个 Run 没有可重试的文件夹入口配置")
     request["retry_of_run_id"] = run_id
     request["name"] = f"{run['name']} retry"
+    if str(request.get("run_type") or "model_inference") == "video_compare":
+        return _create_video_compare_run(db, workspace, request)
     return _create_run_from_files(db, workspace, request)
+
+
+def _reference_config(
+    video_group: str,
+    selected_videos: list[str],
+    frame_step: int,
+    max_frames: int | None,
+    resolution_mode: str,
+    height: int,
+    width: int,
+) -> dict:
+    return {
+        "video_group": video_group,
+        "selected_videos": list(selected_videos),
+        "frame_step": int(frame_step),
+        "max_frames": max_frames,
+        "resolution_mode": resolution_mode,
+        "height": int(height),
+        "width": int(width),
+        "decode_strategy": DECODE_STRATEGY_VERSION,
+    }
+
+
+def _reference_key(config: dict) -> str:
+    return hashlib.sha256(json.dumps(config, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _worker_launch_metadata(execution_mode: str, devices: list[str], has_metrics: bool) -> dict:
+    if execution_mode == "multi_npu":
+        return {
+            "mode": "auto_process",
+            "inference_workers": [{"role": "inference", "device_filter": device} for device in devices],
+            "metric_worker": bool(has_metrics),
+        }
+    if execution_mode == "multi_cuda":
+        return {
+            "mode": "local_threads",
+            "inference_workers": [{"role": "all", "device_filter": None} for _device in devices],
+            "metric_worker": False,
+        }
+    return {"mode": "local_thread", "inference_workers": [{"role": "all", "device_filter": None}], "metric_worker": False}
+
+
+def _cleanup_run_artifacts(db: Database, workspace: WorkspaceConfig, run_id: int) -> dict:
+    run = db.get_run(run_id)
+    if str(run.get("status") or "") not in TERMINAL_RUN_STATUSES:
+        raise ValueError("cleanup-artifacts is only allowed after a run is completed, failed, or canceled")
+    run_dir = (workspace.runs_dir / str(run_id)).resolve()
+    runs_root = workspace.runs_dir.resolve()
+    if not _is_relative_to(run_dir, runs_root):
+        raise ValueError("run output directory is outside workspace runs directory")
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+    db.mark_run_artifacts_cleaned(run_id)
+    return {"run_id": run_id, "artifact_cleaned": True, "output_dir": str(run_dir)}
 
 
 def _checkpoint_relative(workspace: WorkspaceConfig, checkpoint_path: Path | None) -> str | None:
@@ -561,15 +778,16 @@ def _checkpoint_relative(workspace: WorkspaceConfig, checkpoint_path: Path | Non
 def _resolve_execution_devices(body: dict, execution_mode: str) -> list[str]:
     if execution_mode == "single":
         return [str(body.get("device") or "auto")]
-    if execution_mode != "multi_cuda":
-        raise ValueError("execution_mode must be single or multi_cuda")
+    if execution_mode not in {"multi_cuda", "multi_npu"}:
+        raise ValueError("execution_mode must be single, multi_cuda, or multi_npu")
+    kind = "cuda" if execution_mode == "multi_cuda" else "npu"
     raw_devices = body.get("devices") or []
-    devices = [str(device) for device in raw_devices if str(device).startswith("cuda:")]
+    devices = [str(device) for device in raw_devices if str(device).startswith(f"{kind}:")]
     if not devices:
         capabilities = detect_capabilities()
-        devices = [str(row["id"]) for row in capabilities.get("cuda", [])]
+        devices = [str(row["id"]) for row in capabilities.get(kind, [])]
     if not devices:
-        raise ValueError("multi_cuda requires at least one CUDA device")
+        raise ValueError(f"{execution_mode} requires at least one {kind.upper()} device")
     return devices
 
 
@@ -649,6 +867,83 @@ def _start_local_inference_worker(db: Database, workspace: WorkspaceConfig, coun
         threading.Thread(target=_target, args=(index,), daemon=True).start()
 
 
+def _start_local_npu_worker_processes(
+    workspace: WorkspaceConfig,
+    run_id: int,
+    devices: list[str],
+    start_metric_worker: bool = False,
+) -> list[subprocess.Popen]:
+    processes = []
+    logs_dir = workspace.runs_dir / str(run_id) / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    for index, device in enumerate(devices):
+        command = _worker_process_command(
+            workspace,
+            role="inference",
+            device_filter=device,
+            worker_id=f"local-npu-{run_id}-{index}-{device.replace(':', '-')}",
+            once=True,
+            idle_timeout=None,
+        )
+        processes.append(_spawn_worker_process(command, logs_dir / f"worker-{device.replace(':', '-')}.log"))
+    if start_metric_worker:
+        command = _worker_process_command(
+            workspace,
+            role="metric",
+            device_filter=None,
+            worker_id=f"local-metric-{run_id}",
+            once=False,
+            idle_timeout=86400.0,
+        )
+        processes.append(_spawn_worker_process(command, logs_dir / "worker-metric.log"))
+    return processes
+
+
+def _worker_process_command(
+    workspace: WorkspaceConfig,
+    role: str,
+    device_filter: str | None = None,
+    worker_id: str | None = None,
+    once: bool = False,
+    idle_timeout: float | None = None,
+) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "vfieval.cli",
+        "--workspace",
+        str(workspace.root),
+        "worker",
+        "--role",
+        role,
+        "--poll-interval",
+        "1",
+    ]
+    if once:
+        command.append("--once")
+    if worker_id:
+        command.extend(["--worker-id", worker_id])
+    if device_filter:
+        command.extend(["--device-filter", device_filter])
+    if idle_timeout is not None:
+        command.extend(["--idle-timeout", str(float(idle_timeout))])
+    return command
+
+
+def _spawn_worker_process(command: list[str], log_path: Path) -> subprocess.Popen:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ)
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    src_root = str(Path(__file__).resolve().parents[1])
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = src_root if not existing_pythonpath else f"{src_root}{os.pathsep}{existing_pythonpath}"
+    log_handle = log_path.open("ab")
+    try:
+        return subprocess.Popen(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env)
+    finally:
+        log_handle.close()
+
+
 def _selection_hash(selected_videos: list[str], frame_step: int, max_frames: int | None) -> str:
     data = {
         "selected_videos": selected_videos,
@@ -659,6 +954,7 @@ def _selection_hash(selected_videos: list[str], frame_step: int, max_frames: int
 
 
 CORE_TIMELINE_ARTIFACTS = {
+    "gt",
     "pred",
     "difference",
     "flowt_0",
@@ -677,7 +973,13 @@ METRIC_DIRECTIONS = {
     "lpips_convnext": "lower_is_better",
     "cgvqm": "lower_is_better",
 }
-METRIC_STATUSES = ("completed", "unavailable", "failed", "skipped")
+METRIC_TIMELINE_SUPPORT = {
+    "lpips_vit_patch": True,
+    "lpips_convnext": True,
+    "vmaf": False,
+    "cgvqm": False,
+}
+METRIC_STATUSES = ("pending", "running", "completed", "unavailable", "failed", "skipped", "missing")
 
 
 def _run_detail(db: Database, run_id: int) -> dict:
@@ -691,6 +993,9 @@ def _run_timeline(db: Database, run_id: int) -> dict:
     samples = db.list_samples(int(run["dataset_id"]))
     artifacts = db.list_run_artifacts(run_id)
     metrics = _latest_metric_rows(db.list_run_metrics(run_id))
+    metric_job_status = _metric_job_status(db, run)
+    requested_sample_metrics = _requested_sample_metrics(run)
+    requested_video_metrics = _requested_video_metrics(run)
 
     samples_with_artifacts: set[int] = set()
     video_artifacts: dict[str, dict[str, int]] = {}
@@ -741,6 +1046,13 @@ def _run_timeline(db: Database, run_id: int) -> dict:
         )
         sample_id = int(sample["id"])
         timestamps = metadata.get("timestamps") or {}
+        sample_metrics = _sample_metrics_with_defaults(
+            metrics_by_sample.get(sample_id, {}),
+            requested_sample_metrics,
+            bool(sample.get("gt_path")),
+            str(run.get("status") or ""),
+            metric_job_status,
+        )
         group["samples"].append(
             {
                 "sample_id": sample_id,
@@ -750,14 +1062,20 @@ def _run_timeline(db: Database, run_id: int) -> dict:
                 "timestamp": timestamps.get("gt") if isinstance(timestamps, dict) else None,
                 "has_artifacts": sample_id in samples_with_artifacts,
                 "has_gt": bool(sample.get("gt_path")),
-                "metrics": metrics_by_sample.get(sample_id, {}),
-                "metric_status": metric_status_by_sample.get(sample_id, {status: 0 for status in METRIC_STATUSES}),
+                "metrics": sample_metrics,
+                "metric_status": _metric_status_counts(sample_metrics),
             }
         )
 
     videos = []
     for group in groups.values():
         group["samples"] = sorted(group["samples"], key=lambda item: (item["frame_index"], item["sample_index"]))
+        group["video_metrics"] = _video_metrics_with_defaults(
+            actual_metrics=group.get("video_metrics") or {},
+            requested_video_metrics=requested_video_metrics,
+            run_status=str(run.get("status") or ""),
+            metric_job_status=metric_job_status,
+        )
         group["metric_summary"] = _metric_summary_for_video(group["samples"], summary.get("metrics", {}))
         group["worst_samples"] = _worst_samples_for_video(group["samples"])
         videos.append(group)
@@ -891,25 +1209,37 @@ def _timeline_buckets(samples: list[dict], metric_name: str | None, bucket_count
     return buckets
 
 
+def _artifact_payload(artifact: dict) -> dict[str, object]:
+    artifact_id = int(artifact["id"])
+    has_preview = bool((artifact.get("metadata") or {}).get("preview_path"))
+    return {
+        "id": artifact_id,
+        "original": artifact_id,
+        "original_url": f"/api/files/{artifact_id}",
+        "preview_url": f"/api/files/{artifact_id}?variant=preview" if has_preview else f"/api/files/{artifact_id}",
+        "has_preview": has_preview,
+    }
+
+
 def _run_sample_payload(db: Database, run_id: int, sample_id: int) -> dict:
     run = db.get_run(run_id)
     sample = db.get_sample(sample_id)
     if sample is None or int(sample["dataset_id"]) != int(run["dataset_id"]):
         raise ValueError("sample does not belong to this run")
 
-    artifacts: dict[str, int] = {}
+    artifacts: dict[str, object] = {}
     extra_artifacts: list[dict[str, object]] = []
     for artifact in db.list_run_artifacts(run_id):
         if artifact.get("sample_id") != sample_id:
             continue
         kind = artifact["kind"]
         if kind in CORE_TIMELINE_ARTIFACTS:
-            artifacts[kind] = int(artifact["id"])
+            artifacts[kind] = _artifact_payload(artifact)
         elif kind.startswith("extra_"):
-            extra_artifacts.append({"id": int(artifact["id"]), "kind": kind})
+            extra_artifacts.append({"id": int(artifact["id"]), "kind": kind, **_artifact_payload(artifact)})
 
     metric_rows = _latest_metric_rows(db.list_run_metrics(run_id))
-    metrics = {
+    actual_metrics = {
         row["metric_name"]: {
             "status": row["status"],
             "value": row.get("value"),
@@ -918,10 +1248,14 @@ def _run_sample_payload(db: Database, run_id: int, sample_id: int) -> dict:
         for row in metric_rows
         if row.get("sample_id") == sample_id
     }
-    metric_status = {status: 0 for status in METRIC_STATUSES}
-    for metric in metrics.values():
-        status = str(metric.get("status"))
-        metric_status[status] = metric_status.get(status, 0) + 1
+    metrics = _sample_metrics_with_defaults(
+        actual_metrics,
+        _requested_sample_metrics(run),
+        bool(sample.get("gt_path")),
+        str(run.get("status") or ""),
+        _metric_job_status(db, run),
+    )
+    metric_status = _metric_status_counts(metrics)
 
     metadata = sample.get("metadata") or {}
     timestamps = metadata.get("timestamps") or {}
@@ -948,6 +1282,19 @@ def _run_metric_summary(db: Database, run_id: int) -> dict:
     run = db.get_run(run_id)
     requested_metrics = list(run.get("metrics") or [])
     metrics = _latest_metric_rows(db.list_run_metrics(run_id))
+    samples = db.list_samples(int(run["dataset_id"]))
+    metric_job_status = _metric_job_status(db, run)
+    requested_video_metrics = _requested_video_metrics(run)
+    actual_sample_metric_keys = {
+        (int(row["sample_id"]), row["metric_name"])
+        for row in metrics
+        if row.get("sample_id") is not None
+    }
+    actual_video_metric_keys = {
+        (str((row.get("details") or {}).get("video_name") or "video"), row["metric_name"])
+        for row in metrics
+        if row.get("sample_id") is None
+    }
     summary: dict[str, dict[str, object]] = {
         name: _empty_metric_summary(name)
         for name in requested_metrics
@@ -971,6 +1318,40 @@ def _run_metric_summary(db: Database, run_id: int) -> dict:
             reason = details.get("reason") or details.get("type") or status
             if reason not in reasons:
                 reasons.append(reason)
+    for name in _requested_sample_metrics(run):
+        row = summary.setdefault(name, _empty_metric_summary(name))
+        for sample in samples:
+            sample_id = int(sample["id"])
+            if (sample_id, name) in actual_sample_metric_keys:
+                continue
+            default_metric = _default_sample_metric_payload(
+                has_gt=bool(sample.get("gt_path")),
+                run_status=str(run.get("status") or ""),
+                metric_job_status=metric_job_status,
+            )
+            status = default_metric["status"]
+            row[status] = int(row.get(status, 0)) + 1
+            if status in {"failed", "skipped", "missing"}:
+                reasons = row.setdefault("reasons", [])
+                reason = (default_metric.get("details") or {}).get("reason") or status
+                if reason not in reasons:
+                    reasons.append(reason)
+    for name in requested_video_metrics:
+        row = summary.setdefault(name, _empty_metric_summary(name))
+        for video_name in _video_metric_target_names(samples):
+            if (video_name, name) in actual_video_metric_keys:
+                continue
+            default_metric = _default_video_metric_payload(
+                run_status=str(run.get("status") or ""),
+                metric_job_status=metric_job_status,
+            )
+            status = default_metric["status"]
+            row[status] = int(row.get(status, 0)) + 1
+            if status in {"failed", "skipped", "missing"}:
+                reasons = row.setdefault("reasons", [])
+                reason = (default_metric.get("details") or {}).get("reason") or status
+                if reason not in reasons:
+                    reasons.append(reason)
     for row in summary.values():
         values = list(row.pop("_values", []))
         if values:
@@ -988,10 +1369,13 @@ def _empty_metric_summary(name: str) -> dict[str, object]:
     return {
         "metric_name": name,
         "direction": METRIC_DIRECTIONS.get(name, "lower_is_better"),
+        "pending": 0,
+        "running": 0,
         "completed": 0,
         "unavailable": 0,
         "failed": 0,
         "skipped": 0,
+        "missing": 0,
         "mean": None,
         "min": None,
         "max": None,
@@ -1052,6 +1436,92 @@ def _metric_summary_for_video(samples: list[dict[str, object]], global_summary: 
     return summary
 
 
+def _requested_sample_metrics(run: dict[str, object]) -> list[str]:
+    return [
+        name
+        for name in list(run.get("metrics") or [])
+        if METRIC_TIMELINE_SUPPORT.get(str(name), False)
+    ]
+
+
+def _requested_video_metrics(run: dict[str, object]) -> list[str]:
+    return [
+        name
+        for name in list(run.get("metrics") or [])
+        if not METRIC_TIMELINE_SUPPORT.get(str(name), False)
+    ]
+
+
+def _metric_job_status(db: Database, run: dict[str, object]) -> str | None:
+    metric_job_id = run.get("metric_job_id")
+    if metric_job_id is None:
+        return None
+    try:
+        return str(db.get_job(int(metric_job_id)).get("status") or "")
+    except Exception:
+        return None
+
+
+def _default_sample_metric_payload(
+    has_gt: bool,
+    run_status: str,
+    metric_job_status: str | None,
+) -> dict[str, object]:
+    if not has_gt:
+        return {"status": "skipped", "value": None, "details": {"reason": "sample has no ground-truth reference"}}
+    if metric_job_status == "running" or run_status == "metric_running":
+        return {"status": "running", "value": None, "details": {"reason": "metric evaluation is running"}}
+    if metric_job_status == "queued" or run_status in {"queued", "running", "metric_queued"}:
+        return {"status": "pending", "value": None, "details": {"reason": "metric evaluation has not started"}}
+    return {"status": "missing", "value": None, "details": {"reason": "metric result is not available"}}
+
+
+def _default_video_metric_payload(
+    run_status: str,
+    metric_job_status: str | None,
+) -> dict[str, object]:
+    if metric_job_status == "running" or run_status == "metric_running":
+        return {"status": "running", "value": None, "details": {"reason": "video-level metric evaluation is running"}}
+    if metric_job_status == "queued" or run_status in {"queued", "running", "metric_queued"}:
+        return {"status": "pending", "value": None, "details": {"reason": "video-level metric evaluation has not started"}}
+    return {"status": "missing", "value": None, "details": {"reason": "video-level metric result is not available"}}
+
+
+def _sample_metrics_with_defaults(
+    actual_metrics: dict[str, dict[str, object]],
+    requested_sample_metrics: list[str],
+    has_gt: bool,
+    run_status: str,
+    metric_job_status: str | None,
+) -> dict[str, dict[str, object]]:
+    metrics = dict(actual_metrics)
+    for name in requested_sample_metrics:
+        if name not in metrics:
+            metrics[name] = _default_sample_metric_payload(has_gt, run_status, metric_job_status)
+    return metrics
+
+
+def _video_metrics_with_defaults(
+    actual_metrics: dict[str, dict[str, object]],
+    requested_video_metrics: list[str],
+    run_status: str,
+    metric_job_status: str | None,
+) -> dict[str, dict[str, object]]:
+    metrics = dict(actual_metrics)
+    for name in requested_video_metrics:
+        if name not in metrics:
+            metrics[name] = _default_video_metric_payload(run_status, metric_job_status)
+    return metrics
+
+
+def _metric_status_counts(metrics: dict[str, dict[str, object]]) -> dict[str, int]:
+    counts = {status: 0 for status in METRIC_STATUSES}
+    for metric in metrics.values():
+        status = str(metric.get("status") or "missing")
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
 def _worst_samples_for_video(samples: list[dict[str, object]], limit: int = 8) -> dict[str, list[dict[str, object]]]:
     by_metric: dict[str, list[dict[str, object]]] = {}
     for sample in samples:
@@ -1076,10 +1546,22 @@ def _worst_samples_for_video(samples: list[dict[str, object]], limit: int = 8) -
     return result
 
 
+def _video_metric_target_names(samples: list[dict[str, Any]]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
+    for sample in samples:
+        metadata = sample.get("metadata") or {}
+        video_name = str(metadata.get("video_name") or metadata.get("video_file") or "frames")
+        if video_name not in seen:
+            seen.add(video_name)
+            names.append(video_name)
+    return names
+
+
 def _retry_run_metrics(db: Database, run_id: int) -> dict:
     run = db.get_run(run_id)
-    inference_job_id = run.get("inference_job_id")
-    if inference_job_id is None:
+    inference_job_ids = db.run_inference_job_ids(run_id)
+    if not inference_job_ids:
         raise ValueError("Run has no inference job")
     failed_names = sorted(
         {
@@ -1096,7 +1578,8 @@ def _retry_run_metrics(db: Database, run_id: int) -> dict:
         "metric",
         {
             "run_id": run_id,
-            "inference_job_id": int(inference_job_id),
+            "inference_job_id": int(inference_job_ids[0]),
+            "inference_job_ids": inference_job_ids,
             "dataset_id": int(run["dataset_id"]),
             "metric_names": failed_names,
             "retry": True,

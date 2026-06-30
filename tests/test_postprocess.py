@@ -64,6 +64,28 @@ class PostprocessTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "flowt_0"):
             validate_model_outputs(outputs, img0)
 
+    def test_validate_reports_explicit_device_mismatch(self) -> None:
+        img0 = torch.zeros((1, 3, 4, 4), dtype=torch.float32)
+        outputs = {
+            "flowt_0": torch.zeros((1, 2, 4, 4), dtype=torch.float32, device="meta"),
+            "flowt_1": torch.zeros((1, 2, 4, 4), dtype=torch.float32),
+            "mask0": torch.zeros((1, 1, 4, 4), dtype=torch.float32),
+            "mask1": torch.zeros((1, 1, 4, 4), dtype=torch.float32),
+        }
+        with self.assertRaisesRegex(ValueError, r"Model output field flowt_0 is on meta, expected CPU"):
+            validate_model_outputs(outputs, img0)
+
+    def test_validate_reports_explicit_dtype_mismatch(self) -> None:
+        img0 = torch.zeros((1, 3, 4, 4), dtype=torch.float32)
+        outputs = {
+            "flowt_0": torch.zeros((1, 2, 4, 4), dtype=torch.float32),
+            "flowt_1": torch.zeros((1, 2, 4, 4), dtype=torch.float32),
+            "mask0": torch.zeros((1, 1, 4, 4), dtype=torch.float64),
+            "mask1": torch.zeros((1, 1, 4, 4), dtype=torch.float32),
+        }
+        with self.assertRaisesRegex(ValueError, r"Model output field mask0 has dtype torch.float64, expected torch.float32"):
+            validate_model_outputs(outputs, img0)
+
     def test_backward_warp_identity_for_zero_flow(self) -> None:
         image = torch.rand((2, 3, 5, 7), dtype=torch.float32)
         flow = torch.zeros((2, 2, 5, 7), dtype=torch.float32)

@@ -63,9 +63,11 @@ class EndToEndTests(unittest.TestCase):
             self.assertEqual(len(metric_jobs), 1)
             self.assertEqual(metric_jobs[0]["status"], "completed")
             results = db.list_metric_results(inference_job_id=job_id)
-            self.assertEqual(len(results), 2)
+            self.assertEqual(len(results), 1)
             self.assertTrue(all(row["metric_name"] == "cgvqm" for row in results))
             self.assertTrue(all(row["status"] == "unavailable" for row in results))
+            self.assertTrue(all(row["sample_id"] is None for row in results))
+            self.assertIn("requires video artifacts", results[0]["details"]["reason"])
 
 
 if __name__ == "__main__":
