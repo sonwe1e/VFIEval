@@ -392,16 +392,58 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
             if not path.exists() or not path.is_file():
                 return self._error(HTTPStatus.NOT_FOUND, f"file not found: {path}")
             content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-            data = path.read_bytes()
-            self.send_response(HTTPStatus.OK)
+            file_size = path.stat().st_size
+            byte_range = _parse_range_header(self.headers.get("Range"), file_size)
+            if byte_range == "invalid":
+                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                self.send_header("Content-Range", f"bytes */{file_size}")
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                return
+            if byte_range is None:
+                data = path.read_bytes()
+                self.send_response(HTTPStatus.OK)
+                content_length = file_size
+            else:
+                start, end = byte_range
+                with path.open("rb") as handle:
+                    handle.seek(start)
+                    data = handle.read(end - start + 1)
+                self.send_response(HTTPStatus.PARTIAL_CONTENT)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+                content_length = len(data)
             self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Length", str(content_length))
+            self.send_header("Accept-Ranges", "bytes")
             if cache_control:
                 self.send_header("Cache-Control", cache_control)
             self.end_headers()
             self.wfile.write(data)
 
     return VFIEvalHandler
+
+
+def _parse_range_header(range_header: str | None, file_size: int) -> tuple[int, int] | str | None:
+    if not range_header:
+        return None
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header.strip())
+    if not match or file_size < 0:
+        return "invalid"
+    start_text, end_text = match.groups()
+    if not start_text and not end_text:
+        return "invalid"
+    if not start_text:
+        suffix_length = int(end_text)
+        if suffix_length <= 0:
+            return "invalid"
+        start = max(0, file_size - suffix_length)
+        end = file_size - 1
+    else:
+        start = int(start_text)
+        end = int(end_text) if end_text else file_size - 1
+    if start < 0 or end < start or start >= file_size:
+        return "invalid"
+    return start, min(end, file_size - 1)
 
 
 def _compare(db: Database, query: dict[str, list[str]]) -> dict:

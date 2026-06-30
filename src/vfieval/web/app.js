@@ -1006,6 +1006,14 @@ function renderWorstSamples(video, metricName) {
 
 function renderVideoPlayer(label, artifactId) {
   if (!artifactId) return "";
+  const url = `/api/files/${artifactId}`;
+  return `
+    <div class="video-artifact">
+      <span>${escapeHtml(label)}</span>
+      <video controls preload="metadata" src="${escapeHtml(url)}"></video>
+      <a class="small-video-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">open</a>
+    </div>
+  `;
   return `<a class="small-video-link" href="/api/files/${artifactId}" target="_blank" rel="noreferrer">${escapeHtml(label)} 视频</a>`;
 }
 

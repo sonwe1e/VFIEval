@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import importlib
 import importlib.util
 import sys
@@ -11,6 +12,7 @@ import torch
 
 from vfieval.models.base import FlowMaskModel
 from vfieval.models.dummy import DummyFlowMaskModel
+from vfieval.models.utils import move_module_to_device
 
 
 OUTPUT_KEYS = ("flowt_0", "flowt_1", "mask0", "mask1")
@@ -27,9 +29,17 @@ class InferModelAdapter:
 def normalize_infer_output(output: object) -> dict[str, torch.Tensor]:
     if isinstance(output, dict):
         return dict(output)
-    if isinstance(output, (tuple, list)) and len(output) == 4:
+    if isinstance(output, (tuple, list)):
+        if len(output) != 4:
+            raise TypeError(
+                f"Model infer returned {type(output).__name__} with {len(output)} items; "
+                "expected exactly 4 items: flowt_0, flowt_1, mask0, mask1"
+            )
         return dict(zip(OUTPUT_KEYS, output))
-    raise TypeError("模型 infer 必须返回包含 flowt_0/flowt_1/mask0/mask1 的 dict，或四元组")
+    raise TypeError(
+        f"Model infer returned {type(output).__name__}; expected a dict with "
+        "flowt_0/flowt_1/mask0/mask1 or a 4-item tuple/list"
+    )
 
 
 def load_flow_mask_model(
@@ -59,12 +69,10 @@ def load_flow_mask_model(
     module = importlib.import_module(module_name)
     target = getattr(module, attr_name)
     if callable(target):
-        try:
-            model = target(checkpoint_path=checkpoint_path, device=device, metadata=metadata or {})
-        except TypeError:
-            model = target(checkpoint_path, device)
+        model = _call_model_factory(target, checkpoint_path, device, metadata or {})
     else:
         model = target
+    _prepare_user_model(model, device)
     if hasattr(model, "infer") and not hasattr(model, "predict"):
         model = InferModelAdapter(model.infer)
     if callable(model) and not hasattr(model, "predict"):
@@ -72,6 +80,24 @@ def load_flow_mask_model(
     if not hasattr(model, "predict"):
         raise TypeError(f"adapter '{adapter}' did not return an object with predict(img0, img1, t)")
     return model
+
+
+def _prepare_user_model(model: object, device: str) -> None:
+    seen: set[int] = set()
+    _prepare_model_object(model, device, seen)
+    for attr_name in ("model", "net", "network", "module"):
+        child = getattr(model, attr_name, None)
+        if child is not None:
+            _prepare_model_object(child, device, seen)
+
+
+def _prepare_model_object(model: object, device: str, seen: set[int]) -> None:
+    identity = id(model)
+    if identity in seen:
+        return
+    seen.add(identity)
+    if callable(getattr(model, "to", None)) or callable(getattr(model, "eval", None)):
+        move_module_to_device(model, device)
 
 
 def load_model_file(
@@ -82,14 +108,14 @@ def load_model_file(
 ) -> FlowMaskModel:
     path = path.resolve()
     if not path.is_file():
-        raise FileNotFoundError(f"模型文件不存在: {path}")
+        raise FileNotFoundError(f"model file does not exist: {path}")
     if path.suffix.lower() != ".py":
-        raise ValueError(f"模型文件必须是 .py: {path.name}")
+        raise ValueError(f"model file must be a .py file: {path.name}")
 
     digest = hashlib.sha1(f"{path}:{path.stat().st_mtime_ns}:{path.stat().st_size}".encode("utf-8")).hexdigest()
     spec = importlib.util.spec_from_file_location(f"vfieval_user_model_{digest}", path)
     if spec is None or spec.loader is None:
-        raise ImportError(f"无法导入模型文件: {path}")
+        raise ImportError(f"failed to import model file: {path}")
     module = importlib.util.module_from_spec(spec)
     sys.path.insert(0, str(path.parent))
     try:
@@ -102,18 +128,40 @@ def load_model_file(
 
     if hasattr(module, "Model"):
         model_class = getattr(module, "Model")
-        try:
-            model = model_class(checkpoint_path=checkpoint_path, device=device, metadata=metadata or {})
-        except TypeError:
-            model = model_class()
+        model = _call_model_factory(model_class, checkpoint_path, device, metadata or {})
         if not hasattr(model, "infer"):
-            raise TypeError(f"{path.name} 的 Model 类缺少 infer(img0, img1)")
+            raise TypeError(f"{path.name} Model class must define infer(img0, img1)")
+        _prepare_user_model(model, device)
         return InferModelAdapter(model.infer)
 
     if hasattr(module, "infer"):
         infer = getattr(module, "infer")
         if not callable(infer):
-            raise TypeError(f"{path.name} 的 infer 不是可调用对象")
+            raise TypeError(f"{path.name} infer is not callable")
         return InferModelAdapter(infer)
 
-    raise TypeError(f"{path.name} 必须定义 class Model 且包含 infer(img0, img1)，或定义顶层 infer(img0, img1)")
+    raise TypeError(f"{path.name} must define class Model with infer(img0, img1), or top-level infer(img0, img1)")
+
+
+def _call_model_factory(factory, checkpoint_path: str | None, device: str, metadata: dict[str, Any]) -> object:
+    signature = inspect.signature(factory)
+    parameters = signature.parameters
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+        return factory(checkpoint_path=checkpoint_path, device=device, metadata=metadata)
+    if any(name in parameters for name in ("checkpoint_path", "device", "metadata")):
+        kwargs: dict[str, Any] = {}
+        if "checkpoint_path" in parameters:
+            kwargs["checkpoint_path"] = checkpoint_path
+        if "device" in parameters:
+            kwargs["device"] = device
+        if "metadata" in parameters:
+            kwargs["metadata"] = metadata
+        return factory(**kwargs)
+    positional = [
+        param
+        for param in parameters.values()
+        if param.kind in {inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD}
+    ]
+    if len(positional) >= 2:
+        return factory(checkpoint_path, device)
+    return factory()

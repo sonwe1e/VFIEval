@@ -48,6 +48,7 @@ class V3FileFlowTests(unittest.TestCase):
 
     def test_model_file_loader_accepts_dict_tuple_and_extra_outputs(self) -> None:
         import torch
+        from vfieval.models.loader import normalize_infer_output
 
         img0 = torch.zeros((1, 3, 8, 8), dtype=torch.float32)
         img1 = torch.ones((1, 3, 8, 8), dtype=torch.float32)
@@ -63,6 +64,91 @@ class V3FileFlowTests(unittest.TestCase):
         bad_model = load_flow_mask_model(f"file:{ROOT / 'models' / 'test_bad_shape.py'}")
         with self.assertRaisesRegex(ValueError, "flowt_0"):
             validate_model_outputs(bad_model.predict(img0, img1, 0.5), img0)
+        with self.assertRaisesRegex(TypeError, "expected exactly 4 items"):
+            normalize_infer_output((torch.zeros(1), torch.zeros(1)))
+
+    def test_model_loader_moves_user_model_and_inner_module_to_device(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp) / "portable_model.py"
+            model_path.write_text(
+                """
+class Inner:
+    def __init__(self):
+        self.calls = []
+
+    def to(self, device):
+        self.calls.append(("to", str(device)))
+        return self
+
+    def eval(self):
+        self.calls.append(("eval", None))
+        return self
+
+
+class Model:
+    def __init__(self, checkpoint_path=None, device="cpu", metadata=None):
+        self.calls = [("init", str(device))]
+        self.net = Inner()
+
+    def to(self, device):
+        self.calls.append(("to", str(device)))
+        return self
+
+    def eval(self):
+        self.calls.append(("eval", None))
+        return self
+
+    def infer(self, img0, img1):
+        batch, _channels, height, width = img0.shape
+        flow = img0.new_zeros((batch, 2, height, width))
+        mask = img0.new_zeros((batch, 1, height, width))
+        return flow, flow, mask, mask
+""",
+                encoding="utf-8",
+            )
+
+            adapter = load_flow_mask_model(f"file:{model_path}", device="npu:3")
+            model = adapter._infer.__self__
+
+        self.assertIn(("init", "npu:3"), model.calls)
+        self.assertIn(("to", "npu:3"), model.calls)
+        self.assertIn(("eval", None), model.calls)
+        self.assertIn(("to", "npu:3"), model.net.calls)
+        self.assertIn(("eval", None), model.net.calls)
+
+    def test_model_loader_surfaces_constructor_type_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model_path = Path(tmp) / "bad_init_model.py"
+            model_path.write_text(
+                """
+class Model:
+    def __init__(self, checkpoint_path=None, device="cpu", metadata=None):
+        raise TypeError("checkpoint tensor layout is invalid")
+
+    def infer(self, img0, img1):
+        raise AssertionError("not reached")
+""",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(TypeError, "checkpoint tensor layout is invalid"):
+                load_flow_mask_model(f"file:{model_path}", device="cpu")
+
+    def test_portable_checkpoint_helper_loads_on_cpu_then_moves_module(self) -> None:
+        import torch
+
+        from vfieval.models.utils import load_state_dict_portable
+
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_path = Path(tmp) / "model.pth"
+            source = torch.nn.Linear(2, 1)
+            target = torch.nn.Linear(2, 1)
+            torch.save({"state_dict": source.state_dict()}, checkpoint_path)
+
+            load_state_dict_portable(target, checkpoint_path, device="cpu")
+
+        for name, value in source.state_dict().items():
+            self.assertTrue(torch.equal(value, target.state_dict()[name]))
 
     def test_discovery_and_preflight(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -292,6 +378,17 @@ class V3FileFlowTests(unittest.TestCase):
                 self.assertIn("gt_video", kinds)
                 self.assertIn("diff_video", kinds)
                 self.assertEqual(kinds.count("pred_video"), 1)
+                pred_video = next(artifact for artifact in artifacts if artifact["kind"] == "pred_video")
+                range_request = urllib.request.Request(
+                    f"{base_url}/api/files/{pred_video['id']}",
+                    headers={"Range": "bytes=0-15"},
+                )
+                with urllib.request.urlopen(range_request, timeout=30) as response:
+                    partial = response.read()
+                    self.assertEqual(response.status, 206)
+                    self.assertEqual(response.headers["Accept-Ranges"], "bytes")
+                    self.assertTrue(response.headers["Content-Range"].startswith("bytes 0-15/"))
+                self.assertEqual(len(partial), 16)
                 self.assertTrue(Path(run["metadata"]["output_dir"]).exists())
                 self.assertEqual(run["metadata"]["selected_videos"], [selected_video])
                 self.assertIn("reference_key", run["metadata"])
@@ -707,6 +804,7 @@ class V3FileFlowTests(unittest.TestCase):
                 self.assertIn('<img src="${escapeHtml(url)}" alt="${escapeHtml(label)}" loading="lazy">', app_js)
                 self.assertIn('href="${escapeHtml(item.original_url || `/api/files/${item.id}`)}"', app_js)
                 self.assertIn('src="${escapeHtml(item.preview_url || `/api/files/${item.id}`)}"', app_js)
+                self.assertIn('<video controls preload="metadata" src="${escapeHtml(url)}"></video>', app_js)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -1906,7 +2004,7 @@ class V3FileFlowTests(unittest.TestCase):
             self.assertIn("model dry-run failed on npu:0", result["errors"][0]["message"])
             self.assertIn("model_init/checkpoint_load", result["errors"][0]["message"])
             self.assertIn("Expected all tensors to be on the same device", result["errors"][0]["message"])
-            self.assertIn("map_location=device", result["errors"][0]["message"])
+            self.assertIn("map_location='cpu'", result["errors"][0]["message"])
             self.assertIn("model.to(device)", result["errors"][0]["message"])
             self.assertIn("Model(..., device=...)", result["errors"][0]["message"])
 

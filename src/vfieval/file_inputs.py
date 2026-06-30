@@ -729,7 +729,7 @@ def _dry_run_failure_hint(stage: str, detail: str) -> str | None:
     if stage == "model_init/checkpoint_load":
         return (
             "Ensure Model(..., device=...) uses the requested device, checkpoint restore uses "
-            "torch.load(..., map_location=device), and the network is moved with model.to(device)."
+            "torch.load(..., map_location='cpu'), and the network is moved with model.to(device)."
         )
     if stage in {"predict", "postprocess"} and "Expected all tensors to be on the same device" in detail:
         return (

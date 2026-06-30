@@ -84,6 +84,17 @@ class Model:
 
 Tuple return `(flowt_0, flowt_1, mask0, mask1)` is allowed.
 
+Model checkpoints should be portable across CPU, CUDA, and Ascend NPU workers. User model files should load checkpoint bytes on CPU first, then move the constructed network to the requested runtime device:
+
+```python
+state = torch.load(checkpoint_path, map_location="cpu")
+network.load_state_dict(state["state_dict"] if "state_dict" in state else state)
+network.to(device)
+network.eval()
+```
+
+The helper `vfieval.models.utils.load_state_dict_portable(module, checkpoint_path, device)` is available for this pattern. Do not deserialize checkpoints directly onto a fixed device such as `npu:0` or `cuda:0`.
+
 `flowt_0` and `flowt_1` are backward flow in resized pixel coordinates. They represent displacement from the target middle-frame pixel to the source pixel in `img0` or `img1`. `mask0` and `mask1` are logits, not probabilities.
 
 Core outputs must match input batch, device, dtype, and channel count. Spatial resolution may be lower than the input; the platform must resize flow and mask to the inference resolution before warp/compose, scaling flow x/y magnitudes with width/height.
@@ -134,6 +145,8 @@ Primary UI should use paged video APIs and windowed timelines: `GET /api/runs/{i
 
 The default UI should load preview artifacts first. Original 4K or larger artifacts should load only after explicit user action. Clicking a metric curve point or worst-sample row should load only that sample's core artifacts.
 
+GT/Pred/Diff video artifacts must be playable in the browser. `GET /api/files/{artifact_id}` must support HTTP byte ranges for video playback and return `Accept-Ranges: bytes`; Run Detail should use lightweight `<video controls preload="metadata">` controls rather than auto-loading full videos.
+
 Core artifacts should be grouped so only the selected artifact group loads previews:
 
 - Basic comparison: `gt`, `pred`, `diff`
@@ -155,6 +168,10 @@ Keep SQLite as metadata and index storage. Keep artifacts on disk. Prefer depend
 Primary execution remains split between the Web/API control plane, inference workers, and metric workers. Inference failure must not erase already-readable logs. Metric failure must not block viewing completed inference artifacts.
 
 Future remote workers should be implemented through explicit HTTP worker APIs. Do not let remote workers mutate SQLite directly.
+
+## Codex Maintenance Workflow
+
+Every Codex session working on VFIEval should read this `AGENTS.md` before planning or modifying code. When a task reveals a stable project rule, deployment constraint, or recurring failure mode, update this file in the same change set after tests pass. Keep these updates concise and specific to VFIEval; do not turn this file into a changelog.
 
 ## V12 Execution Checklist
 
