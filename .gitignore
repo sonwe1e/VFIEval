@@ -1,0 +1,11 @@
+.vfieval/
+.vfieval-*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+dist/
+build/
+*.egg-info/

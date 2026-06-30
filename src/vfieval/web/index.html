@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>VFIEval 推理工具</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="app-header">
+      <div>
+        <h1>VFIEval</h1>
+        <p>放模型文件，选视频文件夹，直接推理。</p>
+      </div>
+      <nav class="nav" aria-label="主导航">
+        <button class="nav-item active" data-view="create" type="button">新建推理</button>
+        <button class="nav-item" data-view="runs" type="button">运行记录</button>
+      </nav>
+    </header>
+
+    <main class="shell">
+      <section id="view-create" class="view active">
+        <form id="infer-form" class="panel infer-grid">
+          <label>
+            <span>模型文件</span>
+            <select name="model_file" required></select>
+          </label>
+          <label>
+            <span>视频集</span>
+            <select name="video_group" required></select>
+          </label>
+          <label>
+            <span>输出分辨率</span>
+            <select name="resolution_mode">
+              <option value="original">原始</option>
+              <option value="720p">720p</option>
+              <option value="custom">自定义</option>
+            </select>
+          </label>
+          <label class="custom-size">
+            <span>高度</span>
+            <input name="height" type="number" min="1" placeholder="H">
+          </label>
+          <label class="custom-size">
+            <span>宽度</span>
+            <input name="width" type="number" min="1" placeholder="W">
+          </label>
+          <label>
+            <span>设备</span>
+            <select name="device">
+              <option value="auto">auto</option>
+              <option value="cuda">cuda</option>
+              <option value="npu">npu</option>
+              <option value="cpu">cpu</option>
+            </select>
+          </label>
+          <label>
+            <span>精度</span>
+            <select name="precision">
+              <option value="auto">auto</option>
+              <option value="fp32">fp32</option>
+              <option value="fp16">fp16</option>
+              <option value="bf16">bf16</option>
+            </select>
+          </label>
+          <details class="advanced">
+            <summary>高级设置</summary>
+            <div class="advanced-grid">
+              <label>
+                <span>Batch Size</span>
+                <input name="batch_size" type="number" min="1" value="1">
+              </label>
+              <label>
+                <span>frame_step</span>
+                <input name="frame_step" type="number" min="1" value="1">
+              </label>
+              <label>
+                <span>max_frames</span>
+                <input name="max_frames" type="number" min="1" placeholder="不限制">
+              </label>
+            </div>
+            <div class="metric-options">
+              <span>可选指标</span>
+              <div id="metrics-options" class="checkbox-row"></div>
+            </div>
+          </details>
+          <button id="start-run" type="submit" disabled>开始推理</button>
+        </form>
+
+        <section id="video-selection" class="panel video-selection"></section>
+        <section id="preflight" class="panel preflight"></section>
+      </section>
+
+      <section id="view-runs" class="view">
+        <section class="panel">
+          <div class="panel-head">
+            <h2>运行记录</h2>
+            <button id="refresh" class="secondary" type="button">刷新</button>
+          </div>
+          <div id="runs-table" class="table"></div>
+        </section>
+        <section id="run-detail" class="panel"></section>
+      </section>
+    </main>
+
+    <div id="toast" role="status"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
