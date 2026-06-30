@@ -6,11 +6,13 @@ from typing import Any
 from PIL import Image
 
 from vfieval.config import WorkspaceConfig
-from vfieval.file_inputs import VIDEO_SUFFIXES, inspect_video, project_root
+from vfieval.db import Database
+from vfieval.file_inputs import VIDEO_SUFFIXES, inspect_video, project_root, resolve_video_group
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 TIMESTAMP_ALIGNMENT_TOLERANCE_SECONDS = 1e-3
+COMPARE_SOURCE_RUN_STATUSES = {"completed", "metric_queued", "metric_running"}
 
 
 def resolve_compare_source_path(workspace: WorkspaceConfig, source: str) -> Path:
@@ -22,6 +24,8 @@ def resolve_compare_source_path(workspace: WorkspaceConfig, source: str) -> Path
         path = (project_root(workspace) / path).resolve()
     else:
         path = path.resolve()
+    if ".." in path.parts:
+        raise ValueError("compare source path must not contain '..'")
     if not path.exists():
         raise FileNotFoundError(f"compare source not found: {path}")
     if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES:
@@ -31,8 +35,21 @@ def resolve_compare_source_path(workspace: WorkspaceConfig, source: str) -> Path
     raise ValueError(f"unsupported compare source: {path}")
 
 
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
 def inspect_compare_source(workspace: WorkspaceConfig, source: str) -> dict[str, Any]:
     path = resolve_compare_source_path(workspace, source)
+    return inspect_compare_path(workspace, path)
+
+
+def inspect_compare_path(workspace: WorkspaceConfig, path: Path) -> dict[str, Any]:
+    path = path.resolve()
     if path.is_file():
         info = inspect_video(path, workspace, exact=True)
         if not info.get("decodable"):
@@ -66,6 +83,134 @@ def inspect_compare_source(workspace: WorkspaceConfig, source: str) -> dict[str,
         "metadata_source": "frames",
         "frame_count_source": "directory_listing",
     }
+
+
+def resolve_compare_descriptor(
+    workspace: WorkspaceConfig,
+    db: Database,
+    descriptor: Any,
+    role: str | None = None,
+) -> dict[str, Any]:
+    if isinstance(descriptor, str):
+        info = inspect_compare_source(workspace, descriptor)
+        info.update({"descriptor_kind": "path", "role": role or "unknown", "label": info["name"]})
+        return info
+    if not isinstance(descriptor, dict):
+        raise ValueError("compare source descriptor must be an object or legacy path string")
+
+    kind = str(descriptor.get("kind") or "").strip()
+    if kind == "video_group":
+        if role not in {None, "reference"}:
+            raise ValueError("video_group descriptors are only valid for the compare reference")
+        info = _resolve_video_group_descriptor(workspace, descriptor)
+        info.update({"descriptor_kind": "video_group", "role": "reference"})
+        return info
+    if kind == "run_artifact":
+        if "path" in descriptor:
+            raise ValueError("run_artifact descriptors must not include client-supplied paths")
+        info = _resolve_run_artifact_descriptor(workspace, db, descriptor)
+        info.update({"descriptor_kind": "run_artifact", "role": role or "distorted"})
+        return info
+    if not kind and "path" in descriptor:
+        raise ValueError("structured compare descriptors must use server-resolved sources, not path fields")
+    raise ValueError(f"unsupported compare source descriptor kind: {kind or '<missing>'}")
+
+
+def _resolve_video_group_descriptor(workspace: WorkspaceConfig, descriptor: dict[str, Any]) -> dict[str, Any]:
+    group = str(descriptor.get("group") or "").strip()
+    video = str(descriptor.get("video") or "").strip()
+    if not group or not video:
+        raise ValueError("video_group compare descriptor requires group and video")
+    if Path(video).name != video:
+        raise ValueError("video_group compare descriptor video must be a file name")
+    folder = resolve_video_group(workspace, group)
+    path = (folder / video).resolve()
+    if not _is_relative_to(path, folder.resolve()):
+        raise ValueError("video_group compare descriptor resolved outside its video group")
+    if not path.exists():
+        raise FileNotFoundError(f"compare GT video not found: {group}/{video}")
+    info = inspect_compare_path(workspace, path)
+    info.update({"group": group, "video": video, "label": descriptor.get("label") or video})
+    return info
+
+
+def _resolve_run_artifact_descriptor(
+    workspace: WorkspaceConfig,
+    db: Database,
+    descriptor: dict[str, Any],
+) -> dict[str, Any]:
+    run_id = _positive_int(descriptor.get("run_id"), "run_artifact descriptor requires run_id")
+    artifact_kind = str(descriptor.get("artifact_kind") or "pred_video")
+    run = db.get_run(run_id)
+    if run.get("artifact_cleaned_at") is not None:
+        raise ValueError(f"run {run_id} artifacts have been cleaned")
+    if str(run.get("status") or "") not in COMPARE_SOURCE_RUN_STATUSES:
+        raise ValueError(f"run {run_id} is not ready for compare sources: {run.get('status')}")
+
+    artifacts = db.list_run_artifacts(run_id, kind=artifact_kind)
+    artifact_id = descriptor.get("artifact_id")
+    video = str(descriptor.get("video") or "").strip()
+    artifact = None
+    if artifact_id not in {None, ""}:
+        desired_id = _positive_int(artifact_id, "artifact_id must be a positive integer")
+        artifact = next((row for row in artifacts if int(row["id"]) == desired_id), None)
+    else:
+        artifact = next((row for row in artifacts if _artifact_matches_video(row, video)), None)
+    if artifact is None:
+        target = f"artifact_id={artifact_id}" if artifact_id not in {None, ""} else f"video={video or '<any>'}"
+        raise FileNotFoundError(f"run {run_id} has no {artifact_kind} compare source for {target}")
+
+    path = Path(str(artifact["path"])).resolve()
+    workspace_root = workspace.root.resolve()
+    if not _is_relative_to(path, workspace_root):
+        raise ValueError("run artifact compare source resolved outside the VFIEval workspace")
+    info = inspect_compare_path(workspace, path)
+    metadata = artifact.get("metadata") or {}
+    video_name = str(metadata.get("video_name") or video or path.stem)
+    label = str(
+        descriptor.get("label")
+        or descriptor.get("track_label")
+        or metadata.get("compare_track_label")
+        or run.get("name")
+        or f"run-{run_id}"
+    )
+    info.update(
+        {
+            "run_id": run_id,
+            "run_name": run.get("name"),
+            "artifact_id": int(artifact["id"]),
+            "artifact_kind": artifact_kind,
+            "video": video_name,
+            "video_name": video_name,
+            "label": label,
+            "track_label": label,
+            "track_run_id": run_id,
+            "artifact_metadata": metadata,
+        }
+    )
+    return info
+
+
+def _artifact_matches_video(artifact: dict[str, Any], video: str) -> bool:
+    if not video:
+        return True
+    metadata = artifact.get("metadata") or {}
+    candidates = {
+        str(metadata.get("video_name") or ""),
+        str(metadata.get("video_file") or ""),
+        Path(str(artifact.get("path") or "")).stem,
+    }
+    return video in candidates
+
+
+def _positive_int(value: Any, message: str) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(message) from exc
+    if number <= 0:
+        raise ValueError(message)
+    return number
 
 
 def validate_strict_alignment(reference: dict[str, Any], distorted: dict[str, Any]) -> None:

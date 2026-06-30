@@ -85,6 +85,7 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                     sample_id=sample_id,
                     cache_config=metric_cache_configs[metric_name],
                 )
+            details = {**_compare_track_details(sample, artifact), **details}
 
             db.add_metric_result(
                 job_id=job_id,
@@ -140,7 +141,11 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                     if reference_artifact is None:
                         status = "skipped"
                         value = None
-                        details = {"reason": "video has no ground-truth reference", "video_name": video_name}
+                        details = {
+                            "reason": "video has no ground-truth reference",
+                            "video_name": video_name,
+                            **_compare_track_details(None, artifact),
+                        }
                     else:
                         status, value, details = _evaluate_with_cache(
                             db=db,
@@ -151,7 +156,7 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                             sample_id=None,
                             cache_config=metric_cache_configs[metric_name],
                         )
-                        details = {"video_name": video_name, **details}
+                        details = {"video_name": video_name, **_compare_track_details(None, artifact), **details}
                     db.add_metric_result(
                         job_id=job_id,
                         inference_job_id=int(artifact["job_id"]),
@@ -188,6 +193,21 @@ def _raise_if_canceled(db: Database, run_id: int | None, job_id: int) -> None:
         db.cancel_job(job_id, error)
         db.cancel_run(run_id, error)
         raise RunCanceled("用户取消了 Run")
+
+
+def _compare_track_details(sample: dict[str, Any] | None, artifact: dict[str, Any] | None) -> dict[str, Any]:
+    details: dict[str, Any] = {}
+    for source in ((sample or {}).get("metadata") or {}, (artifact or {}).get("metadata") or {}):
+        for key in (
+            "compare_track_label",
+            "compare_track_key",
+            "compare_track_index",
+            "compare_track_run_id",
+            "compare_track_artifact_id",
+        ):
+            if key in source and source[key] is not None:
+                details[key] = source[key]
+    return details
 
 
 def _evaluate_with_cache(

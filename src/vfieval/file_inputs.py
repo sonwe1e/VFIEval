@@ -220,7 +220,7 @@ def resolve_selected_videos(workspace: WorkspaceConfig, video_group: str, select
 def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, Any]) -> dict[str, Any]:
     if str(payload.get("run_type") or "model_inference") == "video_compare":
         from vfieval.compare_inputs import (
-            inspect_compare_source,
+            resolve_compare_descriptor,
             validate_strict_alignment,
             validate_strict_decoded_alignment,
         )
@@ -235,6 +235,7 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
             "warnings": [],
             "reference": {},
             "distorted": {},
+            "distorted_tracks": [],
             "alignment": {"mode": str(payload.get("align_mode") or "strict")},
             "metrics": {
                 "requested": selected_metrics,
@@ -247,38 +248,61 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
             "output_dir": str(workspace.runs_dir / str(db.next_run_id())),
         }
         try:
-            reference = inspect_compare_source(workspace, str(payload.get("reference") or ""))
-            distorted = inspect_compare_source(workspace, str(payload.get("distorted") or ""))
             align_mode = str(payload.get("align_mode") or "strict")
             if align_mode != "strict":
                 raise ValueError("video_compare currently only supports strict alignment for external inputs")
-            validate_strict_alignment(reference, distorted)
+            reference = resolve_compare_descriptor(workspace, db, payload.get("reference"), role="reference")
+            distorted_payload = payload.get("distorted")
+            distorted_descriptors = distorted_payload if isinstance(distorted_payload, list) else [distorted_payload]
+            distorted_descriptors = [item for item in distorted_descriptors if item is not None and item != ""]
+            if not distorted_descriptors:
+                raise ValueError("video_compare requires at least one distorted track")
             reference_frames, reference_fps, reference_timestamps = _load_compare_source_frames(
                 workspace,
                 Path(str(reference["path"])),
                 "compare_reference",
             )
-            distorted_frames, distorted_fps, distorted_timestamps = _load_compare_source_frames(
-                workspace,
-                Path(str(distorted["path"])),
-                "compare_distorted",
-            )
-            validate_strict_decoded_alignment(
-                reference_frames=reference_frames,
-                distorted_frames=distorted_frames,
-                reference_fps=reference_fps,
-                distorted_fps=distorted_fps,
-                reference_timestamps=reference_timestamps,
-                distorted_timestamps=distorted_timestamps,
-            )
+            distorted_tracks = []
+            for track_index, descriptor in enumerate(distorted_descriptors):
+                distorted = resolve_compare_descriptor(workspace, db, descriptor, role="distorted")
+                track_label = str(distorted.get("track_label") or distorted.get("label") or f"pred{track_index + 1}")
+                try:
+                    validate_strict_alignment(reference, distorted)
+                    distorted_frames, distorted_fps, distorted_timestamps = _load_compare_source_frames(
+                        workspace,
+                        Path(str(distorted["path"])),
+                        f"compare_distorted_{track_index}",
+                    )
+                    validate_strict_decoded_alignment(
+                        reference_frames=reference_frames,
+                        distorted_frames=distorted_frames,
+                        reference_fps=reference_fps,
+                        distorted_fps=distorted_fps,
+                        reference_timestamps=reference_timestamps,
+                        distorted_timestamps=distorted_timestamps,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(f"track {track_label}: {exc}") from exc
+                track = dict(distorted)
+                track.update(
+                    {
+                        "track_index": track_index,
+                        "track_label": track_label,
+                        "frame_count": len(distorted_frames),
+                        "fps": distorted_fps,
+                    }
+                )
+                distorted_tracks.append(track)
             result["reference"] = reference
-            result["distorted"] = distorted
+            result["distorted"] = distorted_tracks[0] if distorted_tracks else {}
+            result["distorted_tracks"] = distorted_tracks
             result["alignment"] = {
                 "mode": "strict",
                 "frame_count": len(reference_frames),
                 "width": int(reference["width"]),
                 "height": int(reference["height"]),
-                "fps": reference_fps if reference_fps is not None else distorted_fps,
+                "fps": reference_fps if reference_fps is not None else (distorted_tracks[0].get("fps") if distorted_tracks else None),
+                "track_count": len(distorted_tracks),
                 "verified_with": "decoded_frames",
             }
         except Exception as exc:
@@ -763,16 +787,14 @@ def _check_device(device: str, precision: str) -> dict[str, Any]:
     effective_device = normalize_device_name(requested_device)
 
     if str(effective_device).startswith("cuda") and not torch.cuda.is_available():
-        return {"status": "error", "message": "CUDA 不可用", "effective_device": effective_device}
+        return {"status": "error", "message": "CUDA is not available", "effective_device": effective_device}
     if str(effective_device).startswith("npu"):
         available = [device["id"] for device in list_npu_devices()]
         reason = None if available else npu_unavailable_reason()
         if reason is not None:
             return {"status": "error", "message": f"NPU unavailable: {reason}", "effective_device": effective_device}
-            return {"status": "error", "message": "NPU 不可用：未安装 torch_npu 或未检测到 NPU", "effective_device": effective_device}
         if effective_device not in available:
             return {"status": "error", "message": f"NPU device does not exist: {effective_device}", "effective_device": effective_device}
-            return {"status": "error", "message": f"NPU 设备不存在: {effective_device}", "effective_device": effective_device}
 
     kind = device_type_name(effective_device)
     supported = supported_precisions(kind, available=kind == "cpu" or str(effective_device).startswith(("cuda", "npu")))
@@ -781,23 +803,18 @@ def _check_device(device: str, precision: str) -> dict[str, Any]:
     if requested_precision == "auto":
         effective_precision = "fp16" if str(effective_device).startswith(("cuda", "npu")) else "fp32"
     if effective_precision in {"fp16", "bf16"} and not str(effective_device).startswith(("cuda", "npu")):
-        warning = f"{effective_device} 不支持 {effective_precision} autocast，已回退 fp32"
+        warning = f"{effective_device} does not support {effective_precision} autocast; falling back to fp32"
         effective_precision = "fp32"
     if effective_precision == "bf16" and str(effective_device).startswith("cuda"):
         if hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
-            warning = "当前 CUDA 设备不支持 bf16，已回退 fp32"
+            warning = "Current CUDA device does not support bf16; falling back to fp32"
             effective_precision = "fp32"
     if str(effective_device).startswith(("cuda", "npu")) and effective_precision not in supported:
-        warning = f"{kind.upper()} does not support {effective_precision}; falling back to fp32"
-        warning = f"{kind.upper()} 不支持 {effective_precision}，已回退 fp32"
-        warning = f"{kind.upper()} 涓嶆敮鎸?{effective_precision}锛屽凡鍥為€€ fp32"
+        unsupported = effective_precision
         effective_precision = "fp32"
-    if str(effective_device).startswith(("cuda", "npu")) and requested_precision not in {"auto", "fp32"} and requested_precision not in supported and effective_precision == "fp32":
+        warning = f"{kind.upper()} does not support {unsupported}; falling back to fp32"
+    if not warning and str(effective_device).startswith(("cuda", "npu")) and requested_precision not in {"auto", "fp32"} and requested_precision not in supported and effective_precision == "fp32":
         warning = f"{kind.upper()} does not support {requested_precision}; falling back to fp32"
-        warning = f"{kind.upper()} 不支持 {requested_precision}，已回退 fp32"
-    if warning and str(effective_device).startswith(("cuda", "npu")) and effective_precision == "fp32" and requested_precision != "fp32":
-        unsupported_precision = requested_precision if requested_precision != "auto" else "fp16"
-        warning = f"{kind.upper()} does not support {unsupported_precision}; falling back to fp32"
     return {
         "status": "ok",
         "requested_device": requested_device,
@@ -829,12 +846,11 @@ def _check_multi_accelerator(payload: dict[str, Any], precision: str, kind: str)
     if unavailable_reason is not None:
         return {"status": "error", "message": f"{kind.upper()} unavailable: {unavailable_reason}", "effective_device": mode}
     if not available:
-        return {"status": "error", "message": f"{kind.upper()} 不可用，无法启用 {mode}", "effective_device": mode}
+        return {"status": "error", "message": f"{kind.upper()} is not available; cannot enable {mode}", "effective_device": mode}
     devices = requested or available
     invalid = [device for device in devices if device not in available]
     if invalid:
         return {"status": "error", "message": f"{kind.upper()} device does not exist: {', '.join(invalid)}", "effective_device": mode}
-        return {"status": "error", "message": f"{kind.upper()} 设备不存在: {', '.join(invalid)}", "effective_device": mode}
     requested_precision = precision or "auto"
     effective_precision = requested_precision
     warning = None
@@ -842,11 +858,12 @@ def _check_multi_accelerator(payload: dict[str, Any], precision: str, kind: str)
     if requested_precision == "auto":
         effective_precision = "fp16"
     if kind == "cuda" and effective_precision == "bf16" and hasattr(torch.cuda, "is_bf16_supported") and not torch.cuda.is_bf16_supported():
-        warning = "当前 CUDA 设备不支持 bf16，已回退 fp32"
+        warning = "Current CUDA device does not support bf16; falling back to fp32"
         effective_precision = "fp32"
     if effective_precision not in supported:
-        warning = f"{kind.upper()} 不支持 {effective_precision}，已回退 fp32"
+        unsupported = effective_precision
         effective_precision = "fp32"
+        warning = f"{kind.upper()} does not support {unsupported}; falling back to fp32"
     if warning and effective_precision == "fp32" and requested_precision != "fp32":
         unsupported_precision = requested_precision if requested_precision != "auto" else "fp16"
         warning = f"{kind.upper()} does not support {unsupported_precision}; falling back to fp32"

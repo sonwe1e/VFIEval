@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -144,6 +145,9 @@ def scan_video_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: int
 def scan_compare_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: int) -> int:
     dataset = db.get_dataset(dataset_id)
     metadata = dataset.get("metadata") or {}
+    if metadata.get("compare_tracks"):
+        return _scan_multitrack_compare_dataset(db, workspace, dataset_id, metadata)
+
     reference_path = resolve_compare_source_path(workspace, str(metadata.get("reference_path") or ""))
     distorted_path = resolve_compare_source_path(workspace, str(metadata.get("distorted_path") or ""))
     align_mode = str(metadata.get("align_mode") or "strict")
@@ -209,6 +213,109 @@ def scan_compare_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: i
             "video_name": compare_name,
             "reference_frame_count": len(reference_frames),
             "distorted_frame_count": len(distorted_frames),
+        },
+    )
+    return added
+
+
+def _scan_multitrack_compare_dataset(
+    db: Database,
+    workspace: WorkspaceConfig,
+    dataset_id: int,
+    metadata: dict[str, Any],
+) -> int:
+    reference_path = resolve_compare_source_path(workspace, str(metadata.get("reference_path") or ""))
+    align_mode = str(metadata.get("align_mode") or "strict")
+    if align_mode != "strict":
+        raise ValueError("compare datasets currently only support strict alignment")
+    tracks = list(metadata.get("compare_tracks") or [])
+    if not tracks:
+        raise ValueError("multi-track compare dataset requires at least one track")
+
+    reference_frames, reference_fps, reference_timestamps = _load_compare_source_frames(workspace, reference_path, "compare_reference")
+    video_name = str(metadata.get("video_name") or reference_path.stem)
+    video_token = _sample_token(video_name)
+    added = 0
+    scanned_tracks: list[dict[str, Any]] = []
+
+    for track_index, track in enumerate(tracks):
+        distorted_path = resolve_compare_source_path(workspace, str(track.get("distorted_path") or ""))
+        track_label = str(track.get("track_label") or track.get("label") or f"pred{track_index + 1}")
+        track_token = _sample_token(track_label)
+        distorted_frames, distorted_fps, distorted_timestamps = _load_compare_source_frames(
+            workspace,
+            distorted_path,
+            f"compare_distorted_{track_index}",
+        )
+        validate_strict_decoded_alignment(
+            reference_frames=reference_frames,
+            distorted_frames=distorted_frames,
+            reference_fps=reference_fps,
+            distorted_fps=distorted_fps,
+            reference_timestamps=reference_timestamps,
+            distorted_timestamps=distorted_timestamps,
+        )
+        scanned_tracks.append(
+            {
+                "track_label": track_label,
+                "track_key": track_token,
+                "track_run_id": track.get("track_run_id"),
+                "artifact_id": track.get("artifact_id"),
+                "distorted_path": str(distorted_path),
+                "frame_count": len(distorted_frames),
+            }
+        )
+        for frame_index, (reference_frame, distorted_frame) in enumerate(zip(reference_frames, distorted_frames)):
+            reference_size = image_size(reference_frame)
+            distorted_size = image_size(distorted_frame)
+            if reference_size != distorted_size:
+                raise ValueError(
+                    f"track {track_label}: strict compare requires matching frame dimensions: "
+                    f"{reference_frame.name}={reference_size[0]}x{reference_size[1]} vs "
+                    f"{distorted_frame.name}={distorted_size[0]}x{distorted_size[1]}"
+                )
+            sample_index = track_index * len(reference_frames) + frame_index
+            db.add_sample(
+                dataset_id=dataset_id,
+                name=f"{video_token}__{track_token}__{frame_index:06d}",
+                img0_path=str(reference_frame.resolve()),
+                img1_path=str(distorted_frame.resolve()),
+                gt_path=str(reference_frame.resolve()),
+                metadata={
+                    "source_type": "compare",
+                    "compare_group": video_name,
+                    "video_name": video_name,
+                    "video_file": metadata.get("video_file") or reference_path.name,
+                    "reference_path": str(reference_path),
+                    "distorted_path": str(distorted_path),
+                    "frame_index": frame_index,
+                    "sample_index": sample_index,
+                    "fps": reference_fps or distorted_fps or 24.0,
+                    "compare_track_label": track_label,
+                    "compare_track_key": track_token,
+                    "compare_track_index": track_index,
+                    "compare_track_run_id": track.get("track_run_id"),
+                    "compare_track_artifact_id": track.get("artifact_id"),
+                    "timestamps": {
+                        "gt": reference_timestamps[frame_index] if frame_index < len(reference_timestamps) else None,
+                        "pred": distorted_timestamps[frame_index] if frame_index < len(distorted_timestamps) else None,
+                    },
+                },
+            )
+            added += 1
+
+    db.update_dataset_scan_info(
+        dataset_id,
+        None,
+        video_count=1 if added else 0,
+        frame_count=added,
+        metadata={
+            "reference_path": str(reference_path),
+            "align_mode": align_mode,
+            "video_name": video_name,
+            "reference_frame_count": len(reference_frames),
+            "track_count": len(scanned_tracks),
+            "compare_tracks": scanned_tracks,
         },
     )
     return added
@@ -475,6 +582,11 @@ def _video_sample_metadata(
     else:
         metadata["frame_index"] = img0_index
     return metadata
+
+
+def _sample_token(value: str) -> str:
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value).strip())
+    return token.strip("._") or "track"
 
 
 def _optional_positive_int(value: Any) -> int | None:

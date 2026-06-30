@@ -46,6 +46,11 @@ const state = {
   expandedExtraArtifactsBySample: {},
   selectedCudaDevices: new Set(),
   selectedNpuDevices: new Set(),
+  compareSources: { gt: [], pred: [] },
+  selectedCompareGtKey: "",
+  selectedComparePredArtifacts: new Set(),
+  sampleAbortController: null,
+  timelineAbortController: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -136,6 +141,11 @@ function renderModeSections() {
     item.hidden = item.dataset.modeSection !== runType;
   });
   $("video-selection").hidden = runType !== "model_inference";
+  document.querySelectorAll(".mode-compare input[name='reference'], .mode-compare input[name='distorted']").forEach((input) => {
+    const label = input.closest("label");
+    if (label) label.hidden = true;
+  });
+  $("video-selection").hidden = false;
 }
 
 function renderOptions() {
@@ -281,13 +291,78 @@ async function loadVideoGroupPage(groupName, page = 1) {
   renderVideoSelection();
 }
 
+function compareGtKey(row) {
+  return `${row.group || ""}::${row.video || ""}`;
+}
+
+function selectedCompareGt() {
+  return (state.compareSources.gt || []).find((row) => compareGtKey(row) === state.selectedCompareGtKey) || null;
+}
+
+function selectedComparePredRows() {
+  return (state.compareSources.pred || []).filter((row) => state.selectedComparePredArtifacts.has(Number(row.artifact_id)));
+}
+
+function ensureCompareSelection() {
+  const gtRows = state.compareSources.gt || [];
+  if (!state.selectedCompareGtKey && gtRows.length) {
+    state.selectedCompareGtKey = compareGtKey(gtRows[0]);
+  }
+  const availablePredIds = new Set((state.compareSources.pred || []).map((row) => Number(row.artifact_id)));
+  state.selectedComparePredArtifacts = new Set(
+    Array.from(state.selectedComparePredArtifacts).filter((artifactId) => availablePredIds.has(Number(artifactId))),
+  );
+}
+
 function renderVideoSelection() {
   if (currentRunType() !== "model_inference") {
+    ensureCompareSelection();
+    const gtRows = state.compareSources.gt || [];
+    const predRows = state.compareSources.pred || [];
+    const selectedPreds = state.selectedComparePredArtifacts;
+    $("video-selection").innerHTML = `
+      <div class="panel-head">
+        <div>
+          <h2>Compare sources</h2>
+          <p class="muted">Select one GT from videos/ and one or more Pred tracks from completed run artifacts.</p>
+        </div>
+        <div class="metric-summary">
+          <span>GT ${escapeHtml(gtRows.length)}</span>
+          <span>Pred ${escapeHtml(predRows.length)}</span>
+          <span>Selected ${escapeHtml(selectedPreds.size)}</span>
+        </div>
+      </div>
+      <div class="compare-source-grid">
+        <section>
+          <h3>GT</h3>
+          <div class="table compact-table">${table(gtRows, [
+            { label: "", render: (row) => `<input type="radio" name="compare_gt_pick" data-compare-gt="${escapeHtml(compareGtKey(row))}" ${state.selectedCompareGtKey === compareGtKey(row) ? "checked" : ""}>` },
+            { label: "Video", render: (row) => `${escapeHtml(row.group)}/${escapeHtml(row.video)}` },
+            { label: "Frames", render: (row) => escapeHtml(row.frame_count || 0) },
+            { label: "Size", render: (row) => `${escapeHtml(row.width || "-")}x${escapeHtml(row.height || "-")}` },
+            { label: "FPS", render: (row) => formatNumber(row.fps) },
+          ])}</div>
+        </section>
+        <section>
+          <h3>Pred tracks</h3>
+          <div class="table compact-table">${table(predRows, [
+            { label: "", render: (row) => `<input type="checkbox" data-compare-pred="${escapeHtml(row.artifact_id)}" ${selectedPreds.has(Number(row.artifact_id)) ? "checked" : ""}>` },
+            { label: "Run", render: (row) => `#${escapeHtml(row.run_id)} ${escapeHtml(row.run_name || "")}` },
+            { label: "Video", render: (row) => escapeHtml(row.video || "-") },
+            { label: "Frames", render: (row) => escapeHtml(row.frame_count || 0) },
+            { label: "Track", render: (row) => escapeHtml(row.compare_track_label || row.run_name || `run-${row.run_id}`) },
+          ])}</div>
+        </section>
+      </div>
+    `;
+    return;
+    /*
     $("video-selection").innerHTML = `
       <h2>对比输入</h2>
       <p class="muted">双视频对比模式直接使用上面的 GT / Pred 路径，不需要视频集列表。</p>
     `;
     return;
+    */
   }
   const group = currentGroup();
   const page = group ? state.videoPages[group.name] : null;
@@ -332,6 +407,24 @@ function selectedMetrics() {
 function payloadFromForm() {
   const data = formData($("infer-form"));
   if ((data.run_type || "model_inference") === "video_compare") {
+    const gt = selectedCompareGt();
+    const predRows = selectedComparePredRows();
+    if (gt && predRows.length) {
+      return {
+        run_type: "video_compare",
+        reference: { kind: "video_group", group: gt.group, video: gt.video },
+        distorted: predRows.map((row) => ({
+          kind: "run_artifact",
+          run_id: Number(row.run_id),
+          video: row.video,
+          artifact_id: Number(row.artifact_id),
+          label: row.compare_track_label || row.run_name || `run-${row.run_id}`,
+        })),
+        extra_layers: [],
+        align_mode: data.align_mode || "strict",
+        metrics: selectedMetrics(),
+      };
+    }
     return {
       run_type: "video_compare",
       reference: data.reference || "",
@@ -371,7 +464,8 @@ function schedulePreflight(delay = 250) {
 async function runPreflight() {
   const payload = payloadFromForm();
   if (payload.run_type === "video_compare") {
-    if (!payload.reference || !payload.distorted) {
+    const hasDistorted = Array.isArray(payload.distorted) ? payload.distorted.length > 0 : !!payload.distorted;
+    if (!payload.reference || !hasDistorted) {
       state.preflight = null;
       renderPreflight();
       return;
@@ -494,6 +588,8 @@ function renderPreflight() {
   start.disabled = !result.ok;
 
   if (result.run_type === "video_compare") {
+    const tracks = result.distorted_tracks || (result.distorted ? [result.distorted] : []);
+    const trackLabels = tracks.map((track) => track.track_label || track.label || track.name).filter(Boolean).join(", ");
     $("preflight").innerHTML = `
       <div class="panel-head">
         <h2>运行前预检查</h2>
@@ -502,7 +598,8 @@ function renderPreflight() {
       <div class="summary-grid">
         <div><span>模式</span><strong>video_compare</strong></div>
         <div><span>GT</span><strong>${escapeHtml(result.reference?.name || "-")}</strong></div>
-        <div><span>Pred</span><strong>${escapeHtml(result.distorted?.name || "-")}</strong></div>
+        <div><span>Pred</span><strong>${escapeHtml(`${tracks.length || 0} track(s)`)}</strong></div>
+        <div><span>Tracks</span><strong>${escapeHtml(trackLabels || "-")}</strong></div>
         <div><span>帧数</span><strong>${escapeHtml(result.alignment?.frame_count ?? "-")}</strong></div>
         <div><span>分辨率</span><strong>${escapeHtml(`${result.alignment?.width || "-"}x${result.alignment?.height || "-"}`)}</strong></div>
         <div><span>FPS</span><strong>${formatNumber(result.alignment?.fps)}</strong></div>
@@ -690,8 +787,9 @@ function renderRunError(run) {
   if (run.error.job_id) parts.push(`Job ${run.error.job_id}`);
   if (parts.length) {
     const meta = `<p class="muted">${escapeHtml(parts.join(" | "))}</p>`;
-    return `<div class="message error"><p><strong>${escapeHtml(run.error.type || "Error")}</strong>: ${escapeHtml(run.error.message || JSON.stringify(run.error))}</p>${meta}</div>`;
+    return `<div class="message error run-error-banner"><p><strong>${escapeHtml(run.error.type || "Error")}</strong>: ${escapeHtml(run.error.message || JSON.stringify(run.error))}</p>${meta}<button class="secondary" data-retry-run="${escapeHtml(run.id)}" type="button">Retry this Run</button></div>`;
   }
+  return `<div class="message error run-error-banner"><p><strong>${escapeHtml(run.error.type || "Error")}</strong>: ${escapeHtml(run.error.message || JSON.stringify(run.error))}</p><button class="secondary" data-retry-run="${escapeHtml(run.id)}" type="button">Retry this Run</button></div>`;
   return `<div class="message error"><p><strong>${escapeHtml(run.error.type || "错误")}</strong>: ${escapeHtml(run.error.message || JSON.stringify(run.error))}</p></div>`;
 }
 
@@ -749,11 +847,22 @@ function renderCleanedArtifactsNotice(run) {
 async function loadRunVideoTimeline(runId, videoName, options = {}) {
   const metric = options.metric || state.selectedMetricByRun[runId] || "";
   const windowStart = Number(options.windowStart ?? 0);
-  const payload = await api(
-    `/api/runs/${runId}/videos/${encodeURIComponent(videoName)}/timeline?bucket_count=160&window_start=${windowStart}&window_size=300${metric ? `&metric=${encodeURIComponent(metric)}` : ""}`,
-  );
-  state.runVideoTimelines[`${runId}:${videoName}`] = payload;
-  return payload;
+  if (state.timelineAbortController) state.timelineAbortController.abort();
+  const controller = new AbortController();
+  state.timelineAbortController = controller;
+  try {
+    const payload = await api(
+      `/api/runs/${runId}/videos/${encodeURIComponent(videoName)}/timeline?bucket_count=160&window_start=${windowStart}&window_size=300${metric ? `&metric=${encodeURIComponent(metric)}` : ""}`,
+      { signal: controller.signal },
+    );
+    state.runVideoTimelines[`${runId}:${videoName}`] = payload;
+    return payload;
+  } catch (error) {
+    if (error.name === "AbortError") return state.runVideoTimelines[`${runId}:${videoName}`] || null;
+    throw error;
+  } finally {
+    if (state.timelineAbortController === controller) state.timelineAbortController = null;
+  }
 }
 
 function renderRunVideosPager() {
@@ -1010,11 +1119,24 @@ function renderVideoPlayer(label, artifactId) {
   return `
     <div class="video-artifact">
       <span>${escapeHtml(label)}</span>
-      <video controls preload="metadata" src="${escapeHtml(url)}"></video>
+      <video controls playsinline preload="metadata" src="${escapeHtml(url)}" onerror="this.outerHTML='<p class=\\'muted\\'>浏览器无法播放此视频格式。</p>'"></video>
       <a class="small-video-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">open</a>
     </div>
   `;
-  return `<a class="small-video-link" href="/api/files/${artifactId}" target="_blank" rel="noreferrer">${escapeHtml(label)} 视频</a>`;
+}
+
+function renderVideoArtifacts(video) {
+  const tracks = video.video_artifact_tracks || [];
+  if (tracks.length) {
+    return tracks
+      .map((item) => renderVideoPlayer(`${item.track_label || "shared"} / ${item.kind}`, item.id))
+      .join("");
+  }
+  return `
+    ${renderVideoPlayer("pred", video.video_artifacts?.pred_video)}
+    ${renderVideoPlayer("gt", video.video_artifacts?.gt_video)}
+    ${renderVideoPlayer("diff", video.video_artifacts?.diff_video)}
+  `;
 }
 
 function renderVideoTimeline(video) {
@@ -1031,9 +1153,7 @@ function renderVideoTimeline(video) {
         <p class="muted">${samples.length} 个样本，FPS ${formatNumber(video.fps)}</p>
       </div>
       <div class="actions">
-        ${renderVideoPlayer("pred", video.video_artifacts?.pred_video)}
-        ${renderVideoPlayer("gt", video.video_artifacts?.gt_video)}
-        ${renderVideoPlayer("diff", video.video_artifacts?.diff_video)}
+        ${renderVideoArtifacts(video)}
       </div>
     </div>
     ${renderMetricToolbar(video, metricName)}
@@ -1059,11 +1179,16 @@ async function loadSampleDetail(sampleId) {
   const key = `${state.selectedRun.id}:${sampleId}`;
   if (state.sampleDetails[key] || state.sampleDetailLoading[key]) return;
   state.sampleDetailLoading[key] = true;
+  if (state.sampleAbortController) state.sampleAbortController.abort();
+  const controller = new AbortController();
+  state.sampleAbortController = controller;
   try {
-    state.sampleDetails[key] = await api(`/api/runs/${state.selectedRun.id}/samples/${sampleId}`);
+    state.sampleDetails[key] = await api(`/api/runs/${state.selectedRun.id}/samples/${sampleId}`, { signal: controller.signal });
   } catch (error) {
+    if (error.name === "AbortError") return;
     state.sampleDetails[key] = { sample_id: sampleId, artifacts: {}, extra_artifacts: [], load_error: error.message };
   } finally {
+    if (state.sampleAbortController === controller) state.sampleAbortController = null;
     delete state.sampleDetailLoading[key];
     renderRunDetail();
   }
@@ -1117,9 +1242,14 @@ function renderSamplePreview(sample) {
     loadSampleDetail(sample.sample_id);
   }
   if (sample.has_artifacts === false) {
-    const reason = state.selectedRun?.artifact_cleaned_at
-      ? "这个 Run 的产物已清理；如需重新查看预览，请重试重新生成。"
-      : "这个样本当前没有可用产物。";
+    let reason;
+    if (sample.error) {
+      reason = `样本处理失败: ${escapeHtml(sample.error.error_type || "Error")}: ${escapeHtml(sample.error.message || "unknown")}`;
+    } else if (state.selectedRun?.artifact_cleaned_at) {
+      reason = "这个 Run 的产物已清理；如需重新查看预览，请重试重新生成。";
+    } else {
+      reason = "这个样本当前没有可用产物。";
+    }
     return `
       <div class="sample-meta">
         <strong>${escapeHtml(sample.sample_name)}</strong>
@@ -1127,7 +1257,7 @@ function renderSamplePreview(sample) {
         <span>${sample.timestamp === null || sample.timestamp === undefined ? "-" : `${formatNumber(sample.timestamp)}s`}</span>
         ${renderSampleMetrics(sample)}
       </div>
-      <div class="message warn"><p><strong>没有可加载的产物</strong>: ${escapeHtml(reason)}</p></div>
+      <div class="message warn"><p><strong>没有可加载的产物</strong>: ${reason}</p></div>
     `;
   }
   const payload = detail
@@ -1244,15 +1374,19 @@ function formatDuration(value) {
 }
 
 async function refreshCatalog() {
-  const [modelFiles, videoGroups, runs, metricHealth, checkpoints, devices] = await Promise.all([
+  const [modelFiles, videoGroups, runs, metricHealth, checkpoints, devices, compareGt, comparePred] = await Promise.all([
     api("/api/model-files"),
     api("/api/video-groups"),
     api("/api/runs"),
     api("/api/metrics/health"),
     api("/api/checkpoints"),
     api("/api/devices"),
+    api("/api/compare-sources/gt"),
+    api("/api/compare-sources/pred"),
   ]);
   Object.assign(state, { modelFiles, videoGroups, runs, metricHealth, checkpoints, devices });
+  state.compareSources = { gt: compareGt.sources || [], pred: comparePred.sources || [] };
+  ensureCompareSelection();
   renderMetricOptions();
   renderOptions();
   renderMetricEnvironmentPanel();
@@ -1324,6 +1458,22 @@ $("infer-form").addEventListener("change", async (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  const compareGt = event.target.closest("[data-compare-gt]");
+  if (compareGt) {
+    state.selectedCompareGtKey = compareGt.dataset.compareGt;
+    renderVideoSelection();
+    schedulePreflight(0);
+    return;
+  }
+  const comparePred = event.target.closest("[data-compare-pred]");
+  if (comparePred) {
+    const artifactId = Number(comparePred.dataset.comparePred);
+    if (comparePred.checked) state.selectedComparePredArtifacts.add(artifactId);
+    else state.selectedComparePredArtifacts.delete(artifactId);
+    renderVideoSelection();
+    schedulePreflight(0);
+    return;
+  }
   const videoCheckbox = event.target.closest("[data-video-name]");
   if (videoCheckbox) {
     const group = currentGroup();
@@ -1471,5 +1621,15 @@ document.addEventListener("click", async (event) => {
   }
 });
 
+function startRunsPoll() {
+  setInterval(() => {
+    if (document.hidden) return;
+    refreshRunsOnly().catch(() => {});
+  }, 2000);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refreshRunsOnly().catch(() => {});
+  });
+}
+
 refreshCatalog().catch((error) => toast(error.message));
-setInterval(() => refreshRunsOnly().catch(() => {}), 2000);
+startRunsPoll();

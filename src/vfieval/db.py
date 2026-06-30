@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
 );
 
 CREATE INDEX IF NOT EXISTS idx_artifacts_job_kind ON artifacts(job_id, kind);
+CREATE INDEX IF NOT EXISTS idx_artifacts_sample ON artifacts(sample_id, kind);
 
 CREATE TABLE IF NOT EXISTS metric_results (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,6 +117,7 @@ CREATE TABLE IF NOT EXISTS metric_results (
 );
 
 CREATE INDEX IF NOT EXISTS idx_metric_results_inference ON metric_results(inference_job_id, metric_name);
+CREATE INDEX IF NOT EXISTS idx_metric_results_sample ON metric_results(sample_id, metric_name);
 
 CREATE TABLE IF NOT EXISTS metric_cache (
     cache_key TEXT PRIMARY KEY,
@@ -180,6 +182,7 @@ CREATE TABLE IF NOT EXISTS run_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_run_jobs_run_role ON run_jobs(run_id, role, shard_index);
 CREATE INDEX IF NOT EXISTS idx_run_jobs_job ON run_jobs(job_id);
+CREATE INDEX IF NOT EXISTS idx_run_jobs_device ON run_jobs(device);
 """
 
 
@@ -232,6 +235,9 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_run_jobs_run_role ON run_jobs(run_id, role, shard_index);
             CREATE INDEX IF NOT EXISTS idx_run_jobs_job ON run_jobs(job_id);
+            CREATE INDEX IF NOT EXISTS idx_run_jobs_device ON run_jobs(device);
+            CREATE INDEX IF NOT EXISTS idx_artifacts_sample ON artifacts(sample_id, kind);
+            CREATE INDEX IF NOT EXISTS idx_metric_results_sample ON metric_results(sample_id, metric_name);
             """
         )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(datasets)").fetchall()}
@@ -494,6 +500,78 @@ class Database:
             raise KeyError(f"sample {sample_id} not found")
         row["metadata"] = _loads(row.pop("metadata_json"))
         return row
+
+    def list_samples_by_video(self, run_id: int, video_name: str) -> list[dict[str, Any]]:
+        run = self.get_run(run_id)
+        dataset_id = int(run["dataset_id"])
+        video_text = str(video_name or "")
+        if not video_text:
+            return []
+        patterns = [
+            f'%"video_name": "{video_text}"%',
+            f'%"video_file": "{video_text}"%',
+            f'%"compare_group": "{video_text}"%',
+        ]
+        name_patterns = [
+            f"{video_text}__%",
+            f"%_{video_text}_%",
+        ]
+        clauses = ["metadata_json LIKE ?" for _ in patterns] + ["name LIKE ?" for _ in name_patterns]
+        rows = self.query(
+            f"""
+            SELECT *
+            FROM samples
+            WHERE dataset_id = ?
+              AND ({' OR '.join(clauses)})
+            ORDER BY name
+            """,
+            [dataset_id, *patterns, *name_patterns],
+        )
+        for row in rows:
+            row["metadata"] = _loads(row.pop("metadata_json"))
+        return rows
+
+    def list_run_video_summaries(self, run_id: int, query: str = "") -> list[dict[str, Any]]:
+        run = self.get_run(run_id)
+        dataset_id = int(run["dataset_id"])
+        rows = self.query(
+            """
+            SELECT
+                COALESCE(
+                    json_extract(metadata_json, '$.video_name'),
+                    json_extract(metadata_json, '$.video_file'),
+                    'frames'
+                ) AS video_name,
+                COALESCE(
+                    json_extract(metadata_json, '$.video_file'),
+                    json_extract(metadata_json, '$.video_name'),
+                    'frames'
+                ) AS video_file,
+                AVG(CAST(COALESCE(json_extract(metadata_json, '$.fps'), 0) AS REAL)) AS fps,
+                COUNT(*) AS sample_count
+            FROM samples
+            WHERE dataset_id = ?
+            GROUP BY video_name, video_file
+            ORDER BY video_file, video_name
+            """,
+            (dataset_id,),
+        )
+        normalized_query = str(query or "").strip().lower()
+        result = []
+        for row in rows:
+            video_name = str(row.get("video_name") or "frames")
+            video_file = str(row.get("video_file") or video_name)
+            if normalized_query and normalized_query not in video_name.lower() and normalized_query not in video_file.lower():
+                continue
+            result.append(
+                {
+                    "video_name": video_name,
+                    "video_file": video_file,
+                    "fps": float(row.get("fps") or 0.0),
+                    "sample_count": int(row.get("sample_count") or 0),
+                }
+            )
+        return result
 
     def create_experiment(
         self,
@@ -1097,6 +1175,29 @@ class Database:
             metrics.extend(self.list_metric_results(inference_job_id=int(job_id)))
         return metrics
 
+    def list_run_video_metrics(self, run_id: int, video_name: str | None = None) -> list[dict[str, Any]]:
+        job_ids = self.run_inference_job_ids(run_id)
+        if not job_ids:
+            return []
+        placeholders = ",".join("?" for _ in job_ids)
+        rows = self.query(
+            f"""
+            SELECT *
+            FROM metric_results
+            WHERE sample_id IS NULL
+              AND inference_job_id IN ({placeholders})
+            ORDER BY metric_name, id
+            """,
+            job_ids,
+        )
+        result = []
+        for row in rows:
+            row["details"] = _loads(row.pop("details_json"))
+            if video_name is not None and str((row.get("details") or {}).get("video_name") or "") != str(video_name):
+                continue
+            result.append(row)
+        return result
+
     def list_run_samples(self, run_id: int) -> list[dict[str, Any]]:
         run = self.get_run(run_id)
         samples = self.list_samples(int(run["dataset_id"]))
@@ -1304,6 +1405,20 @@ class Database:
             row["metadata"] = _loads(row.pop("metadata_json"))
         return rows
 
+    def list_artifacts_by_sample(self, sample_id: int, kind: str | None = None) -> list[dict[str, Any]]:
+        clauses = ["sample_id = ?"]
+        params: list[Any] = [sample_id]
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        rows = self.query(
+            f"SELECT * FROM artifacts WHERE {' AND '.join(clauses)} ORDER BY kind, id",
+            params,
+        )
+        for row in rows:
+            row["metadata"] = _loads(row.pop("metadata_json"))
+        return rows
+
     def add_metric_result(
         self,
         job_id: int,
@@ -1333,6 +1448,20 @@ class Database:
                 "SELECT * FROM metric_results WHERE inference_job_id = ? ORDER BY id",
                 (inference_job_id,),
             )
+        for row in rows:
+            row["details"] = _loads(row.pop("details_json"))
+        return rows
+
+    def list_metrics_by_sample(self, sample_id: int, metric_name: str | None = None) -> list[dict[str, Any]]:
+        clauses = ["sample_id = ?"]
+        params: list[Any] = [sample_id]
+        if metric_name is not None:
+            clauses.append("metric_name = ?")
+            params.append(metric_name)
+        rows = self.query(
+            f"SELECT * FROM metric_results WHERE {' AND '.join(clauses)} ORDER BY metric_name, id",
+            params,
+        )
         for row in rows:
             row["details"] = _loads(row.pop("details_json"))
         return rows

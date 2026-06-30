@@ -4,7 +4,7 @@ from _test_helpers import outputs_for_mode
 
 
 class Model:
-    def infer(self, img0, img1):
+    def infer(self, img0, img1, size=(123, 456)):
         outputs = outputs_for_mode(img0, "average")
         for tensor in outputs.values():
             if tensor.device != img0.device:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -153,23 +154,28 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
         t3 = time.perf_counter()
         for idx, row in enumerate(batch_rows):
             _raise_if_canceled(db, run_id, job_id)
-            sample_dir = run_dir / sanitize_name(row["name"])
-            paths = save_visual_bundle(bundle, sample_dir, idx)
-            for kind, path in paths.items():
-                _add_image_artifact_with_preview(db, job_id, int(row["id"]), kind, path, {"sample": row["name"]})
-            extra_paths = _save_extra_outputs(outputs, sample_dir, idx)
-            for kind, path in extra_paths.items():
-                _add_image_artifact_with_preview(db, job_id, int(row["id"]), kind, path, {"sample": row["name"]})
+            try:
+                sample_dir = run_dir / sanitize_name(row["name"])
+                paths = save_visual_bundle(bundle, sample_dir, idx)
+                for kind, path in paths.items():
+                    _add_image_artifact_with_preview(db, job_id, int(row["id"]), kind, path, {"sample": row["name"]})
+                extra_paths = _save_extra_outputs(outputs, sample_dir, idx)
+                for kind, path in extra_paths.items():
+                    _add_image_artifact_with_preview(db, job_id, int(row["id"]), kind, path, {"sample": row["name"]})
 
-            diff_path = None
-            if row.get("gt_path"):
-                gt = load_rgb_tensor(row["gt_path"], device).unsqueeze(0)
-                gt = resize_batch(gt, height, width)[0]
-                _add_image_artifact_with_preview(db, job_id, int(row["id"]), "gt", Path(row["gt_path"]), {"sample": row["name"]})
-                diff_path = sample_dir / "difference.png"
-                save_difference(composed["pred"][idx], gt, diff_path)
-                _add_image_artifact_with_preview(db, job_id, int(row["id"]), "difference", diff_path, {"sample": row["name"]})
-            _collect_video_frame(video_groups, row, paths["pred"], diff_path)
+                diff_path = None
+                if row.get("gt_path"):
+                    gt = load_rgb_tensor(row["gt_path"], device).unsqueeze(0)
+                    gt = resize_batch(gt, height, width)[0]
+                    _add_image_artifact_with_preview(db, job_id, int(row["id"]), "gt", Path(row["gt_path"]), {"sample": row["name"]})
+                    diff_path = sample_dir / "difference.png"
+                    save_difference(composed["pred"][idx], gt, diff_path)
+                    _add_image_artifact_with_preview(db, job_id, int(row["id"]), "difference", diff_path, {"sample": row["name"]})
+                _collect_video_frame(video_groups, row, paths["pred"], diff_path)
+            except RunCanceled:
+                raise
+            except Exception as exc:
+                _record_sample_error(db, job_id, int(row["id"]), row["name"], exc)
 
             processed += 1
             db.update_job_progress(job_id, processed)
@@ -249,17 +255,23 @@ def _run_video_compare_job(
     for row in samples:
         _raise_if_canceled(db, run_id, job_id)
         t0 = time.perf_counter()
-        sample_dir = run_dir / sanitize_name(row["name"])
-        sample_dir.mkdir(parents=True, exist_ok=True)
-        gt_output_path = _copy_compare_image(Path(row["gt_path"]), sample_dir / "gt.png")
-        pred_output_path = _copy_compare_image(Path(row["img1_path"]), sample_dir / "pred.png")
-        diff_output_path = sample_dir / "difference.png"
-        save_difference(load_rgb_tensor(pred_output_path), load_rgb_tensor(gt_output_path), diff_output_path)
+        try:
+            sample_dir = run_dir / sanitize_name(row["name"])
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            gt_output_path = _copy_compare_image(Path(row["gt_path"]), sample_dir / "gt.png")
+            pred_output_path = _copy_compare_image(Path(row["img1_path"]), sample_dir / "pred.png")
+            diff_output_path = sample_dir / "difference.png"
+            save_difference(load_rgb_tensor(pred_output_path), load_rgb_tensor(gt_output_path), diff_output_path)
 
-        _add_image_artifact_with_preview(db, job_id, int(row["id"]), "gt", gt_output_path, {"sample": row["name"]})
-        _add_image_artifact_with_preview(db, job_id, int(row["id"]), "pred", pred_output_path, {"sample": row["name"]})
-        _add_image_artifact_with_preview(db, job_id, int(row["id"]), "difference", diff_output_path, {"sample": row["name"]})
-        _collect_compare_frame(video_groups, row, gt_output_path, pred_output_path, diff_output_path)
+            artifact_metadata = {"sample": row["name"], **_compare_track_metadata(row)}
+            _add_image_artifact_with_preview(db, job_id, int(row["id"]), "gt", gt_output_path, artifact_metadata)
+            _add_image_artifact_with_preview(db, job_id, int(row["id"]), "pred", pred_output_path, artifact_metadata)
+            _add_image_artifact_with_preview(db, job_id, int(row["id"]), "difference", diff_output_path, artifact_metadata)
+            _collect_compare_frame(video_groups, row, gt_output_path, pred_output_path, diff_output_path)
+        except RunCanceled:
+            raise
+        except Exception as exc:
+            _record_sample_error(db, job_id, int(row["id"]), row["name"], exc)
 
         processed += 1
         db.update_job_progress(job_id, processed)
@@ -333,6 +345,21 @@ def _add_image_artifact_with_preview(
     return db.add_artifact(job_id, sample_id, kind, str(path), "image/png", preview_metadata)
 
 
+def _compare_track_metadata(sample: dict[str, Any]) -> dict[str, Any]:
+    metadata = sample.get("metadata") or {}
+    result: dict[str, Any] = {}
+    for key in (
+        "compare_track_label",
+        "compare_track_key",
+        "compare_track_index",
+        "compare_track_run_id",
+        "compare_track_artifact_id",
+    ):
+        if key in metadata and metadata[key] is not None:
+            result[key] = metadata[key]
+    return result
+
+
 def _copy_compare_image(source_path: Path, output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(source_path).convert("RGB") as image:
@@ -363,6 +390,19 @@ def _save_extra_outputs(outputs: dict[str, torch.Tensor], sample_dir: Path, inde
             # Extra visualizations must not invalidate the core flow/mask contract.
             continue
     return paths
+
+
+def _record_sample_error(db: Database, job_id: int, sample_id: int, sample_name: str, exc: Exception) -> None:
+    error_type = type(exc).__name__
+    message = str(exc)[:500]
+    db.add_artifact(
+        job_id,
+        sample_id,
+        "sample_error",
+        "",
+        "application/json",
+        {"sample": sample_name, "error_type": error_type, "message": message},
+    )
 
 
 def _raise_if_canceled(db: Database, run_id: int | None, job_id: int) -> None:
@@ -431,6 +471,10 @@ def _collect_compare_frame(
             "pred_path": Path(pred_path),
             "gt_path": Path(gt_path),
             "diff_path": Path(diff_path),
+            "track_label": metadata.get("compare_track_label"),
+            "track_key": metadata.get("compare_track_key"),
+            "track_run_id": metadata.get("compare_track_run_id"),
+            "track_artifact_id": metadata.get("compare_track_artifact_id"),
         }
     )
 
@@ -447,6 +491,9 @@ def _write_video_artifacts(
             continue
         video_name = sanitize_name(str(group["video_name"]))
         fps = float(group["fps"] or 24.0)
+        if any(frame.get("track_label") for frame in frames):
+            _write_multitrack_compare_video_artifacts(db, job_id, run_dir, group, frames, video_name, fps)
+            continue
         video_dir = run_dir / "videos" / video_name
         pred_frames_dir = video_dir / "pred_frames"
         gt_frames_dir = video_dir / "gt_frames"
@@ -454,13 +501,14 @@ def _write_video_artifacts(
         pred_frame_paths = _copy_ordered_frames([frame["pred_path"] for frame in frames], pred_frames_dir)
         pred_video_path = video_dir / "pred.mp4"
         _write_mp4(pred_frame_paths, pred_video_path, fps)
+        pred_metadata = _video_artifact_metadata(group["video_name"], frames, pred_frame_paths, fps)
         db.add_artifact(
             job_id,
             None,
             "pred_video",
             str(pred_video_path),
             "video/mp4",
-            {"video_name": group["video_name"], "frames": len(frames)},
+            pred_metadata,
         )
 
         gt_paths = [frame["gt_path"] for frame in frames if frame["gt_path"] is not None]
@@ -468,13 +516,14 @@ def _write_video_artifacts(
             gt_frame_paths = _copy_ordered_frames(gt_paths, gt_frames_dir)
             gt_video_path = video_dir / "gt.mp4"
             _write_mp4(gt_frame_paths, gt_video_path, fps)
+            gt_metadata = _video_artifact_metadata(group["video_name"], frames, gt_frame_paths, fps)
             db.add_artifact(
                 job_id,
                 None,
                 "gt_video",
                 str(gt_video_path),
                 "video/mp4",
-                {"video_name": group["video_name"], "frames": len(frames)},
+                gt_metadata,
             )
 
         diff_paths = [frame["diff_path"] for frame in frames if frame["diff_path"] is not None]
@@ -482,13 +531,14 @@ def _write_video_artifacts(
             diff_frame_paths = _copy_ordered_frames(diff_paths, diff_frames_dir)
             diff_video_path = video_dir / "diff.mp4"
             _write_mp4(diff_frame_paths, diff_video_path, fps)
+            diff_metadata = _video_artifact_metadata(group["video_name"], frames, diff_frame_paths, fps)
             db.add_artifact(
                 job_id,
                 None,
                 "diff_video",
                 str(diff_video_path),
                 "video/mp4",
-                {"video_name": group["video_name"], "frames": len(frames)},
+                diff_metadata,
             )
 
         manifest = {
@@ -502,6 +552,120 @@ def _write_video_artifacts(
         (video_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def _write_multitrack_compare_video_artifacts(
+    db: Database,
+    job_id: int,
+    run_dir: Path,
+    group: dict[str, Any],
+    frames: list[dict[str, Any]],
+    video_name: str,
+    fps: float,
+) -> None:
+    video_dir = run_dir / "videos" / video_name
+    tracks: dict[str, list[dict[str, Any]]] = {}
+    gt_by_order: dict[int, Path] = {}
+    for frame in frames:
+        track_label = str(frame.get("track_label") or "pred")
+        track_key = str(frame.get("track_key") or sanitize_name(track_label))
+        tracks.setdefault(track_key, []).append(frame)
+        if frame.get("gt_path") is not None:
+            gt_by_order.setdefault(int(frame["order"]), Path(frame["gt_path"]))
+
+    gt_video_path = None
+    ordered_gt = [gt_by_order[index] for index in sorted(gt_by_order)]
+    if ordered_gt:
+        gt_frame_paths = _copy_ordered_frames(ordered_gt, video_dir / "gt_frames")
+        gt_video_path = video_dir / "gt.mp4"
+        _write_mp4(gt_frame_paths, gt_video_path, fps)
+        db.add_artifact(
+            job_id,
+            None,
+            "gt_video",
+            str(gt_video_path),
+            "video/mp4",
+            _video_artifact_metadata(group["video_name"], frames, gt_frame_paths, fps),
+        )
+
+    manifest_tracks = []
+    for track_key, track_frames in sorted(tracks.items()):
+        ordered = sorted(track_frames, key=lambda item: item["order"])
+        if not ordered:
+            continue
+        track_label = str(ordered[0].get("track_label") or track_key)
+        track_dir = video_dir / sanitize_name(track_label)
+        pred_frame_paths = _copy_ordered_frames([Path(frame["pred_path"]) for frame in ordered], track_dir / "pred_frames")
+        pred_video_path = track_dir / "pred.mp4"
+        _write_mp4(pred_frame_paths, pred_video_path, fps)
+        track_metadata = {
+            "compare_track_label": track_label,
+            "compare_track_key": track_key,
+            "compare_track_run_id": ordered[0].get("track_run_id"),
+            "compare_track_artifact_id": ordered[0].get("track_artifact_id"),
+        }
+        db.add_artifact(
+            job_id,
+            None,
+            "pred_video",
+            str(pred_video_path),
+            "video/mp4",
+            {**_video_artifact_metadata(group["video_name"], ordered, pred_frame_paths, fps), **track_metadata},
+        )
+
+        diff_video_path = None
+        diff_paths = [Path(frame["diff_path"]) for frame in ordered if frame.get("diff_path") is not None]
+        if len(diff_paths) == len(ordered):
+            diff_frame_paths = _copy_ordered_frames(diff_paths, track_dir / "diff_frames")
+            diff_video_path = track_dir / "diff.mp4"
+            _write_mp4(diff_frame_paths, diff_video_path, fps)
+            db.add_artifact(
+                job_id,
+                None,
+                "diff_video",
+                str(diff_video_path),
+                "video/mp4",
+                {**_video_artifact_metadata(group["video_name"], ordered, diff_frame_paths, fps), **track_metadata},
+            )
+
+        manifest_tracks.append(
+            {
+                "track_label": track_label,
+                "track_key": track_key,
+                "frames": len(ordered),
+                "pred_video": str(pred_video_path.resolve()),
+                "diff_video": str(diff_video_path.resolve()) if diff_video_path else None,
+                "compare_track_run_id": ordered[0].get("track_run_id"),
+                "compare_track_artifact_id": ordered[0].get("track_artifact_id"),
+            }
+        )
+
+    manifest = {
+        "video_name": group["video_name"],
+        "fps": fps,
+        "frames": len(ordered_gt) if ordered_gt else 0,
+        "gt_video": str(gt_video_path.resolve()) if gt_video_path else None,
+        "tracks": manifest_tracks,
+    }
+    video_dir.mkdir(parents=True, exist_ok=True)
+    (video_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _video_artifact_metadata(
+    video_name: str,
+    frames: list[dict[str, Any]],
+    frame_paths: list[Path],
+    fps: float,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"video_name": video_name, "frames": len(frame_paths), "fps": fps}
+    if frame_paths:
+        try:
+            with Image.open(frame_paths[0]) as image:
+                width, height = image.size
+            metadata.update({"width": int(width), "height": int(height)})
+        except Exception:
+            pass
+    return metadata
+
+
 def _copy_ordered_frames(frame_paths: list[Path], output_dir: Path) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     copied = []
@@ -513,6 +677,36 @@ def _copy_ordered_frames(frame_paths: list[Path], output_dir: Path) -> list[Path
 
 
 def _write_mp4(frame_paths: list[Path], output_path: Path, fps: float) -> None:
+    frame_dir = frame_paths[0].parent
+    if _write_mp4_ffmpeg(frame_dir, output_path, fps):
+        return
+    _write_mp4_cv2(frame_paths, output_path, fps)
+
+
+def _write_mp4_ffmpeg(frame_dir: Path, output_path: Path, fps: float) -> bool:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+        "-framerate", str(fps),
+        "-i", str(frame_dir / "%06d.png"),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        str(output_path),
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=600)
+    except subprocess.TimeoutExpired:
+        return False
+    if result.returncode != 0:
+        return False
+    return output_path.exists()
+
+
+def _write_mp4_cv2(frame_paths: list[Path], output_path: Path, fps: float) -> None:
     try:
         import cv2
     except ImportError as exc:
@@ -524,7 +718,9 @@ def _write_mp4(frame_paths: list[Path], output_path: Path, fps: float) -> None:
     height, width = first.shape[:2]
     encode_width = width if width % 2 == 0 else width + 1
     encode_height = height if height % 2 == 0 else height + 1
-    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (encode_width, encode_height))
+    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"avc1"), fps, (encode_width, encode_height))
+    if not writer.isOpened():
+        writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (encode_width, encode_height))
     if not writer.isOpened():
         raise RuntimeError(f"failed to create video artifact: {output_path}")
     try:

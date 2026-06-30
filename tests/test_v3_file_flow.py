@@ -804,7 +804,7 @@ class Model:
                 self.assertIn('<img src="${escapeHtml(url)}" alt="${escapeHtml(label)}" loading="lazy">', app_js)
                 self.assertIn('href="${escapeHtml(item.original_url || `/api/files/${item.id}`)}"', app_js)
                 self.assertIn('src="${escapeHtml(item.preview_url || `/api/files/${item.id}`)}"', app_js)
-                self.assertIn('<video controls preload="metadata" src="${escapeHtml(url)}"></video>', app_js)
+                self.assertIn('<video controls playsinline preload="metadata" src="${escapeHtml(url)}"', app_js)
             finally:
                 server.shutdown()
                 server.server_close()

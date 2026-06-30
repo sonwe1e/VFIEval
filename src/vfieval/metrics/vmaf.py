@@ -37,7 +37,10 @@ class VmafMetric:
             "null",
             "-",
         ]
-        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=600)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("ffmpeg vmaf timed out after 600 seconds")
         if completed.returncode != 0:
             stderr = completed.stderr.strip()
             if "No such filter" in stderr or "libvmaf" in stderr:
