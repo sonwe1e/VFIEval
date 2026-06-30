@@ -247,10 +247,28 @@ summary {
   align-items: start;
 }
 
+.compare-layer-picker {
+  margin-top: 12px;
+}
+
 .run-error-banner {
   display: grid;
   gap: 8px;
   justify-items: start;
+}
+
+.video-master-controls,
+.segmented {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.segmented .active {
+  background: var(--accent-soft);
+  border-color: #a9bee6;
+  color: var(--accent);
 }
 
 .metric-setup-list {
@@ -732,6 +750,46 @@ th {
   margin-bottom: 10px;
 }
 
+.timeline-skeleton,
+.skeleton-card {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.timeline-skeleton span,
+.skeleton-card span {
+  display: block;
+  height: 14px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #eef2f7, #f8fafc, #eef2f7);
+  background-size: 180% 100%;
+  animation: skeleton-shimmer 1.2s ease-in-out infinite;
+}
+
+.timeline-skeleton span:nth-child(1) {
+  width: 96%;
+}
+
+.timeline-skeleton span:nth-child(2),
+.skeleton-card span:nth-child(1) {
+  width: 72%;
+}
+
+.timeline-skeleton span:nth-child(3),
+.skeleton-card span:nth-child(2) {
+  width: 44%;
+}
+
+@keyframes skeleton-shimmer {
+  0% {
+    background-position: 180% 0;
+  }
+  100% {
+    background-position: -180% 0;
+  }
+}
+
 .artifact-tabs {
   display: flex;
   flex-wrap: wrap;
@@ -749,6 +807,55 @@ th {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: 10px;
+}
+
+.compare-layer-panel {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.compare-layer-grid {
+  --compare-grid-columns: 3;
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(180px, calc((100% - (var(--compare-grid-columns) - 1) * 10px) / var(--compare-grid-columns)));
+  gap: 10px;
+  overflow-x: auto;
+  padding-bottom: 6px;
+}
+
+.compare-layer-tile {
+  min-width: 180px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: inherit;
+  text-decoration: none;
+  background: #fff;
+  overflow: hidden;
+}
+
+.compare-layer-tile img {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+  display: block;
+  background: #eef2f7;
+}
+
+.chip-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.chip-row small,
+.chip-row strong {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .preview-slot {

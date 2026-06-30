@@ -531,6 +531,51 @@ class Database:
             row["metadata"] = _loads(row.pop("metadata_json"))
         return rows
 
+    def find_sample_by_video_frame(
+        self,
+        run_id: int,
+        video_name: str,
+        frame_index: int,
+        track_label: str | None = None,
+    ) -> dict[str, Any] | None:
+        run = self.get_run(run_id)
+        dataset_id = int(run["dataset_id"])
+        video_text = str(video_name or "")
+        params: list[Any] = [dataset_id, video_text, video_text, int(frame_index), int(frame_index)]
+        track_clause = ""
+        if track_label:
+            track_clause = """
+              AND (
+                json_extract(metadata_json, '$.compare_track_label') IS NULL
+                OR json_extract(metadata_json, '$.compare_track_label') = ?
+              )
+            """
+            params.append(str(track_label))
+        rows = self.query(
+            f"""
+            SELECT *
+            FROM samples
+            WHERE dataset_id = ?
+              AND (
+                json_extract(metadata_json, '$.video_name') = ?
+                OR json_extract(metadata_json, '$.video_file') = ?
+              )
+              AND (
+                CAST(json_extract(metadata_json, '$.frame_index') AS INTEGER) = ?
+                OR CAST(json_extract(metadata_json, '$.sample_index') AS INTEGER) = ?
+              )
+              {track_clause}
+            ORDER BY id
+            LIMIT 1
+            """,
+            params,
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        row["metadata"] = _loads(row.pop("metadata_json"))
+        return row
+
     def list_run_video_summaries(self, run_id: int, query: str = "") -> list[dict[str, Any]]:
         run = self.get_run(run_id)
         dataset_id = int(run["dataset_id"])
@@ -1168,6 +1213,37 @@ class Database:
         for job_id in self.run_inference_job_ids(run_id):
             artifacts.extend(self.list_artifacts(job_id=int(job_id), kind=kind))
         return artifacts
+
+    def list_run_video_artifacts(
+        self,
+        run_id: int,
+        video_name: str | None = None,
+        kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        job_ids = self.run_inference_job_ids(run_id)
+        if not job_ids:
+            return []
+        placeholders = ",".join("?" for _ in job_ids)
+        clauses = ["job_id IN (" + placeholders + ")", "sample_id IS NULL"]
+        params: list[Any] = list(job_ids)
+        if kind is not None:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if video_name is not None:
+            clauses.append("json_extract(metadata_json, '$.video_name') = ?")
+            params.append(str(video_name))
+        rows = self.query(
+            f"""
+            SELECT *
+            FROM artifacts
+            WHERE {' AND '.join(clauses)}
+            ORDER BY kind, id
+            """,
+            params,
+        )
+        for row in rows:
+            row["metadata"] = _loads(row.pop("metadata_json"))
+        return rows
 
     def list_run_metrics(self, run_id: int) -> list[dict[str, Any]]:
         metrics: list[dict[str, Any]] = []

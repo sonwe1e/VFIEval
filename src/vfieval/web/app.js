@@ -49,8 +49,10 @@ const state = {
   compareSources: { gt: [], pred: [] },
   selectedCompareGtKey: "",
   selectedComparePredArtifacts: new Set(),
+  selectedCompareLayerKinds: new Set(["flowt_0", "flowt_1", "mask0", "mask1", "warp0", "warp1", "blend"]),
   sampleAbortController: null,
   timelineAbortController: null,
+  compareGridColumns: 3,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -354,6 +356,17 @@ function renderVideoSelection() {
           ])}</div>
         </section>
       </div>
+      <section class="compare-layer-picker">
+        <h3>Extra layers</h3>
+        <div class="checkbox-row">
+          ${["flowt_0", "flowt_1", "mask0", "mask1", "warp0", "warp1", "blend"].map((kind) => `
+            <label class="check-item">
+              <input type="checkbox" data-compare-layer-kind="${escapeHtml(kind)}" ${state.selectedCompareLayerKinds.has(kind) ? "checked" : ""}>
+              <span>${escapeHtml(kind)}</span>
+            </label>
+          `).join("")}
+        </div>
+      </section>
     `;
     return;
     /*
@@ -420,7 +433,11 @@ function payloadFromForm() {
           artifact_id: Number(row.artifact_id),
           label: row.compare_track_label || row.run_name || `run-${row.run_id}`,
         })),
-        extra_layers: [],
+        extra_layers: predRows.map((row) => ({
+          source: "run_artifact",
+          run_id: Number(row.run_id),
+          kinds: Array.from(state.selectedCompareLayerKinds),
+        })),
         align_mode: data.align_mode || "strict",
         metrics: selectedMetrics(),
       };
@@ -925,7 +942,7 @@ function renderRunDetail() {
         ${renderRunVideosPager()}
       </aside>
       <section class="sample-viewer">
-        ${video ? renderVideoTimeline(video) : (selectedVideoName ? "<p class=\"muted\">正在加载时间轴...</p>" : "<p class=\"muted\">暂无结果。</p>")}
+        ${video ? renderVideoTimeline(video) : (selectedVideoName ? "<div class=\"timeline-skeleton\" aria-busy=\"true\"><span></span><span></span><span></span></div>" : "<p class=\"muted\">暂无结果。</p>")}
       </section>
     </div>
   `;
@@ -1139,6 +1156,19 @@ function renderVideoArtifacts(video) {
   `;
 }
 
+function renderVideoMasterControls(video) {
+  const count = (video.video_artifact_tracks || []).length
+    || ["pred_video", "gt_video", "diff_video"].filter((kind) => video.video_artifacts?.[kind]).length;
+  if (count <= 1) return "";
+  return `
+    <div class="video-master-controls">
+      <button class="secondary" data-master-video-play="${escapeHtml(video.video_name)}" type="button">Play all</button>
+      <button class="secondary" data-master-video-pause="${escapeHtml(video.video_name)}" type="button">Pause all</button>
+      <button class="secondary" data-master-video-sync="${escapeHtml(video.video_name)}" type="button">Sync time</button>
+    </div>
+  `;
+}
+
 function renderVideoTimeline(video) {
   const samples = video.samples || [];
   const key = `${state.selectedRun.id}:${video.video_name}`;
@@ -1153,6 +1183,7 @@ function renderVideoTimeline(video) {
         <p class="muted">${samples.length} 个样本，FPS ${formatNumber(video.fps)}</p>
       </div>
       <div class="actions">
+        ${renderVideoMasterControls(video)}
         ${renderVideoArtifacts(video)}
       </div>
     </div>
@@ -1236,6 +1267,40 @@ function renderExtraArtifacts(sample) {
   `;
 }
 
+function renderCompareLayers(sample) {
+  const layers = sample.compare_layers || [];
+  if (!layers.length) return "";
+  const columns = state.compareGridColumns || 3;
+  return `
+    <section class="compare-layer-panel">
+      <div class="chart-head">
+        <strong>Compare layers</strong>
+        <div class="segmented">
+          ${[2, 3, 4].map((count) => `
+            <button class="secondary ${Number(columns) === count ? "active" : ""}" data-compare-grid-columns="${count}" type="button">${count}</button>
+          `).join("")}
+        </div>
+      </div>
+      <div class="compare-layer-grid" style="--compare-grid-columns: ${escapeHtml(columns)}">
+        ${layers.map((layer) => {
+          const artifact = layer.artifact || {};
+          const url = artifact.preview_url || artifact.original_url;
+          const href = artifact.original_url || url;
+          return `
+            <a class="compare-layer-tile" data-layer-video="${escapeHtml(sample.metadata?.video_name || "")}" data-layer-frame="${escapeHtml(sample.frame_index ?? "")}" href="${escapeHtml(href || "#")}" target="_blank" rel="noreferrer">
+              <span class="chip-row">
+                <small>${escapeHtml(layer.track_label || `run-${layer.track_run_id || "-"}`)}</small>
+                <strong>${escapeHtml(layer.kind || "-")}</strong>
+              </span>
+              ${url ? `<img src="${escapeHtml(url)}" alt="${escapeHtml(`${layer.track_label || ""} ${layer.kind || ""}`)}" loading="lazy">` : "<p class=\"muted\">no preview</p>"}
+            </a>
+          `;
+        }).join("")}
+      </div>
+    </section>
+  `;
+}
+
 function renderSamplePreview(sample) {
   const detail = sampleDetail(sample.sample_id);
   if (!detail && sample.has_artifacts !== false) {
@@ -1266,6 +1331,7 @@ function renderSamplePreview(sample) {
         ...sample,
         artifacts: detail.artifacts || sample.artifacts || {},
         extra_artifacts: detail.extra_artifacts || sample.extra_artifacts || [],
+        compare_layers: detail.compare_layers || sample.compare_layers || [],
         sample_files: detail.sample_files || sample.sample_files || {},
         load_error: detail.load_error,
       }
@@ -1277,7 +1343,7 @@ function renderSamplePreview(sample) {
     ? (payload.load_error
         ? `<div class="message error"><p><strong>样本产物加载失败</strong>: ${escapeHtml(payload.load_error)}</p></div>`
         : "")
-    : "<p class=\"muted sample-loading\">正在按需加载这一帧的产物...</p>";
+    : "<div class=\"sample-loading skeleton-card\" aria-busy=\"true\"><span></span><span></span></div>";
   return `
     <div class="sample-meta">
       <strong>${escapeHtml(payload.sample_name)}</strong>
@@ -1294,6 +1360,7 @@ function renderSamplePreview(sample) {
     <div class="preview-grid">
       ${group.items.map(([kind, label]) => renderPreviewSlot(payload, kind, label)).join("")}
     </div>
+    ${renderCompareLayers(payload)}
     ${renderExtraArtifacts(payload)}
   `;
 }
@@ -1305,6 +1372,24 @@ function setSampleIndex(videoName, index) {
   const max = Math.max(0, (video.samples || []).length - 1);
   state.selectedSampleByVideo[`${state.selectedRun.id}:${videoName}`] = Math.max(0, Math.min(max, index));
   renderRunDetail();
+}
+
+function activeVideoElements() {
+  return Array.from(document.querySelectorAll(".sample-viewer .video-artifact video"));
+}
+
+function syncActiveVideos(action) {
+  const videos = activeVideoElements();
+  if (!videos.length) return;
+  const leader = videos.find((video) => !Number.isNaN(video.currentTime)) || videos[0];
+  const currentTime = leader.currentTime || 0;
+  for (const video of videos) {
+    if (Math.abs((video.currentTime || 0) - currentTime) > 0.05) {
+      video.currentTime = currentTime;
+    }
+    if (action === "play") video.play().catch(() => {});
+    if (action === "pause") video.pause();
+  }
 }
 
 async function setSampleByFrame(videoName, frameIndex) {
@@ -1474,6 +1559,15 @@ document.addEventListener("change", (event) => {
     schedulePreflight(0);
     return;
   }
+  const compareLayerKind = event.target.closest("[data-compare-layer-kind]");
+  if (compareLayerKind) {
+    const kind = compareLayerKind.dataset.compareLayerKind;
+    if (compareLayerKind.checked) state.selectedCompareLayerKinds.add(kind);
+    else state.selectedCompareLayerKinds.delete(kind);
+    renderVideoSelection();
+    schedulePreflight(0);
+    return;
+  }
   const videoCheckbox = event.target.closest("[data-video-name]");
   if (videoCheckbox) {
     const group = currentGroup();
@@ -1564,6 +1658,24 @@ document.addEventListener("click", async (event) => {
   if (runVideosPage && state.selectedRun) {
     await loadRunVideosPage(state.selectedRun.id, Number(runVideosPage.dataset.runVideosPage));
     renderRunDetail();
+    return;
+  }
+  const gridColumns = event.target.closest("[data-compare-grid-columns]");
+  if (gridColumns) {
+    state.compareGridColumns = Number(gridColumns.dataset.compareGridColumns || 3);
+    renderRunDetail();
+    return;
+  }
+  if (event.target.closest("[data-master-video-play]")) {
+    syncActiveVideos("play");
+    return;
+  }
+  if (event.target.closest("[data-master-video-pause]")) {
+    syncActiveVideos("pause");
+    return;
+  }
+  if (event.target.closest("[data-master-video-sync]")) {
+    syncActiveVideos("sync");
     return;
   }
   const videoTab = event.target.closest("[data-run-video]");

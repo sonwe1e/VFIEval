@@ -900,7 +900,7 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
             "run_type": "video_compare",
             "reference": body.get("reference"),
             "distorted": body.get("distorted"),
-            "extra_layers": body.get("extra_layers") or [],
+            "extra_layers": body.get("extra_layers") if "extra_layers" in body else None,
             "align_mode": "strict",
             "metrics": metrics,
         },
@@ -1191,6 +1191,7 @@ CORE_TIMELINE_ARTIFACTS = {
 }
 
 VIDEO_TIMELINE_ARTIFACTS = {"pred_video", "gt_video", "diff_video"}
+COMPARE_LAYER_ARTIFACTS = ("flowt_0", "flowt_1", "mask0", "mask1", "warp0", "warp1", "blend")
 METRIC_DIRECTIONS = {
     "vmaf": "higher_is_better",
     "lpips_vit_patch": "lower_is_better",
@@ -1517,11 +1518,90 @@ def _video_artifact_tracks(db: Database, run_id: int, video_name: str) -> list[d
 def _video_artifacts_for_video(db: Database, run_id: int, video_name: str) -> list[dict]:
     rows = []
     for kind in VIDEO_TIMELINE_ARTIFACTS:
-        for artifact in db.list_run_artifacts(run_id, kind=kind):
-            metadata = artifact.get("metadata") or {}
-            if str(metadata.get("video_name") or "") == str(video_name):
-                rows.append(artifact)
+        rows.extend(db.list_run_video_artifacts(run_id, video_name=video_name, kind=kind))
     return rows
+
+
+def _compare_layer_payloads(db: Database, run: dict[str, object], sample: dict) -> list[dict[str, object]]:
+    metadata = sample.get("metadata") or {}
+    if metadata.get("source_type") != "compare":
+        return []
+    video_name = str(metadata.get("video_name") or metadata.get("compare_group") or "")
+    frame_index = int(metadata.get("frame_index") or metadata.get("sample_index") or 0)
+    track_rows = _compare_track_rows(run, metadata)
+    requested_layers = _requested_compare_layers(run)
+    if requested_layers is not None and not requested_layers:
+        return []
+    layers: list[dict[str, object]] = []
+    for track in track_rows:
+        source_run_id = track.get("track_run_id")
+        if source_run_id in {None, ""}:
+            continue
+        track_label = str(track.get("track_label") or f"run-{source_run_id}")
+        source_sample = db.find_sample_by_video_frame(int(source_run_id), video_name, frame_index)
+        if source_sample is None:
+            continue
+        allowed_kinds = requested_layers.get(int(source_run_id), set()) if requested_layers is not None else None
+        for artifact in db.list_artifacts_by_sample(int(source_sample["id"])):
+            kind = str(artifact["kind"])
+            if kind not in COMPARE_LAYER_ARTIFACTS:
+                continue
+            if allowed_kinds is not None and kind not in allowed_kinds:
+                continue
+            layers.append(
+                {
+                    "kind": kind,
+                    "group": _compare_layer_group(kind),
+                    "track_label": track_label,
+                    "track_run_id": int(source_run_id),
+                    "source_sample_id": int(source_sample["id"]),
+                    "artifact": _artifact_payload(artifact),
+                }
+            )
+    return sorted(layers, key=lambda item: (str(item["group"]), str(item["kind"]), str(item["track_label"])))
+
+
+def _compare_track_rows(run: dict[str, object], sample_metadata: dict[str, object]) -> list[dict[str, object]]:
+    rows = []
+    for track in (run.get("metadata") or {}).get("distorted_tracks") or []:
+        rows.append(
+            {
+                "track_label": track.get("track_label") or track.get("label"),
+                "track_run_id": track.get("track_run_id") or track.get("run_id"),
+            }
+        )
+    if not rows and sample_metadata.get("compare_track_run_id") is not None:
+        rows.append(
+            {
+                "track_label": sample_metadata.get("compare_track_label"),
+                "track_run_id": sample_metadata.get("compare_track_run_id"),
+            }
+        )
+    return rows
+
+
+def _requested_compare_layers(run: dict[str, object]) -> dict[int, set[str]] | None:
+    request = (run.get("metadata") or {}).get("request") or {}
+    if "extra_layers" not in request or request.get("extra_layers") is None:
+        return None
+    result: dict[int, set[str]] = {}
+    for layer in request.get("extra_layers") or []:
+        if str(layer.get("source") or "run_artifact") != "run_artifact":
+            continue
+        run_id = layer.get("run_id")
+        if run_id in {None, ""}:
+            continue
+        kinds = {str(kind) for kind in (layer.get("kinds") or []) if str(kind) in COMPARE_LAYER_ARTIFACTS}
+        result[int(run_id)] = kinds
+    return result
+
+
+def _compare_layer_group(kind: str) -> str:
+    if kind.startswith("flow"):
+        return "flow"
+    if kind.startswith("mask"):
+        return "mask"
+    return "warp"
 
 
 def _find_timeline_video(videos: list[dict], video_name: str) -> dict:
@@ -1645,6 +1725,7 @@ def _run_sample_payload(db: Database, run_id: int, sample_id: int) -> dict:
         "track_index": metadata.get("compare_track_index"),
         "artifacts": artifacts,
         "extra_artifacts": extra_artifacts,
+        "compare_layers": _compare_layer_payloads(db, run, sample),
         "sample_files": {
             "img0": f"/api/sample-files/{sample_id}/img0",
             "img1": f"/api/sample-files/{sample_id}/img1",

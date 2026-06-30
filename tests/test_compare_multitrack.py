@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from vfieval.pipeline.inference import run_inference_job
 
-from v13_test_utils import add_completed_pred_run, make_workspace, post_json, start_server, stop_server, write_mp4
+from v13_test_utils import add_completed_pred_run, get_json, make_workspace, post_json, start_server, stop_server, write_mp4
 
 
 class CompareMultitrackTests(unittest.TestCase):
@@ -37,6 +37,10 @@ class CompareMultitrackTests(unittest.TestCase):
                 "distorted": [
                     {"kind": "run_artifact", "run_id": run_a, "video": "clip", "label": "ModelA"},
                     {"kind": "run_artifact", "run_id": run_b, "video": "clip", "label": "ModelB"},
+                ],
+                "extra_layers": [
+                    {"source": "run_artifact", "run_id": run_a, "kinds": ["flowt_0", "mask0"]},
+                    {"source": "run_artifact", "run_id": run_b, "kinds": ["flowt_0", "mask0"]},
                 ],
                 "metrics": [],
             }
@@ -74,6 +78,13 @@ class CompareMultitrackTests(unittest.TestCase):
 
                 pred_sample_artifacts = db.list_artifacts_by_sample(int(samples[0]["id"]), kind="pred")
                 self.assertIn(pred_sample_artifacts[0]["metadata"]["compare_track_label"], {"ModelA", "ModelB"})
+
+                model_a_sample = next(row for row in samples if row["name"] == "clip__ModelA__000000")
+                sample_detail = get_json(base_url, f"/api/runs/{run_id}/samples/{model_a_sample['id']}")
+                layers = sample_detail["compare_layers"]
+                self.assertEqual({row["track_label"] for row in layers}, {"ModelA", "ModelB"})
+                self.assertIn("flowt_0", {row["kind"] for row in layers})
+                self.assertIn("mask0", {row["kind"] for row in layers})
             finally:
                 stop_server(server, thread)
 
