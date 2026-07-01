@@ -1,4 +1,5 @@
 const STATUS_LABELS = {
+  decoding: "Decoding",
   queued: "排队中",
   running: "推理中",
   completed: "已完成",
@@ -125,6 +126,29 @@ function metricHealthBadge(name) {
   if (!row) return "";
   const title = row.reason || row.status;
   return `<small class="metric-health ${escapeHtml(row.status)}" title="${escapeHtml(title)}">${escapeHtml(row.status)}</small>`;
+}
+
+function decodeBackendStatus(name) {
+  const row = state.devices?.decode_backends?.[name];
+  if (row === true) return { available: true, label: "available", detail: "" };
+  if (row === false || !row) return { available: false, label: "missing", detail: `${name} is not available` };
+  return {
+    available: Boolean(row.available),
+    label: row.available ? "available" : "missing",
+    detail: row.error || row.version || row.path || "",
+  };
+}
+
+function renderDecodeBackendNotice() {
+  const ffmpeg = decodeBackendStatus("ffmpeg");
+  const opencv = decodeBackendStatus("opencv");
+  const preferred = ffmpeg.available ? "ffmpeg" : (opencv.available ? "opencv fallback" : "none");
+  const severity = ffmpeg.available || opencv.available ? "message" : "message warn";
+  return `
+    <div class="${severity}">
+      <p><strong>Decode backend</strong>: ${escapeHtml(preferred)}. FFmpeg ${escapeHtml(ffmpeg.label)}${ffmpeg.detail ? ` (${escapeHtml(ffmpeg.detail)})` : ""}; OpenCV ${escapeHtml(opencv.label)}${opencv.detail ? ` (${escapeHtml(opencv.detail)})` : ""}.</p>
+    </div>
+  `;
 }
 
 function renderMetricOptions() {
@@ -648,6 +672,7 @@ function renderPreflight() {
     ${renderMessages("errors", result.errors || [])}
     ${renderMessages("warnings", result.warnings || [])}
     ${renderMetricHealthTable(result.metrics?.health || {})}
+    ${renderDecodeBackendNotice()}
     <h3>本次推理视频</h3>
     <div class="table">${table(videos, [
       { label: "视频", render: (row) => escapeHtml(row.name) },
@@ -776,8 +801,10 @@ async function selectRun(runId, options = {}) {
 
 function renderInferencePhase(run) {
   const runType = run.metadata?.run_type || "model_inference";
+  if (run.status === "decoding") return "Decoding video frames";
   if (run.status === "queued") return runType === "video_compare" ? "等待生成对比产物" : "等待推理";
   if (run.status === "running") return runType === "video_compare" ? "生成对比产物中" : "推理中";
+  if (run.status === "failed" && run.error?.phase === "decode") return "Decode failed";
   if (run.status === "failed") return "失败";
   if (run.status === "canceled" || run.status === "cancel_requested") return "已取消";
   return run.inference_job_id ? "已完成" : "未开始";
@@ -786,6 +813,7 @@ function renderInferencePhase(run) {
 function renderMetricPhase(run) {
   const metrics = run.metrics || [];
   if (!metrics.length) return "未选择指标";
+  if (run.status === "decoding") return "Waiting for decode";
   if (run.status === "metric_queued") return "评测排队";
   if (run.status === "metric_running") return "评测中";
   if (run.metric_job_id) return "已完成";
@@ -826,10 +854,27 @@ function renderJobProgress(job) {
 }
 
 function renderJobLabel(job) {
+  if (job.role === "decode" || job.kind === "decode") {
+    return "decode";
+  }
   if (job.role === "inference") {
     return `inference #${escapeHtml(job.shard_index ?? 0)}`;
   }
   return escapeHtml(job.role || job.kind || "job");
+}
+
+function renderJobDetail(job) {
+  const result = job.result || {};
+  if (job.role === "decode" || job.kind === "decode") {
+    const bits = [];
+    if (result.backend) bits.push(`backend=${result.backend}`);
+    if (result.manifest_backend) bits.push(`cached=${result.manifest_backend}`);
+    if (result.current_video) bits.push(`video=${result.current_video}`);
+    if (result.cache_hits || result.cache_misses) bits.push(`cache ${result.cache_hits || 0}/${result.cache_misses || 0}`);
+    if (result.fallback_reason) bits.push(`fallback=${result.fallback_reason}`);
+    return escapeHtml(bits.join(" | ") || "-");
+  }
+  return "-";
 }
 
 function renderJobError(job) {
@@ -849,6 +894,7 @@ function renderRunJobs(run) {
         { label: "设备", render: (job) => escapeHtml(job.device || job.payload?.device || "-") },
         { label: "状态", render: (job) => statusBadge(job.status) },
         { label: "进度", render: (job) => renderJobProgress(job) },
+        { label: "详情", render: (job) => renderJobDetail(job) },
         { label: "Worker", render: (job) => escapeHtml(job.worker_id || "-") },
         { label: "错误原因", render: (job) => renderJobError(job) },
       ])}</div>
@@ -859,6 +905,37 @@ function renderRunJobs(run) {
 function renderCleanedArtifactsNotice(run) {
   if (!run?.artifact_cleaned_at) return "";
   return `<div class="message warn"><p><strong>产物已清理</strong>: 这个 Run 的磁盘产物已经删除；时间线和指标摘要仍可查看，如需重新查看 Pred / GT / Diff，请重试重新生成。</p></div>`;
+}
+
+function renderDecodePanel(run) {
+  const job = (run.jobs || []).find((item) => item.role === "decode" || item.kind === "decode");
+  if (!job && run.status !== "decoding") return "";
+  const result = job?.result || {};
+  const current = Number(job?.progress_current ?? run.progress_current ?? result.decoded_frames ?? 0);
+  const total = Number(job?.progress_total ?? run.progress_total ?? result.total_frames ?? 0);
+  const percent = total > 0 ? Math.max(0, Math.min(100, Math.round((current / total) * 100))) : 0;
+  const backend = result.backend || "auto";
+  const currentVideo = result.current_video || "-";
+  const cacheText = `${result.cache_hits || 0} hit / ${result.cache_misses || 0} miss`;
+  return `
+    <section class="decode-panel">
+      <div class="panel-head">
+        <div>
+          <h3>Decode progress</h3>
+          <p class="muted">Frames are decoded before inference jobs are queued.</p>
+        </div>
+        ${statusBadge(job?.status || run.status)}
+      </div>
+      <div class="progress-bar" aria-label="decode progress"><span style="width: ${percent}%"></span></div>
+      <div class="summary-grid">
+        <div><span>Frames</span><strong>${escapeHtml(current)}/${escapeHtml(total || "-")}</strong></div>
+        <div><span>Current video</span><strong>${escapeHtml(currentVideo)}</strong></div>
+        <div><span>Backend</span><strong>${escapeHtml(backend)}</strong></div>
+        <div><span>Cache</span><strong>${escapeHtml(cacheText)}</strong></div>
+      </div>
+      ${result.fallback_reason ? `<div class="message warn"><p><strong>Decode fallback</strong>: ${escapeHtml(result.fallback_reason)}</p></div>` : ""}
+    </section>
+  `;
 }
 
 async function loadRunVideoTimeline(runId, videoName, options = {}) {
@@ -927,6 +1004,7 @@ function renderRunDetail() {
     </div>
     ${renderRunError(run)}
     ${renderCleanedArtifactsNotice(run)}
+    ${renderDecodePanel(run)}
     <div class="message"><p><strong>Execution</strong>: ${runExecutionTarget(run)}</p></div>
     ${renderMetricHealthTable(run.metadata?.metric_health || {})}
     ${renderRunJobs(run)}

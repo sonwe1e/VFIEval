@@ -27,6 +27,7 @@ These are done and must not regress:
 - Per-sample exceptions are captured as `sample_error` artifacts instead of failing the whole run.
 - `GET /api/files/{artifact_id}` honors HTTP byte ranges and streams in 4 MiB chunks for video playback.
 - Run deletion and cleanup only touch `.vfieval/runs/{run_id}` and run-scoped metadata.
+- Video-group Run creation must expose decoding as a `decode` job with frame progress, backend details, and fallback reasons before inference jobs are queued.
 
 ## Current Priorities
 

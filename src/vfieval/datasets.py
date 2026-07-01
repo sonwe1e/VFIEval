@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import subprocess
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from typing import Any, Callable
 
 from PIL import Image
 
@@ -21,9 +25,16 @@ from vfieval.file_inputs import VIDEO_SUFFIXES, decode_cache_dir, decode_cache_k
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
-def scan_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: int) -> int:
+def scan_dataset(
+    db: Database,
+    workspace: WorkspaceConfig,
+    dataset_id: int,
+    progress_callback: ProgressCallback | None = None,
+    decode_backend: str = "auto",
+) -> int:
     dataset = db.get_dataset(dataset_id)
     source_type = dataset.get("source_type") or "frames"
     db.clear_samples(dataset_id)
@@ -32,7 +43,7 @@ def scan_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: int) -> i
         db.update_dataset_scan_info(dataset_id, None, video_count=0, frame_count=count)
         return count
     if source_type == "video":
-        return scan_video_dataset(db, workspace, dataset_id)
+        return scan_video_dataset(db, workspace, dataset_id, progress_callback=progress_callback, decode_backend=decode_backend)
     if source_type == "compare":
         return scan_compare_dataset(db, workspace, dataset_id)
     raise ValueError(f"unsupported dataset source_type: {source_type}")
@@ -70,7 +81,13 @@ def scan_triplet_dataset(db: Database, dataset_id: int) -> int:
     return added
 
 
-def scan_video_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: int) -> int:
+def scan_video_dataset(
+    db: Database,
+    workspace: WorkspaceConfig,
+    dataset_id: int,
+    progress_callback: ProgressCallback | None = None,
+    decode_backend: str = "auto",
+) -> int:
     dataset = db.get_dataset(dataset_id)
     metadata = dataset.get("metadata") or {}
     decode_mode = dataset.get("decode_mode") or ("video_gt_triplets" if dataset["has_gt"] else "video_pairs")
@@ -87,17 +104,67 @@ def scan_video_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: int
     decoded_root.mkdir(parents=True, exist_ok=True)
     added = 0
     decoded_frames = 0
+    decode_results: list[tuple[str, list[Path], float, list[float], dict[str, Any]] | None] = [None for _ in videos]
+    progress_counts = [0 for _ in videos]
+    cache_hits = 0
+    cache_misses = 0
+    lock = Lock()
 
-    for video_index, video_path in enumerate(videos):
+    def decode_one(video_index: int, video_path: Path) -> tuple[str, list[Path], float, list[float], dict[str, Any]]:
         cache_key = decode_cache_key(video_path, decode_mode, frame_step, max_frames)
-        frames, fps, timestamps = _decode_video_cached(
+        local_cache_hit = False
+
+        def on_decode_progress(event: dict[str, Any]) -> None:
+            nonlocal cache_hits, cache_misses, local_cache_hit
+            if progress_callback is None:
+                return
+            frames_done = int(event.get("frames") or 0)
+            with lock:
+                progress_counts[video_index] = frames_done
+                if event.get("event") == "cache_hit" and not local_cache_hit:
+                    local_cache_hit = True
+                    cache_hits += 1
+                elif event.get("event") == "cache_miss" and not event.get("_cache_miss_counted"):
+                    event["_cache_miss_counted"] = True
+                    cache_misses += 1
+                payload = {
+                    **event,
+                    "video_index": video_index,
+                    "video_count": len(videos),
+                    "video_name": video_path.name,
+                    "decoded_frames": sum(progress_counts),
+                    "cache_hits": cache_hits,
+                    "cache_misses": cache_misses,
+                }
+            progress_callback(payload)
+
+        frames, fps, timestamps, decode_info = _decode_video_cached(
             workspace,
             video_path,
             cache_key,
             max_frames,
             decode_mode,
             frame_step,
+            progress_callback=on_decode_progress,
+            decode_backend=decode_backend,
         )
+        return cache_key, frames, fps, timestamps, decode_info
+
+    worker_count = _decode_worker_count(len(videos), metadata)
+    if worker_count > 1:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {executor.submit(decode_one, index, path): index for index, path in enumerate(videos)}
+            for future in as_completed(futures):
+                decode_results[futures[future]] = future.result()
+    else:
+        for video_index, video_path in enumerate(videos):
+            decode_results[video_index] = decode_one(video_index, video_path)
+
+    for video_index, video_path in enumerate(videos):
+        result = decode_results[video_index]
+        if result is None:
+            raise RuntimeError(f"video decode did not produce a result: {video_path.name}")
+        cache_key, frames, fps, timestamps, decode_info = result
         decoded_frames += len(frames)
         if decode_mode == "video_gt_triplets":
             added += _add_video_triplets(
@@ -137,6 +204,7 @@ def scan_video_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: int
             "video_glob": video_glob,
             "selected_videos": [path.name for path in videos],
             "decode_mode": decode_mode,
+            "decode_backend": decode_backend,
         },
     )
     return added
@@ -436,7 +504,7 @@ def _load_compare_source_frames(
 ) -> tuple[list[Path], float | None, list[float | None]]:
     if source_path.is_file() and source_path.suffix.lower() in VIDEO_SUFFIXES:
         cache_key = decode_cache_key(source_path, cache_prefix, 1, None)
-        frames, fps, timestamps = _decode_video_cached(
+        frames, fps, timestamps, _decode_info = _decode_video_cached(
             workspace,
             source_path,
             cache_key,
@@ -460,7 +528,9 @@ def _decode_video_cached(
     max_frames: int | None,
     decode_mode: str,
     frame_step: int,
-) -> tuple[list[Path], float, list[float]]:
+    progress_callback: ProgressCallback | None = None,
+    decode_backend: str = "auto",
+) -> tuple[list[Path], float, list[float], dict[str, Any]]:
     output_dir = decode_cache_dir(workspace, cache_key)
     manifest_path = output_dir / "manifest.json"
     if manifest_path.exists():
@@ -468,7 +538,22 @@ def _decode_video_cached(
         frames = [Path(path) for path in manifest.get("frames", []) if Path(path).exists()]
         timestamps = [float(value) for value in manifest.get("timestamps", [])]
         if frames and len(timestamps) == len(frames):
-            return frames, float(manifest.get("fps") or 24.0), timestamps
+            decode_info = {
+                "backend": "cache",
+                "manifest_backend": manifest.get("decode_backend"),
+                "fallback_reason": manifest.get("decode_fallback_reason"),
+                "cache_hit": True,
+            }
+            if progress_callback:
+                progress_callback(
+                    {
+                        "event": "cache_hit",
+                        "backend": "cache",
+                        "manifest_backend": manifest.get("decode_backend"),
+                        "frames": len(frames),
+                    }
+                )
+            return frames, float(manifest.get("fps") or 24.0), timestamps, decode_info
 
     partial_dir = output_dir.with_name(output_dir.name + ".partial")
     if partial_dir.exists():
@@ -477,7 +562,15 @@ def _decode_video_cached(
         shutil.rmtree(output_dir)
     partial_dir.mkdir(parents=True, exist_ok=True)
     try:
-        frames, fps, timestamps = _decode_video(video_path, partial_dir, max_frames)
+        if progress_callback:
+            progress_callback({"event": "cache_miss", "backend": decode_backend, "frames": 0})
+        frames, fps, timestamps, decode_info = _decode_video(
+            video_path,
+            partial_dir,
+            max_frames,
+            decode_backend=decode_backend,
+            progress_callback=progress_callback,
+        )
         width, height = _frame_size(frames[0]) if frames else (0, 0)
         manifest = {
             "video_name": video_path.stem,
@@ -496,19 +589,51 @@ def _decode_video_cached(
             "decode_mode": decode_mode,
             "frame_step": frame_step,
             "max_frames": max_frames,
+            "decode_backend": decode_info.get("backend"),
+            "decode_fallback_reason": decode_info.get("fallback_reason"),
             "color": "RGB",
         }
         (partial_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
         partial_dir.rename(output_dir)
         frames = [output_dir / path.name for path in frames]
-        return frames, fps, timestamps
+        return frames, fps, timestamps, decode_info
     except Exception:
         if partial_dir.exists():
             shutil.rmtree(partial_dir)
         raise
 
 
-def _decode_video(video_path: Path, output_dir: Path, max_frames: int | None) -> tuple[list[Path], float, list[float]]:
+def _decode_video(
+    video_path: Path,
+    output_dir: Path,
+    max_frames: int | None,
+    decode_backend: str = "auto",
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[list[Path], float, list[float], dict[str, Any]]:
+    requested = str(decode_backend or "auto")
+    fallback_reason = None
+    if requested in {"auto", "ffmpeg"}:
+        try:
+            frames, fps, timestamps = _decode_video_ffmpeg(video_path, output_dir, max_frames, progress_callback)
+            return frames, fps, timestamps, {"backend": "ffmpeg", "fallback_reason": None}
+        except Exception as exc:
+            if requested == "ffmpeg":
+                raise
+            fallback_reason = f"ffmpeg unavailable or failed: {exc}"
+            _clear_decoded_frames(output_dir)
+            if progress_callback:
+                progress_callback({"event": "fallback", "backend": "opencv", "fallback_reason": fallback_reason, "frames": 0})
+
+    frames, fps, timestamps = _decode_video_opencv(video_path, output_dir, max_frames, progress_callback)
+    return frames, fps, timestamps, {"backend": "opencv", "fallback_reason": fallback_reason}
+
+
+def _decode_video_opencv(
+    video_path: Path,
+    output_dir: Path,
+    max_frames: int | None,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[list[Path], float, list[float]]:
     try:
         import cv2
     except ImportError as exc:
@@ -534,11 +659,132 @@ def _decode_video(video_path: Path, output_dir: Path, max_frames: int | None) ->
             Image.fromarray(rgb).save(frame_path)
             frames.append(frame_path)
             timestamps.append(timestamp_ms / 1000.0)
+            if progress_callback and (len(frames) == 1 or len(frames) % 10 == 0):
+                progress_callback({"event": "frame", "backend": "opencv", "frames": len(frames)})
     finally:
         capture.release()
     if not frames:
         raise RuntimeError(f"video has no decodable frames: {video_path}")
+    if progress_callback:
+        progress_callback({"event": "video_done", "backend": "opencv", "frames": len(frames)})
     return frames, fps, timestamps
+
+
+def _decode_video_ffmpeg(
+    video_path: Path,
+    output_dir: Path,
+    max_frames: int | None,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[list[Path], float, list[float]]:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is not on PATH")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pattern = output_dir / "%06d.png"
+    command = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-vsync",
+        "0",
+    ]
+    if max_frames is not None:
+        command.extend(["-frames:v", str(int(max_frames))])
+    command.append(str(pattern))
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    last_count = -1
+    while process.poll() is None:
+        count = len(list(output_dir.glob("*.png")))
+        if progress_callback and count != last_count:
+            progress_callback({"event": "frame", "backend": "ffmpeg", "frames": count})
+            last_count = count
+        time.sleep(0.25)
+    stdout, stderr = process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError((stderr or stdout or "ffmpeg decode failed").strip())
+    frames = sorted(output_dir.glob("*.png"))
+    if not frames:
+        raise RuntimeError(f"ffmpeg produced no frames: {video_path}")
+    fps = _probe_video_fps(video_path)
+    timestamps = [index / fps for index in range(len(frames))]
+    if progress_callback:
+        progress_callback({"event": "video_done", "backend": "ffmpeg", "frames": len(frames)})
+    return frames, fps, timestamps
+
+
+def _decode_worker_count(video_count: int, metadata: dict[str, Any]) -> int:
+    requested = metadata.get("decode_workers")
+    if requested in {None, ""}:
+        return max(1, min(4, int(video_count or 1)))
+    return max(1, min(int(requested), int(video_count or 1)))
+
+
+def _clear_decoded_frames(output_dir: Path) -> None:
+    for path in output_dir.glob("*.png"):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _probe_video_fps(video_path: Path) -> float:
+    try:
+        import cv2
+
+        capture = cv2.VideoCapture(str(video_path))
+        try:
+            fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+            if fps > 0:
+                return fps
+        finally:
+            capture.release()
+    except Exception:
+        pass
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        try:
+            completed = subprocess.run(
+                [
+                    ffprobe,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=avg_frame_rate,r_frame_rate",
+                    "-of",
+                    "json",
+                    str(video_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            payload = json.loads(completed.stdout or "{}")
+            stream = (payload.get("streams") or [{}])[0]
+            return _parse_rate(stream.get("avg_frame_rate")) or _parse_rate(stream.get("r_frame_rate")) or 24.0
+        except Exception:
+            pass
+    return 24.0
+
+
+def _parse_rate(value: Any) -> float | None:
+    text = str(value or "")
+    if not text or text == "0/0":
+        return None
+    if "/" in text:
+        numerator, denominator = text.split("/", 1)
+        denominator_value = float(denominator or 0)
+        if denominator_value == 0:
+            return None
+        return float(numerator) / denominator_value
+    parsed = float(text)
+    return parsed if parsed > 0 else None
 
 
 def _frame_size(path: Path) -> tuple[int, int]:

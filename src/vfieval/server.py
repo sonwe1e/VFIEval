@@ -37,6 +37,7 @@ from vfieval.file_inputs import (
 )
 from vfieval.metrics import METRIC_NAMES
 from vfieval.metrics.health import metrics_health
+from vfieval.orchestration import start_decode_worker
 from vfieval.worker import WorkerOptions, detect_capabilities, run_worker
 
 
@@ -306,8 +307,8 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     return self._json(retry, status=HTTPStatus.CREATED)
                 if path == "/api/jobs":
                     kind = body["kind"]
-                    if kind not in {"inference", "metric"}:
-                        return self._error(HTTPStatus.BAD_REQUEST, "kind must be inference or metric")
+                    if kind not in {"decode", "inference", "metric"}:
+                        return self._error(HTTPStatus.BAD_REQUEST, "kind must be decode, inference, or metric")
                     job_id = db.create_job(kind, body.get("payload") or {})
                     return self._json({"job_id": job_id, "kind": kind}, status=HTTPStatus.CREATED)
                 if path == "/api/jobs/claim":
@@ -752,10 +753,6 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
             "selected_videos": selected_videos,
         },
     )
-    samples = scan_dataset(db, workspace, dataset_id)
-    if samples <= 0:
-        raise ValueError("视频集没有生成可推理 triplets")
-
     metadata = {
         "run_type": "model_inference",
         "source": "folder_flow",
@@ -794,6 +791,7 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
     if body.get("retry_of_run_id") is not None:
         metadata["retry_of_run_id"] = int(body["retry_of_run_id"])
     name = body.get("name") or f"{model_path.stem} / {video_folder.name}"
+    output_dir = str(workspace.runs_dir / str(db.next_run_id()))
     run_id = db.create_run(
         name=name,
         model_id=model_id,
@@ -804,17 +802,27 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         device=execution_mode if is_multi else device,
         precision=precision,
         metrics=metrics,
-        metadata={**metadata, "output_dir": str(workspace.runs_dir / str(db.next_run_id()))},
-        create_inference_job=not is_multi,
+        metadata={**metadata, "output_dir": output_dir},
+        create_inference_job=False,
     )
-    if is_multi:
-        _create_inference_shards(db, run_id, model_id, dataset_id, height, width, precision, metrics, devices, int(body.get("batch_size_per_device") or body.get("batch_size") or 1))
-        if execution_mode == "multi_npu":
-            _start_local_npu_worker_processes(workspace, run_id, devices, start_metric_worker=bool(metrics))
-        else:
-            _start_local_inference_worker(db, workspace, count=len(devices))
-    else:
-        _start_local_inference_worker(db, workspace)
+    total_decode_frames = _decode_progress_total(video_infos, max_frames)
+    db.add_run_job(
+        run_id,
+        "decode",
+        {
+            "run_id": run_id,
+            "dataset_id": dataset_id,
+            "video_group": video_folder.name,
+            "selected_videos": selected_videos,
+            "video_count": len(selected_videos),
+            "total_frames": total_decode_frames,
+            "decode_backend": str(body.get("decode_backend") or "auto"),
+        },
+        progress_total=total_decode_frames,
+        metadata={"phase": "decode"},
+    )
+    db.update_run_progress(run_id, 0, total_decode_frames, "decoding")
+    start_decode_worker(db, workspace)
     return {"run_id": run_id, "run": db.get_run(run_id), "preflight": preflight}
 
 
@@ -1175,6 +1183,14 @@ def _selection_hash(selected_videos: list[str], frame_step: int, max_frames: int
         "max_frames": max_frames,
     }
     return hashlib.sha1(json.dumps(data, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+
+def _decode_progress_total(video_infos: list[dict], max_frames: int | None) -> int:
+    total = 0
+    for info in video_infos:
+        frame_count = int(info.get("frame_count") or 0)
+        total += min(frame_count, int(max_frames)) if max_frames else frame_count
+    return total
 
 
 CORE_TIMELINE_ARTIFACTS = {

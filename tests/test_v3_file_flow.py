@@ -2008,7 +2008,7 @@ class Model:
             self.assertIn("model.to(device)", result["errors"][0]["message"])
             self.assertIn("Model(..., device=...)", result["errors"][0]["message"])
 
-    def test_api_multi_npu_run_exposes_shard_jobs(self) -> None:
+    def test_api_multi_npu_run_queues_decode_before_shard_jobs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
             workspace.ensure()
@@ -2023,7 +2023,7 @@ class Model:
                 with (
                     patch("vfieval.file_inputs.list_npu_devices", return_value=fake_npus),
                     patch("vfieval.file_inputs._dry_run_model_file", return_value=None),
-                    patch("vfieval.server._start_local_npu_worker_processes", return_value=[]),
+                    patch("vfieval.server.start_decode_worker") as start_decode_worker,
                 ):
                     created = _post(
                         base_url,
@@ -2043,12 +2043,14 @@ class Model:
                 run = _get(base_url, f"/api/runs/{created['run_id']}")
                 self.assertEqual(run["metadata"]["execution_mode"], "multi_npu")
                 self.assertEqual(run["metadata"]["devices"], ["npu:0", "npu:1"])
+                self.assertEqual(run["status"], "decoding")
+                start_decode_worker.assert_called_once()
+                decode_jobs = [job for job in run["jobs"] if job["role"] == "decode"]
+                self.assertEqual(len(decode_jobs), 1)
+                self.assertEqual(decode_jobs[0]["status"], "queued")
+                self.assertGreater(int(decode_jobs[0]["progress_total"] or 0), 0)
                 inference_jobs = [job for job in run["jobs"] if job["role"] == "inference"]
-                self.assertEqual(len(inference_jobs), 2)
-                self.assertEqual([job["device"] for job in inference_jobs], ["npu:0", "npu:1"])
-                self.assertEqual([job["shard_index"] for job in inference_jobs], [0, 1])
-                self.assertTrue(all(job["status"] == "queued" for job in inference_jobs))
-                self.assertTrue(all(int(job["progress_total"] or 0) > 0 for job in inference_jobs))
+                self.assertEqual(inference_jobs, [])
             finally:
                 server.shutdown()
                 server.server_close()

@@ -66,7 +66,7 @@ def main(argv: list[str] | None = None) -> int:
     prepare_metrics.add_argument("--check-only", action="store_true")
 
     worker = sub.add_parser("worker")
-    worker.add_argument("--role", choices=["inference", "metric", "all"], default="all")
+    worker.add_argument("--role", choices=["decode", "inference", "metric", "all"], default="all")
     worker.add_argument("--once", action="store_true")
     worker.add_argument("--poll-interval", type=float, default=5.0)
     worker.add_argument("--worker-id")

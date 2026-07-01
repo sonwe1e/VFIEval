@@ -472,6 +472,7 @@ th {
 }
 
 .queued,
+.decoding,
 .running,
 .cancel_requested,
 .metric_queued,
@@ -491,6 +492,30 @@ th {
   gap: 8px;
   align-items: center;
   flex-wrap: wrap;
+}
+
+.decode-panel {
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 14px;
+  background: rgba(255, 255, 255, 0.62);
+}
+
+.progress-bar {
+  height: 10px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: #efe8d7;
+  border: 1px solid var(--line);
+  margin: 10px 0 14px;
+}
+
+.progress-bar span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--accent), #6aa18f);
+  transition: width 180ms ease;
 }
 
 .compact-head {

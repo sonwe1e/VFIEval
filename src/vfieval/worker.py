@@ -4,6 +4,7 @@ import os
 import platform
 import shutil
 import socket
+import subprocess
 import time
 import traceback
 from dataclasses import dataclass
@@ -14,15 +15,18 @@ from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
 from vfieval.devices import list_npu_devices, npu_unavailable_reason, prepare_worker_device, supported_precisions
 from vfieval.job_errors import describe_job_failure, enrich_job_error
+from vfieval.orchestration import create_inference_jobs_for_run, start_workers_for_run
+from vfieval.pipeline.decode_runner import run_decode_job
 from vfieval.pipeline.inference import RunCanceled, run_inference_job
 from vfieval.pipeline.metrics_runner import run_metric_job
 from vfieval.metrics import METRIC_NAMES
 
 
 ROLE_KINDS = {
+    "decode": ["decode"],
     "inference": ["inference"],
     "metric": ["metric"],
-    "all": ["inference", "metric"],
+    "all": ["decode", "inference", "metric"],
 }
 
 
@@ -66,10 +70,7 @@ def detect_capabilities() -> dict[str, object]:
             "npu": supported_precisions("npu", available=bool(npu_devices)),
         },
         "metric_support": list(METRIC_NAMES),
-        "decode_backends": {
-            "opencv": _module_available("cv2"),
-            "ffmpeg": shutil.which("ffmpeg") is not None,
-        },
+        "decode_backends": _decode_backend_capabilities(),
     }
 
 
@@ -79,6 +80,47 @@ def _module_available(name: str) -> bool:
         return True
     except ImportError:
         return False
+
+
+def _module_error(name: str) -> str | None:
+    try:
+        __import__(name)
+        return None
+    except ImportError as exc:
+        return str(exc)
+
+
+def _decode_backend_capabilities() -> dict[str, dict[str, object]]:
+    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg_version = None
+    ffmpeg_error = None
+    if ffmpeg:
+        try:
+            completed = subprocess.run(
+                [ffmpeg, "-version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            first_line = (completed.stdout or completed.stderr or "").splitlines()
+            ffmpeg_version = first_line[0] if first_line else None
+            if completed.returncode != 0:
+                ffmpeg_error = completed.stderr.strip() or "ffmpeg -version failed"
+        except Exception as exc:
+            ffmpeg_error = str(exc)
+    return {
+        "opencv": {
+            "available": _module_available("cv2"),
+            "error": _module_error("cv2"),
+        },
+        "ffmpeg": {
+            "available": bool(ffmpeg) and ffmpeg_error is None,
+            "path": ffmpeg,
+            "version": ffmpeg_version,
+            "error": ffmpeg_error or (None if ffmpeg else "ffmpeg is not on PATH"),
+        },
+    }
 
 
 def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions) -> None:
@@ -109,7 +151,15 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
         last_activity = time.time()
 
         try:
-            if job["kind"] == "inference":
+            if job["kind"] == "decode":
+                result = run_decode_job(db, workspace, int(job["id"]))
+                if db.get_job(int(job["id"]))["status"] != "canceled":
+                    db.complete_job(int(job["id"]), result)
+                    run_id = job.get("payload", {}).get("run_id")
+                    if run_id is not None:
+                        create_inference_jobs_for_run(db, int(run_id))
+                        start_workers_for_run(db, workspace, int(run_id))
+            elif job["kind"] == "inference":
                 result = run_inference_job(db, workspace, int(job["id"]))
                 if db.get_job(int(job["id"]))["status"] != "canceled":
                     db.complete_job(int(job["id"]), result.__dict__)

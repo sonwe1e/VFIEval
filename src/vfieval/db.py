@@ -1017,8 +1017,14 @@ class Database:
         inference_job_id = run.get("inference_job_id")
         metric_job_id = run.get("metric_job_id")
         run_job_ids = [int(row["job_id"]) for row in self.list_run_jobs(run_id)]
+        job_rows = self.list_run_jobs(run_id)
+        has_running_job = any(str(row.get("status") or "") == "running" for row in job_rows)
         with self.connection() as conn:
-            if run["status"] in {"queued", "metric_queued"} and (inference_job_id is not None or metric_job_id is not None or run_job_ids):
+            if (
+                run["status"] in {"queued", "metric_queued", "decoding"}
+                and not has_running_job
+                and (inference_job_id is not None or metric_job_id is not None or run_job_ids)
+            ):
                 target_ids = list(dict.fromkeys(
                     [
                         *run_job_ids,
@@ -1400,14 +1406,30 @@ class Database:
         claimed = self.get_job(int(row["id"]))
         return claimed
 
-    def update_job_progress(self, job_id: int, current: int, total: int | None = None) -> None:
+    def update_job_progress(
+        self,
+        job_id: int,
+        current: int,
+        total: int | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> None:
         with self.connection() as conn:
-            if total is None:
+            if total is None and result is None:
                 conn.execute("UPDATE jobs SET progress_current = ? WHERE id = ?", (current, job_id))
-            else:
+            elif total is None:
+                conn.execute(
+                    "UPDATE jobs SET progress_current = ?, result_json = ? WHERE id = ?",
+                    (current, _json(result), job_id),
+                )
+            elif result is None:
                 conn.execute(
                     "UPDATE jobs SET progress_current = ?, progress_total = ? WHERE id = ?",
                     (current, total, job_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE jobs SET progress_current = ?, progress_total = ?, result_json = ? WHERE id = ?",
+                    (current, total, _json(result), job_id),
                 )
 
     def complete_job(self, job_id: int, result: dict[str, Any] | None = None) -> None:
