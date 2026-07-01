@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
+from vfieval.file_inputs import decode_cache_key
 from vfieval.orchestration import create_inference_jobs_for_run
 from vfieval.pipeline.decode_runner import run_decode_job
 from vfieval.server import _create_run_from_files
@@ -184,6 +185,104 @@ class DecodeProgressTests(unittest.TestCase):
         self.assertTrue(capabilities["decode_backends"]["opencv"]["available"])
         self.assertFalse(capabilities["decode_backends"]["ffmpeg"]["available"])
         self.assertIn("PATH", capabilities["decode_backends"]["ffmpeg"]["error"])
+
+    def test_second_run_reuses_decode_cache_without_decoding_again(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video_path = root / "clip.mp4"
+            video_path.write_bytes(b"not a real video but stable cache input")
+            workspace = WorkspaceConfig.from_root(root / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("dummy", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset(
+                "video",
+                str(root),
+                True,
+                source_type="video",
+                decode_mode="video_gt_triplets",
+                metadata={"frame_step": 1, "selected_videos": ["clip.mp4"]},
+            )
+
+            def fake_decode(_video_path, output_dir, _max_frames, decode_backend="auto", progress_callback=None):
+                frames = []
+                for index in range(5):
+                    frame = output_dir / f"{index:06d}.png"
+                    Image.new("RGB", (8, 8), (index, 0, 0)).save(frame)
+                    frames.append(frame)
+                if progress_callback:
+                    progress_callback({"event": "video_done", "backend": "opencv", "frames": len(frames)})
+                return frames, 24.0, [index / 24.0 for index in range(5)], {"backend": "opencv", "fallback_reason": None}
+
+            first_run = db.create_run("first", model_id, dataset_id, 8, 8, 1, "cpu", "fp32", [], create_inference_job=False)
+            first_job = db.add_run_job(
+                first_run,
+                "decode",
+                {"run_id": first_run, "dataset_id": dataset_id, "total_frames": 5},
+                progress_total=5,
+            )
+            with patch("vfieval.datasets._decode_video", side_effect=fake_decode) as decode_video:
+                first_result = run_decode_job(db, workspace, first_job)
+            self.assertEqual(first_result["samples"], 3)
+            decode_video.assert_called_once()
+
+            second_run = db.create_run("second", model_id, dataset_id, 8, 8, 1, "cpu", "fp32", [], create_inference_job=False)
+            second_job = db.add_run_job(
+                second_run,
+                "decode",
+                {"run_id": second_run, "dataset_id": dataset_id, "total_frames": 5},
+                progress_total=5,
+            )
+            with (
+                patch("vfieval.datasets._decode_video_ffmpeg") as ffmpeg_decode,
+                patch("vfieval.datasets._decode_video_opencv") as opencv_decode,
+            ):
+                second_result = run_decode_job(db, workspace, second_job)
+
+            ffmpeg_decode.assert_not_called()
+            opencv_decode.assert_not_called()
+            second_job_row = db.get_job(second_job)
+            self.assertEqual(second_result["samples"], 3)
+            self.assertEqual(second_job_row["result"]["phase"], "indexing_cached_frames")
+            self.assertEqual(second_job_row["result"]["backend"], "cache")
+            self.assertEqual(second_job_row["result"]["cache_hits"], 1)
+            self.assertEqual(second_job_row["result"]["cache_misses"], 0)
+            self.assertEqual(second_job_row["result"]["manifest_backend"], "opencv")
+            self.assertEqual(second_job_row["progress_current"], 5)
+
+    def test_decode_cache_key_ignores_model_runtime_and_metric_choices(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = Path(tmp) / "clip.mp4"
+            video_path.write_bytes(b"same source video")
+
+            base_key = decode_cache_key(video_path, "video_gt_triplets", 1, 12)
+            changed_model = decode_cache_key(video_path, "video_gt_triplets", 1, 12)
+            changed_checkpoint = decode_cache_key(video_path, "video_gt_triplets", 1, 12)
+            changed_device = decode_cache_key(video_path, "video_gt_triplets", 1, 12)
+            changed_metrics = decode_cache_key(video_path, "video_gt_triplets", 1, 12)
+
+            self.assertEqual(base_key, changed_model)
+            self.assertEqual(base_key, changed_checkpoint)
+            self.assertEqual(base_key, changed_device)
+            self.assertEqual(base_key, changed_metrics)
+
+    def test_decode_cache_key_changes_when_sampling_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = Path(tmp) / "clip.mp4"
+            video_path.write_bytes(b"same source video")
+
+            base_key = decode_cache_key(video_path, "video_gt_triplets", 1, 12)
+
+            self.assertNotEqual(base_key, decode_cache_key(video_path, "video_gt_triplets", 2, 12))
+            self.assertNotEqual(base_key, decode_cache_key(video_path, "video_gt_triplets", 1, 24))
+
+    def test_run_detail_contains_decode_cache_reuse_copy(self) -> None:
+        app_js = (ROOT / "src" / "vfieval" / "web" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("Reusing decoded cache", app_js)
+        self.assertIn("rebuilding this Run's sample index", app_js)
+        self.assertIn("Cache miss", app_js)
 
 
 if __name__ == "__main__":

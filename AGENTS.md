@@ -28,6 +28,7 @@ These are done and must not regress:
 - `GET /api/files/{artifact_id}` honors HTTP byte ranges and streams in 4 MiB chunks for video playback.
 - Run deletion and cleanup only touch `.vfieval/runs/{run_id}` and run-scoped metadata.
 - Video-group Run creation must expose decoding as a `decode` job with frame progress, backend details, and fallback reasons before inference jobs are queued.
+- Re-running the same video input must reuse `decode_cache`; only stale or missing cache entries should be decoded again, and UI must distinguish cache reuse from actual decoding.
 
 ## Current Priorities
 

@@ -26,6 +26,8 @@ def run_decode_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
         "total_frames": total_frames,
         "cache_hits": 0,
         "cache_misses": 0,
+        "cache_hit_videos": [],
+        "cache_miss_videos": [],
         "fallback_reason": None,
         "samples": 0,
     }
@@ -44,17 +46,30 @@ def run_decode_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
         ensure_not_canceled()
         decoded_frames = int(event.get("decoded_frames") or state.get("decoded_frames") or 0)
         total = int(event.get("total_frames") or state.get("total_frames") or total_frames or 0)
+        cache_hits = int(event.get("cache_hits") or state.get("cache_hits") or 0)
+        cache_misses = int(event.get("cache_misses") or state.get("cache_misses") or 0)
+        backend = event.get("backend") or state.get("backend") or decode_backend
+        if cache_hits > 0 and cache_misses > 0:
+            backend = "mixed"
+        elif cache_hits > 0 and cache_misses == 0:
+            backend = "cache"
+        phase = event.get("phase") or state.get("phase") or "decode"
+        if cache_hits > 0 and cache_misses == 0 and phase == "decode":
+            phase = "indexing_cached_frames"
         state.update(
             {
-                "backend": event.get("backend") or state.get("backend") or decode_backend,
+                "phase": phase,
+                "backend": backend,
                 "manifest_backend": event.get("manifest_backend") or state.get("manifest_backend"),
                 "current_video": event.get("video_name") or state.get("current_video"),
                 "video_index": int(event.get("video_index") or state.get("video_index") or 0),
                 "video_count": int(event.get("video_count") or state.get("video_count") or 0),
                 "decoded_frames": decoded_frames,
                 "total_frames": total,
-                "cache_hits": int(event.get("cache_hits") or state.get("cache_hits") or 0),
-                "cache_misses": int(event.get("cache_misses") or state.get("cache_misses") or 0),
+                "cache_hits": cache_hits,
+                "cache_misses": cache_misses,
+                "cache_hit_videos": event.get("cache_hit_videos") or state.get("cache_hit_videos") or [],
+                "cache_miss_videos": event.get("cache_miss_videos") or state.get("cache_miss_videos") or [],
                 "fallback_reason": event.get("fallback_reason") or state.get("fallback_reason"),
             }
         )
@@ -63,6 +78,7 @@ def run_decode_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
             db.update_run_progress(run_id, decoded_frames, total if total > 0 else None, "decoding")
 
     ensure_not_canceled()
+    state["phase"] = "checking_cache"
     db.update_job_progress(job_id, 0, total_frames if total_frames > 0 else None, result=dict(state))
     if run_id is not None:
         db.mark_run_started(run_id, "decoding")
@@ -79,6 +95,9 @@ def run_decode_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
     if samples <= 0:
         raise ValueError("视频解码未生成可推理的样本")
 
+    if int(state.get("cache_hits") or 0) > 0 and int(state.get("cache_misses") or 0) == 0:
+        state["phase"] = "indexing_cached_frames"
+        state["backend"] = "cache"
     state.update({"status": "completed", "samples": int(samples)})
     db.update_job_progress(
         job_id,

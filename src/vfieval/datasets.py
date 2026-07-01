@@ -108,6 +108,8 @@ def scan_video_dataset(
     progress_counts = [0 for _ in videos]
     cache_hits = 0
     cache_misses = 0
+    cache_hit_videos: list[str] = []
+    cache_miss_videos: list[str] = []
     lock = Lock()
 
     def decode_one(video_index: int, video_path: Path) -> tuple[str, list[Path], float, list[float], dict[str, Any]]:
@@ -124,9 +126,11 @@ def scan_video_dataset(
                 if event.get("event") == "cache_hit" and not local_cache_hit:
                     local_cache_hit = True
                     cache_hits += 1
+                    cache_hit_videos.append(video_path.name)
                 elif event.get("event") == "cache_miss" and not event.get("_cache_miss_counted"):
                     event["_cache_miss_counted"] = True
                     cache_misses += 1
+                    cache_miss_videos.append(video_path.name)
                 payload = {
                     **event,
                     "video_index": video_index,
@@ -135,6 +139,8 @@ def scan_video_dataset(
                     "decoded_frames": sum(progress_counts),
                     "cache_hits": cache_hits,
                     "cache_misses": cache_misses,
+                    "cache_hit_videos": list(cache_hit_videos),
+                    "cache_miss_videos": list(cache_miss_videos),
                 }
             progress_callback(payload)
 
@@ -548,6 +554,7 @@ def _decode_video_cached(
                 progress_callback(
                     {
                         "event": "cache_hit",
+                        "phase": "indexing_cached_frames",
                         "backend": "cache",
                         "manifest_backend": manifest.get("decode_backend"),
                         "frames": len(frames),
@@ -563,7 +570,7 @@ def _decode_video_cached(
     partial_dir.mkdir(parents=True, exist_ok=True)
     try:
         if progress_callback:
-            progress_callback({"event": "cache_miss", "backend": decode_backend, "frames": 0})
+            progress_callback({"event": "cache_miss", "phase": "decoding", "backend": decode_backend, "frames": 0})
         frames, fps, timestamps, decode_info = _decode_video(
             video_path,
             partial_dir,
@@ -572,13 +579,14 @@ def _decode_video_cached(
             progress_callback=progress_callback,
         )
         width, height = _frame_size(frames[0]) if frames else (0, 0)
+        final_frames = [output_dir / path.name for path in frames]
         manifest = {
             "video_name": video_path.stem,
             "video_file": video_path.name,
             "video_path": str(video_path.resolve()),
             "cache_key": cache_key,
             "fps": fps,
-            "frames": [str(path.resolve()) for path in frames],
+            "frames": [str(path.resolve()) for path in final_frames],
             "timestamps": timestamps,
             "frame_count": len(frames),
             "width": width,
@@ -595,8 +603,7 @@ def _decode_video_cached(
         }
         (partial_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
         partial_dir.rename(output_dir)
-        frames = [output_dir / path.name for path in frames]
-        return frames, fps, timestamps, decode_info
+        return final_frames, fps, timestamps, decode_info
     except Exception:
         if partial_dir.exists():
             shutil.rmtree(partial_dir)

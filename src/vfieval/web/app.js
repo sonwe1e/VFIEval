@@ -867,10 +867,12 @@ function renderJobDetail(job) {
   const result = job.result || {};
   if (job.role === "decode" || job.kind === "decode") {
     const bits = [];
+    if (result.phase) bits.push(`phase=${result.phase}`);
     if (result.backend) bits.push(`backend=${result.backend}`);
     if (result.manifest_backend) bits.push(`cached=${result.manifest_backend}`);
     if (result.current_video) bits.push(`video=${result.current_video}`);
     if (result.cache_hits || result.cache_misses) bits.push(`cache ${result.cache_hits || 0}/${result.cache_misses || 0}`);
+    if (result.cache_miss_videos?.length) bits.push(`miss=${result.cache_miss_videos.join(", ")}`);
     if (result.fallback_reason) bits.push(`fallback=${result.fallback_reason}`);
     return escapeHtml(bits.join(" | ") || "-");
   }
@@ -917,12 +919,20 @@ function renderDecodePanel(run) {
   const backend = result.backend || "auto";
   const currentVideo = result.current_video || "-";
   const cacheText = `${result.cache_hits || 0} hit / ${result.cache_misses || 0} miss`;
+  const phase = result.phase || (backend === "cache" ? "indexing_cached_frames" : "decoding");
+  const cacheMissVideos = result.cache_miss_videos || [];
+  const decodeTitle = phase === "checking_cache" ? "Checking decode cache" : phase === "indexing_cached_frames" ? "Reusing decoded cache" : "Decode progress";
+  const decodeHint = phase === "checking_cache"
+    ? "Checking whether decoded frames can be reused before inference jobs are queued."
+    : phase === "indexing_cached_frames"
+      ? "Reusing decoded frames and rebuilding this Run's sample index."
+      : "Frames are decoded before inference jobs are queued.";
   return `
     <section class="decode-panel">
       <div class="panel-head">
         <div>
-          <h3>Decode progress</h3>
-          <p class="muted">Frames are decoded before inference jobs are queued.</p>
+          <h3>${escapeHtml(decodeTitle)}</h3>
+          <p class="muted">${escapeHtml(decodeHint)}</p>
         </div>
         ${statusBadge(job?.status || run.status)}
       </div>
@@ -933,6 +943,7 @@ function renderDecodePanel(run) {
         <div><span>Backend</span><strong>${escapeHtml(backend)}</strong></div>
         <div><span>Cache</span><strong>${escapeHtml(cacheText)}</strong></div>
       </div>
+      ${cacheMissVideos.length ? `<div class="message warn"><p><strong>Cache miss</strong>: ${escapeHtml(cacheMissVideos.join(", "))} will be decoded again because its cache is missing or stale.</p></div>` : ""}
       ${result.fallback_reason ? `<div class="message warn"><p><strong>Decode fallback</strong>: ${escapeHtml(result.fallback_reason)}</p></div>` : ""}
     </section>
   `;
