@@ -43,11 +43,6 @@ def _is_relative_to(path: Path, root: Path) -> bool:
         return False
 
 
-def inspect_compare_source(workspace: WorkspaceConfig, source: str) -> dict[str, Any]:
-    path = resolve_compare_source_path(workspace, source)
-    return inspect_compare_path(workspace, path)
-
-
 def inspect_compare_path(workspace: WorkspaceConfig, path: Path) -> dict[str, Any]:
     path = path.resolve()
     if path.is_file():
@@ -91,12 +86,11 @@ def resolve_compare_descriptor(
     descriptor: Any,
     role: str | None = None,
 ) -> dict[str, Any]:
-    if isinstance(descriptor, str):
-        info = inspect_compare_source(workspace, descriptor)
-        info.update({"descriptor_kind": "path", "role": role or "unknown", "label": info["name"]})
-        return info
     if not isinstance(descriptor, dict):
-        raise ValueError("compare source descriptor must be an object or legacy path string")
+        raise ValueError(
+            "compare source descriptor must be an object with a 'kind' field; "
+            "raw path strings are no longer accepted"
+        )
 
     kind = str(descriptor.get("kind") or "").strip()
     if kind == "video_group":

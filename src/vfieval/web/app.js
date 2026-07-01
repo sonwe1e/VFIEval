@@ -167,10 +167,6 @@ function renderModeSections() {
     item.hidden = item.dataset.modeSection !== runType;
   });
   $("video-selection").hidden = runType !== "model_inference";
-  document.querySelectorAll(".mode-compare input[name='reference'], .mode-compare input[name='distorted']").forEach((input) => {
-    const label = input.closest("label");
-    if (label) label.hidden = true;
-  });
   $("video-selection").hidden = false;
 }
 
@@ -446,30 +442,24 @@ function payloadFromForm() {
   if ((data.run_type || "model_inference") === "video_compare") {
     const gt = selectedCompareGt();
     const predRows = selectedComparePredRows();
-    if (gt && predRows.length) {
-      return {
-        run_type: "video_compare",
-        reference: { kind: "video_group", group: gt.group, video: gt.video },
-        distorted: predRows.map((row) => ({
-          kind: "run_artifact",
-          run_id: Number(row.run_id),
-          video: row.video,
-          artifact_id: Number(row.artifact_id),
-          label: row.compare_track_label || row.run_name || `run-${row.run_id}`,
-        })),
-        extra_layers: predRows.map((row) => ({
-          source: "run_artifact",
-          run_id: Number(row.run_id),
-          kinds: Array.from(state.selectedCompareLayerKinds),
-        })),
-        align_mode: data.align_mode || "strict",
-        metrics: selectedMetrics(),
-      };
+    if (!gt || !predRows.length) {
+      return null;
     }
     return {
       run_type: "video_compare",
-      reference: data.reference || "",
-      distorted: data.distorted || "",
+      reference: { kind: "video_group", group: gt.group, video: gt.video },
+      distorted: predRows.map((row) => ({
+        kind: "run_artifact",
+        run_id: Number(row.run_id),
+        video: row.video,
+        artifact_id: Number(row.artifact_id),
+        label: row.compare_track_label || row.run_name || `run-${row.run_id}`,
+      })),
+      extra_layers: predRows.map((row) => ({
+        source: "run_artifact",
+        run_id: Number(row.run_id),
+        kinds: Array.from(state.selectedCompareLayerKinds),
+      })),
       align_mode: data.align_mode || "strict",
       metrics: selectedMetrics(),
     };
@@ -504,14 +494,12 @@ function schedulePreflight(delay = 250) {
 
 async function runPreflight() {
   const payload = payloadFromForm();
-  if (payload.run_type === "video_compare") {
-    const hasDistorted = Array.isArray(payload.distorted) ? payload.distorted.length > 0 : !!payload.distorted;
-    if (!payload.reference || !hasDistorted) {
-      state.preflight = null;
-      renderPreflight();
-      return;
-    }
-  } else if (!payload.model_file || !payload.video_group) {
+  if (!payload) {
+    state.preflight = null;
+    renderPreflight();
+    return;
+  }
+  if (payload.run_type !== "video_compare" && (!payload.model_file || !payload.video_group)) {
     state.preflight = null;
     renderPreflight();
     return;
@@ -698,6 +686,11 @@ function table(rows, columns) {
 
 async function startRun(event) {
   event.preventDefault();
+  const payload = payloadFromForm();
+  if (!payload) {
+    toast("请先在选择器里选好 GT 和 Pred");
+    return;
+  }
   await runPreflight();
   if (!state.preflight?.ok) {
     toast("预检查未通过");
@@ -705,7 +698,7 @@ async function startRun(event) {
   }
   const created = await api("/api/runs", {
     method: "POST",
-    body: JSON.stringify(payloadFromForm()),
+    body: JSON.stringify(payload),
   });
   toast(`Run #${created.run_id} 已开始`);
   switchView("runs");
@@ -909,6 +902,26 @@ function renderCleanedArtifactsNotice(run) {
   return `<div class="message warn"><p><strong>产物已清理</strong>: 这个 Run 的磁盘产物已经删除；时间线和指标摘要仍可查看，如需重新查看 Pred / GT / Diff，请重试重新生成。</p></div>`;
 }
 
+function renderModelLoadReport(run) {
+  const report = run?.result?.model_load;
+  if (!report || typeof report !== "object") return "";
+  const matched = Number(report.matched ?? 0);
+  const total = Number(report.total_in_checkpoint ?? 0);
+  const missing = Array.isArray(report.missing_keys) ? report.missing_keys : [];
+  const unexpected = Array.isArray(report.unexpected_keys) ? report.unexpected_keys : [];
+  const hasProblem = missing.length > 0 || unexpected.length > 0;
+  const cls = hasProblem ? "message warn" : "message";
+  const summary = `已匹配权重: ${matched} / ${total} (missing ${missing.length}, unexpected ${unexpected.length})`;
+  const detailBits = [];
+  if (missing.length) {
+    detailBits.push(`<details><summary>missing keys (${missing.length})</summary><pre>${escapeHtml(missing.slice(0, 100).join("\n"))}</pre></details>`);
+  }
+  if (unexpected.length) {
+    detailBits.push(`<details><summary>unexpected keys (${unexpected.length})</summary><pre>${escapeHtml(unexpected.slice(0, 100).join("\n"))}</pre></details>`);
+  }
+  return `<div class="${cls}"><p><strong>Checkpoint</strong>: ${escapeHtml(summary)}</p>${detailBits.join("")}</div>`;
+}
+
 function renderDecodePanel(run) {
   const job = (run.jobs || []).find((item) => item.role === "decode" || item.kind === "decode");
   if (!job && run.status !== "decoding") return "";
@@ -1015,6 +1028,7 @@ function renderRunDetail() {
     </div>
     ${renderRunError(run)}
     ${renderCleanedArtifactsNotice(run)}
+    ${renderModelLoadReport(run)}
     ${renderDecodePanel(run)}
     <div class="message"><p><strong>Execution</strong>: ${runExecutionTarget(run)}</p></div>
     ${renderMetricHealthTable(run.metadata?.metric_health || {})}

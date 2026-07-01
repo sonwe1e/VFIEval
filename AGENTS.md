@@ -15,6 +15,7 @@ Do not add training features. Do not implement PSNR.
 - V11 added the foundation for NPU-aware device handling, run deletion and cleanup, preview artifacts, checkpoint discovery, and lightweight artifact grouping.
 - V12 closed real deployment loops: Ascend NPU multi-device inference, portable metric assets, strict device consistency, direct GT/Pred video comparison (single track, local-path input), 4K-safe lazy previews, per-sample error capture, byte-range artifact streaming, and clearer failure reporting.
 - V13 turns Compare into a first-class evaluation surface: GT and Pred are selected from server-resident resources (`videos/` groups and completed-run pred artifacts), one GT can be compared against multiple Pred tracks (predA / predB / ...), flow / mask / warp layers can be shown side-by-side, and the timeline/sample APIs are restructured so a single page request does not load the entire run.
+- V13.1 unblocked NPU/CUDA throughput and closed silent-failure gaps: the inference pipeline now overlaps decode / model / save via a prefetch pool and an async save pool, checkpoint loads produce a structured report with missing/unexpected keys, dry-run inspects flow/mask magnitudes to catch "weights never loaded" runs before the queue starts, and the last raw-string Compare descriptor path was removed from HTTP surface, JS payloads, and tests.
 
 ## Recently Stabilized (V12)
 
@@ -52,7 +53,8 @@ Do not expand to remote workers, auth, object storage, or new metric families un
 - Do not substitute unavailable metrics with a different score.
 - Do not render all 4K artifacts at once.
 - Every failed run must show a human-readable error in UI.
-- Compare's primary entry must select GT from `videos/{group}/` and Pred from completed-run artifacts via the server APIs. Typed absolute paths remain only as a fallback under an "advanced" disclosure, never as the default form.
+- Runs where the model outputs are structurally valid but semantically empty (flow ≈ 0 and mask ≈ constant, or NaN) must be surfaced as preflight warnings — do not let a "weights never loaded" run silently proceed to a gray-blend result.
+- Compare's primary entry must select GT from `videos/{group}/` and Pred from completed-run artifacts via the server APIs. Raw string descriptors and typed absolute paths are no longer accepted by `POST /api/preflight` or `POST /api/runs` — the server rejects any `reference` / `distorted` field that is not a `{kind: ...}` dict.
 - A Compare run may carry multiple Pred tracks. Every Pred tile in the UI must display its `track_label` and `kind` so the user can tell which model produced which output.
 - The server never trusts a `path` field sent by the client for Pred / flow / mask sources. The descriptor (`{kind, run_id, video, ...}`) is resolved server-side through `db.list_run_artifacts` and `file_inputs` helpers.
 - Sample-level and video-level APIs (`/api/runs/{id}/videos`, `/videos/{name}/timeline`, `/samples/{id}`) must not iterate the entire run's samples / artifacts / metrics. Only the legacy `/api/runs/{id}/timeline` debug endpoint is allowed to materialize a full-run view.
@@ -164,9 +166,7 @@ Run creation accepts a structured Compare payload:
 }
 ```
 
-The legacy string form (`reference: "<path>"`, `distorted: "<path>"`) remains accepted as a compatibility fallback for the advanced form, but is not surfaced as the default UI.
-
-Server-side descriptor resolution lives in `compare_inputs.resolve_compare_descriptor(workspace, db, descriptor)`. It must reject any descriptor whose resolved disk path is not produced by `file_inputs` (for GT) or `db.list_run_artifacts` (for Pred / flow / mask). Path strings sent by the client are never used directly.
+Server-side descriptor resolution lives in `compare_inputs.resolve_compare_descriptor(workspace, db, descriptor)`. It must reject any descriptor whose resolved disk path is not produced by `file_inputs` (for GT) or `db.list_run_artifacts` (for Pred / flow / mask). Path strings sent by the client are never used directly. Raw string descriptors are rejected outright with `"compare source descriptor must be an object with a 'kind' field"` — the legacy fallback has been removed.
 
 Compare run artifacts must be track-scoped on disk: `.vfieval/runs/{run_id}/videos/{video_name}/{track_label}/pred.mp4` and `.../diff.mp4`. The `gt.mp4` for that video is shared across tracks at `.vfieval/runs/{run_id}/videos/{video_name}/gt.mp4`. Each sample row's `name` encodes `{video_stem}__{track_label}__{frame_index:06d}` so per-track timeline filtering works without schema changes. Artifact metadata records `compare_track_label` and `compare_track_run_id` for every Pred / flow / mask / warp / blend artifact.
 
@@ -195,6 +195,23 @@ Strict alignment (`compare_inputs.validate_strict_alignment`) is applied per `(r
 - Every tile must show its `track_label` and `kind` chip. Default `extra_*` group stays collapsed.
 - Video tiles use `<video controls playsinline preload="metadata">` and remain paused on load. A master play control synchronizes `currentTime` and `play()` across all tiles in the active group so multi-track videos do not drift.
 - Hovering a tile highlights the corresponding frame on the timeline; clicking a timeline point updates every tile in the grid.
+
+## Inference Pipeline Concurrency
+
+The inference hot loop is asynchronous by default. Do not reintroduce per-sample `.cpu()` calls or synchronous PNG writes on the main compute thread.
+
+- `_iter_prefetched_batches` runs a `ThreadPoolExecutor` (default 2 workers, configurable via `payload["prefetch_workers"]`) that PIL-decodes `img0` / `img1` / GT in parallel and holds up to 2 batches ahead of the device. `pin_memory()` is applied when CUDA is available so the device transfer can be `non_blocking=True`.
+- The main loop only does `.to(device, non_blocking=True)` → `model.predict` → `normalize` → `compose_interpolated` → a single `.detach().to("cpu")` per bundle, then hands off to the save pool. It must not touch the filesystem or SQLite.
+- `_AsyncSavePipeline` runs a `ThreadPoolExecutor` sized `min(8, cpu_count())` (configurable via `payload["save_workers"]`). Each background sample writes 8 core PNGs, per-artifact previews, extra visualizations, difference, and `db.add_artifact` records. Because every write uses its own short-lived sqlite3 connection through `Database.connection()`, WAL-mode file locking is enough — no cross-thread `Lock` around DB writes.
+- Progress updates coalesce to at most `total // 200` events; do not push per-sample updates from inside the save pool.
+
+## Preflight Diagnostics
+
+`_dry_run_model_file` returns `{output_health, model_load}` and `preflight_run` promotes both into the response so the UI can surface silent-failure runs before they start.
+
+- `output_health.stats` records `abs_mean` / `abs_max` / `nan_count` for `flowt_0`, `flowt_1`, and post-sigmoid `mask0` / `mask1`. If `abs_max < 1e-4` on both flows AND `std < 1e-3` on both masks, a warning is emitted (`"flow ≈ 0 且 mask ≈ constant"`) — this is the checkpoint-never-loaded signature (`sigmoid(0) = 0.5`).
+- `model_load` is produced by `vfieval.models.utils.load_state_dict_portable`. It loads with `strict=False`, returns `{checkpoint_path, matched, total_in_checkpoint, missing_keys, unexpected_keys}`, and attaches the same dict to `module._last_load_report`. Any non-empty missing/unexpected list surfaces as a `CheckpointLoadReport` warning in `preflight` and as `run.result_json.model_load` after inference; `run_dir/logs/model_load.log` records the same list.
+- The Run Detail UI (`renderModelLoadReport`) renders the summary line and switches to a warn banner when either list is non-empty.
 
 ## NPU And Multi-Device Rules
 
@@ -261,7 +278,13 @@ Every Codex session working on VFIEval should read this `AGENTS.md` before plann
 3. Make multi-track Compare reach `.vfieval/runs/{run_id}/videos/{video_name}/{track_label}/pred.mp4` on disk and surface labeled `(track, kind)` tiles in Run Detail. Strict alignment runs per track; any failure aborts the whole run with a per-track reason.
 4. Add the three new indices (`idx_artifacts_sample`, `idx_metric_results_sample`, `idx_run_jobs_device`) to `db.py` and rewrite `_run_videos` / `_run_video_timeline` / `_run_sample_payload` so they no longer call `_run_timeline` internally.
 5. Pause the frontend runs poll on `document.hidden`, abort stale sample/timeline requests with `AbortController`, and bind the `run-error-banner` retry to `_retry_run`.
-6. Keep the primary UI clean: no model registration, dataset registration, raw jobs, or experiment administration in the first-run workflow. The Compare advanced fallback for typed local paths stays collapsed.
+6. Keep the primary UI clean: no model registration, dataset registration, raw jobs, or experiment administration in the first-run workflow. Compare no longer exposes any typed local-path input.
+
+## V13.1 Fixes Landed
+
+1. **Async inference throughput** — `pipeline/inference.py` was refactored around `_iter_prefetched_batches` and `_AsyncSavePipeline`. The main compute loop performs one device→host transfer per batch; PNG encoding, preview generation, and `db.add_artifact` inserts happen in the background save pool. Timing accounting now separates `decode` (prefetch wait), `model`, `post`, `save` (main-thread submit time only). `payload["save_workers"]` and `payload["prefetch_workers"]` allow per-run tuning.
+2. **Silent-failure diagnostics** — `load_state_dict_portable` no longer discards `missing_keys` / `unexpected_keys`. `_dry_run_model_file` inspects flow magnitude and mask variance and returns diagnostics up through `preflight_run` / Run Detail. Any run whose checkpoint didn't attach is flagged before compute starts.
+3. **Compare raw-path removal** — `web/index.html` no longer contains reference/distorted text inputs; `app.js::payloadFromForm` returns `null` unless a structured GT + Pred picker selection exists; `compare_inputs.resolve_compare_descriptor` rejects strings; `server.py` dispatches `video_compare` strictly on `run_type`. Six `tests/test_v3_file_flow.py` cases were rewritten to use `{kind: "video_group"}` / `{kind: "run_artifact"}` descriptors via `v13_test_utils`; `test_video_compare_rejects_raw_string_descriptors` asserts the new rejection path.
 
 ## Future Roadmap
 

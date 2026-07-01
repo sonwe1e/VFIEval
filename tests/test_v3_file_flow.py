@@ -20,6 +20,9 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from v13_test_utils import add_completed_pred_run, make_workspace, post_json, start_server, stop_server, write_mp4
 
 from vfieval.config import WorkspaceConfig
 from vfieval.datasets import scan_compare_dataset, scan_triplet_dataset
@@ -1377,103 +1380,75 @@ class Model:
                 thread.join(timeout=5)
 
     def test_api_video_compare_run_generates_gt_pred_diff(self) -> None:
-        from PIL import Image
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": tmp}, clear=False):
+            workspace, db = make_workspace(tmp)
+            gt_path = Path(tmp) / "videos" / "anime" / "clip.mp4"
+            gt_path.parent.mkdir(parents=True, exist_ok=True)
+            write_mp4(gt_path, [(index * 20, 0, 0) for index in range(3)])
+            pred_path = workspace.root / "pred.mp4"
+            write_mp4(pred_path, [(0, index * 20, 0) for index in range(3)])
+            run_a = add_completed_pred_run(db, workspace, "ModelA", pred_path)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
-            workspace.ensure()
-            db = Database(workspace.db_path)
-            db.init()
-            reference_dir = Path(tmp) / "reference_frames"
-            distorted_dir = Path(tmp) / "distorted_frames"
-            reference_dir.mkdir()
-            distorted_dir.mkdir()
-            for index in range(3):
-                Image.new("RGB", (16, 16), (index * 20, 0, 0)).save(reference_dir / f"{index:06d}.png")
-                Image.new("RGB", (16, 16), (0, index * 20, 0)).save(distorted_dir / f"{index:06d}.png")
+            payload = {
+                "run_type": "video_compare",
+                "reference": {"kind": "video_group", "group": "anime", "video": "clip.mp4"},
+                "distorted": [{"kind": "run_artifact", "run_id": run_a, "video": "clip", "label": "ModelA"}],
+                "align_mode": "strict",
+            }
 
-            server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(db, workspace))
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            server, thread, base_url = start_server(db, workspace)
             try:
-                preflight = _post(
-                    base_url,
-                    "/api/preflight",
-                    {
-                        "run_type": "video_compare",
-                        "reference": str(reference_dir),
-                        "distorted": str(distorted_dir),
-                        "align_mode": "strict",
-                    },
-                )
+                preflight = post_json(base_url, "/api/preflight", payload)
                 self.assertTrue(preflight["ok"], preflight)
                 self.assertEqual(preflight["alignment"]["frame_count"], 3)
 
-                created = _post(
-                    base_url,
-                    "/api/runs",
-                    {
-                        "run_type": "video_compare",
-                        "reference": str(reference_dir),
-                        "distorted": str(distorted_dir),
-                        "align_mode": "strict",
-                    },
-                )
-                run = _wait_for_run(base_url, created["run_id"])
+                with patch("vfieval.server._start_local_inference_worker", return_value=None):
+                    created = post_json(base_url, "/api/runs", payload)
+                run_id = int(created["run_id"])
+                job_id = int(db.get_run(run_id)["inference_job_id"])
+                run_inference_job(db, workspace, job_id)
+
+                run = db.get_run(run_id)
                 self.assertEqual(run["status"], "completed", run)
                 self.assertEqual(run["metadata"]["run_type"], "video_compare")
 
-                run_videos = _get(base_url, f"/api/runs/{created['run_id']}/videos")
+                run_videos = _get(base_url, f"/api/runs/{run_id}/videos")
                 self.assertEqual(len(run_videos["videos"]), 1)
                 self.assertEqual(run_videos["videos"][0]["sample_count"], 3)
                 self.assertIn("pred_video", run_videos["videos"][0]["video_artifacts"])
 
-                timeline = _get(base_url, f"/api/runs/{created['run_id']}/timeline")
+                timeline = _get(base_url, f"/api/runs/{run_id}/timeline")
                 sample = timeline["videos"][0]["samples"][0]
-                sample_detail = _get(base_url, f"/api/runs/{created['run_id']}/samples/{sample['sample_id']}")
+                sample_detail = _get(base_url, f"/api/runs/{run_id}/samples/{sample['sample_id']}")
                 self.assertIn("gt", sample_detail["artifacts"])
                 self.assertIn("pred", sample_detail["artifacts"])
                 self.assertIn("difference", sample_detail["artifacts"])
                 self.assertNotIn("flowt_0", sample_detail["artifacts"])
                 self.assertNotIn("mask0", sample_detail["artifacts"])
             finally:
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=5)
+                stop_server(server, thread)
 
     def test_video_compare_run_bypasses_model_loading(self) -> None:
-        from PIL import Image
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": tmp}, clear=False):
+            workspace, db = make_workspace(tmp)
+            gt_path = Path(tmp) / "videos" / "anime" / "clip.mp4"
+            gt_path.parent.mkdir(parents=True, exist_ok=True)
+            write_mp4(gt_path, [(index * 20, 0, 0) for index in range(3)])
+            pred_path = workspace.root / "pred.mp4"
+            write_mp4(pred_path, [(0, index * 20, 0) for index in range(3)])
+            run_a = add_completed_pred_run(db, workspace, "ModelA", pred_path)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
-            workspace.ensure()
-            db = Database(workspace.db_path)
-            db.init()
-            reference_dir = Path(tmp) / "reference_frames"
-            distorted_dir = Path(tmp) / "distorted_frames"
-            reference_dir.mkdir()
-            distorted_dir.mkdir()
-            for index in range(3):
-                Image.new("RGB", (16, 16), (index * 20, 0, 0)).save(reference_dir / f"{index:06d}.png")
-                Image.new("RGB", (16, 16), (0, index * 20, 0)).save(distorted_dir / f"{index:06d}.png")
+            payload = {
+                "run_type": "video_compare",
+                "reference": {"kind": "video_group", "group": "anime", "video": "clip.mp4"},
+                "distorted": [{"kind": "run_artifact", "run_id": run_a, "video": "clip", "label": "ModelA"}],
+                "align_mode": "strict",
+            }
 
-            server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(db, workspace))
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            server, thread, base_url = start_server(db, workspace)
             try:
                 with patch("vfieval.server._start_local_inference_worker", return_value=None):
-                    created = _post(
-                        base_url,
-                        "/api/runs",
-                        {
-                            "run_type": "video_compare",
-                            "reference": str(reference_dir),
-                            "distorted": str(distorted_dir),
-                            "align_mode": "strict",
-                        },
-                    )
+                    created = post_json(base_url, "/api/runs", payload)
 
                 run_id = int(created["run_id"])
                 job_id = int(db.get_run(run_id)["inference_job_id"])
@@ -1501,39 +1476,47 @@ class Model:
                 self.assertNotIn("warp0", sample_detail["artifacts"])
                 self.assertNotIn("blend", sample_detail["artifacts"])
             finally:
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=5)
+                stop_server(server, thread)
 
     def test_video_compare_preflight_rejects_mismatched_frame_counts(self) -> None:
-        from PIL import Image
-
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
-            workspace.ensure()
-            db = Database(workspace.db_path)
-            db.init()
-            reference_dir = Path(tmp) / "reference_frames"
-            distorted_dir = Path(tmp) / "distorted_frames"
-            reference_dir.mkdir()
-            distorted_dir.mkdir()
-            for index in range(3):
-                Image.new("RGB", (16, 16), (index * 20, 0, 0)).save(reference_dir / f"{index:06d}.png")
-            for index in range(2):
-                Image.new("RGB", (16, 16), (0, index * 20, 0)).save(distorted_dir / f"{index:06d}.png")
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": tmp}, clear=False):
+            workspace, db = make_workspace(tmp)
+            gt_path = Path(tmp) / "videos" / "anime" / "clip.mp4"
+            gt_path.parent.mkdir(parents=True, exist_ok=True)
+            write_mp4(gt_path, [(index * 20, 0, 0) for index in range(3)])
+            pred_path = workspace.root / "pred-short.mp4"
+            write_mp4(pred_path, [(0, index * 20, 0) for index in range(2)])
+            run_a = add_completed_pred_run(db, workspace, "ModelA", pred_path, sample_count=2)
 
             result = preflight_run(
                 db,
                 workspace,
                 {
                     "run_type": "video_compare",
-                    "reference": str(reference_dir),
-                    "distorted": str(distorted_dir),
+                    "reference": {"kind": "video_group", "group": "anime", "video": "clip.mp4"},
+                    "distorted": [{"kind": "run_artifact", "run_id": run_a, "video": "clip", "label": "ModelA"}],
                     "align_mode": "strict",
                 },
             )
             self.assertFalse(result["ok"])
             self.assertIn("matching frame counts", result["errors"][0]["message"])
+
+    def test_video_compare_rejects_raw_string_descriptors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            source_video = next((ROOT / "videos" / "test_style").glob("*.avi"))
+            result = preflight_run(
+                db,
+                workspace,
+                {
+                    "run_type": "video_compare",
+                    "reference": str(source_video),
+                    "distorted": str(source_video),
+                    "align_mode": "strict",
+                },
+            )
+            self.assertFalse(result["ok"])
+            self.assertIn("descriptor must be an object", result["errors"][0]["message"])
 
     def test_compare_dataset_rejects_mismatched_fps_metadata(self) -> None:
         from PIL import Image
@@ -1624,13 +1607,15 @@ class Model:
                     scan_compare_dataset(db, workspace, dataset_id)
 
     def test_video_compare_preflight_rejects_mismatched_decoded_fps(self) -> None:
-        source_video = next((ROOT / "videos" / "test_style").glob("*.avi"))
         fake_frames = [Path("ref000.png"), Path("ref001.png")]
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
-            workspace.ensure()
-            db = Database(workspace.db_path)
-            db.init()
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": tmp}, clear=False):
+            workspace, db = make_workspace(tmp)
+            gt_path = Path(tmp) / "videos" / "anime" / "clip.mp4"
+            gt_path.parent.mkdir(parents=True, exist_ok=True)
+            write_mp4(gt_path, [(index * 20, 0, 0) for index in range(2)])
+            pred_path = workspace.root / "pred.mp4"
+            write_mp4(pred_path, [(0, index * 20, 0) for index in range(2)])
+            run_a = add_completed_pred_run(db, workspace, "ModelA", pred_path, sample_count=2)
             with patch(
                 "vfieval.datasets._load_compare_source_frames",
                 side_effect=[
@@ -1643,8 +1628,8 @@ class Model:
                     workspace,
                     {
                         "run_type": "video_compare",
-                        "reference": str(source_video),
-                        "distorted": str(source_video),
+                        "reference": {"kind": "video_group", "group": "anime", "video": "clip.mp4"},
+                        "distorted": [{"kind": "run_artifact", "run_id": run_a, "video": "clip", "label": "ModelA"}],
                         "align_mode": "strict",
                     },
                 )
@@ -1652,13 +1637,15 @@ class Model:
             self.assertIn("matching fps metadata", result["errors"][0]["message"])
 
     def test_video_compare_preflight_rejects_mismatched_decoded_timestamps(self) -> None:
-        source_video = next((ROOT / "videos" / "test_style").glob("*.avi"))
         fake_frames = [Path("ref000.png"), Path("ref001.png")]
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
-            workspace.ensure()
-            db = Database(workspace.db_path)
-            db.init()
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": tmp}, clear=False):
+            workspace, db = make_workspace(tmp)
+            gt_path = Path(tmp) / "videos" / "anime" / "clip.mp4"
+            gt_path.parent.mkdir(parents=True, exist_ok=True)
+            write_mp4(gt_path, [(index * 20, 0, 0) for index in range(2)])
+            pred_path = workspace.root / "pred.mp4"
+            write_mp4(pred_path, [(0, index * 20, 0) for index in range(2)])
+            run_a = add_completed_pred_run(db, workspace, "ModelA", pred_path, sample_count=2)
             with patch(
                 "vfieval.datasets._load_compare_source_frames",
                 side_effect=[
@@ -1671,8 +1658,8 @@ class Model:
                     workspace,
                     {
                         "run_type": "video_compare",
-                        "reference": str(source_video),
-                        "distorted": str(source_video),
+                        "reference": {"kind": "video_group", "group": "anime", "video": "clip.mp4"},
+                        "distorted": [{"kind": "run_artifact", "run_id": run_a, "video": "clip", "label": "ModelA"}],
                         "align_mode": "strict",
                     },
                 )
@@ -1737,27 +1724,6 @@ class Model:
             self.assertEqual(running_summary["metrics"]["lpips_vit_patch"]["running"], 1)
             self.assertEqual(running_summary["metrics"]["vmaf"]["running"], 1)
             self.assertEqual(int(queued_sample["sample_id"]), int(sample_id))
-
-    def test_video_compare_accepts_video_file_inputs(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
-            workspace.ensure()
-            db = Database(workspace.db_path)
-            db.init()
-            source_video = next((ROOT / "videos" / "test_style").glob("*.avi"))
-            result = preflight_run(
-                db,
-                workspace,
-                {
-                    "run_type": "video_compare",
-                    "reference": str(source_video),
-                    "distorted": str(source_video),
-                    "align_mode": "strict",
-                },
-            )
-            self.assertTrue(result["ok"], result)
-            self.assertEqual(result["reference"]["source_kind"], "video")
-            self.assertEqual(result["distorted"]["source_kind"], "video")
 
     def test_partition_samples_keeps_video_groups_together(self) -> None:
         samples = [

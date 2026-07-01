@@ -357,12 +357,13 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
 
     model_path: Path | None = None
     tested_devices: list[str] = []
+    last_diagnostics: dict[str, Any] | None = None
     try:
         model_path = resolve_model_file(workspace, model_file)
         checkpoint_path = resolve_checkpoint(workspace, checkpoint_request, model_path.name)
         for dry_run_device in _dry_run_devices(device_info):
             try:
-                _dry_run_model_file(
+                last_diagnostics = _dry_run_model_file(
                     model_path,
                     checkpoint_path,
                     dry_run_device,
@@ -371,13 +372,44 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
             except Exception as exc:
                 raise RuntimeError(f"model dry-run failed on {dry_run_device}: {exc}") from exc
             tested_devices.append(dry_run_device)
-        result["model"] = {
+        model_row: dict[str, Any] = {
             "name": model_path.name,
             "path": str(model_path),
             "checkpoint": str(checkpoint_path) if checkpoint_path else None,
             "interface_ok": True,
             "tested_devices": tested_devices,
         }
+        if last_diagnostics is not None:
+            health = last_diagnostics.get("output_health") or {}
+            model_row["output_health"] = health
+            model_load = last_diagnostics.get("model_load")
+            if model_load is not None:
+                model_row["model_load"] = model_load
+                missing = list(model_load.get("missing_keys") or [])
+                unexpected = list(model_load.get("unexpected_keys") or [])
+                if missing or unexpected:
+                    result["warnings"].append(
+                        {
+                            "title": "checkpoint 键不完全匹配",
+                            "message": (
+                                f"matched {model_load.get('matched')} / "
+                                f"{model_load.get('total_in_checkpoint')}, "
+                                f"missing {len(missing)}, unexpected {len(unexpected)}"
+                            ),
+                            "type": "CheckpointLoadReport",
+                            "details": {"missing_keys": missing[:20], "unexpected_keys": unexpected[:20]},
+                        }
+                    )
+            for warning_text in health.get("warnings") or []:
+                result["warnings"].append(
+                    {
+                        "title": "模型输出异常",
+                        "message": warning_text,
+                        "type": "ModelOutputHealth",
+                        "details": health.get("stats"),
+                    }
+                )
+        result["model"] = model_row
     except Exception as exc:
         result["ok"] = False
         result["model"] = {"name": model_file, "interface_ok": False, "tested_devices": tested_devices}
@@ -703,7 +735,7 @@ def _dry_run_model_file(
     checkpoint_path: Path | None = None,
     device_name: str = "cpu",
     precision: str = "fp32",
-) -> None:
+) -> dict[str, Any]:
     if device_name.startswith("multi_"):
         device_name = "cpu"
     device = resolve_torch_device(device_name)
@@ -739,6 +771,62 @@ def _dry_run_model_file(
         compose_interpolated(img0, img1, outputs)
     except Exception as exc:
         raise RuntimeError(_describe_dry_run_failure("postprocess", exc)) from exc
+
+    diagnostics = _diagnose_model_outputs(outputs)
+    load_report = _extract_load_report(model)
+    return {"output_health": diagnostics, "model_load": load_report}
+
+
+def _diagnose_model_outputs(outputs: dict[str, torch.Tensor]) -> dict[str, Any]:
+    stats: dict[str, dict[str, float]] = {}
+    for name in ("flowt_0", "flowt_1"):
+        flow = outputs[name].detach().float()
+        stats[name] = {
+            "abs_mean": float(flow.abs().mean().item()),
+            "abs_max": float(flow.abs().max().item()),
+            "nan_count": int(torch.isnan(flow).sum().item()),
+        }
+    for name in ("mask0", "mask1"):
+        raw = outputs[name].detach().float()
+        mask = torch.sigmoid(raw)
+        stats[name] = {
+            "mean": float(mask.mean().item()),
+            "std": float(mask.std().item()),
+            "nan_count": int(torch.isnan(raw).sum().item()),
+        }
+    flow_flat = all(stats[name]["abs_max"] < 1e-4 for name in ("flowt_0", "flowt_1"))
+    mask_flat = all(stats[name]["std"] < 1e-3 for name in ("mask0", "mask1"))
+    has_nan = any(stats[name]["nan_count"] > 0 for name in stats)
+    warnings: list[str] = []
+    if has_nan:
+        warnings.append("模型输出含 NaN，检查数值稳定性 / autocast 精度设置")
+    if flow_flat and mask_flat:
+        warnings.append(
+            "flow ≈ 0 且 mask ≈ constant，通常意味着 checkpoint 未加载或权重初始化仍是 0。"
+            "请确认 Model.__init__ 里读取了 checkpoint_path 并调用了 load_state_dict。"
+        )
+    return {"stats": stats, "warnings": warnings, "flow_flat": flow_flat, "mask_flat": mask_flat, "has_nan": has_nan}
+
+
+def _extract_load_report(model: Any) -> dict[str, Any] | None:
+    for candidate in (model, getattr(model, "_infer", None), getattr(model, "model", None), getattr(model, "net", None), getattr(model, "network", None), getattr(model, "module", None)):
+        if candidate is None:
+            continue
+        try:
+            report = getattr(candidate, "_last_load_report", None)
+        except Exception:
+            report = None
+        if isinstance(report, dict):
+            return report
+        owner = getattr(candidate, "__self__", None)
+        if owner is not None:
+            try:
+                owner_report = getattr(owner, "_last_load_report", None)
+            except Exception:
+                owner_report = None
+            if isinstance(owner_report, dict):
+                return owner_report
+    return None
 
 
 def _describe_dry_run_failure(stage: str, exc: Exception) -> str:

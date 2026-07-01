@@ -245,7 +245,7 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     return self._json(preflight_run(db, workspace, body))
                 if path == "/api/runs":
                     run_type = str(body.get("run_type") or "")
-                    if run_type == "video_compare" or body.get("reference") or body.get("distorted"):
+                    if run_type == "video_compare":
                         created = _create_video_compare_run(db, workspace, body)
                         return self._json(created, status=HTTPStatus.CREATED)
                     if body.get("model_file") or body.get("video_group"):

@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
+import queue
 import re
 import shutil
 import subprocess
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 from PIL import Image
 
@@ -18,11 +23,12 @@ from vfieval.devices import autocast_context, resolve_torch_device
 from vfieval.models import load_flow_mask_model
 from vfieval.pipeline.io import batch_tensors, load_rgb_tensor, resize_batch
 from vfieval.pipeline.postprocess import compose_interpolated, normalize_model_outputs
-from vfieval.pipeline.visualize import save_difference, save_extra_tensor, save_preview_image, save_visual_bundle
+from vfieval.pipeline.visualize import save_difference, save_extra_tensor, save_preview_image
 
 
 VALID_PRECISIONS = {"fp32", "fp16", "bf16"}
 CORE_OUTPUTS = {"flowt_0", "flowt_1", "mask0", "mask1"}
+BUNDLE_KEYS = ("pred", "warp0", "warp1", "blend", "mask0", "mask1", "flowt_0", "flowt_1")
 
 
 class RunCanceled(RuntimeError):
@@ -37,6 +43,55 @@ class InferenceJobResult:
     model_fps: float
     postprocess_fps: float
     save_fps: float
+    model_load: dict[str, Any] | None = None
+    prefetch_wait_seconds: float = 0.0
+    save_backlog_seconds: float = 0.0
+
+
+def _extract_model_load_report(model: Any) -> dict[str, Any] | None:
+    for candidate in (
+        model,
+        getattr(model, "_infer", None),
+        getattr(model, "model", None),
+        getattr(model, "net", None),
+        getattr(model, "network", None),
+        getattr(model, "module", None),
+    ):
+        if candidate is None:
+            continue
+        try:
+            report = getattr(candidate, "_last_load_report", None)
+        except Exception:
+            report = None
+        if isinstance(report, dict):
+            return report
+        owner = getattr(candidate, "__self__", None)
+        if owner is not None:
+            try:
+                owner_report = getattr(owner, "_last_load_report", None)
+            except Exception:
+                owner_report = None
+            if isinstance(owner_report, dict):
+                return owner_report
+    return None
+
+
+def _write_model_load_log(run_dir: Path, report: dict[str, Any]) -> None:
+    if not report:
+        return
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"checkpoint: {report.get('checkpoint_path')}",
+        f"matched: {report.get('matched')} / {report.get('total_in_checkpoint')}",
+        f"missing_keys: {len(report.get('missing_keys') or [])}",
+        f"unexpected_keys: {len(report.get('unexpected_keys') or [])}",
+    ]
+    for key in list(report.get("missing_keys") or [])[:100]:
+        lines.append(f"  - missing: {key}")
+    for key in list(report.get("unexpected_keys") or [])[:100]:
+        lines.append(f"  - unexpected: {key}")
+    (logs_dir / "model_load.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def sanitize_name(name: str) -> str:
@@ -122,69 +177,86 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
         device=str(device),
         metadata=model_row.get("metadata") or {},
     )
+    model_load_report = _extract_model_load_report(model)
 
     run_dir = workspace.runs_dir / (str(run_id) if run_id is not None else f"inference_{job_id:06d}")
     run_dir.mkdir(parents=True, exist_ok=True)
     _write_run_metadata(run_dir, job, model_row, db.get_dataset(dataset_id) if dataset_id else None)
+    if model_load_report is not None:
+        _write_model_load_log(run_dir, model_load_report)
+
+    save_workers = max(1, int(payload.get("save_workers") or min(8, os.cpu_count() or 4)))
+    prefetch_workers = max(1, int(payload.get("prefetch_workers") or 2))
+    pipeline = _AsyncSavePipeline(
+        db=db,
+        job_id=job_id,
+        run_id=run_id,
+        is_shard=is_shard,
+        run_dir=run_dir,
+        save_workers=save_workers,
+    )
 
     timing = {"decode": 0.0, "model": 0.0, "post": 0.0, "save": 0.0}
-    processed = 0
-    video_groups: dict[str, dict[str, Any]] = {}
 
-    for batch_start in range(0, len(samples), batch_size):
-        _raise_if_canceled(db, run_id, job_id)
-        batch_rows = samples[batch_start : batch_start + batch_size]
-
-        t0 = time.perf_counter()
-        img0 = _load_resized_batch([row["img0_path"] for row in batch_rows], device, height, width)
-        img1 = _load_resized_batch([row["img1_path"] for row in batch_rows], device, height, width)
-        timing["decode"] += time.perf_counter() - t0
-
-        t1 = time.perf_counter()
-        with torch.no_grad(), _autocast_context(device, precision):
-            outputs = model.predict(img0, img1, 0.5)
-        normalized_outputs = normalize_model_outputs(outputs, img0)
-        timing["model"] += time.perf_counter() - t1
-
-        t2 = time.perf_counter()
-        composed = compose_interpolated(img0, img1, normalized_outputs)
-        bundle = {**composed, "flowt_0": normalized_outputs["flowt_0"], "flowt_1": normalized_outputs["flowt_1"]}
-        timing["post"] += time.perf_counter() - t2
-
-        t3 = time.perf_counter()
-        for idx, row in enumerate(batch_rows):
+    try:
+        for batch_rows, img0_cpu, img1_cpu, gt_cpu_list, prefetch_wait in _iter_prefetched_batches(
+            samples=samples,
+            batch_size=batch_size,
+            height=height,
+            width=width,
+            has_gt=True,
+            workers=prefetch_workers,
+        ):
             _raise_if_canceled(db, run_id, job_id)
-            try:
-                sample_dir = run_dir / sanitize_name(row["name"])
-                paths = save_visual_bundle(bundle, sample_dir, idx)
-                for kind, path in paths.items():
-                    _add_image_artifact_with_preview(db, job_id, int(row["id"]), kind, path, {"sample": row["name"]})
-                extra_paths = _save_extra_outputs(outputs, sample_dir, idx)
-                for kind, path in extra_paths.items():
-                    _add_image_artifact_with_preview(db, job_id, int(row["id"]), kind, path, {"sample": row["name"]})
+            timing["decode"] += prefetch_wait
 
-                diff_path = None
-                if row.get("gt_path"):
-                    gt = load_rgb_tensor(row["gt_path"], device).unsqueeze(0)
-                    gt = resize_batch(gt, height, width)[0]
-                    _add_image_artifact_with_preview(db, job_id, int(row["id"]), "gt", Path(row["gt_path"]), {"sample": row["name"]})
-                    diff_path = sample_dir / "difference.png"
-                    save_difference(composed["pred"][idx], gt, diff_path)
-                    _add_image_artifact_with_preview(db, job_id, int(row["id"]), "difference", diff_path, {"sample": row["name"]})
-                _collect_video_frame(video_groups, row, paths["pred"], diff_path)
-            except RunCanceled:
-                raise
-            except Exception as exc:
-                _record_sample_error(db, job_id, int(row["id"]), row["name"], exc)
+            t1 = time.perf_counter()
+            img0 = img0_cpu.to(device, non_blocking=True)
+            img1 = img1_cpu.to(device, non_blocking=True)
+            with torch.no_grad(), _autocast_context(device, precision):
+                outputs = model.predict(img0, img1, 0.5)
+            normalized_outputs = normalize_model_outputs(outputs, img0)
+            timing["model"] += time.perf_counter() - t1
 
-            processed += 1
-            db.update_job_progress(job_id, processed)
-            if run_id is not None:
-                if is_shard:
-                    db.update_run_progress_from_jobs(run_id, "running")
-                else:
-                    db.update_run_progress(run_id, processed)
-        timing["save"] += time.perf_counter() - t3
+            t2 = time.perf_counter()
+            composed = compose_interpolated(img0, img1, normalized_outputs)
+            bundle_cpu = {
+                "pred": composed["pred"].detach().to("cpu"),
+                "warp0": composed["warp0"].detach().to("cpu"),
+                "warp1": composed["warp1"].detach().to("cpu"),
+                "blend": composed["blend"].detach().to("cpu"),
+                "mask0": composed["mask0"].detach().to("cpu"),
+                "mask1": composed["mask1"].detach().to("cpu"),
+                "flowt_0": normalized_outputs["flowt_0"].detach().to("cpu"),
+                "flowt_1": normalized_outputs["flowt_1"].detach().to("cpu"),
+            }
+            extra_cpu: dict[str, torch.Tensor] = {}
+            for name, tensor in outputs.items():
+                if name in CORE_OUTPUTS or not isinstance(tensor, torch.Tensor):
+                    continue
+                try:
+                    extra_cpu[name] = tensor.detach().to("cpu")
+                except Exception:
+                    continue
+            timing["post"] += time.perf_counter() - t2
+
+            t3 = time.perf_counter()
+            pipeline.submit_batch(
+                batch_rows=batch_rows,
+                bundle_cpu=bundle_cpu,
+                extra_cpu=extra_cpu,
+                gt_cpu_list=gt_cpu_list,
+            )
+            timing["save"] += time.perf_counter() - t3
+
+        pipeline.wait_for_all()
+    except BaseException:
+        pipeline.shutdown()
+        raise
+
+    processed = pipeline.processed_count
+    video_groups = pipeline.video_groups
+    pipeline.shutdown()
 
     if video_groups:
         _write_video_artifacts(db, job_id, run_dir, video_groups)
@@ -198,7 +270,9 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
         save_fps=_fps(processed, timing["save"]),
     )
 
-    result_dict = result.__dict__
+    result_dict = dict(result.__dict__)
+    if model_load_report is not None:
+        result_dict["model_load"] = model_load_report
     artifact_summary = db.summarize_artifacts(job_id)
 
     if is_shard:
@@ -744,3 +818,263 @@ def _fit_video_frame(frame, width: int, height: int):
     except ImportError as exc:
         raise RuntimeError("resizing video frames requires opencv-python (cv2)") from exc
     return cv2.copyMakeBorder(frame, 0, height - frame.shape[0], 0, width - frame.shape[1], cv2.BORDER_REPLICATE)
+
+
+def _load_rgb_cpu(path: str, height: int, width: int) -> torch.Tensor:
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        arr = np.asarray(image, dtype=np.float32) / 255.0
+    tensor = torch.from_numpy(arr).permute(2, 0, 1).contiguous().unsqueeze(0)
+    if tensor.shape[-2:] != (height, width):
+        tensor = torch.nn.functional.interpolate(tensor, size=(height, width), mode="bilinear", align_corners=False)
+    return tensor.squeeze(0)
+
+
+def _load_batch_cpu(paths: list[str], height: int, width: int) -> torch.Tensor:
+    tensors = [_load_rgb_cpu(path, height, width) for path in paths]
+    stacked = torch.stack(tensors, dim=0)
+    if torch.cuda.is_available():
+        try:
+            stacked = stacked.pin_memory()
+        except Exception:
+            pass
+    return stacked
+
+
+def _iter_prefetched_batches(
+    samples: list[dict[str, Any]],
+    batch_size: int,
+    height: int,
+    width: int,
+    has_gt: bool,
+    workers: int,
+):
+    """Yield (batch_rows, img0_cpu, img1_cpu, gt_cpu_list, wait_seconds) tuples.
+
+    Prefetches up to 2 batches ahead on a small CPU pool so PIL decode and
+    resize overlap with device compute. wait_seconds is how long the main
+    loop blocked waiting for the next batch to arrive.
+    """
+    if not samples:
+        return
+    workers = max(1, int(workers or 1))
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="vfi-prefetch")
+    pending: list[tuple[list[dict[str, Any]], Future, Future, Future | None]] = []
+    max_ahead = 2
+
+    def _submit(batch_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], Future, Future, Future | None]:
+        img0_paths = [row["img0_path"] for row in batch_rows]
+        img1_paths = [row["img1_path"] for row in batch_rows]
+        img0_future = pool.submit(_load_batch_cpu, img0_paths, height, width)
+        img1_future = pool.submit(_load_batch_cpu, img1_paths, height, width)
+        gt_future: Future | None = None
+        if has_gt and any(row.get("gt_path") for row in batch_rows):
+            def _load_gts(paths: list[str | None]) -> list[torch.Tensor | None]:
+                loaded: list[torch.Tensor | None] = []
+                for path in paths:
+                    if not path:
+                        loaded.append(None)
+                        continue
+                    loaded.append(_load_rgb_cpu(path, height, width))
+                return loaded
+
+            gt_future = pool.submit(_load_gts, [row.get("gt_path") for row in batch_rows])
+        return batch_rows, img0_future, img1_future, gt_future
+
+    try:
+        cursor = 0
+        while cursor < len(samples) and len(pending) < max_ahead:
+            end = min(cursor + batch_size, len(samples))
+            pending.append(_submit(samples[cursor:end]))
+            cursor = end
+
+        while pending:
+            batch_rows, img0_future, img1_future, gt_future = pending.pop(0)
+            wait_start = time.perf_counter()
+            img0_cpu = img0_future.result()
+            img1_cpu = img1_future.result()
+            gt_cpu_list = gt_future.result() if gt_future is not None else [None] * len(batch_rows)
+            wait_seconds = time.perf_counter() - wait_start
+
+            if cursor < len(samples):
+                end = min(cursor + batch_size, len(samples))
+                pending.append(_submit(samples[cursor:end]))
+                cursor = end
+
+            yield batch_rows, img0_cpu, img1_cpu, gt_cpu_list, wait_seconds
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+class _AsyncSavePipeline:
+    """Background PNG-encoding + DB-insert pool for inference artifacts.
+
+    Each sqlite3 connection is short-lived and created inside the worker
+    thread (via Database.connection()), so no cross-thread lock is needed —
+    WAL mode already serializes writes at the file level.
+    """
+
+    def __init__(
+        self,
+        *,
+        db: Database,
+        job_id: int,
+        run_id: int | None,
+        is_shard: bool,
+        run_dir: Path,
+        save_workers: int,
+    ) -> None:
+        self._db = db
+        self._job_id = job_id
+        self._run_id = run_id
+        self._is_shard = is_shard
+        self._run_dir = run_dir
+        self._pool = ThreadPoolExecutor(max_workers=save_workers, thread_name_prefix="vfi-save")
+        self._pending: list[Future] = []
+        self._lock = threading.Lock()
+        self._processed = 0
+        self._total = 0
+        self._video_groups: dict[str, dict[str, Any]] = {}
+        self._last_progress_report = 0
+
+    @property
+    def processed_count(self) -> int:
+        return self._processed
+
+    @property
+    def video_groups(self) -> dict[str, dict[str, Any]]:
+        return self._video_groups
+
+    def submit_batch(
+        self,
+        *,
+        batch_rows: list[dict[str, Any]],
+        bundle_cpu: dict[str, torch.Tensor],
+        extra_cpu: dict[str, torch.Tensor],
+        gt_cpu_list: list[torch.Tensor | None],
+    ) -> None:
+        self._total += len(batch_rows)
+        with self._lock:
+            for idx, row in enumerate(batch_rows):
+                per_sample_bundle = {name: bundle_cpu[name][idx] for name in bundle_cpu}
+                per_sample_extra = {name: extra_cpu[name][idx] for name in extra_cpu}
+                gt_tensor = gt_cpu_list[idx] if idx < len(gt_cpu_list) else None
+                future = self._pool.submit(
+                    self._save_sample,
+                    dict(row),
+                    per_sample_bundle,
+                    per_sample_extra,
+                    gt_tensor,
+                )
+                future.add_done_callback(self._on_sample_done)
+                self._pending.append(future)
+
+    def wait_for_all(self) -> None:
+        while True:
+            with self._lock:
+                pending = list(self._pending)
+                self._pending = []
+            if not pending:
+                return
+            for future in pending:
+                exc = future.exception()
+                if exc is not None and not isinstance(exc, Exception):
+                    raise exc
+
+    def shutdown(self) -> None:
+        self._pool.shutdown(wait=True)
+
+    def _save_sample(
+        self,
+        row: dict[str, Any],
+        bundle: dict[str, torch.Tensor],
+        extra: dict[str, torch.Tensor],
+        gt_tensor: torch.Tensor | None,
+    ) -> None:
+        job_id = self._job_id
+        sample_id = int(row["id"])
+        sample_name = row["name"]
+        try:
+            sample_dir = self._run_dir / sanitize_name(sample_name)
+            paths = _save_visual_bundle_from_cpu(bundle, sample_dir)
+            for kind, path in paths.items():
+                _add_image_artifact_with_preview(self._db, job_id, sample_id, kind, path, {"sample": sample_name})
+            extra_paths: dict[str, Path] = {}
+            for name, tensor in extra.items():
+                try:
+                    safe_name = sanitize_name(name)
+                    path = sample_dir / f"extra_{safe_name}.png"
+                    save_extra_tensor(tensor, path, index=0)
+                    extra_paths[f"extra_{safe_name}"] = path
+                except Exception:
+                    continue
+            for kind, path in extra_paths.items():
+                _add_image_artifact_with_preview(self._db, job_id, sample_id, kind, path, {"sample": sample_name})
+
+            diff_path = None
+            if gt_tensor is not None and row.get("gt_path"):
+                _add_image_artifact_with_preview(
+                    self._db, job_id, sample_id, "gt", Path(row["gt_path"]), {"sample": sample_name}
+                )
+                diff_path = sample_dir / "difference.png"
+                save_difference(bundle["pred"], gt_tensor, diff_path)
+                _add_image_artifact_with_preview(
+                    self._db, job_id, sample_id, "difference", diff_path, {"sample": sample_name}
+                )
+            with self._lock:
+                _collect_video_frame(self._video_groups, row, paths["pred"], diff_path)
+        except Exception as exc:
+            _record_sample_error(self._db, job_id, sample_id, sample_name, exc)
+
+    def _on_sample_done(self, future: Future) -> None:
+        with self._lock:
+            self._processed += 1
+            processed = self._processed
+            total = self._total
+            try:
+                self._pending.remove(future)
+            except ValueError:
+                pass
+            step = max(1, total // 200)
+            report_now = processed == total or processed - self._last_progress_report >= step
+            if report_now:
+                self._last_progress_report = processed
+        if not report_now:
+            return
+        try:
+            self._db.update_job_progress(self._job_id, processed)
+            if self._run_id is not None:
+                if self._is_shard:
+                    self._db.update_run_progress_from_jobs(self._run_id, "running")
+                else:
+                    self._db.update_run_progress(self._run_id, processed)
+        except Exception:
+            pass
+
+
+def _save_visual_bundle_from_cpu(bundle: dict[str, torch.Tensor], sample_dir: Path) -> dict[str, Path]:
+    """Save an already-on-CPU bundle. Mirrors save_visual_bundle but skips
+    the per-tensor .cpu() calls that visualize.save_visual_bundle does when
+    the input still lives on the device."""
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    from vfieval.pipeline.visualize import save_rgb_tensor, save_mask, save_flow
+
+    paths = {
+        "pred": sample_dir / "pred.png",
+        "warp0": sample_dir / "warp0.png",
+        "warp1": sample_dir / "warp1.png",
+        "blend": sample_dir / "blend.png",
+        "mask0": sample_dir / "mask0.png",
+        "mask1": sample_dir / "mask1.png",
+        "flowt_0": sample_dir / "flowt_0.png",
+        "flowt_1": sample_dir / "flowt_1.png",
+    }
+    save_rgb_tensor(bundle["pred"], paths["pred"])
+    save_rgb_tensor(bundle["warp0"], paths["warp0"])
+    save_rgb_tensor(bundle["warp1"], paths["warp1"])
+    save_rgb_tensor(bundle["blend"], paths["blend"])
+    save_mask(bundle["mask0"], paths["mask0"])
+    save_mask(bundle["mask1"], paths["mask1"])
+    save_flow(bundle["flowt_0"], paths["flowt_0"])
+    save_flow(bundle["flowt_1"], paths["flowt_1"])
+    return paths
