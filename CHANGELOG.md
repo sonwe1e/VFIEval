@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## [2026-07-01 23:20]
+- Added repository layout and Git ownership rules so source files, generated test fixtures, local user inputs, runtime state, metric assets, and automatic backups have clear homes.
+- Updated ignore rules to keep real models, videos, checkpoints, metric assets, SQLite state, runtime outputs, local tool settings, and file-level backups out of Git while preserving generated test fixtures.
+- Files affected: `.gitignore`, `REPO_LAYOUT.md`, `AGENTS.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
+## [2026-07-01 21:11]
+- Improved first-screen usability and large-workspace efficiency: lightweight video-group summaries, paged/searchable video and Compare source pickers, cached preflight dry-runs, cancellable stale preflight requests, default-collapsed Compare extra layers, and corrected multi-track Compare source labels.
+- Reduced Run Detail timeline SQL fan-out by adding chunked batched sample artifact/metric reads, window-scoped artifact loading, and reused video artifact rows.
+- Files affected: `src/vfieval/file_inputs.py`, `src/vfieval/server.py`, `src/vfieval/db.py`, `src/vfieval/web/app.js`, `src/vfieval/web/styles.css`, `tests/test_compare_sources_api.py`, `tests/test_compare_ui_hooks.py`, `tests/test_sample_api_scope.py`, `README.md`, `IMPLEMENT.md`.
+
 ## V11 - 多卡 NPU、Run 删除与轻量预览
 
 - 新增 `multi_npu` 执行模式，使用 `torch_npu` 检测 `npu:0`、`npu:1` 等设备，并沿用 `run_jobs` 按视频粒度拆分 inference shard。

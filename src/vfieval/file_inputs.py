@@ -22,6 +22,7 @@ VIDEO_SUFFIXES = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 CHECKPOINT_SUFFIXES = {".bin", ".ckpt", ".pth", ".pt", ".safetensors"}
 DECODE_STRATEGY_VERSION = "opencv-rgb-v1"
 VIDEO_INSPECT_VERSION = "ffprobe-opencv-v3"
+_DRY_RUN_CACHE: dict[str, dict[str, Any]] = {}
 
 
 def project_root(workspace: WorkspaceConfig) -> Path:
@@ -89,21 +90,21 @@ def list_checkpoints(workspace: WorkspaceConfig, model_file: str | None = None) 
     return sorted(rows, key=lambda item: (str(item["model"]), -int(item["mtime_ns"]), str(item["relative_path"])))
 
 
-def list_video_groups(workspace: WorkspaceConfig) -> list[dict[str, Any]]:
+def list_video_groups(workspace: WorkspaceConfig, include_videos: bool = True) -> list[dict[str, Any]]:
     root = videos_dir(workspace)
     if not root.exists():
         return []
     groups = []
     for folder in sorted(path for path in root.iterdir() if path.is_dir()):
-        videos = [_video_summary(workspace, video) for video in _iter_videos(folder)]
-        groups.append(
-            {
-                "name": folder.name,
-                "path": str(folder),
-                "video_count": len(videos),
-                "videos": videos,
-            }
-        )
+        paths = _iter_videos(folder)
+        row = {
+            "name": folder.name,
+            "path": str(folder),
+            "video_count": len(paths),
+        }
+        if include_videos:
+            row["videos"] = [_video_summary(workspace, video) for video in paths]
+        groups.append(row)
     return groups
 
 
@@ -125,16 +126,25 @@ def list_video_group_videos(
         path for path in all_paths
         if not normalized_query or normalized_query in path.name.lower()
     ]
-    videos = [
-        video_summary(workspace, video, frame_step=frame_step, max_frames=max_frames, exact=False)
-        for video in paths
-    ]
-    videos = _sort_video_summaries(videos, sort)
     page_size = min(200, max(1, int(page_size or 50)))
     page = max(1, int(page or 1))
-    total = len(videos)
+    total = len(paths)
     start = (page - 1) * page_size
-    paged = videos[start : start + page_size]
+    sort_key = sort[1:] if sort.startswith("-") else sort
+    if sort_key == "name":
+        paths = sorted(paths, key=lambda item: item.name, reverse=sort.startswith("-"))
+        paged_paths = paths[start : start + page_size]
+        paged = [
+            video_summary(workspace, video, frame_step=frame_step, max_frames=max_frames, exact=False)
+            for video in paged_paths
+        ]
+    else:
+        videos = [
+            video_summary(workspace, video, frame_step=frame_step, max_frames=max_frames, exact=False)
+            for video in paths
+        ]
+        videos = _sort_video_summaries(videos, sort)
+        paged = videos[start : start + page_size]
     return {
         "name": folder.name,
         "path": str(folder),
@@ -146,6 +156,7 @@ def list_video_group_videos(
         "query": query,
         "sort": sort,
         "all_video_names": all_names,
+        "filtered_video_names": [path.name for path in paths],
         "videos": paged,
     }
 
@@ -363,7 +374,7 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
         checkpoint_path = resolve_checkpoint(workspace, checkpoint_request, model_path.name)
         for dry_run_device in _dry_run_devices(device_info):
             try:
-                last_diagnostics = _dry_run_model_file(
+                last_diagnostics = _cached_dry_run_model_file(
                     model_path,
                     checkpoint_path,
                     dry_run_device,
@@ -775,6 +786,44 @@ def _dry_run_model_file(
     diagnostics = _diagnose_model_outputs(outputs)
     load_report = _extract_load_report(model)
     return {"output_health": diagnostics, "model_load": load_report}
+
+
+def _cached_dry_run_model_file(
+    model_path: Path,
+    checkpoint_path: Path | None = None,
+    device_name: str = "cpu",
+    precision: str = "fp32",
+) -> dict[str, Any]:
+    key = _dry_run_cache_key(model_path, checkpoint_path, device_name, precision)
+    cached = _DRY_RUN_CACHE.get(key)
+    if cached is not None:
+        return json.loads(json.dumps(cached, default=str))
+    result = _dry_run_model_file(model_path, checkpoint_path, device_name, precision)
+    _DRY_RUN_CACHE[key] = json.loads(json.dumps(result, default=str))
+    return result
+
+
+def _dry_run_cache_key(model_path: Path, checkpoint_path: Path | None, device_name: str, precision: str) -> str:
+    model_stat = model_path.stat()
+    checkpoint_payload = None
+    if checkpoint_path is not None:
+        checkpoint_stat = checkpoint_path.stat()
+        checkpoint_payload = {
+            "path": str(checkpoint_path.resolve()).replace("\\", "/"),
+            "size": checkpoint_stat.st_size,
+            "mtime_ns": checkpoint_stat.st_mtime_ns,
+        }
+    payload = {
+        "model_path": str(model_path.resolve()).replace("\\", "/"),
+        "model_size": model_stat.st_size,
+        "model_mtime_ns": model_stat.st_mtime_ns,
+        "checkpoint": checkpoint_payload,
+        "device": str(device_name),
+        "precision": str(precision),
+        "loader_id": id(load_flow_mask_model),
+        "postprocess_id": id(compose_interpolated),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _diagnose_model_outputs(outputs: dict[str, torch.Tensor]) -> dict[str, Any]:

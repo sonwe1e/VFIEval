@@ -56,9 +56,9 @@ Web UI 会自动扫描：
 
 - `models/*.py` 作为模型下拉框。
 - `checkpoints/{model_stem}/*` 作为权重下拉框，可选择不加载、自动最新或具体文件。
-- `videos/*/` 作为视频集下拉框。
+- `videos/*/` 作为视频集下拉框；首屏只读取分组摘要，具体视频、缩略图和缓存状态会在选择视频集后按页加载。
 - 点击 `刷新文件列表` 后会重新扫描模型、权重、视频集和设备，不需要刷新浏览器页面。
-- 选择后自动预检查模型接口、已选视频、真实帧数、triplets、缓存状态和设备/精度。
+- 选择稳定后自动预检查模型接口、已选视频、真实帧数、triplets、缓存状态和设备/精度；重复的模型 dry-run 会复用缓存，提交任务前仍会强制检查一次。
 - 视频列表默认全选，支持服务端分页、按文件名搜索、排序和缩略图，也可以只勾选本次要推理的视频。
 
 默认测试模型和测试视频已经随工作区提供。也可以重新生成测试视频：
@@ -132,6 +132,17 @@ Contract：
 
 Run Detail 默认不会一次性加载所有视频和所有图片。页面先读取 Run 的视频摘要，再按当前视频加载窗口化 `timeline`；只有选中某个样本时，才调用 `GET /api/runs/{id}/samples/{sample_id}` 加载对应的 `GT / Pred / Diff / Flow / Mask / Warp / Blend`。
 
+## Direct GT/Pred Compare
+
+`Run 类型` 选择 `双视频对比` 后，页面会按需加载 Compare 来源：
+
+- GT 从 `videos/{group}/` 中选择，支持搜索和分页。
+- Pred 从已完成 Run 的 `pred_video` artifact 中选择，并按当前 GT 视频自动过滤。
+- 每个 Pred track 可以在表格里编辑显示标签，创建 Run 时写入 `label`。
+- `flow/mask/warp/blend` extra layers 默认不选，展开 `Extra layers` 后再选择需要对照的层，避免样本详情一次加载过多预览。
+
+Compare Run Detail 会按 track 显示 `pred/diff` 视频，GT 视频共享；样本级 extra layers 仍按 `kind × track` 横向网格展示。
+
 ## 指标曲线
 
 高级设置里可以选择指标：
@@ -197,8 +208,10 @@ Status interpretation:
 - `GET /api/model-files`
 - `GET /api/checkpoints?model_file=...`
 - `GET /api/devices`
-- `GET /api/video-groups`
+- `GET /api/video-groups`，支持 `summary=1` 只返回分组和数量
 - `GET /api/video-groups/{name}/videos?page=&page_size=&q=&sort=`
+- `GET /api/compare-sources/gt?page=&page_size=&q=&group=`
+- `GET /api/compare-sources/pred?page=&page_size=&q=&video=&run_id=`
 - `GET /api/video-thumbnails/{key}`
 - `GET /api/metrics/health`
 - `POST /api/preflight`
@@ -230,7 +243,7 @@ Status interpretation:
 - `execution_mode=multi_npu` 会按视频粒度拆分为多个 inference shard job，每个 shard 绑定一个 NPU，并由本地 UI 自动启动独立 worker 进程领取对应设备的任务。
 - 手动启动 worker 时可以使用 `python -m vfieval.cli --workspace .vfieval worker --role inference --device-filter npu:0 --idle-timeout 120`，绑定后的 worker 只领取对应 NPU 的 shard。
 - 预检查会在最终 device/dtype 上执行模型 dry-run，能提前暴露 CPU/NPU tensor 不匹配。
-- 新建任务页默认只读取文件目录、预检查和 `GET /api/runs` 轮询；不会在后台自动加载 Run Detail、timeline、sample detail 或预览图。
+- 新建任务页首屏只读取模型/视频分组摘要、Run 摘要、设备和指标健康；视频列表、Compare 来源和预检查会在用户加载或选择后再请求。
 - Run Detail 默认加载 `512px` 预览图，原图只在点击预览时打开；核心产物按 `图像 / Flow / Mask / Warp` 分组，避免一次性加载十张 4K 图。
 - 失败或不想看的 Run 可以删除记录；产物清理需要单独点击，避免误删结果。
 - 指标缓存 key 会绑定 metric 名称、适配器/资产版本、当前 evaluator 环境以及 GT/Pred 文件身份；更换 manifest、权重或可执行环境后不会继续复用旧的 `unavailable` 缓存结果。

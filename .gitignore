@@ -1,5 +1,37 @@
+# VFIEval runtime state
 .vfieval/
 .vfieval-*/
+archive/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Local user inputs
+models/*
+!models/
+!models/_test_helpers.py
+!models/test_*.py
+
+videos/*
+!videos/
+!videos/test_*/
+!videos/test_*/*
+
+checkpoints/*
+!checkpoints/
+!checkpoints/test_*/
+!checkpoints/test_*/*
+
+# Local metric assets
+set/metrics/
+
+# Local tool and environment state
+.env*
+.agents/
+.claude/settings.local.json
+*.backup.*
+
+# Python and build outputs
 __pycache__/
 *.py[cod]
 .pytest_cache/

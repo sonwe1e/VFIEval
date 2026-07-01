@@ -1517,6 +1517,44 @@ class Database:
             row["metadata"] = _loads(row.pop("metadata_json"))
         return rows
 
+    def list_artifacts_by_samples(
+        self,
+        sample_ids: Iterable[int],
+        job_ids: Iterable[int] | None = None,
+        kind: str | None = None,
+    ) -> list[dict[str, Any]]:
+        ids = [int(sample_id) for sample_id in sample_ids]
+        if not ids:
+            return []
+        job_filter: list[int] | None = None
+        if job_ids is not None:
+            job_filter = [int(job_id) for job_id in job_ids]
+            if not job_filter:
+                return []
+        fixed_param_count = (len(job_filter) if job_filter is not None else 0) + (1 if kind is not None else 0)
+        chunk_size = max(1, 900 - fixed_param_count)
+        rows: list[dict[str, Any]] = []
+        for offset in range(0, len(ids), chunk_size):
+            chunk = ids[offset : offset + chunk_size]
+            clauses = [f"sample_id IN ({','.join('?' for _ in chunk)})"]
+            params: list[Any] = list(chunk)
+            if job_filter is not None:
+                clauses.append(f"job_id IN ({','.join('?' for _ in job_filter)})")
+                params.extend(job_filter)
+            if kind is not None:
+                clauses.append("kind = ?")
+                params.append(kind)
+            rows.extend(
+                self.query(
+                    f"SELECT * FROM artifacts WHERE {' AND '.join(clauses)} ORDER BY sample_id, kind, id",
+                    params,
+                )
+            )
+        rows.sort(key=lambda row: (int(row["sample_id"]), str(row["kind"]), int(row["id"])))
+        for row in rows:
+            row["metadata"] = _loads(row.pop("metadata_json"))
+        return rows
+
     def add_metric_result(
         self,
         job_id: int,
@@ -1560,6 +1598,44 @@ class Database:
             f"SELECT * FROM metric_results WHERE {' AND '.join(clauses)} ORDER BY metric_name, id",
             params,
         )
+        for row in rows:
+            row["details"] = _loads(row.pop("details_json"))
+        return rows
+
+    def list_metrics_by_samples(
+        self,
+        sample_ids: Iterable[int],
+        inference_job_ids: Iterable[int] | None = None,
+        metric_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        ids = [int(sample_id) for sample_id in sample_ids]
+        if not ids:
+            return []
+        job_filter: list[int] | None = None
+        if inference_job_ids is not None:
+            job_filter = [int(job_id) for job_id in inference_job_ids]
+            if not job_filter:
+                return []
+        fixed_param_count = (len(job_filter) if job_filter is not None else 0) + (1 if metric_name is not None else 0)
+        chunk_size = max(1, 900 - fixed_param_count)
+        rows: list[dict[str, Any]] = []
+        for offset in range(0, len(ids), chunk_size):
+            chunk = ids[offset : offset + chunk_size]
+            clauses = [f"sample_id IN ({','.join('?' for _ in chunk)})"]
+            params: list[Any] = list(chunk)
+            if job_filter is not None:
+                clauses.append(f"inference_job_id IN ({','.join('?' for _ in job_filter)})")
+                params.extend(job_filter)
+            if metric_name is not None:
+                clauses.append("metric_name = ?")
+                params.append(metric_name)
+            rows.extend(
+                self.query(
+                    f"SELECT * FROM metric_results WHERE {' AND '.join(clauses)} ORDER BY sample_id, metric_name, id",
+                    params,
+                )
+            )
+        rows.sort(key=lambda row: (int(row["sample_id"]), str(row["metric_name"]), int(row["id"])))
         for row in rows:
             row["details"] = _loads(row.pop("details_json"))
         return rows

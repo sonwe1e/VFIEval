@@ -90,6 +90,7 @@ Metric dependencies, weights, native evaluator binaries, and config files should
 - Video groups are discovered from `videos/*/`.
 - Metric assets are discovered from `set/metrics/`.
 - Run artifacts live under `.vfieval/runs/{run_id}/`.
+- Repository layout, naming, and Git ownership rules live in `REPO_LAYOUT.md`. Keep real user models, videos, checkpoints, metric assets, SQLite files, runtime outputs, local tool state, and `*.backup.YYYYMMDD_HHMMSS` backups out of Git; keep generated `test_*` models, checkpoints, and videos tracked for clean-checkout tests.
 
 Legacy `models`, `datasets`, `jobs`, and `experiments` APIs may remain for compatibility, but those concepts must not pollute the primary UI.
 

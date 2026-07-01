@@ -419,6 +419,16 @@ summary {
   margin-bottom: 10px;
 }
 
+.source-tools {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.compact-pager {
+  justify-content: flex-start;
+}
+
 .video-thumb {
   display: block;
   width: 96px;

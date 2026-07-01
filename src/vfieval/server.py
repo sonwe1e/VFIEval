@@ -13,6 +13,7 @@ import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from vfieval.config import WorkspaceConfig
@@ -20,6 +21,7 @@ from vfieval.datasets import scan_dataset
 from vfieval.db import Database
 from vfieval.file_inputs import (
     DECODE_STRATEGY_VERSION,
+    VIDEO_SUFFIXES,
     inspect_video,
     list_checkpoints,
     list_video_group_videos,
@@ -33,6 +35,7 @@ from vfieval.file_inputs import (
     resolve_run_dimensions,
     resolve_video_group,
     thumbnail_path,
+    video_summary,
     videos_dir,
 )
 from vfieval.metrics import METRIC_NAMES
@@ -79,7 +82,8 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                 if path == "/api/devices":
                     return self._json(detect_capabilities())
                 if path == "/api/video-groups":
-                    return self._json(list_video_groups(workspace))
+                    summary = query.get("summary", ["0"])[0] in {"1", "true", "yes"}
+                    return self._json(list_video_groups(workspace, include_videos=not summary))
                 match = re.fullmatch(r"/api/video-groups/([^/]+)/videos", path)
                 if match:
                     frame_step = max(1, int(query.get("frame_step", ["1"])[0] or 1))
@@ -525,10 +529,10 @@ def _compare(db: Database, query: dict[str, list[str]]) -> dict:
 
 def _compare_sources(db: Database, workspace: WorkspaceConfig, source_type: str, query: dict[str, list[str]]) -> dict:
     if source_type == "gt":
-        return {"sources": _compare_gt_sources(workspace)}
+        return _compare_gt_sources(workspace, query)
     if source_type == "pred":
         run_id = _optional_int(query.get("run_id", [None])[0])
-        return {"sources": _compare_pred_sources(db, workspace, run_id)}
+        return _compare_pred_sources(db, workspace, query, run_id)
     if source_type in {"flow", "mask"}:
         run_id = _optional_int(query.get("run_id", [None])[0])
         if run_id is None:
@@ -538,35 +542,57 @@ def _compare_sources(db: Database, workspace: WorkspaceConfig, source_type: str,
     raise ValueError(f"unsupported compare source type: {source_type}")
 
 
-def _compare_gt_sources(workspace: WorkspaceConfig) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
+def _compare_gt_sources(workspace: WorkspaceConfig, query: dict[str, list[str]]) -> dict:
+    group_filter = str(query.get("group", [""])[0] or "").strip()
+    text_filter = str(query.get("q", [""])[0] or "").strip().lower()
+    page, page_size = _source_pagination(query)
     root = videos_dir(workspace)
-    for group in list_video_groups(workspace):
-        group_name = str(group["name"])
-        for video in group.get("videos") or []:
-            path = (root / group_name / str(video["name"])).resolve()
-            rows.append(
-                {
-                    "kind": "video_group",
-                    "group": group_name,
-                    "video": video["name"],
-                    "video_name": Path(str(video["name"])).stem,
-                    "path": str(path),
-                    "frame_count": int(video.get("frame_count") or 0),
-                    "width": int(video.get("width") or 0),
-                    "height": int(video.get("height") or 0),
-                    "fps": video.get("fps"),
-                    "duration_seconds": video.get("duration_seconds"),
-                    "decodable": bool(video.get("decodable")),
-                    "thumbnail_url": video.get("thumbnail_url"),
-                }
-            )
-    return rows
+    candidates: list[tuple[str, Path]] = []
+    if root.exists():
+        for folder in sorted(path for path in root.iterdir() if path.is_dir()):
+            if group_filter and folder.name != group_filter:
+                continue
+            for path in sorted(folder.iterdir()):
+                if not path.is_file() or path.suffix.lower() not in VIDEO_SUFFIXES:
+                    continue
+                searchable = f"{folder.name}/{path.name}".lower()
+                if text_filter and text_filter not in searchable:
+                    continue
+                candidates.append((folder.name, path))
+    total = len(candidates)
+    start = (page - 1) * page_size
+    rows: list[dict[str, object]] = []
+    for group_name, path in candidates[start : start + page_size]:
+        video = video_summary(workspace, path, exact=False)
+        rows.append(
+            {
+                "kind": "video_group",
+                "group": group_name,
+                "video": video["name"],
+                "video_name": Path(str(video["name"])).stem,
+                "path": str(path.resolve()),
+                "frame_count": int(video.get("frame_count") or 0),
+                "width": int(video.get("width") or 0),
+                "height": int(video.get("height") or 0),
+                "fps": video.get("fps"),
+                "duration_seconds": video.get("duration_seconds"),
+                "decodable": bool(video.get("decodable")),
+                "thumbnail_url": video.get("thumbnail_url"),
+            }
+        )
+    return _source_page_payload(rows, page, page_size, total, query=query)
 
 
-def _compare_pred_sources(db: Database, workspace: WorkspaceConfig, run_id: int | None = None) -> list[dict[str, object]]:
+def _compare_pred_sources(
+    db: Database,
+    workspace: WorkspaceConfig,
+    query: dict[str, list[str]],
+    run_id: int | None = None,
+) -> dict:
     runs = [db.get_run(run_id)] if run_id is not None else db.list_runs(limit=10000)
     rows: list[dict[str, object]] = []
+    text_filter = str(query.get("q", [""])[0] or "").strip().lower()
+    video_filter = str(query.get("video", [""])[0] or "").strip()
     for run in runs:
         if run.get("deleted_at") is not None or run.get("artifact_cleaned_at") is not None:
             continue
@@ -602,8 +628,42 @@ def _compare_pred_sources(db: Database, workspace: WorkspaceConfig, run_id: int 
                     )
                 except Exception:
                     pass
+            searchable = f"{row.get('run_name') or ''} {row.get('video') or ''} {row.get('compare_track_label') or ''}".lower()
+            if text_filter and text_filter not in searchable:
+                continue
+            if video_filter and str(row.get("video") or "") != video_filter and Path(str(row.get("video") or "")).stem != video_filter:
+                continue
             rows.append(row)
-    return sorted(rows, key=lambda item: (str(item.get("video") or ""), str(item.get("run_name") or ""), int(item["artifact_id"])))
+    rows = sorted(rows, key=lambda item: (str(item.get("video") or ""), str(item.get("run_name") or ""), int(item["artifact_id"])))
+    page, page_size = _source_pagination(query)
+    total = len(rows)
+    start = (page - 1) * page_size
+    return _source_page_payload(rows[start : start + page_size], page, page_size, total, query=query)
+
+
+def _source_pagination(query: dict[str, list[str]]) -> tuple[int, int]:
+    page = max(1, int(query.get("page", ["1"])[0] or 1))
+    page_size_raw = query.get("page_size", [None])[0]
+    if page_size_raw in {None, ""}:
+        return page, 10000
+    return page, min(200, max(1, int(page_size_raw)))
+
+
+def _source_page_payload(
+    rows: list[dict[str, object]],
+    page: int,
+    page_size: int,
+    total: int,
+    query: dict[str, list[str]],
+) -> dict:
+    return {
+        "sources": rows,
+        "page": page,
+        "page_size": page_size,
+        "filtered_count": total,
+        "total_pages": max(1, (total + page_size - 1) // page_size),
+        "query": query.get("q", [""])[0],
+    }
 
 
 def _compare_layer_sources(db: Database, run_id: int, source_type: str, video_name: str | None = None) -> list[dict[str, object]]:
@@ -1333,25 +1393,33 @@ def _run_timeline(db: Database, run_id: int) -> dict:
 def _run_videos(db: Database, run_id: int, page: int = 1, page_size: int = 50, q: str = "") -> dict:
     run = db.get_run(run_id)
     summaries = db.list_run_video_summaries(run_id, q)
+    requested_video_metrics = _requested_video_metrics(run)
+    metric_job_status = _metric_job_status(db, run)
     page_size = min(200, max(1, int(page_size or 50)))
     page = max(1, int(page or 1))
     total = len(summaries)
     start = (page - 1) * page_size
     videos = []
     for summary in summaries[start : start + page_size]:
-        samples = db.list_samples_by_video(run_id, str(summary["video_name"]))
-        video_payload = _build_video_payload(db, run, samples, str(summary["video_name"]))
+        video_name = str(summary["video_name"])
+        actual_video_metrics = _video_metric_payloads(db, run_id, video_name)
+        video_artifacts = _video_artifacts_for_video(db, run_id, video_name)
         videos.append(
             {
-                "video_name": video_payload.get("video_name") or summary["video_name"],
-                "video_file": video_payload.get("video_file") or summary.get("video_file"),
-                "fps": video_payload.get("fps") or summary.get("fps"),
-                "sample_count": int(summary.get("sample_count") or len(video_payload.get("samples") or [])),
-                "video_artifacts": video_payload.get("video_artifacts") or {},
-                "video_artifact_tracks": video_payload.get("video_artifact_tracks") or [],
-                "video_metrics": video_payload.get("video_metrics") or {},
-                "metric_summary": video_payload.get("metric_summary") or {},
-                "worst_samples": video_payload.get("worst_samples") or {},
+                "video_name": video_name,
+                "video_file": summary.get("video_file") or video_name,
+                "fps": summary.get("fps"),
+                "sample_count": int(summary.get("sample_count") or 0),
+                "video_artifacts": _video_artifact_map_from_rows(video_artifacts),
+                "video_artifact_tracks": _video_artifact_tracks_from_rows(video_artifacts),
+                "video_metrics": _video_metrics_with_defaults(
+                    actual_metrics=actual_video_metrics,
+                    requested_video_metrics=requested_video_metrics,
+                    run_status=str(run.get("status") or ""),
+                    metric_job_status=metric_job_status,
+                ),
+                "metric_summary": {},
+                "worst_samples": {},
             }
         )
     return {
@@ -1374,33 +1442,60 @@ def _run_video_timeline(
     window_size: int = 300,
 ) -> dict:
     run = db.get_run(run_id)
-    sample_rows = db.list_samples_by_video(run_id, video_name)
+    sample_rows = sorted(db.list_samples_by_video(run_id, video_name), key=_timeline_sample_sort_key)
     if not sample_rows:
         raise ValueError(f"video not found in run timeline: {video_name}")
-    video = _build_video_payload(db, run, sample_rows, video_name)
-    samples = list(video.get("samples") or [])
-    metric_name = metric or _first_metric_name(samples)
+    job_ids = set(db.run_inference_job_ids(run_id))
+    requested_sample_metrics = _requested_sample_metrics(run)
+    requested_video_metrics = _requested_video_metrics(run)
+    metric_job_status = _metric_job_status(db, run)
+    metric_entries = _sample_metric_entries(db, run, sample_rows, job_ids, requested_sample_metrics, metric_job_status)
+    metric_name = metric or _first_metric_name(metric_entries)
     bucket_count = min(1000, max(1, int(bucket_count or 120)))
     window_size = min(2000, max(1, int(window_size or 300)))
-    window_start = max(0, min(int(window_start or 0), max(0, len(samples) - 1)))
-    window_samples = samples[window_start : window_start + window_size]
+    window_start = max(0, min(int(window_start or 0), max(0, len(sample_rows) - 1)))
+    window_rows = sample_rows[window_start : window_start + window_size]
+    window_samples = _sample_timeline_entries(db, run, window_rows, job_ids, requested_sample_metrics, metric_job_status)
+    first_meta = (sample_rows[0].get("metadata") if sample_rows else {}) or {}
+    current_video_name = str(first_meta.get("video_name") or video_name)
+    video_file = str(first_meta.get("video_file") or current_video_name)
+    actual_video_metrics = _video_metric_payloads(db, run_id, current_video_name)
+    video_artifacts = _video_artifacts_for_video(db, run_id, current_video_name)
     return {
         "run_id": run_id,
-        "video_name": video.get("video_name"),
-        "video_file": video.get("video_file"),
-        "fps": video.get("fps"),
+        "video_name": current_video_name,
+        "video_file": video_file,
+        "fps": float(first_meta.get("fps") or 0.0),
         "metric": metric_name,
-        "sample_count": len(samples),
+        "sample_count": len(sample_rows),
         "window_start": window_start,
         "window_size": window_size,
-        "overview": _timeline_buckets(samples, metric_name, bucket_count),
+        "overview": _timeline_buckets(metric_entries, metric_name, bucket_count),
         "samples": window_samples,
-        "video_artifacts": video.get("video_artifacts") or {},
-        "video_artifact_tracks": video.get("video_artifact_tracks") or [],
-        "video_metrics": video.get("video_metrics") or {},
-        "metric_summary": video.get("metric_summary") or {},
-        "worst_samples": video.get("worst_samples") or {},
+        "video_artifacts": _video_artifact_map_from_rows(video_artifacts),
+        "video_artifact_tracks": _video_artifact_tracks_from_rows(video_artifacts),
+        "video_metrics": _video_metrics_with_defaults(
+            actual_metrics=actual_video_metrics,
+            requested_video_metrics=requested_video_metrics,
+            run_status=str(run.get("status") or ""),
+            metric_job_status=metric_job_status,
+        ),
+        "metric_summary": _metric_summary_for_video(
+            metric_entries,
+            {name: _empty_metric_summary(name) for name in run.get("metrics") or []},
+        ),
+        "worst_samples": _worst_samples_for_video(metric_entries),
     }
+
+
+def _timeline_sample_sort_key(sample: dict) -> tuple[int, str, int, int]:
+    metadata = sample.get("metadata") or {}
+    return (
+        int(metadata.get("frame_index") or metadata.get("sample_index") or 0),
+        str(metadata.get("compare_track_label") or ""),
+        int(metadata.get("sample_index") or 0),
+        int(sample.get("id") or 0),
+    )
 
 
 def _build_video_payload(db: Database, run: dict[str, object], samples: list[dict], requested_video_name: str) -> dict:
@@ -1408,10 +1503,7 @@ def _build_video_payload(db: Database, run: dict[str, object], samples: list[dic
     requested_sample_metrics = _requested_sample_metrics(run)
     requested_video_metrics = _requested_video_metrics(run)
     metric_job_status = _metric_job_status(db, run)
-    entries = [
-        _sample_timeline_entry(db, run, sample, job_ids, requested_sample_metrics, metric_job_status)
-        for sample in samples
-    ]
+    entries = _sample_timeline_entries(db, run, samples, job_ids, requested_sample_metrics, metric_job_status)
     entries.sort(
         key=lambda item: (
             int(item.get("frame_index") or 0),
@@ -1423,6 +1515,7 @@ def _build_video_payload(db: Database, run: dict[str, object], samples: list[dic
     video_name = str(first_meta.get("video_name") or requested_video_name)
     video_file = str(first_meta.get("video_file") or video_name)
     actual_video_metrics = _video_metric_payloads(db, int(run["id"]), video_name)
+    video_artifacts = _video_artifacts_for_video(db, int(run["id"]), video_name)
     video_metrics = _video_metrics_with_defaults(
         actual_metrics=actual_video_metrics,
         requested_video_metrics=requested_video_metrics,
@@ -1434,8 +1527,8 @@ def _build_video_payload(db: Database, run: dict[str, object], samples: list[dic
         "video_file": video_file,
         "fps": float(first_meta.get("fps") or 0.0),
         "samples": entries,
-        "video_artifacts": _video_artifact_map(db, int(run["id"]), video_name),
-        "video_artifact_tracks": _video_artifact_tracks(db, int(run["id"]), video_name),
+        "video_artifacts": _video_artifact_map_from_rows(video_artifacts),
+        "video_artifact_tracks": _video_artifact_tracks_from_rows(video_artifacts),
         "video_metrics": video_metrics,
         "metric_summary": _metric_summary_for_video(entries, {name: _empty_metric_summary(name) for name in run.get("metrics") or []}),
         "worst_samples": _worst_samples_for_video(entries),
@@ -1450,8 +1543,82 @@ def _sample_timeline_entry(
     requested_sample_metrics: list[str],
     metric_job_status: str | None,
 ) -> dict[str, object]:
+    artifact_rows = [row for row in db.list_artifacts_by_sample(int(sample["id"])) if int(row["job_id"]) in job_ids]
+    metric_rows = _latest_metric_rows(
+        [row for row in db.list_metrics_by_sample(int(sample["id"])) if int(row["inference_job_id"]) in job_ids]
+    )
+    return _sample_timeline_entry_from_rows(
+        run,
+        sample,
+        artifact_rows,
+        metric_rows,
+        requested_sample_metrics,
+        metric_job_status,
+    )
+
+
+def _sample_timeline_entries(
+    db: Database,
+    run: dict[str, object],
+    samples: list[dict],
+    job_ids: set[int],
+    requested_sample_metrics: list[str],
+    metric_job_status: str | None,
+) -> list[dict[str, object]]:
+    sample_ids = [int(sample["id"]) for sample in samples]
+    artifacts_by_sample: dict[int, list[dict]] = {}
+    for artifact in db.list_artifacts_by_samples(sample_ids, job_ids=job_ids):
+        artifacts_by_sample.setdefault(int(artifact["sample_id"]), []).append(artifact)
+    metrics_by_sample: dict[int, list[dict]] = {}
+    for metric in _latest_metric_rows(db.list_metrics_by_samples(sample_ids, inference_job_ids=job_ids)):
+        metrics_by_sample.setdefault(int(metric["sample_id"]), []).append(metric)
+    return [
+        _sample_timeline_entry_from_rows(
+            run,
+            sample,
+            artifacts_by_sample.get(int(sample["id"]), []),
+            metrics_by_sample.get(int(sample["id"]), []),
+            requested_sample_metrics,
+            metric_job_status,
+        )
+        for sample in samples
+    ]
+
+
+def _sample_metric_entries(
+    db: Database,
+    run: dict[str, object],
+    samples: list[dict],
+    job_ids: set[int],
+    requested_sample_metrics: list[str],
+    metric_job_status: str | None,
+) -> list[dict[str, object]]:
+    sample_ids = [int(sample["id"]) for sample in samples]
+    metrics_by_sample: dict[int, list[dict]] = {}
+    for metric in _latest_metric_rows(db.list_metrics_by_samples(sample_ids, inference_job_ids=job_ids)):
+        metrics_by_sample.setdefault(int(metric["sample_id"]), []).append(metric)
+    return [
+        _sample_timeline_entry_from_rows(
+            run,
+            sample,
+            [],
+            metrics_by_sample.get(int(sample["id"]), []),
+            requested_sample_metrics,
+            metric_job_status,
+        )
+        for sample in samples
+    ]
+
+
+def _sample_timeline_entry_from_rows(
+    run: dict[str, object],
+    sample: dict,
+    artifact_rows: list[dict],
+    metric_rows: list[dict],
+    requested_sample_metrics: list[str],
+    metric_job_status: str | None,
+) -> dict[str, object]:
     sample_id = int(sample["id"])
-    artifact_rows = [row for row in db.list_artifacts_by_sample(sample_id) if int(row["job_id"]) in job_ids]
     sample_errors: list[dict[str, str]] = []
     has_artifacts = False
     for artifact in artifact_rows:
@@ -1461,9 +1628,6 @@ def _sample_timeline_entry(
             sample_errors.append({"error_type": meta.get("error_type", ""), "message": meta.get("message", "")})
         else:
             has_artifacts = True
-    metric_rows = _latest_metric_rows(
-        [row for row in db.list_metrics_by_sample(sample_id) if int(row["inference_job_id"]) in job_ids]
-    )
     actual_metrics = {
         row["metric_name"]: {
             "status": row["status"],
@@ -1512,13 +1676,21 @@ def _video_metric_payloads(db: Database, run_id: int, video_name: str) -> dict[s
 
 
 def _video_artifact_map(db: Database, run_id: int, video_name: str) -> dict[str, int]:
+    return _video_artifact_map_from_rows(_video_artifacts_for_video(db, run_id, video_name))
+
+
+def _video_artifact_map_from_rows(artifacts: list[dict]) -> dict[str, int]:
     result: dict[str, int] = {}
-    for artifact in _video_artifacts_for_video(db, run_id, video_name):
+    for artifact in artifacts:
         result.setdefault(artifact["kind"], int(artifact["id"]))
     return result
 
 
 def _video_artifact_tracks(db: Database, run_id: int, video_name: str) -> list[dict[str, object]]:
+    return _video_artifact_tracks_from_rows(_video_artifacts_for_video(db, run_id, video_name))
+
+
+def _video_artifact_tracks_from_rows(artifacts: list[dict]) -> list[dict[str, object]]:
     return [
         {
             "id": int(artifact["id"]),
@@ -1527,15 +1699,16 @@ def _video_artifact_tracks(db: Database, run_id: int, video_name: str) -> list[d
             "track_label": (artifact.get("metadata") or {}).get("compare_track_label"),
             "track_run_id": (artifact.get("metadata") or {}).get("compare_track_run_id"),
         }
-        for artifact in _video_artifacts_for_video(db, run_id, video_name)
+        for artifact in artifacts
     ]
 
 
 def _video_artifacts_for_video(db: Database, run_id: int, video_name: str) -> list[dict]:
-    rows = []
-    for kind in VIDEO_TIMELINE_ARTIFACTS:
-        rows.extend(db.list_run_video_artifacts(run_id, video_name=video_name, kind=kind))
-    return rows
+    return [
+        artifact
+        for artifact in db.list_run_video_artifacts(run_id, video_name=video_name)
+        if artifact["kind"] in VIDEO_TIMELINE_ARTIFACTS
+    ]
 
 
 def _compare_layer_payloads(db: Database, run: dict[str, object], sample: dict) -> list[dict[str, object]]:
