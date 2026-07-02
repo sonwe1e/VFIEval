@@ -1281,6 +1281,7 @@ class Database:
                 "inference_job_ids": [int(job["job_id"]) for job in jobs],
                 "inference_job_id": int(jobs[0]["job_id"]),
                 "metric_names": metrics,
+                "metric_device": str(run.get("device") or "cpu"),
             }
             metric_job_id = self.add_run_job(
                 run_id,

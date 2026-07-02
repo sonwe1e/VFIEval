@@ -416,6 +416,7 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
             "inference_job_id": job_id,
             "dataset_id": dataset_id,
             "metric_names": metric_names,
+            "metric_device": str(device),
         }
         if run_id is not None:
             metric_payload["run_id"] = run_id
@@ -508,6 +509,7 @@ def _run_video_compare_job(
             "inference_job_id": job_id,
             "dataset_id": dataset_id,
             "metric_names": metric_names,
+            "metric_device": str((run or {}).get("device") or job.get("payload", {}).get("device") or "cpu"),
         }
         if run_id is not None:
             metric_payload["run_id"] = run_id

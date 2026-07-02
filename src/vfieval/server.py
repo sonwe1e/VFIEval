@@ -2277,6 +2277,7 @@ def _retry_run_metrics(db: Database, run_id: int) -> dict:
             "inference_job_ids": inference_job_ids,
             "dataset_id": int(run["dataset_id"]),
             "metric_names": failed_names,
+            "metric_device": str(run.get("device") or "cpu"),
             "retry": True,
         },
     )

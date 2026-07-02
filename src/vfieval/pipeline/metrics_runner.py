@@ -24,6 +24,7 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
     inference_job_id = inference_job_ids[0]
     metric_names = list(payload.get("metric_names", []))
     run_id = int(payload["run_id"]) if payload.get("run_id") is not None else None
+    metric_device = str(payload.get("metric_device") or "cpu")
     if not metric_names:
         raise ValueError("metric job requires metric_names")
     unsupported = [name for name in metric_names if name not in METRIC_NAMES]
@@ -84,6 +85,7 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                     distorted_path=distorted_path,
                     sample_id=sample_id,
                     cache_config=metric_cache_configs[metric_name],
+                    metric_device=metric_device,
                 )
             details = {**_compare_track_details(sample, artifact), **details}
 
@@ -155,6 +157,7 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                             distorted_path=Path(artifact["path"]),
                             sample_id=None,
                             cache_config=metric_cache_configs[metric_name],
+                            metric_device=metric_device,
                         )
                         details = {"video_name": video_name, **_compare_track_details(None, artifact), **details}
                     db.add_metric_result(
@@ -218,17 +221,19 @@ def _evaluate_with_cache(
     distorted_path: Path,
     sample_id: int | None,
     cache_config: dict[str, Any],
+    metric_device: str = "cpu",
 ) -> tuple[str, float | None, dict[str, Any]]:
     config = {
         "cache_version": METRIC_CACHE_VERSION,
         "metric": cache_config,
+        "metric_device": metric_device,
     }
     cache_key = metric_cache_key(metric_name, reference_path, distorted_path, config)
     cached = db.get_metric_cache(cache_key)
     if cached:
         return cached["status"], cached["value"], {"cached": True, **cached["details"]}
 
-    metric = create_metric(metric_name, workspace)
+    metric = create_metric(metric_name, workspace, device=metric_device)
     work_dir = workspace.tmp_dir / "metrics" / metric_name / hashlib.sha1(cache_key.encode("utf-8")).hexdigest()
     try:
         result = metric.evaluate(reference_path, distorted_path, work_dir)

@@ -721,6 +721,20 @@ function renderMetricSetupList(rows) {
   `;
 }
 
+function renderMetricHealthSummary(rows) {
+  const problemRows = rows.filter((row) => !row.available);
+  if (!problemRows.length) return "<p class=\"muted\">All configured metrics are available.</p>";
+  return `
+    <div class="metric-health-summary">
+      ${problemRows.map((row) => `
+        <span title="${escapeHtml(row.reason || row.status)}">
+          <strong>${escapeHtml(row.name)}</strong> ${escapeHtml(row.status)}
+        </span>
+      `).join("")}
+    </div>
+  `;
+}
+
 function renderMetricHealthTable(rowsByName) {
   const rows = Object.entries(rowsByName || {}).map(([name, row]) => ({ name, ...row }));
   if (!rows.length) return "";
@@ -780,6 +794,7 @@ function renderMetricEnvironmentPanel() {
   const rows = Object.values(state.metricHealth.metrics || {});
   const available = rows.filter((row) => row.available).length;
   const unavailable = rows.length - available;
+  const rowsByName = state.metricHealth?.metrics || {};
   container.innerHTML = `
     <div class="panel-head">
       <div>
@@ -791,7 +806,11 @@ function renderMetricEnvironmentPanel() {
         <span>unavailable ${escapeHtml(unavailable)}</span>
       </div>
     </div>
-    ${renderPortableMetricHealthTable(state.metricHealth?.metrics || {})}
+    ${renderMetricHealthSummary(Object.entries(rowsByName).map(([name, row]) => ({ name, ...row })))}
+    <details class="metric-health-details">
+      <summary>Metric Health</summary>
+      ${renderPortableMetricHealthTable(rowsByName)}
+    </details>
   `;
 }
 
@@ -1416,38 +1435,53 @@ function renderMetricChart(video, selectedIndex, metricName) {
   const points = values
     .map((value, index) => {
       if (value === null) return null;
-      const x = samples.length <= 1 ? 0 : (index / (samples.length - 1)) * 100;
+      const x = samples.length <= 1 ? 50 : 4 + (index / (samples.length - 1)) * 92;
       const normalized = max === min ? 0.5 : (value - min) / (max - min);
-      const y = 34 - normalized * 28;
+      const y = 42 - normalized * 30;
       return `${x.toFixed(2)},${y.toFixed(2)}`;
     })
     .filter(Boolean)
     .join(" ");
-  const markerX = samples.length <= 1 ? 0 : (selectedIndex / (samples.length - 1)) * 100;
+  const markerX = samples.length <= 1 ? 50 : 4 + (selectedIndex / (samples.length - 1)) * 92;
+  const selectedValue = values[selectedIndex];
+  const selectedY = selectedValue === null || !Number.isFinite(selectedValue)
+    ? 46
+    : 42 - (max === min ? 0.5 : (selectedValue - min) / (max - min)) * 30;
   return `
     <div class="chart" data-chart-video="${escapeHtml(video.video_name)}">
       <div class="chart-head">
         <strong>${escapeHtml(metricName)}</strong>
         <span class="muted">点击曲线定位当前帧</span>
       </div>
-      <svg viewBox="0 0 100 40" preserveAspectRatio="none" role="img">
-        <polyline points="${points}" fill="none" stroke="currentColor" stroke-width="1.6"></polyline>
-        <line x1="${markerX.toFixed(2)}" x2="${markerX.toFixed(2)}" y1="3" y2="37"></line>
-        ${renderMetricPoints(video.video_name, samples, metricName, min, max)}
+      <svg class="metric-chart-svg" viewBox="0 0 100 56" preserveAspectRatio="none" role="img">
+        <g class="chart-grid">
+          <line x1="4" x2="96" y1="12" y2="12"></line>
+          <line x1="4" x2="96" y1="27" y2="27"></line>
+          <line x1="4" x2="96" y1="42" y2="42"></line>
+        </g>
+        <polyline class="metric-line" points="${points}" fill="none"></polyline>
+        <line class="current-marker" x1="${markerX.toFixed(2)}" x2="${markerX.toFixed(2)}" y1="8" y2="46"></line>
+        <circle class="selected-metric-point" cx="${markerX.toFixed(2)}" cy="${selectedY.toFixed(2)}" r="1.8"></circle>
+        ${renderMetricPoints(video.video_name, samples, metricName, min, max, selectedIndex)}
       </svg>
+      <div class="chart-scale">
+        <span>min ${formatNumber(min)}</span>
+        <span>max ${formatNumber(max)}</span>
+      </div>
     </div>
   `;
 }
 
-function renderMetricPoints(videoName, samples, metricName, min, max) {
+function renderMetricPoints(videoName, samples, metricName, min, max, selectedIndex) {
   return samples.map((sample, index) => {
     const metric = sample.metrics?.[metricName];
-    const x = samples.length <= 1 ? 0 : (index / (samples.length - 1)) * 100;
+    const x = samples.length <= 1 ? 50 : 4 + (index / (samples.length - 1)) * 92;
     const status = metric?.status || "missing";
     const value = metric?.value;
     const normalized = status === "completed" && value !== null && max !== min ? (Number(value) - min) / (max - min) : 0.5;
-    const y = status === "completed" ? 34 - normalized * 28 : 36;
-    return `<circle class="metric-point ${escapeHtml(status)}" data-chart-video="${escapeHtml(videoName)}" data-chart-sample="${index}" data-frame-index="${escapeHtml(sample.frame_index)}" cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="1.4"><title>${escapeHtml(status)} ${escapeHtml(value ?? metricReason(metric))}</title></circle>`;
+    const y = status === "completed" ? 42 - normalized * 30 : 46;
+    const selectedClass = index === selectedIndex ? " selected" : "";
+    return `<circle class="metric-point ${escapeHtml(status)}${selectedClass}" data-chart-video="${escapeHtml(videoName)}" data-chart-sample="${index}" data-frame-index="${escapeHtml(sample.frame_index)}" cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="1.05"><title>${escapeHtml(status)} ${escapeHtml(value ?? metricReason(metric))}</title></circle>`;
   }).join("");
 }
 
@@ -1499,16 +1533,19 @@ function renderVideoPlayer(label, artifactId) {
 
 function renderVideoArtifacts(video) {
   const tracks = video.video_artifact_tracks || [];
+  let items = "";
   if (tracks.length) {
-    return tracks
+    items = tracks
       .map((item) => renderVideoPlayer(`${item.track_label || "shared"} / ${item.kind}`, item.id))
       .join("");
+  } else {
+    items = `
+      ${renderVideoPlayer("pred", video.video_artifacts?.pred_video)}
+      ${renderVideoPlayer("gt", video.video_artifacts?.gt_video)}
+      ${renderVideoPlayer("diff", video.video_artifacts?.diff_video)}
+    `;
   }
-  return `
-    ${renderVideoPlayer("pred", video.video_artifacts?.pred_video)}
-    ${renderVideoPlayer("gt", video.video_artifacts?.gt_video)}
-    ${renderVideoPlayer("diff", video.video_artifacts?.diff_video)}
-  `;
+  return items.trim() ? `<div class="video-artifact-strip">${items}</div>` : "";
 }
 
 function renderVideoMasterControls(video) {
@@ -1539,9 +1576,9 @@ function renderVideoTimeline(video) {
       </div>
       <div class="actions">
         ${renderVideoMasterControls(video)}
-        ${renderVideoArtifacts(video)}
       </div>
     </div>
+    ${renderVideoArtifacts(video)}
     ${renderMetricToolbar(video, metricName)}
     ${renderMetricChart(video, selectedIndex, metricName)}
     ${renderWorstSamples(video, metricName)}

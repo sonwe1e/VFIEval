@@ -91,6 +91,7 @@ Metric dependencies, weights, native evaluator binaries, and config files should
 - Metric assets are discovered from `set/metrics/`.
 - Run artifacts live under `.vfieval/runs/{run_id}/`.
 - Repository layout, naming, and Git ownership rules live in `REPO_LAYOUT.md`. Keep real user models, videos, checkpoints, metric assets, SQLite files, runtime outputs, local tool state, and `*.backup.YYYYMMDD_HHMMSS` backups out of Git; keep generated `test_*` models, checkpoints, and videos tracked for clean-checkout tests.
+- Generated `test_*` models, checkpoints, and videos are committed fixtures, not cleanup candidates. When session backups accumulate, archive `*.backup.YYYYMMDD_HHMMSS` files under `archive/file_backups/{timestamp}/` instead of leaving them scattered beside source files.
 
 Legacy `models`, `datasets`, `jobs`, and `experiments` APIs may remain for compatibility, but those concepts must not pollute the primary UI.
 
@@ -239,6 +240,14 @@ Per-sample metrics may be plotted as timeline curves. Video-level metrics such a
 `lpips_vit_patch`, `lpips_convnext`, and `cgvqm` now resolve through `set/metrics/<metric>/manifest.json` with `input_mode`, `driver.command`, `required_files`, and optional `env`. Missing manifest or required files maps to `missing_weights`; missing driver executables or invalid manifest structure maps to `missing_evaluator`.
 
 `vmaf` remains the first built-in real metric path. It resolves `ffmpeg` from `set/metrics/vmaf/manifest.json -> ffmpeg_path` first, then falls back to `PATH`; health payloads and run metadata should expose `implementation_mode`, `manifest_path`, `driver_command`, and `resolved_executable`.
+
+`lpips_vit_patch` is an internal DINOv2 feature-distance metric using `dinov2_vits14_reg` by default. `lpips_convnext` is an internal timm ConvNeXt V2 tiny feature-distance metric using `convnextv2_tiny.fcmae_ft_in22k_in1k` by default. Both are sample-level, lower-is-better metrics; `prepare-metrics` downloads their default assets into `set/metrics/`, while missing Python packages remain `missing_dependency`.
+
+`cgvqm` runs as a video-only wrapper around a local IntelLabs CGVQM checkout declared in `set/metrics/cgvqm/manifest.json`. `prepare-metrics` downloads the checkout and writes `run_cgvqm_vfieval.py`; the wrapper reads VFIEval JSON from stdin and writes `{status, value, details}` JSON to stdout.
+
+Metric evaluation resolution must be explicit and part of health, result details, and cache keys: DINOv2 uses max edge 518 padded to 14, ConvNeXt uses max edge 288 padded to 32, and CGVQM uses temporary evaluation videos capped to long edge 720 without overwriting original artifacts.
+
+Metric jobs inherit the run's inference device through `metric_device`. CUDA/NPU metric execution may be attempted, but a metric-side device or warmup failure must be recorded as `unavailable` with the device and reason; do not silently fall back to CPU.
 
 Metric cache keys must include metric name, adapter version, metric config, manifest fingerprint, driver fingerprint, reference identity, and distorted identity. Reopening a Run Detail page must read SQLite and artifacts only; it must not trigger metric recomputation.
 

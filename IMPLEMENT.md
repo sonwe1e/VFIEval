@@ -1,5 +1,110 @@
 # IMPLEMENT
 
+## [2026-07-03 01:18] CGVQM and Run Detail Usability Fixes
+
+Discussed:
+- The screenshot showed CGVQM unavailable because the wrapper stopped at `demo_cgvqm`, metric health panels consumed too much vertical space, video artifacts rendered as tiny black bars, and the metric curve looked too heavy.
+
+Implemented:
+- Updated the generated CGVQM wrapper and the current local wrapper to call IntelLabs `run_cgvqm(distorted, reference, cgvqm_type=CGVQM_2, device=..., patch_pool="max", patch_scale=4)`.
+- Collapsed Metric Health behind a details disclosure while keeping a short unavailable summary visible.
+- Moved Run Detail video artifacts into a dedicated strip and restored 16:9 video sizing.
+- Reworked the metric chart with light grid lines, min/max labels, a thinner curve, and a clearer current-frame marker.
+
+Files changed:
+- `src/vfieval/metrics/health.py`
+- `set/metrics/cgvqm/run_cgvqm_vfieval.py`
+- `src/vfieval/web/app.js`
+- `src/vfieval/web/styles.css`
+- `tests/test_metrics.py`
+- `tests/test_compare_ui_hooks.py`
+- `tests/test_v3_file_flow.py`
+- `CHANGELOG.md`
+- `IMPLEMENT.md`
+
+Status:
+- Complete. Passed targeted metric/UI/file-flow tests, bundled Node syntax check for `app.js`, `python -m py_compile src\vfieval\metrics\health.py`, full `python -m unittest discover -s tests`, and `git diff --check`.
+
+## [2026-07-03 00:49] Metric Asset Downloads and Evaluation Resolution
+
+Discussed:
+- The previous implementation left missing weights unresolved because `prepare-metrics` only wrote templates.
+- The metric setup now needs to download assets into `set/metrics/` and lock each evaluation scheme to a known resolution before scoring.
+
+Implemented:
+- Made `prepare-metrics` download default DINOv2, ConvNeXt V2, and CGVQM assets, write runnable manifests, skip existing declared assets, and support `--force`.
+- Kept `prepare-metrics --check-only` read-only and kept Python dependency installation out of scope.
+- Added source URLs, fixed evaluation resolution, pad multiple, normalization, and CGVQM video long-edge fields to health and cache config.
+- Added CGVQM temporary resize-video preparation capped to long edge 720 without modifying original artifacts.
+
+Files changed:
+- `src/vfieval/metrics/health.py`
+- `src/vfieval/metrics/feature.py`
+- `src/vfieval/metrics/cgvqm.py`
+- `src/vfieval/cli.py`
+- `tests/test_metrics.py`
+- `tests/test_v3_file_flow.py`
+- `README.md`
+- `AGENTS.md`
+- `CHANGELOG.md`
+- `IMPLEMENT.md`
+
+Status:
+- Complete. Passed changed-file `py_compile`, targeted metric/file-flow/end-to-end tests, full `python -m unittest discover -s tests`, stale-doc scan, and `git diff --check`.
+
+## [2026-07-03 00:27] Remaining Metric Adapters
+
+Discussed:
+- The user decided not to implement per-triplet VMAF and asked to complete the remaining metrics instead.
+- The agreed defaults were DINOv2 ViT-S/14 registers for `lpips_vit_patch`, timm ConvNeXt V2 tiny for `lpips_convnext`, a lightweight local wrapper for IntelLabs CGVQM, local-only assets, and no silent CPU fallback when CUDA/NPU metric execution fails.
+
+Implemented:
+- Added internal feature-distance adapters for `lpips_vit_patch` and `lpips_convnext`, plus a CGVQM wrapper adapter that reads the existing manifest command contract.
+- Reworked metric health and `prepare-metrics` manifests so DINOv2, ConvNeXt, and CGVQM report missing local repos, weights, Python packages, and wrapper commands clearly.
+- Propagated `metric_device` from inference runs into metric jobs, cache keys, and metric adapter construction.
+- Updated tests and docs for missing-assets behavior, CGVQM wrapper execution, cache invalidation, device failure handling, sample/video metric placement, and clean-checkout unavailable results.
+
+Files changed:
+- `src/vfieval/metrics/health.py`
+- `src/vfieval/metrics/registry.py`
+- `src/vfieval/metrics/feature.py`
+- `src/vfieval/metrics/cgvqm.py`
+- `src/vfieval/pipeline/metrics_runner.py`
+- `src/vfieval/pipeline/inference.py`
+- `src/vfieval/db.py`
+- `src/vfieval/server.py`
+- `tests/test_metrics.py`
+- `tests/test_v3_file_flow.py`
+- `tests/test_end_to_end.py`
+- `README.md`
+- `AGENTS.md`
+- `CHANGELOG.md`
+- `IMPLEMENT.md`
+
+Status:
+- Complete. Passed changed-file `py_compile`, passed `python -m unittest discover -s tests`, passed `git diff --check`, archived file backups, and confirmed no stray backup files remained outside the archive flow.
+
+## [2026-07-03 00:04] Backup Archive Cleanup
+
+Discussed:
+- The repository root, `tests/`, and `src/` had accumulated many `*.backup.*` files from earlier sessions, which made real source files harder to scan.
+- The committed `test_*` models and videos are intentional fixtures and should stay where the clean-checkout tests expect them, but local backup files needed a better long-term home.
+
+Implemented:
+- Added `scripts/archive_file_backups.py` to collect scattered `*.backup.*` files, move them into `archive/file_backups/{timestamp}/`, preserve repository-relative paths, and write a `manifest.json` for the archived session.
+- Updated `REPO_LAYOUT.md` and `AGENTS.md` so future sessions keep committed `test_*` fixtures in place and archive backup files instead of leaving them beside source files.
+- Used the new archive flow to move the current repository-local backup files out of the working source and test directories.
+
+Files changed:
+- `scripts/archive_file_backups.py`
+- `REPO_LAYOUT.md`
+- `AGENTS.md`
+- `CHANGELOG.md`
+- `IMPLEMENT.md`
+
+Status:
+- Complete. Archived 55 scattered backup files into `archive/file_backups/20260703_000417/`, verified `python scripts/archive_file_backups.py --dry-run` reports `moved_count = 0`, passed `python -m unittest discover -s tests`, and passed `git diff --check`.
+
 ## [2026-07-02 23:59] Portable Metric Driver and VMAF Smoke Path
 
 Discussed:

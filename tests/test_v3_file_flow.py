@@ -532,9 +532,12 @@ class Model:
                 health = _get(base_url, "/api/metrics/health")
                 self.assertIn("lpips_vit_patch", health["metrics"])
                 self.assertIn("setup_summary", health["metrics"]["lpips_vit_patch"])
-                self.assertEqual(health["metrics"]["lpips_vit_patch"]["implementation_mode"], "manifest_command")
+                self.assertEqual(health["metrics"]["lpips_vit_patch"]["implementation_mode"], "dinov2_feature_distance")
+                self.assertEqual(health["metrics"]["lpips_vit_patch"]["backbone"], "dinov2_vits14_reg")
                 self.assertTrue(health["metrics"]["lpips_vit_patch"]["manifest_path"].endswith("lpips_vit_patch\\manifest.json"))
-                self.assertIn("driver_command", health["metrics"]["lpips_vit_patch"])
+                self.assertEqual(health["metrics"]["lpips_vit_patch"]["device_policy"], "require_run_device")
+                self.assertEqual(health["metrics"]["lpips_vit_patch"]["eval_resolution"], {"mode": "max_edge", "value": 518})
+                self.assertTrue(health["metrics"]["lpips_vit_patch"]["auto_download"])
                 self.assertIn("input_mode", health["metrics"]["vmaf"])
                 self.assertEqual(health["metrics"]["vmaf"]["implementation_mode"], "ffmpeg_libvmaf")
                 self.assertIn("resolved_executable", health["metrics"]["vmaf"])
@@ -652,6 +655,8 @@ class Model:
 
     def test_api_file_run_with_metric_records_unavailable_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
+            previous_metric_assets = os.environ.get("VFIEVAL_METRIC_ASSETS_DIR")
+            os.environ["VFIEVAL_METRIC_ASSETS_DIR"] = str(Path(tmp) / "missing_metrics")
             workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
             workspace.ensure()
             db = Database(workspace.db_path)
@@ -682,13 +687,13 @@ class Model:
                 self.assertEqual(run["status"], "completed", run)
                 self.assertIsNotNone(run["metric_job_id"])
                 self.assertEqual(run["metadata"]["metric_health"]["lpips_vit_patch"]["status"], "missing_weights")
-                self.assertTrue(run["metadata"]["metric_health"]["lpips_vit_patch"]["weights_path"].endswith("lpips_vit_patch\\manifest.json"))
-                self.assertEqual(run["metadata"]["metric_health"]["lpips_vit_patch"]["implementation_mode"], "manifest_command")
+                self.assertTrue(run["metadata"]["metric_health"]["lpips_vit_patch"]["weights_path"].endswith("lpips_vit_patch\\dinov2_vits14_reg.pth"))
+                self.assertEqual(run["metadata"]["metric_health"]["lpips_vit_patch"]["implementation_mode"], "dinov2_feature_distance")
                 self.assertTrue(run["metadata"]["metric_health"]["lpips_vit_patch"]["manifest_path"].endswith("lpips_vit_patch\\manifest.json"))
 
                 summary = _get(base_url, f"/api/runs/{run_id}/metric-summary")
                 self.assertEqual(summary["metrics"]["lpips_vit_patch"]["unavailable"], 2)
-                self.assertIn("metric driver is missing_weights", summary["metrics"]["lpips_vit_patch"]["reasons"][0])
+                self.assertIn("lpips_vit_patch metric is missing_weights", summary["metrics"]["lpips_vit_patch"]["reasons"][0])
 
                 timeline = _get(base_url, f"/api/runs/{run_id}/timeline")
                 statuses = [
@@ -700,6 +705,44 @@ class Model:
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=5)
+                if previous_metric_assets is None:
+                    os.environ.pop("VFIEVAL_METRIC_ASSETS_DIR", None)
+                else:
+                    os.environ["VFIEVAL_METRIC_ASSETS_DIR"] = previous_metric_assets
+
+    def test_metric_job_payload_inherits_resolved_inference_device(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dataset_root = Path(tmp) / "dataset"
+            for folder in ("img0", "img1", "gt"):
+                (dataset_root / folder).mkdir(parents=True)
+            Image.new("RGB", (8, 8), (10, 20, 30)).save(dataset_root / "img0" / "sample000.png")
+            Image.new("RGB", (8, 8), (30, 20, 10)).save(dataset_root / "img1" / "sample000.png")
+            Image.new("RGB", (8, 8), (20, 10, 30)).save(dataset_root / "gt" / "sample000.png")
+
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("dummy", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("metric-device", str(dataset_root), True)
+            self.assertEqual(scan_triplet_dataset(db, dataset_id), 1)
+            run_id = db.create_run(
+                name="metric-device",
+                model_id=model_id,
+                dataset_id=dataset_id,
+                height=8,
+                width=8,
+                batch_size=1,
+                device="cpu",
+                precision="fp32",
+                metrics=["lpips_vit_patch"],
+            )
+
+            run_worker(db, workspace, WorkerOptions(role="inference", once=True, worker_id="metric-device-inference"))
+            run = db.get_run(run_id)
+            metric_job = db.get_job(int(run["metric_job_id"]))
+
+            self.assertEqual(metric_job["payload"]["metric_device"], "cpu")
 
     def test_reopening_run_detail_endpoints_does_not_enqueue_new_work(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -939,7 +982,9 @@ class Model:
                 self.assertIn("renderMetricEnvironmentPanel();", app_js)
                 self.assertIn('state.metricHealth.asset_root || "set/metrics"', app_js)
                 self.assertIn("function renderPortableMetricHealthTable(rowsByName)", app_js)
-                self.assertIn("renderPortableMetricHealthTable(state.metricHealth?.metrics || {})", app_js)
+                self.assertIn("<details class=\"metric-health-details\">", app_js)
+                self.assertIn("renderMetricHealthSummary", app_js)
+                self.assertIn("renderPortableMetricHealthTable(rowsByName)", app_js)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -1063,6 +1108,8 @@ class Model:
 
     def test_api_file_run_records_cgvqm_as_video_only_metric(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
+            previous_metric_assets = os.environ.get("VFIEVAL_METRIC_ASSETS_DIR")
+            os.environ["VFIEVAL_METRIC_ASSETS_DIR"] = str(Path(tmp) / "missing_metrics")
             workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
             workspace.ensure()
             db = Database(workspace.db_path)
@@ -1094,7 +1141,7 @@ class Model:
 
                 summary = _get(base_url, f"/api/runs/{run_id}/metric-summary")
                 self.assertEqual(summary["metrics"]["cgvqm"]["unavailable"], 1)
-                self.assertIn("metric driver is missing_weights", summary["metrics"]["cgvqm"]["reasons"][0])
+                self.assertIn("cgvqm evaluator is missing_weights", summary["metrics"]["cgvqm"]["reasons"][0])
 
                 timeline = _get(base_url, f"/api/runs/{run_id}/timeline")
                 self.assertNotIn("cgvqm", timeline["videos"][0]["samples"][0]["metrics"])
@@ -1104,6 +1151,10 @@ class Model:
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=5)
+                if previous_metric_assets is None:
+                    os.environ.pop("VFIEVAL_METRIC_ASSETS_DIR", None)
+                else:
+                    os.environ["VFIEVAL_METRIC_ASSETS_DIR"] = previous_metric_assets
 
     def test_run_detail_api_exposes_human_readable_failed_run_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2490,7 +2541,7 @@ class Model:
             self.assertEqual(health["asset_root"], str(Path(tmp) / "set" / "metrics"))
             self.assertEqual(health["metrics"]["lpips_vit_patch"]["status"], "missing_weights")
             self.assertFalse(health["metrics"]["lpips_vit_patch"]["available"])
-            self.assertTrue(health["metrics"]["lpips_vit_patch"]["weights_path"].endswith("lpips_vit_patch\\manifest.json"))
+            self.assertTrue(health["metrics"]["lpips_vit_patch"]["weights_path"].endswith("lpips_vit_patch\\dinov2_vits14_reg.pth"))
             self.assertTrue(health["metrics"]["lpips_vit_patch"]["manifest_path"].endswith("lpips_vit_patch\\manifest.json"))
 
     def test_metric_health_uses_user_facing_statuses(self) -> None:
@@ -2503,11 +2554,11 @@ class Model:
                     vmaf = metric_health(workspace, "vmaf")
                 cgvqm = metric_health(workspace, "cgvqm")
         self.assertEqual(lpips["status"], "missing_weights")
-        self.assertTrue(lpips["weights_path"].endswith("lpips_vit_patch\\manifest.json"))
+        self.assertTrue(lpips["weights_path"].endswith("lpips_vit_patch\\dinov2_vits14_reg.pth"))
         self.assertEqual(lpips["input_mode"], "sample_pair")
-        self.assertEqual(lpips["implementation_mode"], "manifest_command")
-        self.assertIn("project-local manifest", lpips["setup_summary"])
-        self.assertTrue(any(item["kind"] == "driver" for item in lpips["setup_requirements"]))
+        self.assertEqual(lpips["implementation_mode"], "dinov2_feature_distance")
+        self.assertIn("DINOv2", lpips["setup_summary"])
+        self.assertEqual(lpips["device_policy"], "require_run_device")
         self.assertEqual(vmaf["status"], "missing_evaluator")
         self.assertFalse(vmaf["available"])
         self.assertEqual(vmaf["input_mode"], "video_only")
@@ -2521,27 +2572,31 @@ class Model:
             workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
             workspace.ensure()
             project_root = Path(tmp)
-            manifest_path = project_root / "set" / "metrics" / "lpips_vit_patch" / "manifest.json"
+            manifest_path = project_root / "set" / "metrics" / "cgvqm" / "manifest.json"
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
-            (manifest_path.parent / "weights.bin").write_bytes(b"weights")
+            (manifest_path.parent / "weights").mkdir()
+            (manifest_path.parent / "CGVQM").mkdir()
             manifest_path.write_text(
                 json.dumps(
                     {
-                        "metric_name": "lpips_vit_patch",
+                        "metric_name": "cgvqm",
                         "asset_version": "v2",
-                        "input_mode": "sample_pair",
+                        "implementation_mode": "cgvqm_wrapper",
+                        "repo_dir": "CGVQM",
+                        "weights_path": "weights",
+                        "device_policy": "require_run_device",
                         "driver": {"command": ["missing-driver.exe"]},
-                        "required_files": ["weights.bin"],
                         "env": {},
                     }
                 ),
                 encoding="utf-8",
             )
             with patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": str(project_root), "VFIEVAL_METRIC_ASSETS_DIR": ""}, clear=False):
-                lpips = metric_health(workspace, "lpips_vit_patch")
-            self.assertEqual(lpips["status"], "missing_evaluator")
-            self.assertFalse(lpips["available"])
-            self.assertIn("driver executable", lpips["reason"])
+                with patch("vfieval.metrics.health.importlib.util.find_spec", return_value=object()):
+                    cgvqm = metric_health(workspace, "cgvqm")
+            self.assertEqual(cgvqm["status"], "missing_evaluator")
+            self.assertFalse(cgvqm["available"])
+            self.assertIn("driver executable", cgvqm["reason"])
 
     def test_worker_process_command_includes_device_filter_and_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

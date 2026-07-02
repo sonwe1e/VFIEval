@@ -65,6 +65,7 @@ def main(argv: list[str] | None = None) -> int:
 
     prepare_metrics = sub.add_parser("prepare-metrics")
     prepare_metrics.add_argument("--check-only", action="store_true")
+    prepare_metrics.add_argument("--force", action="store_true")
 
     smoke_metric = sub.add_parser("smoke-metric")
     smoke_metric.add_argument("--metric", choices=METRIC_NAMES, required=True)
@@ -162,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "prepare-metrics":
-        result = metrics_health(workspace) if args.check_only else prepare_metric_asset_manifest(workspace)
+        result = metrics_health(workspace) if args.check_only else prepare_metric_asset_manifest(workspace, force=args.force)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
 

@@ -173,7 +173,7 @@ python -m vfieval.cli --workspace .vfieval smoke-metric --metric vmaf --referenc
 
 ### Metric setup details
 
-`prepare-metrics` only creates placeholder manifests under `set/metrics/`. It does not download weights, install evaluator bindings, or modify system binaries. `GET /api/metrics/health` reports the exact status, reason, evaluator type, implementation mode, manifest path, resolved executable, driver command, input mode, timeline support, and expected project-local paths.
+`prepare-metrics` downloads missing default metric assets into `set/metrics/` and writes runnable manifests. It does not install Python packages or system binaries. `prepare-metrics --check-only` is read-only, and `GET /api/metrics/health` reports status, source URLs, fixed evaluation resolution, manifest paths, executable paths, input mode, and timeline support.
 
 Current metric setup contract:
 
@@ -190,10 +190,18 @@ set/
       manifest.json
 ```
 
-- `lpips_vit_patch`: provide `set/metrics/lpips_vit_patch/manifest.json` plus the driver command and required assets referenced by that manifest. VFIEval runs the declared command and does not auto-download weights.
-- `lpips_convnext`: provide `set/metrics/lpips_convnext/manifest.json` plus the driver command and required assets referenced by that manifest. VFIEval runs the declared command and does not auto-download weights.
-- `cgvqm`: provide `set/metrics/cgvqm/manifest.json` plus the driver command and required assets referenced by that manifest. This remains a video-level metric and does not synthesize per-frame points.
+- `lpips_vit_patch`: `prepare-metrics` downloads the DINOv2 checkout and ViT-S/14 registers weights into `set/metrics/lpips_vit_patch/`.
+- `lpips_convnext`: `prepare-metrics` downloads the local ConvNeXt V2 tiny checkpoint into `set/metrics/lpips_convnext/`.
+- `cgvqm`: `prepare-metrics` downloads the IntelLabs CGVQM checkout and writes the VFIEval JSON wrapper into `set/metrics/cgvqm/`. This remains a video-level metric and does not synthesize per-frame points.
 - `vmaf`: this is the first metric that can run immediately in the current build. Install `ffmpeg` with the `libvmaf` filter on `PATH`, or set `set/metrics/vmaf/manifest.json -> ffmpeg_path` to a project-local portable ffmpeg binary.
+
+Current remaining-metric adapters:
+
+- `lpips_vit_patch` is a sample-level DINOv2 feature-distance metric. Default backbone: `dinov2_vits14_reg`. Evaluation uses max edge `518`, preserves aspect ratio, and pads to a multiple of `14`.
+- `lpips_convnext` is a sample-level ConvNeXt V2 feature-distance metric. Default backbone: `convnextv2_tiny.fcmae_ft_in22k_in1k`. Evaluation uses max edge `288`, preserves aspect ratio, and pads to a multiple of `32`.
+- `cgvqm` is a video-level wrapper around a local IntelLabs CGVQM checkout. Evaluation videos are written under the metric work directory with long edge capped at `720`; original artifacts are not overwritten.
+- Metric jobs inherit the Run's inference device through `metric_device`. If CUDA/NPU metric warmup fails, VFIEval records `unavailable` with the device and reason instead of falling back to CPU.
+- `prepare-metrics --check-only` is read-only. `prepare-metrics --force` replaces only VFIEval-declared metric assets, not unrelated user files. Python packages such as `timm`, `safetensors`, `av`, and `scipy` are never installed automatically.
 
 Status interpretation:
 
@@ -202,7 +210,7 @@ Status interpretation:
 - `missing_dependency`: the Python package dependency for that metric is missing from the current environment.
 - `available`: the current build can attempt to execute that metric without substituting another score.
 
-指标资产默认放在项目根目录的 `set/metrics/`，也可以用 `VFIEVAL_METRIC_ASSETS_DIR` 指向其它可迁移目录。缺少依赖、权重或 evaluator 时，指标会记录为 `unavailable` 并显示原因，不会自动下载，也不会替换成其它分数。
+Metric assets live under `set/metrics/` by default, or under `VFIEVAL_METRIC_ASSETS_DIR` when that environment variable is set. Missing dependencies, failed downloads, or unsupported evaluator devices are recorded as `unavailable`; VFIEval never substitutes a different metric score.
 
 ## API
 

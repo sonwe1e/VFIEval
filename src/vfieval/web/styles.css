@@ -279,7 +279,32 @@ summary {
 .metric-health-table {
   display: grid;
   gap: 8px;
-  margin-top: 12px;
+  margin-top: 8px;
+}
+
+.metric-health-details {
+  margin-top: 10px;
+}
+
+.metric-health-details summary {
+  color: var(--accent);
+}
+
+.metric-health-details .metric-health-table {
+  padding-top: 8px;
+}
+
+.metric-health-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.metric-health-summary span {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 6px;
+  background: #fff;
 }
 
 .compare-source-grid {
@@ -632,10 +657,8 @@ th {
 
 .video-artifact {
   display: grid;
-  grid-template-columns: auto minmax(120px, 180px) auto;
   gap: 6px;
-  align-items: center;
-  max-width: 270px;
+  min-width: 180px;
 }
 
 .video-artifact span {
@@ -645,7 +668,10 @@ th {
 
 .video-artifact video {
   width: 100%;
-  height: 32px;
+  aspect-ratio: 16 / 9;
+  min-height: 96px;
+  object-fit: contain;
+  display: block;
   background: #111;
   border-radius: 6px;
 }
@@ -654,6 +680,14 @@ th {
   min-height: 28px;
   padding: 4px 7px;
   font-size: 12px;
+}
+
+.video-artifact-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 260px));
+  gap: 10px;
+  align-items: start;
+  margin-bottom: 12px;
 }
 
 .chart {
@@ -674,15 +708,45 @@ th {
 
 .chart svg {
   width: 100%;
-  height: 150px;
+  height: 190px;
   display: block;
   color: var(--accent);
   cursor: crosshair;
 }
 
-.chart line {
+.chart-grid line {
+  stroke: #dfe5ef;
+  stroke-width: 0.35;
+}
+
+.metric-line {
+  stroke: var(--accent);
+  stroke-width: 0.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+}
+
+.current-marker {
+  stroke: var(--bad);
+  stroke-width: 0.55;
+  vector-effect: non-scaling-stroke;
+}
+
+.selected-metric-point {
+  fill: #fff;
   stroke: var(--bad);
   stroke-width: 0.8;
+  vector-effect: non-scaling-stroke;
+}
+
+.chart-scale {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 4px;
 }
 
 .metric-toolbar {
@@ -699,6 +763,11 @@ th {
 
 .metric-point {
   cursor: pointer;
+  opacity: 0.9;
+}
+
+.metric-point.selected {
+  opacity: 0;
 }
 
 .metric-point.unavailable,

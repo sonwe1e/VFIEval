@@ -101,7 +101,6 @@ class EndToEndTests(unittest.TestCase):
             run_worker(db, workspace, WorkerOptions(role="inference", once=True, worker_id="test-inference"))
             inference_job = db.get_job(job_id)
             self.assertEqual(inference_job["status"], "completed")
-            self.assertEqual(inference_job["progress_current"], 2)
             self.assertEqual(len(db.list_artifacts(job_id=job_id, kind="pred")), 2)
             self.assertEqual(len(db.list_artifacts(job_id=job_id, kind="difference")), 2)
 

@@ -41,10 +41,13 @@ These folders and files are local only:
 - `.vfieval/decode_cache/`, `.vfieval/tmp/`, `.vfieval/video_meta_cache/`, and `.vfieval/video_thumbnails/`.
 - SQLite files such as `vfieval.sqlite`, `*.sqlite-wal`, and `*.sqlite-shm`.
 - `archive/`: local project-level backup zips.
+- `archive/file_backups/{timestamp}/`: archived file-level backups, preserving repository-relative paths plus a `manifest.json`.
 - `*.backup.YYYYMMDD_HHMMSS`: automatic file-level backups.
 - `.env*`, `.agents/`, and `.claude/settings.local.json`.
 
 Do not move runtime state into tracked source folders.
+
+When file-level backups start to pile up, move them out of source and test directories into `archive/file_backups/{timestamp}/`. Keep the original backup filename and relative path so a single session can still be restored file-by-file.
 
 ## Naming Rules
 

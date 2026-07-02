@@ -1,5 +1,27 @@
 # CHANGELOG
 
+## [2026-07-03 01:18]
+- Fixed CGVQM's generated wrapper so it calls IntelLabs `run_cgvqm` with VFIEval's GT/Pred videos instead of reporting that only `demo_cgvqm` exists.
+- Made the metric environment health details collapsible, restored Run Detail videos to readable 16:9 tiles, and refined metric timeline charts with grid lines, scale labels, and lighter strokes.
+- Files affected: `src/vfieval/metrics/health.py`, `set/metrics/cgvqm/run_cgvqm_vfieval.py`, `src/vfieval/web/app.js`, `src/vfieval/web/styles.css`, `tests/test_metrics.py`, `tests/test_compare_ui_hooks.py`, `tests/test_v3_file_flow.py`, `CHANGELOG.md`, `IMPLEMENT.md`.
+
+## [2026-07-03 00:49]
+- Changed `prepare-metrics` from placeholder-only setup to default asset preparation: it now downloads DINOv2, ConvNeXt V2, and CGVQM assets into `set/metrics/`, writes runnable manifests, supports `--force`, and keeps `--check-only` read-only.
+- Fixed metric resolution policy: DINOv2 evaluates at max edge 518 padded to 14, ConvNeXt at max edge 288 padded to 32, and CGVQM writes temporary 720-long-edge evaluation videos without overwriting artifacts.
+- Added health/cache fields for source URLs, evaluation resolution, pad multiple, normalization policy, and video evaluation long edge.
+- Files affected: `src/vfieval/metrics/health.py`, `src/vfieval/metrics/feature.py`, `src/vfieval/metrics/cgvqm.py`, `src/vfieval/cli.py`, `tests/test_metrics.py`, `tests/test_v3_file_flow.py`, `README.md`, `AGENTS.md`, `CHANGELOG.md`, `IMPLEMENT.md`.
+
+## [2026-07-03 00:27]
+- Completed the remaining metric adapters: `lpips_vit_patch` now uses a local DINOv2 ViT-S/14 registers feature-distance path, `lpips_convnext` uses a local timm ConvNeXt V2 tiny feature-distance path, and `cgvqm` runs through a local wrapper command.
+- Metric jobs now inherit the resolved inference device as `metric_device`, include it in cache config, and record device/warmup failures as `unavailable` instead of silently falling back to CPU.
+- Updated metric health, prepared manifests, tests, and docs so clean checkouts report missing local assets clearly while local metric installations can run without auto-downloading code or weights.
+- Files affected: `src/vfieval/metrics/health.py`, `src/vfieval/metrics/registry.py`, `src/vfieval/metrics/feature.py`, `src/vfieval/metrics/cgvqm.py`, `src/vfieval/pipeline/metrics_runner.py`, `src/vfieval/pipeline/inference.py`, `src/vfieval/db.py`, `src/vfieval/server.py`, `tests/test_metrics.py`, `tests/test_v3_file_flow.py`, `tests/test_end_to_end.py`, `README.md`, `AGENTS.md`, `CHANGELOG.md`, `IMPLEMENT.md`.
+
+## [2026-07-03 00:04]
+- Added `scripts/archive_file_backups.py` so scattered `*.backup.*` files can be moved into timestamped `archive/file_backups/` sessions with a manifest instead of staying mixed into source and test folders.
+- Archived the existing repository-local file backups into a single timestamped backup session and clarified that committed `test_*` fixtures stay in place while ad hoc backups move to `archive/file_backups/`.
+- Files affected: `scripts/archive_file_backups.py`, `REPO_LAYOUT.md`, `AGENTS.md`, `CHANGELOG.md`, `IMPLEMENT.md`.
+
 ## [2026-07-02 23:59]
 - Replaced the placeholder LPIPS/CGVQM metric adapter with a manifest-driven command runner so project-local manifests can declare `driver.command`, `required_files`, and optional environment variables without hardcoded evaluator bindings.
 - Made VMAF resolve `ffmpeg` from `set/metrics/vmaf/manifest.json -> ffmpeg_path` before falling back to `PATH`, added richer metric health diagnostics plus a `vfieval smoke-metric` CLI, and fixed Windows `libvmaf` log-path escaping.

@@ -25,6 +25,23 @@ class CompareUiHookTests(unittest.TestCase):
         self.assertIn("--compare-grid-columns", styles)
         self.assertIn("grid-auto-flow: column", styles)
 
+    def test_metric_health_video_tiles_and_chart_are_compact_but_readable(self) -> None:
+        app_js = (ROOT / "src" / "vfieval" / "web" / "app.js").read_text(encoding="utf-8")
+        styles = (ROOT / "src" / "vfieval" / "web" / "styles.css").read_text(encoding="utf-8")
+
+        self.assertIn("<details class=\"metric-health-details\">", app_js)
+        self.assertIn("renderMetricHealthSummary", app_js)
+        self.assertIn("video-artifact-strip", app_js)
+        self.assertIn("class=\"metric-chart-svg\"", app_js)
+        self.assertIn("class=\"chart-grid\"", app_js)
+        self.assertIn("class=\"current-marker\"", app_js)
+        self.assertIn(".video-artifact-strip", styles)
+        self.assertIn("aspect-ratio: 16 / 9;", styles)
+        self.assertIn("min-height: 96px;", styles)
+        self.assertNotIn("height: 32px;", styles)
+        self.assertIn(".metric-line", styles)
+        self.assertIn(".chart-scale", styles)
+
     def test_usability_controls_are_wired_without_legacy_compare_path_copy(self) -> None:
         app_js = (ROOT / "src" / "vfieval" / "web" / "app.js").read_text(encoding="utf-8")
 
