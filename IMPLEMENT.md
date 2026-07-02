@@ -1,5 +1,57 @@
 # IMPLEMENT
 
+## [2026-07-02 23:59] Portable Metric Driver and VMAF Smoke Path
+
+Discussed:
+- The metric stack still treated LPIPS/CGVQM as "available in theory" while the shipped adapter always raised `unavailable`, so the build needed a real portable execution contract instead of a placeholder native-binding story.
+- VMAF needed to become the immediately usable path in the current build, including a direct smoke command and clearer health diagnostics about which `ffmpeg` binary is actually being used.
+
+Implemented:
+- Reworked `src/vfieval/metrics/health.py` around manifest-aware checks. LPIPS/CGVQM now validate `driver.command`, `required_files`, optional `env`, manifest shape, resolved executable, and cache fingerprints. VMAF now inspects an optional `set/metrics/vmaf/manifest.json`, resolves `ffmpeg_path` before `PATH`, and reports `implementation_mode`, `manifest_path`, `driver_command`, and `resolved_executable`.
+- Replaced the placeholder `NativeMetric` behavior with a real manifest-command runner in `src/vfieval/metrics/native.py`, wired the registry to it, and added `vfieval smoke-metric --metric ... --reference ... --distorted ...` in `src/vfieval/cli.py`.
+- Updated `src/vfieval/metrics/vmaf.py` to reuse the resolved health config and fixed Windows `libvmaf` log-path escaping so real `ffmpeg` runs can write JSON logs correctly.
+- Updated the metric environment UI and documentation to show the richer diagnostics and explain that VMAF is the first immediately runnable metric while LPIPS/CGVQM require a manifest + driver + assets under `set/metrics/`.
+- Added metric-focused tests for manifest health mapping, manifest-driver success/unavailable/failed stdout protocol, driver fingerprint cache invalidation, VMAF manifest overrides, CLI smoke execution, and file-flow metric metadata/API behavior.
+
+Files changed:
+- `src/vfieval/metrics/health.py`
+- `src/vfieval/metrics/native.py`
+- `src/vfieval/metrics/registry.py`
+- `src/vfieval/metrics/vmaf.py`
+- `src/vfieval/cli.py`
+- `src/vfieval/web/app.js`
+- `tests/test_metrics.py`
+- `tests/test_v3_file_flow.py`
+- `README.md`
+- `AGENTS.md`
+- `CHANGELOG.md`
+- `IMPLEMENT.md`
+
+Status:
+- Complete. Passed targeted metric tests, passed `python -m unittest discover -s tests`, and passed `git diff --check`.
+
+## [2026-07-02 23:16] 4K Test Fixture and Larger Dry-Run Probe
+
+Discussed:
+- The repository needed a built-in 4K video fixture so discovery and preflight can cover UHD metadata without pushing the default `test_style` path through 4K assets.
+- The preflight dry-run probe was still using an `8x8` input, which was too small for some shape-sensitive model checks.
+
+Implemented:
+- Added a new generated test video group `videos/test_4k/` with one short `3840x2160` `mp4v` clip.
+- Changed the dry-run probe input in `src/vfieval/file_inputs.py` from `(1, 3, 8, 8)` to `(1, 3, 128, 128)`.
+- Added the probe shape to the dry-run cache key so the larger probe invalidates older in-process cache entries automatically.
+- Extended `tests/test_v3_file_flow.py` to assert the larger probe reaches platform post-processing and that `test_4k` is discovered with UHD metadata and original-resolution preflight output.
+
+Files changed:
+- `scripts/generate_test_assets.py`
+- `src/vfieval/file_inputs.py`
+- `tests/test_v3_file_flow.py`
+- `CHANGELOG.md`
+- `IMPLEMENT.md`
+
+Status:
+- Complete. Generated the `videos/test_4k/` fixture, passed targeted dry-run and discovery tests, passed `python -m unittest discover -s tests`, and passed `git diff --check`.
+
 ## [2026-07-02 15:35] Runtime Output Diagnostics and Shard Failure Cleanup
 
 Discussed:

@@ -23,6 +23,7 @@ CHECKPOINT_SUFFIXES = {".bin", ".ckpt", ".pth", ".pt", ".safetensors"}
 DECODE_STRATEGY_VERSION = "opencv-rgb-v1"
 VIDEO_INSPECT_VERSION = "ffprobe-opencv-v3"
 _DRY_RUN_CACHE: dict[str, dict[str, Any]] = {}
+DRY_RUN_INPUT_SHAPE = (1, 3, 128, 128)
 
 
 def project_root(workspace: WorkspaceConfig) -> Path:
@@ -766,8 +767,8 @@ def _dry_run_model_file(
         raise RuntimeError(_describe_dry_run_failure("model_init/checkpoint_load", exc)) from exc
 
     try:
-        img0 = torch.zeros((1, 3, 8, 8), dtype=dtype, device=device)
-        img1 = torch.ones((1, 3, 8, 8), dtype=dtype, device=device)
+        img0 = torch.zeros(DRY_RUN_INPUT_SHAPE, dtype=dtype, device=device)
+        img1 = torch.ones(DRY_RUN_INPUT_SHAPE, dtype=dtype, device=device)
         with torch.no_grad():
             outputs = model.predict(img0, img1, 0.5)
     except Exception as exc:
@@ -820,6 +821,7 @@ def _dry_run_cache_key(model_path: Path, checkpoint_path: Path | None, device_na
         "checkpoint": checkpoint_payload,
         "device": str(device_name),
         "precision": str(precision),
+        "probe_shape": list(DRY_RUN_INPUT_SHAPE),
         "loader_id": id(load_flow_mask_model),
         "postprocess_id": id(compose_interpolated),
     }

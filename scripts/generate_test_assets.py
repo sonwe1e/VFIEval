@@ -9,11 +9,13 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 TEST_STYLE = ROOT / "videos" / "test_style"
 EDGE_CASES = ROOT / "videos" / "test_edge_cases"
+TEST_4K = ROOT / "videos" / "test_4k"
 
 
 def main() -> None:
     TEST_STYLE.mkdir(parents=True, exist_ok=True)
     EDGE_CASES.mkdir(parents=True, exist_ok=True)
+    TEST_4K.mkdir(parents=True, exist_ok=True)
     write_video(TEST_STYLE / "gradient_motion.avi", gradient_motion, frames=12, size=(96, 64), fourcc="MJPG")
     write_video(TEST_STYLE / "blocks_motion.avi", blocks_motion, frames=12, size=(96, 64), fourcc="MJPG")
     write_video(TEST_STYLE / "thin_lines_motion.mp4", thin_lines_motion, frames=12, size=(96, 64), fourcc="mp4v")
@@ -23,6 +25,7 @@ def main() -> None:
     write_video(TEST_STYLE / "odd_resolution_中文 空格.avi", gradient_motion, frames=12, size=(95, 63), fourcc="MJPG")
     write_video(EDGE_CASES / "short_less_than_3_frames.avi", blocks_motion, frames=2, size=(64, 48), fourcc="MJPG")
     write_video(EDGE_CASES / "alternate_encoding.mp4", repeated_texture, frames=8, size=(80, 56), fourcc="mp4v")
+    write_video(TEST_4K / "uhd_gradient_motion.mp4", gradient_motion, frames=6, size=(3840, 2160), fourcc="mp4v")
 
 
 def write_video(path: Path, renderer, frames: int, size: tuple[int, int], fourcc: str) -> None:

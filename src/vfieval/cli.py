@@ -7,7 +7,8 @@ from pathlib import Path
 from vfieval.config import WorkspaceConfig
 from vfieval.datasets import scan_dataset
 from vfieval.db import Database
-from vfieval.metrics import METRIC_NAMES
+from vfieval.metrics import METRIC_NAMES, create_metric
+from vfieval.metrics.base import MetricUnavailable
 from vfieval.metrics.health import metrics_health, prepare_metric_asset_manifest
 from vfieval.server import run_server
 from vfieval.worker import WorkerOptions, run_worker
@@ -64,6 +65,12 @@ def main(argv: list[str] | None = None) -> int:
 
     prepare_metrics = sub.add_parser("prepare-metrics")
     prepare_metrics.add_argument("--check-only", action="store_true")
+
+    smoke_metric = sub.add_parser("smoke-metric")
+    smoke_metric.add_argument("--metric", choices=METRIC_NAMES, required=True)
+    smoke_metric.add_argument("--reference", required=True)
+    smoke_metric.add_argument("--distorted", required=True)
+    smoke_metric.add_argument("--work-dir")
 
     worker = sub.add_parser("worker")
     worker.add_argument("--role", choices=["decode", "inference", "metric", "all"], default="all")
@@ -158,6 +165,28 @@ def main(argv: list[str] | None = None) -> int:
         result = metrics_health(workspace) if args.check_only else prepare_metric_asset_manifest(workspace)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
+
+    if args.command == "smoke-metric":
+        metric = create_metric(args.metric, workspace)
+        reference = Path(args.reference).resolve()
+        distorted = Path(args.distorted).resolve()
+        work_dir = Path(args.work_dir).resolve() if args.work_dir else workspace.tmp_dir / "smoke-metric" / args.metric
+        try:
+            result = metric.evaluate(reference, distorted, work_dir)
+            payload = {"status": result.status, "value": result.value, "details": result.details}
+            code = 0
+        except MetricUnavailable as exc:
+            payload = {"status": "unavailable", "value": None, "details": {"reason": str(exc)}}
+            code = 0
+        except Exception as exc:
+            payload = {
+                "status": "failed",
+                "value": None,
+                "details": {"reason": str(exc), "type": type(exc).__name__},
+            }
+            code = 1
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return code
 
     if args.command == "worker":
         run_worker(

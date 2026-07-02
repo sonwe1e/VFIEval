@@ -24,9 +24,7 @@ from vfieval.models import load_flow_mask_model
 from vfieval.pipeline.io import batch_tensors, load_rgb_tensor, resize_batch
 from vfieval.pipeline.postprocess import (
     compose_interpolated,
-    compose_interpolated_native,
     normalize_model_outputs,
-    resize_bundle,
 )
 from vfieval.pipeline.visualize import save_difference, save_extra_tensor, save_preview_image, save_rgb_tensor
 
@@ -34,6 +32,10 @@ from vfieval.pipeline.visualize import save_difference, save_extra_tensor, save_
 VALID_PRECISIONS = {"fp32", "fp16", "bf16"}
 DEFAULT_VISUALIZE_HEIGHT = 384
 DEFAULT_VISUALIZE_WIDTH = 832
+# Above this max edge a downscaled preview thumbnail is worth its extra encode;
+# at or below it the saved artifact is already small enough to display directly,
+# so skipping the preview removes redundant save-pool work on long videos.
+PREVIEW_SKIP_MAX_EDGE = 1024
 CORE_OUTPUTS = {"flowt_0", "flowt_1", "mask0", "mask1"}
 BUNDLE_KEYS = ("pred", "warp0", "warp1", "blend", "mask0", "mask1", "flowt_0", "flowt_1")
 
@@ -336,12 +338,16 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
             timing["model"] += time.perf_counter() - t1
 
             t2 = time.perf_counter()
-            # Compose at the model's native flow/mask resolution, then resize the
-            # whole bundle once to the visualization resolution. This keeps warp,
-            # blend and PNG encoding off the full inference resolution, which is
-            # the CPU-side work that otherwise leaves the device idle.
-            composed = compose_interpolated_native(img0, img1, outputs)
-            composed_viz = resize_bundle(composed, visualize_height, visualize_width)
+            # Compose at the visualization resolution: downscale the (near
+            # full-res) source frames to viz size, upsample the model's low-res
+            # flow/mask to match, then warp. Warping sharp sources keeps pred
+            # crisp (warping the model's native 208x448 pixels would blur it),
+            # while composing at viz res instead of full inference res keeps the
+            # on-device work and the PNG payload small.
+            img0_viz = _resize_to_device(img0, visualize_height, visualize_width)
+            img1_viz = _resize_to_device(img1, visualize_height, visualize_width)
+            normalized_viz = normalize_model_outputs(outputs, img0_viz)
+            composed_viz = compose_interpolated(img0_viz, img1_viz, normalized_viz)
             bundle_cpu = {
                 "pred": composed_viz["pred"].detach().to("cpu"),
                 "warp0": composed_viz["warp0"].detach().to("cpu"),
@@ -349,8 +355,8 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
                 "blend": composed_viz["blend"].detach().to("cpu"),
                 "mask0": composed_viz["mask0"].detach().to("cpu"),
                 "mask1": composed_viz["mask1"].detach().to("cpu"),
-                "flowt_0": composed_viz["flowt_0"].detach().to("cpu"),
-                "flowt_1": composed_viz["flowt_1"].detach().to("cpu"),
+                "flowt_0": normalized_viz["flowt_0"].detach().to("cpu"),
+                "flowt_1": normalized_viz["flowt_1"].detach().to("cpu"),
             }
             output_health.update(bundle_cpu)
             extra_cpu: dict[str, torch.Tensor] = {}
@@ -543,6 +549,15 @@ def _resize_chw(tensor: torch.Tensor, height: int, width: int) -> torch.Tensor:
     return resized.squeeze(0)
 
 
+def _resize_to_device(tensor: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """Resize a BCHW tensor in place on its current device (no host copy)."""
+    if tuple(tensor.shape[-2:]) == (height, width):
+        return tensor
+    return torch.nn.functional.interpolate(
+        tensor, size=(height, width), mode="bilinear", align_corners=False
+    )
+
+
 def _fps(count: int, seconds: float) -> float:
     if seconds <= 0:
         return 0.0
@@ -564,14 +579,21 @@ def _add_image_artifact_with_preview(
     kind: str,
     path: Path,
     metadata: dict[str, Any],
+    make_preview: bool = True,
 ) -> int:
-    preview_path = path.parent / "preview" / path.name
+    # Previews exist so the UI can render a small thumbnail without fetching a
+    # multi-megapixel original. When the artifact itself is already small (the
+    # visualization resolution defaults to 832x384, at or below the 512px
+    # preview edge), the extra thumbnail encode is pure overhead on the save
+    # pool and the UI falls back to the original URL when no preview exists.
     preview_metadata = dict(metadata)
-    try:
-        preview = save_preview_image(path, preview_path)
-        preview_metadata.update({"preview_path": str(preview), "preview_max_edge": 512})
-    except Exception:
-        pass
+    if make_preview:
+        preview_path = path.parent / "preview" / path.name
+        try:
+            preview = save_preview_image(path, preview_path)
+            preview_metadata.update({"preview_path": str(preview), "preview_max_edge": 512})
+        except Exception:
+            pass
     return db.add_artifact(job_id, sample_id, kind, str(path), "image/png", preview_metadata)
 
 
@@ -1175,8 +1197,17 @@ class _AsyncSavePipeline:
         try:
             sample_dir = self._run_dir / sanitize_name(sample_name)
             paths = _save_visual_bundle_from_cpu(bundle, sample_dir)
+            # Previews are only worth their extra encode when the artifact is
+            # genuinely large. At the default visualization resolution the saved
+            # image is already small, so skip the redundant thumbnail — the
+            # biggest save-pool cost on long videos. The UI falls back to the
+            # original URL when no preview exists.
+            pred_h, pred_w = int(bundle["pred"].shape[-2]), int(bundle["pred"].shape[-1])
+            make_preview = max(pred_h, pred_w) > PREVIEW_SKIP_MAX_EDGE
             for kind, path in paths.items():
-                _add_image_artifact_with_preview(self._db, job_id, sample_id, kind, path, {"sample": sample_name})
+                _add_image_artifact_with_preview(
+                    self._db, job_id, sample_id, kind, path, {"sample": sample_name}, make_preview=make_preview
+                )
             extra_paths: dict[str, Path] = {}
             for name, tensor in extra.items():
                 try:
@@ -1187,7 +1218,9 @@ class _AsyncSavePipeline:
                 except Exception:
                     continue
             for kind, path in extra_paths.items():
-                _add_image_artifact_with_preview(self._db, job_id, sample_id, kind, path, {"sample": sample_name})
+                _add_image_artifact_with_preview(
+                    self._db, job_id, sample_id, kind, path, {"sample": sample_name}, make_preview=False
+                )
 
             diff_path = None
             gt_path = None
@@ -1201,12 +1234,12 @@ class _AsyncSavePipeline:
                 gt_path = sample_dir / "gt.png"
                 save_rgb_tensor(gt_tensor, gt_path)
                 _add_image_artifact_with_preview(
-                    self._db, job_id, sample_id, "gt", gt_path, {"sample": sample_name}
+                    self._db, job_id, sample_id, "gt", gt_path, {"sample": sample_name}, make_preview=False
                 )
                 diff_path = sample_dir / "difference.png"
                 save_difference(bundle["pred"], gt_tensor, diff_path)
                 _add_image_artifact_with_preview(
-                    self._db, job_id, sample_id, "difference", diff_path, {"sample": sample_name}
+                    self._db, job_id, sample_id, "difference", diff_path, {"sample": sample_name}, make_preview=False
                 )
             with self._lock:
                 _collect_video_frame(self._video_groups, row, paths["pred"], diff_path, gt_path)

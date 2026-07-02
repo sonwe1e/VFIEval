@@ -692,10 +692,19 @@ function renderPreflightError(error) {
 function renderMetricSetup(row) {
   const summary = row.setup_summary || "-";
   const requirements = Array.isArray(row.setup_requirements) ? row.setup_requirements : [];
+  const diagnostics = [
+    row.implementation_mode ? `<li><strong>mode</strong>: ${escapeHtml(row.implementation_mode)}</li>` : "",
+    row.manifest_path ? `<li><strong>manifest</strong>: ${escapeHtml(row.manifest_path)}</li>` : "",
+    row.resolved_executable ? `<li><strong>executable</strong>: ${escapeHtml(row.resolved_executable)}</li>` : "",
+    Array.isArray(row.driver_command) && row.driver_command.length
+      ? `<li><strong>driver</strong>: ${escapeHtml(row.driver_command.join(" "))}</li>`
+      : "",
+  ].filter(Boolean).join("");
   const list = requirements.length
     ? `<ul>${requirements.map((item) => `<li><strong>${escapeHtml(item.kind || "requirement")}</strong>: ${escapeHtml(item.target || "-")} <span>${escapeHtml(item.description || "")}</span></li>`).join("")}</ul>`
     : "";
-  return `<div class="metric-setup"><p>${escapeHtml(summary)}</p>${list}</div>`;
+  const detailList = diagnostics ? `<ul>${diagnostics}</ul>` : "";
+  return `<div class="metric-setup"><p>${escapeHtml(summary)}</p>${detailList}${list}</div>`;
 }
 
 function renderMetricSetupList(rows) {
@@ -733,6 +742,29 @@ function renderMetricHealthTable(rowsByName) {
   `;
 }
 
+function renderPortableMetricHealthTable(rowsByName) {
+  const rows = Object.entries(rowsByName || {}).map(([name, row]) => ({ name, ...row }));
+  if (!rows.length) return "";
+  return `
+    <section class="metric-health-table">
+      <h3>Metric Health</h3>
+      <div class="table compact-table">${table(rows, [
+        { label: "Metric", render: (row) => escapeHtml(row.name) },
+        { label: "Status", render: (row) => escapeHtml(row.status) },
+        { label: "Mode", render: (row) => escapeHtml(row.implementation_mode || "-") },
+        { label: "Granularity", render: (row) => escapeHtml(row.granularity || "-") },
+        { label: "Timeline", render: (row) => row.supports_timeline ? "yes" : "no" },
+        { label: "Input", render: (row) => escapeHtml(row.input_mode || "-") },
+        { label: "Evaluator", render: (row) => escapeHtml(row.evaluator || "-") },
+        { label: "Path", render: (row) => escapeHtml(row.manifest_path || row.weights_path || (row.expected_paths || [])[0] || "-") },
+        { label: "Exec", render: (row) => escapeHtml(row.resolved_executable || row.executable || "-") },
+        { label: "Reason", render: (row) => escapeHtml(row.reason || "-") },
+      ])}</div>
+      ${renderMetricSetupList(rows)}
+    </section>
+  `;
+}
+
 function renderMetricEnvironmentPanel() {
   const container = $("metric-environment");
   if (!container) return;
@@ -759,7 +791,7 @@ function renderMetricEnvironmentPanel() {
         <span>unavailable ${escapeHtml(unavailable)}</span>
       </div>
     </div>
-    ${renderMetricHealthTable(state.metricHealth?.metrics || {})}
+    ${renderPortableMetricHealthTable(state.metricHealth?.metrics || {})}
   `;
 }
 
@@ -813,7 +845,7 @@ function renderPreflight() {
       </div>
       ${renderMessages("errors", result.errors || [])}
       ${renderMessages("warnings", result.warnings || [])}
-      ${renderMetricHealthTable(result.metrics?.health || {})}
+      ${renderPortableMetricHealthTable(result.metrics?.health || {})}
     `;
     return;
   }
@@ -837,7 +869,7 @@ function renderPreflight() {
     </div>
     ${renderMessages("errors", result.errors || [])}
     ${renderMessages("warnings", result.warnings || [])}
-    ${renderMetricHealthTable(result.metrics?.health || {})}
+    ${renderPortableMetricHealthTable(result.metrics?.health || {})}
     ${renderDecodeBackendNotice()}
     <h3>本次推理视频</h3>
     <div class="table">${table(videos, [
@@ -1251,7 +1283,7 @@ function renderRunDetail() {
     ${renderOutputHealthReport(run)}
     ${renderDecodePanel(run)}
     <div class="message"><p><strong>Execution</strong>: ${runExecutionTarget(run)}</p></div>
-    ${renderMetricHealthTable(run.metadata?.metric_health || {})}
+    ${renderPortableMetricHealthTable(run.metadata?.metric_health || {})}
     ${renderRunJobs(run)}
     <div class="run-workspace">
       <aside class="video-tabs">

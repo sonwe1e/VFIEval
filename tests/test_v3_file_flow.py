@@ -167,6 +167,12 @@ class Model:
             self.assertIn("test_style", [row["name"] for row in video_groups])
             test_style = next(row for row in video_groups if row["name"] == "test_style")
             first_video = test_style["videos"][0]["name"]
+            self.assertIn("test_4k", [row["name"] for row in video_groups])
+            test_4k = next(row for row in video_groups if row["name"] == "test_4k")
+            self.assertEqual(test_4k["video_count"], 1)
+            self.assertEqual(test_4k["videos"][0]["width"], 3840)
+            self.assertEqual(test_4k["videos"][0]["height"], 2160)
+            four_k_video = test_4k["videos"][0]["name"]
             self.assertIn(
                 test_style["videos"][0]["frame_count_source"],
                 {"container", "exact", "estimated", "ffprobe_nb_frames", "ffprobe_duration"},
@@ -220,6 +226,28 @@ class Model:
             self.assertEqual(selected["video_group"]["video_count"], 1)
             self.assertEqual(selected["video_group"]["selected_videos"], [first_video])
             self.assertEqual(selected["video_group"]["videos"][0]["frame_count_source"], "exact")
+
+            four_k = preflight_run(
+                db,
+                workspace,
+                {
+                    "model_file": "test_average.py",
+                    "video_group": "test_4k",
+                    "selected_videos": [four_k_video],
+                    "device": "cpu",
+                    "precision": "fp32",
+                    "resolution_mode": "original",
+                    "max_frames": 4,
+                },
+            )
+            self.assertTrue(four_k["ok"], four_k)
+            self.assertEqual(four_k["video_group"]["video_count"], 1)
+            self.assertEqual(four_k["video_group"]["selected_videos"], [four_k_video])
+            self.assertEqual(four_k["video_group"]["videos"][0]["width"], 3840)
+            self.assertEqual(four_k["video_group"]["videos"][0]["height"], 2160)
+            self.assertEqual(four_k["resolution"]["mode"], "original")
+            self.assertEqual(four_k["resolution"]["width"], 3840)
+            self.assertEqual(four_k["resolution"]["height"], 2160)
 
             empty_selection = preflight_run(
                 db,
@@ -287,7 +315,9 @@ class Model:
                 observed["called"] = True
                 observed["device"] = str(img0.device)
                 observed["dtype"] = str(img0.dtype)
+                observed["img_shape"] = tuple(img0.shape)
                 observed["flow_device"] = str(outputs["flowt_0"].device)
+                observed["flow_shape"] = tuple(outputs["flowt_0"].shape)
                 observed["mask_dtype"] = str(outputs["mask0"].dtype)
                 return {
                     "warp0": img0,
@@ -320,6 +350,8 @@ class Model:
             self.assertEqual(observed["device"], "cpu")
             self.assertEqual(observed["flow_device"], "cpu")
             self.assertEqual(observed["dtype"], "torch.float32")
+            self.assertEqual(observed["img_shape"], (1, 3, 128, 128))
+            self.assertEqual(observed["flow_shape"], (1, 2, 128, 128))
             self.assertEqual(observed["mask_dtype"], "torch.float32")
 
     def test_api_file_run_generates_video_artifacts(self) -> None:
@@ -500,7 +532,12 @@ class Model:
                 health = _get(base_url, "/api/metrics/health")
                 self.assertIn("lpips_vit_patch", health["metrics"])
                 self.assertIn("setup_summary", health["metrics"]["lpips_vit_patch"])
+                self.assertEqual(health["metrics"]["lpips_vit_patch"]["implementation_mode"], "manifest_command")
+                self.assertTrue(health["metrics"]["lpips_vit_patch"]["manifest_path"].endswith("lpips_vit_patch\\manifest.json"))
+                self.assertIn("driver_command", health["metrics"]["lpips_vit_patch"])
                 self.assertIn("input_mode", health["metrics"]["vmaf"])
+                self.assertEqual(health["metrics"]["vmaf"]["implementation_mode"], "ffmpeg_libvmaf")
+                self.assertIn("resolved_executable", health["metrics"]["vmaf"])
                 worker = _post(
                     base_url,
                     "/api/workers/register",
@@ -646,10 +683,12 @@ class Model:
                 self.assertIsNotNone(run["metric_job_id"])
                 self.assertEqual(run["metadata"]["metric_health"]["lpips_vit_patch"]["status"], "missing_weights")
                 self.assertTrue(run["metadata"]["metric_health"]["lpips_vit_patch"]["weights_path"].endswith("lpips_vit_patch\\manifest.json"))
+                self.assertEqual(run["metadata"]["metric_health"]["lpips_vit_patch"]["implementation_mode"], "manifest_command")
+                self.assertTrue(run["metadata"]["metric_health"]["lpips_vit_patch"]["manifest_path"].endswith("lpips_vit_patch\\manifest.json"))
 
                 summary = _get(base_url, f"/api/runs/{run_id}/metric-summary")
                 self.assertEqual(summary["metrics"]["lpips_vit_patch"]["unavailable"], 2)
-                self.assertIn("native adapter is missing_weights", summary["metrics"]["lpips_vit_patch"]["reasons"][0])
+                self.assertIn("metric driver is missing_weights", summary["metrics"]["lpips_vit_patch"]["reasons"][0])
 
                 timeline = _get(base_url, f"/api/runs/{run_id}/timeline")
                 statuses = [
@@ -899,7 +938,8 @@ class Model:
                 self.assertIn('const container = $("metric-environment");', app_js)
                 self.assertIn("renderMetricEnvironmentPanel();", app_js)
                 self.assertIn('state.metricHealth.asset_root || "set/metrics"', app_js)
-                self.assertIn("renderMetricHealthTable(state.metricHealth?.metrics || {})", app_js)
+                self.assertIn("function renderPortableMetricHealthTable(rowsByName)", app_js)
+                self.assertIn("renderPortableMetricHealthTable(state.metricHealth?.metrics || {})", app_js)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -985,7 +1025,8 @@ class Model:
                 sample_id = int(db.list_samples(int(db.get_run(run_id)["dataset_id"]))[0]["id"])
                 sample_detail = _get(base_url, f"/api/runs/{run_id}/samples/{sample_id}")
                 self.assertTrue(sample_detail["extra_artifacts"])
-                self.assertTrue(sample_detail["extra_artifacts"][0]["preview_url"].endswith("variant=preview"))
+                self.assertIn("preview_url", sample_detail["extra_artifacts"][0])
+                self.assertTrue(sample_detail["extra_artifacts"][0]["preview_url"].startswith("/api/files/"))
 
                 with urllib.request.urlopen(f"{base_url}/app.js", timeout=30) as response:
                     app_js = response.read().decode("utf-8")
@@ -1053,7 +1094,7 @@ class Model:
 
                 summary = _get(base_url, f"/api/runs/{run_id}/metric-summary")
                 self.assertEqual(summary["metrics"]["cgvqm"]["unavailable"], 1)
-                self.assertIn("native adapter is missing_weights", summary["metrics"]["cgvqm"]["reasons"][0])
+                self.assertIn("metric driver is missing_weights", summary["metrics"]["cgvqm"]["reasons"][0])
 
                 timeline = _get(base_url, f"/api/runs/{run_id}/timeline")
                 self.assertNotIn("cgvqm", timeline["videos"][0]["samples"][0]["metrics"])
@@ -2450,6 +2491,7 @@ class Model:
             self.assertEqual(health["metrics"]["lpips_vit_patch"]["status"], "missing_weights")
             self.assertFalse(health["metrics"]["lpips_vit_patch"]["available"])
             self.assertTrue(health["metrics"]["lpips_vit_patch"]["weights_path"].endswith("lpips_vit_patch\\manifest.json"))
+            self.assertTrue(health["metrics"]["lpips_vit_patch"]["manifest_path"].endswith("lpips_vit_patch\\manifest.json"))
 
     def test_metric_health_uses_user_facing_statuses(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2463,28 +2505,43 @@ class Model:
         self.assertEqual(lpips["status"], "missing_weights")
         self.assertTrue(lpips["weights_path"].endswith("lpips_vit_patch\\manifest.json"))
         self.assertEqual(lpips["input_mode"], "sample_pair")
-        self.assertIn("expected project-local manifest path", lpips["setup_summary"])
-        self.assertTrue(any(item["kind"] == "binding" for item in lpips["setup_requirements"]))
+        self.assertEqual(lpips["implementation_mode"], "manifest_command")
+        self.assertIn("project-local manifest", lpips["setup_summary"])
+        self.assertTrue(any(item["kind"] == "driver" for item in lpips["setup_requirements"]))
         self.assertEqual(vmaf["status"], "missing_evaluator")
         self.assertFalse(vmaf["available"])
         self.assertEqual(vmaf["input_mode"], "video_only")
         self.assertIn("libvmaf", vmaf["setup_summary"])
         self.assertTrue(any(item["kind"] == "ffmpeg_filter" for item in vmaf["setup_requirements"]))
+        self.assertEqual(vmaf["implementation_mode"], "ffmpeg_libvmaf")
         self.assertEqual(cgvqm["input_mode"], "video_only")
 
-    def test_metric_health_reports_missing_evaluator_when_native_assets_exist(self) -> None:
+    def test_metric_health_reports_missing_evaluator_when_driver_command_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
             workspace.ensure()
             project_root = Path(tmp)
             manifest_path = project_root / "set" / "metrics" / "lpips_vit_patch" / "manifest.json"
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
-            manifest_path.write_text(json.dumps({"metric_name": "lpips_vit_patch", "asset_version": "v1"}), encoding="utf-8")
+            (manifest_path.parent / "weights.bin").write_bytes(b"weights")
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "metric_name": "lpips_vit_patch",
+                        "asset_version": "v2",
+                        "input_mode": "sample_pair",
+                        "driver": {"command": ["missing-driver.exe"]},
+                        "required_files": ["weights.bin"],
+                        "env": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
             with patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": str(project_root), "VFIEVAL_METRIC_ASSETS_DIR": ""}, clear=False):
                 lpips = metric_health(workspace, "lpips_vit_patch")
             self.assertEqual(lpips["status"], "missing_evaluator")
             self.assertFalse(lpips["available"])
-            self.assertIn("binding", lpips["reason"])
+            self.assertIn("driver executable", lpips["reason"])
 
     def test_worker_process_command_includes_device_filter_and_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -168,11 +168,12 @@ Compare Run Detail 会按 track 显示 `pred/diff` 视频，GT 视频共享；�
 ```powershell
 python -m vfieval.cli --workspace .vfieval prepare-metrics --check-only
 python -m vfieval.cli --workspace .vfieval prepare-metrics
+python -m vfieval.cli --workspace .vfieval smoke-metric --metric vmaf --reference <gt_video> --distorted <pred_video>
 ```
 
 ### Metric setup details
 
-`prepare-metrics` only creates placeholder manifests under `set/metrics/`. It does not download weights, install evaluator bindings, or modify system binaries. `GET /api/metrics/health` reports the exact status, reason, evaluator type, input mode, timeline support, and expected project-local paths.
+`prepare-metrics` only creates placeholder manifests under `set/metrics/`. It does not download weights, install evaluator bindings, or modify system binaries. `GET /api/metrics/health` reports the exact status, reason, evaluator type, implementation mode, manifest path, resolved executable, driver command, input mode, timeline support, and expected project-local paths.
 
 Current metric setup contract:
 
@@ -183,19 +184,21 @@ set/
       manifest.json
     lpips_convnext/
       manifest.json
+    vmaf/
+      manifest.json
     cgvqm/
       manifest.json
 ```
 
-- `lpips_vit_patch`: place the official LPIPS ViT Patch manifest at `set/metrics/lpips_vit_patch/manifest.json`. This build also requires the official native evaluator binding in the active Python environment.
-- `lpips_convnext`: place the official LPIPS ConvNeXt manifest at `set/metrics/lpips_convnext/manifest.json`. This build also requires the official native evaluator binding in the active Python environment.
-- `cgvqm`: place the official CGVQM manifest at `set/metrics/cgvqm/manifest.json`. This build also requires the official native evaluator binding in the active Python environment.
-- `vmaf`: no project-local weights are used in the current build. Install `ffmpeg` on `PATH` and make sure the `libvmaf` filter is available.
+- `lpips_vit_patch`: provide `set/metrics/lpips_vit_patch/manifest.json` plus the driver command and required assets referenced by that manifest. VFIEval runs the declared command and does not auto-download weights.
+- `lpips_convnext`: provide `set/metrics/lpips_convnext/manifest.json` plus the driver command and required assets referenced by that manifest. VFIEval runs the declared command and does not auto-download weights.
+- `cgvqm`: provide `set/metrics/cgvqm/manifest.json` plus the driver command and required assets referenced by that manifest. This remains a video-level metric and does not synthesize per-frame points.
+- `vmaf`: this is the first metric that can run immediately in the current build. Install `ffmpeg` with the `libvmaf` filter on `PATH`, or set `set/metrics/vmaf/manifest.json -> ffmpeg_path` to a project-local portable ffmpeg binary.
 
 Status interpretation:
 
 - `missing_weights`: the expected manifest or referenced project-local assets are not present yet.
-- `missing_evaluator`: the manifest may exist, but the required evaluator binding or system executable is still unavailable.
+- `missing_evaluator`: the manifest may exist, but the declared driver command, interpreter, or system executable is still unavailable.
 - `missing_dependency`: the Python package dependency for that metric is missing from the current environment.
 - `available`: the current build can attempt to execute that metric without substituting another score.
 

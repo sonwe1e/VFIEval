@@ -232,11 +232,15 @@ NPU multi-device inference targets Ascend `torch_npu` and uses single-machine sh
 
 ## Metrics
 
-Only `lpips_vit_patch`, `lpips_convnext`, `vmaf`, and `cgvqm` are valid metrics. Missing native evaluator assets, dependencies, weights, commands, config files, or bindings must produce `unavailable`, never substitute another score.
+Only `lpips_vit_patch`, `lpips_convnext`, `vmaf`, and `cgvqm` are valid metrics. Missing metric manifests, required assets, driver commands, interpreters, system executables, config files, or bindings must produce `unavailable`, never substitute another score.
 
 Per-sample metrics may be plotted as timeline curves. Video-level metrics such as VMAF or CGVQM must be shown as video-level summaries unless the adapter produces real per-sample values. Do not create fake per-frame points from video-level scores.
 
-Metric cache keys must include metric name, adapter version, metric config, reference identity, and distorted identity. Reopening a Run Detail page must read SQLite and artifacts only; it must not trigger metric recomputation.
+`lpips_vit_patch`, `lpips_convnext`, and `cgvqm` now resolve through `set/metrics/<metric>/manifest.json` with `input_mode`, `driver.command`, `required_files`, and optional `env`. Missing manifest or required files maps to `missing_weights`; missing driver executables or invalid manifest structure maps to `missing_evaluator`.
+
+`vmaf` remains the first built-in real metric path. It resolves `ffmpeg` from `set/metrics/vmaf/manifest.json -> ffmpeg_path` first, then falls back to `PATH`; health payloads and run metadata should expose `implementation_mode`, `manifest_path`, `driver_command`, and `resolved_executable`.
+
+Metric cache keys must include metric name, adapter version, metric config, manifest fingerprint, driver fingerprint, reference identity, and distorted identity. Reopening a Run Detail page must read SQLite and artifacts only; it must not trigger metric recomputation.
 
 No-GT samples must be marked `skipped: no ground truth` for full-reference metrics.
 

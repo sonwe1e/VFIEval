@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## [2026-07-02 23:59]
+- Replaced the placeholder LPIPS/CGVQM metric adapter with a manifest-driven command runner so project-local manifests can declare `driver.command`, `required_files`, and optional environment variables without hardcoded evaluator bindings.
+- Made VMAF resolve `ffmpeg` from `set/metrics/vmaf/manifest.json -> ffmpeg_path` before falling back to `PATH`, added richer metric health diagnostics plus a `vfieval smoke-metric` CLI, and fixed Windows `libvmaf` log-path escaping.
+- Updated the metric environment panel, README, AGENTS guidance, and metric/file-flow tests to cover manifest-driver execution, VMAF diagnostics, and the new smoke path.
+- Files affected: `src/vfieval/metrics/health.py`, `src/vfieval/metrics/native.py`, `src/vfieval/metrics/registry.py`, `src/vfieval/metrics/vmaf.py`, `src/vfieval/cli.py`, `src/vfieval/web/app.js`, `tests/test_metrics.py`, `tests/test_v3_file_flow.py`, `README.md`, `AGENTS.md`, `CHANGELOG.md`, `IMPLEMENT.md`.
+
+## [2026-07-02 23:16]
+- Added a dedicated `videos/test_4k/uhd_gradient_motion.mp4` fixture and updated test asset generation so clean checkouts include one short UHD clip without routing the default `test_style` path through 4K assets.
+- Increased the model preflight dry-run probe from `(1, 3, 8, 8)` to `(1, 3, 128, 128)` and versioned the dry-run cache key with the probe shape so stale in-process results are not reused.
+- Extended file-flow tests to verify the larger probe shape reaches post-processing and that the new 4K group is discovered with `3840x2160` metadata and original-resolution preflight output.
+- Files affected: `scripts/generate_test_assets.py`, `src/vfieval/file_inputs.py`, `tests/test_v3_file_flow.py`, `CHANGELOG.md`, `IMPLEMENT.md`.
+
 ## [2026-07-02 15:35]
 - Added runtime output-health diagnostics so completed inference runs record real-frame flow/mask stats and warn when outputs are empty even if checkpoint loading succeeded.
 - Stopped failed multi-shard runs from starting queued sibling shards, and made running sibling shards cancel on the next status check.
