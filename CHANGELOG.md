@@ -1,5 +1,12 @@
 # CHANGELOG
 
+## [2026-07-02 15:35]
+- Added runtime output-health diagnostics so completed inference runs record real-frame flow/mask stats and warn when outputs are empty even if checkpoint loading succeeded.
+- Stopped failed multi-shard runs from starting queued sibling shards, and made running sibling shards cancel on the next status check.
+- Created run directories before marking inference jobs as running so cleanup and retry UI never see a running run without its output directory.
+- Added a 10 MiB request body limit and hid raw internal exception text from API 500 responses.
+- Files affected: `src/vfieval/pipeline/inference.py`, `src/vfieval/db.py`, `src/vfieval/server.py`, `src/vfieval/web/app.js`, `tests/test_v3_file_flow.py`, `AGENTS.md`, `IMPLEMENT.md`, `CHANGELOG.md`.
+
 ## [2026-07-01 23:20]
 - Added repository layout and Git ownership rules so source files, generated test fixtures, local user inputs, runtime state, metric assets, and automatic backups have clear homes.
 - Updated ignore rules to keep real models, videos, checkpoints, metric assets, SQLite state, runtime outputs, local tool settings, and file-level backups out of Git while preserving generated test fixtures.

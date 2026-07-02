@@ -375,6 +375,14 @@ class Model:
                 run_id = created["run_id"]
                 run = _wait_for_run(base_url, run_id)
                 self.assertEqual(run["status"], "completed", run)
+                output_health = run["result"]["output_health"]
+                self.assertEqual(output_health["samples"], 2)
+                self.assertTrue(output_health["flow_flat"])
+                self.assertTrue(output_health["mask_flat"])
+                self.assertTrue(output_health["warnings"])
+                self.assertIn("flowt_0", output_health["stats"])
+                self.assertIn("mask0", output_health["stats"])
+                self.assertTrue((Path(run["result"]["output_dir"]) / "logs" / "output_health.log").is_file())
                 artifacts = _get(base_url, f"/api/runs/{run_id}/artifacts")
                 kinds = [artifact["kind"] for artifact in artifacts]
                 self.assertIn("pred_video", kinds)
@@ -544,6 +552,62 @@ class Model:
                 with urllib.request.urlopen(f"{base_url}/api/devices", timeout=30) as response:
                     self.assertEqual(response.headers.get("Cache-Control"), "no-store")
                     self.assertIn("application/json", response.headers.get("Content-Type", ""))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_server_rejects_oversized_json_body(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(db, workspace))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                request = urllib.request.Request(
+                    f"{base_url}/api/preflight",
+                    data=b'{"payload":"too large"}',
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with (
+                    patch("vfieval.server.MAX_REQUEST_BODY_BYTES", 8),
+                    self.assertRaises(urllib.error.HTTPError) as raised,
+                ):
+                    urllib.request.urlopen(request, timeout=30)
+                self.assertEqual(raised.exception.code, 413)
+                error_payload = json.loads(raised.exception.read().decode("utf-8"))
+                self.assertEqual(error_payload["error"]["type"], "RequestBodyTooLarge")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_server_hides_internal_exception_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(db, workspace))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                def explode(*_args, **_kwargs):
+                    raise RuntimeError("secret internal path D:/Documents/VFIEval")
+
+                db.list_runs = explode
+                with self.assertRaises(urllib.error.HTTPError) as raised:
+                    urllib.request.urlopen(f"{base_url}/api/runs", timeout=30)
+                self.assertEqual(raised.exception.code, 500)
+                error_payload = json.loads(raised.exception.read().decode("utf-8"))
+                self.assertEqual(error_payload["error"]["type"], "InternalServerError")
+                self.assertEqual(error_payload["error"]["message"], "internal server error")
             finally:
                 server.shutdown()
                 server.server_close()
@@ -835,6 +899,29 @@ class Model:
                 self.assertIn("renderMetricEnvironmentPanel();", app_js)
                 self.assertIn('state.metricHealth.asset_root || "set/metrics"', app_js)
                 self.assertIn("renderMetricHealthTable(state.metricHealth?.metrics || {})", app_js)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+    def test_frontend_renders_output_health_report(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(db, workspace))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                with urllib.request.urlopen(f"{base_url}/app.js", timeout=30) as response:
+                    app_js = response.read().decode("utf-8")
+
+                self.assertIn("function renderOutputHealthReport(run)", app_js)
+                self.assertIn("run?.result?.output_health", app_js)
+                self.assertIn("Output health", app_js)
+                self.assertIn("renderOutputHealthReport(run)", app_js)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -2150,6 +2237,120 @@ class Model:
             self.assertEqual(failed_run["error"]["shard_count"], 2)
             self.assertEqual(failed_run["error"]["worker_id"], "worker-npu-1")
             self.assertEqual(failed_run["error"]["job_id"], job1)
+
+    def test_multi_shard_completion_combines_output_health(self) -> None:
+        def health(samples: int, flow_abs_max: float, mask_std: float) -> dict[str, object]:
+            return {
+                "samples": samples,
+                "stats": {
+                    "flowt_0": {"abs_mean": flow_abs_max / 2, "abs_max": flow_abs_max, "nan_count": 0},
+                    "flowt_1": {"abs_mean": flow_abs_max / 2, "abs_max": flow_abs_max, "nan_count": 0},
+                    "mask0": {"mean": 0.5, "std": mask_std, "nan_count": 0},
+                    "mask1": {"mean": 0.5, "std": mask_std, "nan_count": 0},
+                },
+                "warnings": ["flow ~= 0"] if flow_abs_max == 0 else [],
+                "flow_flat": flow_abs_max < 1e-4,
+                "mask_flat": mask_std < 1e-3,
+                "has_nan": False,
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("dummy", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("frames", str(Path(tmp)), True)
+            run_id = db.create_run(
+                name="multi-shard-output-health",
+                model_id=model_id,
+                dataset_id=dataset_id,
+                height=8,
+                width=8,
+                batch_size=1,
+                device="multi_cuda",
+                precision="fp32",
+                metrics=[],
+                create_inference_job=False,
+            )
+            job0 = db.add_run_job(run_id, "inference", {"run_id": run_id}, progress_total=1, shard_index=0, device="cuda:0")
+            job1 = db.add_run_job(run_id, "inference", {"run_id": run_id}, progress_total=1, shard_index=1, device="cuda:1")
+
+            db.complete_job(job0, {"samples": 1, "output_health": health(1, 0.0, 0.0)})
+            db.complete_job(job1, {"samples": 2, "output_health": health(2, 2.0, 0.25)})
+
+            self.assertTrue(db.maybe_complete_multi_run_inference(run_id))
+            run = db.get_run(run_id)
+            output_health = run["result"]["output_health"]
+            self.assertEqual(output_health["samples"], 3)
+            self.assertEqual(output_health["shards"], 2)
+            self.assertFalse(output_health["flow_flat"])
+            self.assertFalse(output_health["mask_flat"])
+            self.assertEqual(output_health["stats"]["flowt_0"]["abs_max"], 2.0)
+            self.assertEqual(output_health["stats"]["mask0"]["std"], 0.25)
+
+    def test_fail_run_cancels_queued_sibling_shards_and_stops_running_shard(self) -> None:
+        from vfieval.pipeline.inference import RunCanceled, _raise_if_canceled
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("dummy", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("frames", str(Path(tmp)), True)
+            run_id = db.create_run(
+                name="multi-shard-fail-cancel",
+                model_id=model_id,
+                dataset_id=dataset_id,
+                height=8,
+                width=8,
+                batch_size=1,
+                device="multi_cuda",
+                precision="fp32",
+                metrics=[],
+                create_inference_job=False,
+            )
+            failing_job = db.add_run_job(
+                run_id,
+                "inference",
+                {"run_id": run_id, "device": "cuda:0", "shard_index": 0, "shard_count": 2},
+                progress_total=1,
+                shard_index=0,
+                device="cuda:0",
+            )
+            queued_sibling_job = db.add_run_job(
+                run_id,
+                "inference",
+                {"run_id": run_id, "device": "cuda:1", "shard_index": 1, "shard_count": 2},
+                progress_total=1,
+                shard_index=1,
+                device="cuda:1",
+            )
+
+            db.fail_run(run_id, {"message": "synthetic shard failure", "device": "cuda:0"})
+
+            # A sibling shard that hadn't been claimed yet must be canceled so
+            # no worker starts it after the run is already terminal.
+            queued_job_row = db.get_job(queued_sibling_job)
+            self.assertEqual(queued_job_row["status"], "canceled")
+            self.assertEqual(queued_job_row["error"]["message"], "sibling shard failed the run")
+
+            # A sibling shard that was already running when the failure landed
+            # must notice on its next cancellation check and stop itself.
+            running_sibling_job = db.add_run_job(
+                run_id,
+                "inference",
+                {"run_id": run_id, "device": "cuda:2", "shard_index": 2, "shard_count": 3},
+                progress_total=1,
+                shard_index=2,
+                device="cuda:2",
+            )
+            with self.assertRaises(RunCanceled):
+                _raise_if_canceled(db, run_id, running_sibling_job)
+            running_job_row = db.get_job(running_sibling_job)
+            self.assertEqual(running_job_row["status"], "canceled")
+            self.assertEqual(running_job_row["error"]["message"], "sibling shard failed the run")
 
     def test_set_npu_device_prefers_integer_index(self) -> None:
         import torch

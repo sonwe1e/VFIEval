@@ -46,6 +46,11 @@ from vfieval.worker import WorkerOptions, detect_capabilities, run_worker
 
 TERMINAL_RUN_STATUSES = {"completed", "failed", "canceled"}
 COMPARE_SOURCE_RUN_STATUSES = {"completed", "metric_queued", "metric_running"}
+MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
+
+
+class _RequestBodyTooLarge(ValueError):
+    pass
 
 
 def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -> None:
@@ -192,13 +197,16 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     return self._send_sample_file(int(match.group(1)), match.group(2))
                 self._error(HTTPStatus.NOT_FOUND, "not found")
             except Exception as exc:
-                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc), type(exc).__name__)
+                self._error_internal(exc)
 
         def do_POST(self) -> None:
             try:
                 parsed = urlparse(self.path)
                 path = parsed.path
-                body = self._read_json()
+                try:
+                    body = self._read_json()
+                except _RequestBodyTooLarge as exc:
+                    return self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, str(exc), "RequestBodyTooLarge")
                 if path == "/api/models":
                     adapter = body["adapter"]
                     if not adapter.startswith("file:") and adapter != "dummy":
@@ -345,7 +353,7 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
             except KeyError as exc:
                 self._error(HTTPStatus.BAD_REQUEST, f"missing field {exc}")
             except Exception as exc:
-                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc), type(exc).__name__)
+                self._error_internal(exc)
 
         def do_DELETE(self) -> None:
             try:
@@ -359,7 +367,7 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                 db.soft_delete_run(run_id)
                 return self._json({"run_id": run_id, "deleted": True})
             except Exception as exc:
-                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc), type(exc).__name__)
+                self._error_internal(exc)
 
         def log_message(self, fmt: str, *args) -> None:
             print(f"{self.address_string()} - {fmt % args}")
@@ -368,6 +376,10 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0:
                 return {}
+            if length > MAX_REQUEST_BODY_BYTES:
+                raise _RequestBodyTooLarge(
+                    f"request body of {length} bytes exceeds the {MAX_REQUEST_BODY_BYTES}-byte limit"
+                )
             return json.loads(self.rfile.read(length).decode("utf-8"))
 
         def _json(self, data, status: HTTPStatus = HTTPStatus.OK, headers: dict[str, str] | None = None) -> None:
@@ -383,6 +395,15 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
 
         def _error(self, status: HTTPStatus, message: str, error_type: str = "Error") -> None:
             self._json({"error": {"type": error_type, "message": message}}, status=status)
+
+        def _error_internal(self, exc: Exception) -> None:
+            # Log full detail server-side; never echo raw exception text (which can
+            # contain internal paths/stack info) back to the client.
+            print(f"internal error handling {self.command} {self.path}: {type(exc).__name__}: {exc}")
+            self._json(
+                {"error": {"type": "InternalServerError", "message": "internal server error"}},
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
         def _send_static(self, name: str) -> None:
             path = Path(__file__).parent / "web" / name

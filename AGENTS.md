@@ -208,6 +208,8 @@ The inference hot loop is asynchronous by default. Do not reintroduce per-sample
 
 ## Preflight Diagnostics
 
+- Completed model-inference runs must store `run.result_json.output_health` and `run_dir/logs/output_health.log`, computed from real inference frames, so checkpoint-load success is not confused with useful flow/mask output.
+
 `_dry_run_model_file` returns `{output_health, model_load}` and `preflight_run` promotes both into the response so the UI can surface silent-failure runs before they start.
 
 - `output_health.stats` records `abs_mean` / `abs_max` / `nan_count` for `flowt_0`, `flowt_1`, and post-sigmoid `mask0` / `mask1`. If `abs_max < 1e-4` on both flows AND `std < 1e-3` on both masks, a warning is emitted (`"flow ≈ 0 且 mask ≈ constant"`) — this is the checkpoint-never-loaded signature (`sigmoid(0) = 0.5`).
@@ -215,6 +217,8 @@ The inference hot loop is asynchronous by default. Do not reintroduce per-sample
 - The Run Detail UI (`renderModelLoadReport`) renders the summary line and switches to a warn banner when either list is non-empty.
 
 ## NPU And Multi-Device Rules
+
+- If any inference shard fails, queued sibling shard jobs must be canceled and running siblings must stop at their next cancellation check.
 
 NPU multi-device inference targets Ascend `torch_npu` and uses single-machine shard workers, not DDP.
 

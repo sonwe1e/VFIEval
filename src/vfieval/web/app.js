@@ -1113,6 +1113,31 @@ function renderModelLoadReport(run) {
   return `<div class="${cls}"><p><strong>Checkpoint</strong>: ${escapeHtml(summary)}</p>${detailBits.join("")}</div>`;
 }
 
+function formatHealthNumber(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "-";
+  if (Math.abs(num) > 0 && Math.abs(num) < 0.01) return num.toExponential(2);
+  return num.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function renderOutputHealthReport(run) {
+  const report = run?.result?.output_health;
+  if (!report || typeof report !== "object") return "";
+  const stats = report.stats || {};
+  const warnings = Array.isArray(report.warnings) ? report.warnings : [];
+  const hasProblem = warnings.length > 0 || report.has_nan || (report.flow_flat && report.mask_flat);
+  const cls = hasProblem ? "message warn" : "message";
+  const summary = [
+    `samples ${report.samples ?? "-"}`,
+    `flow abs_max ${formatHealthNumber(stats.flowt_0?.abs_max)} / ${formatHealthNumber(stats.flowt_1?.abs_max)}`,
+    `mask std ${formatHealthNumber(stats.mask0?.std)} / ${formatHealthNumber(stats.mask1?.std)}`,
+  ].join(", ");
+  const detail = warnings.length
+    ? `<ul>${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>`
+    : "";
+  return `<div class="${cls}"><p><strong>Output health</strong>: ${escapeHtml(summary)}</p>${detail}</div>`;
+}
+
 function renderDecodePanel(run) {
   const job = (run.jobs || []).find((item) => item.role === "decode" || item.kind === "decode");
   if (!job && run.status !== "decoding") return "";
@@ -1220,6 +1245,7 @@ function renderRunDetail() {
     ${renderRunError(run)}
     ${renderCleanedArtifactsNotice(run)}
     ${renderModelLoadReport(run)}
+    ${renderOutputHealthReport(run)}
     ${renderDecodePanel(run)}
     <div class="message"><p><strong>Execution</strong>: ${runExecutionTarget(run)}</p></div>
     ${renderMetricHealthTable(run.metadata?.metric_health || {})}

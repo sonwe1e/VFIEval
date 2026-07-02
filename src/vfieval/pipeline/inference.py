@@ -44,6 +44,7 @@ class InferenceJobResult:
     postprocess_fps: float
     save_fps: float
     model_load: dict[str, Any] | None = None
+    output_health: dict[str, Any] | None = None
     prefetch_wait_seconds: float = 0.0
     save_backlog_seconds: float = 0.0
 
@@ -92,6 +93,113 @@ def _write_model_load_log(run_dir: Path, report: dict[str, Any]) -> None:
     for key in list(report.get("unexpected_keys") or [])[:100]:
         lines.append(f"  - unexpected: {key}")
     (logs_dir / "model_load.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class _OutputHealthAccumulator:
+    def __init__(self) -> None:
+        self._flow: dict[str, dict[str, float]] = {
+            name: {"count": 0.0, "abs_sum": 0.0, "abs_max": 0.0, "nan_count": 0.0}
+            for name in ("flowt_0", "flowt_1")
+        }
+        self._mask: dict[str, dict[str, float]] = {
+            name: {"count": 0.0, "sum": 0.0, "sum_sq": 0.0, "nan_count": 0.0}
+            for name in ("mask0", "mask1")
+        }
+        self._samples = 0
+
+    def update(self, bundle_cpu: dict[str, torch.Tensor]) -> None:
+        pred = bundle_cpu.get("pred")
+        if isinstance(pred, torch.Tensor) and pred.ndim > 0:
+            self._samples += int(pred.shape[0])
+        for name in ("flowt_0", "flowt_1"):
+            self._update_flow(name, bundle_cpu.get(name))
+        for name in ("mask0", "mask1"):
+            self._update_mask(name, bundle_cpu.get(name))
+
+    def _update_flow(self, name: str, tensor: torch.Tensor | None) -> None:
+        if not isinstance(tensor, torch.Tensor):
+            return
+        values = tensor.detach().float()
+        stats = self._flow[name]
+        stats["nan_count"] += float(torch.isnan(values).sum().item())
+        finite = values[torch.isfinite(values)]
+        if finite.numel() == 0:
+            return
+        abs_values = finite.abs()
+        stats["count"] += float(abs_values.numel())
+        stats["abs_sum"] += float(abs_values.sum().item())
+        stats["abs_max"] = max(stats["abs_max"], float(abs_values.max().item()))
+
+    def _update_mask(self, name: str, tensor: torch.Tensor | None) -> None:
+        if not isinstance(tensor, torch.Tensor):
+            return
+        values = tensor.detach().float()
+        stats = self._mask[name]
+        stats["nan_count"] += float(torch.isnan(values).sum().item())
+        finite = values[torch.isfinite(values)]
+        if finite.numel() == 0:
+            return
+        stats["count"] += float(finite.numel())
+        stats["sum"] += float(finite.sum().item())
+        stats["sum_sq"] += float((finite * finite).sum().item())
+
+    def to_dict(self) -> dict[str, Any]:
+        stats: dict[str, dict[str, float | int]] = {}
+        for name, raw in self._flow.items():
+            count = int(raw["count"])
+            stats[name] = {
+                "abs_mean": float(raw["abs_sum"] / count) if count else 0.0,
+                "abs_max": float(raw["abs_max"]),
+                "nan_count": int(raw["nan_count"]),
+            }
+        for name, raw in self._mask.items():
+            count = int(raw["count"])
+            mean = float(raw["sum"] / count) if count else 0.0
+            variance = max(0.0, float(raw["sum_sq"] / count) - mean * mean) if count else 0.0
+            stats[name] = {
+                "mean": mean,
+                "std": float(variance ** 0.5),
+                "nan_count": int(raw["nan_count"]),
+            }
+        flow_flat = all(float(stats[name]["abs_max"]) < 1e-4 for name in ("flowt_0", "flowt_1"))
+        mask_flat = all(float(stats[name]["std"]) < 1e-3 for name in ("mask0", "mask1"))
+        has_nan = any(int(stats[name]["nan_count"]) > 0 for name in stats)
+        warnings: list[str] = []
+        if has_nan:
+            warnings.append("model output contains NaN on real inference frames")
+        if flow_flat and mask_flat:
+            warnings.append(
+                "flow ~= 0 and mask ~= constant on real inference frames; checkpoint may be loaded but model outputs are semantically empty"
+            )
+        return {
+            "stats": stats,
+            "warnings": warnings,
+            "flow_flat": flow_flat,
+            "mask_flat": mask_flat,
+            "has_nan": has_nan,
+            "samples": self._samples,
+        }
+
+
+def _write_output_health_log(run_dir: Path, report: dict[str, Any]) -> None:
+    if not report:
+        return
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    lines = [f"samples: {report.get('samples', 0)}"]
+    for name in ("flowt_0", "flowt_1", "mask0", "mask1"):
+        stats = (report.get("stats") or {}).get(name) or {}
+        if "abs_max" in stats:
+            lines.append(
+                f"{name}: abs_mean={stats.get('abs_mean', 0.0):.8g} abs_max={stats.get('abs_max', 0.0):.8g} nan_count={stats.get('nan_count', 0)}"
+            )
+        else:
+            lines.append(
+                f"{name}: mean={stats.get('mean', 0.0):.8g} std={stats.get('std', 0.0):.8g} nan_count={stats.get('nan_count', 0)}"
+            )
+    for warning in report.get("warnings") or []:
+        lines.append(f"warning: {warning}")
+    (logs_dir / "output_health.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def sanitize_name(name: str) -> str:
@@ -163,6 +271,11 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
             dataset_id=dataset_id,
         )
 
+    model_row = db.get_model(model_id)
+    run_dir = workspace.runs_dir / (str(run_id) if run_id is not None else f"inference_{job_id:06d}")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_run_metadata(run_dir, job, model_row, db.get_dataset(dataset_id) if dataset_id else None)
+
     db.update_job_progress(job_id, 0, len(samples))
     if run_id is not None:
         db.mark_run_started(run_id, "running")
@@ -170,7 +283,6 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
             db.update_run_progress_from_jobs(run_id, "running")
         else:
             db.update_run_progress(run_id, 0, len(samples), "running")
-    model_row = db.get_model(model_id)
     model = load_flow_mask_model(
         adapter=model_row["adapter"],
         checkpoint_path=model_row.get("checkpoint_path"),
@@ -179,9 +291,6 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
     )
     model_load_report = _extract_model_load_report(model)
 
-    run_dir = workspace.runs_dir / (str(run_id) if run_id is not None else f"inference_{job_id:06d}")
-    run_dir.mkdir(parents=True, exist_ok=True)
-    _write_run_metadata(run_dir, job, model_row, db.get_dataset(dataset_id) if dataset_id else None)
     if model_load_report is not None:
         _write_model_load_log(run_dir, model_load_report)
 
@@ -197,6 +306,7 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
     )
 
     timing = {"decode": 0.0, "model": 0.0, "post": 0.0, "save": 0.0}
+    output_health = _OutputHealthAccumulator()
 
     try:
         for batch_rows, img0_cpu, img1_cpu, gt_cpu_list, prefetch_wait in _iter_prefetched_batches(
@@ -230,6 +340,7 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
                 "flowt_0": normalized_outputs["flowt_0"].detach().to("cpu"),
                 "flowt_1": normalized_outputs["flowt_1"].detach().to("cpu"),
             }
+            output_health.update(bundle_cpu)
             extra_cpu: dict[str, torch.Tensor] = {}
             for name, tensor in outputs.items():
                 if name in CORE_OUTPUTS or not isinstance(tensor, torch.Tensor):
@@ -261,6 +372,9 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
     if video_groups:
         _write_video_artifacts(db, job_id, run_dir, video_groups)
 
+    output_health_report = output_health.to_dict()
+    _write_output_health_log(run_dir, output_health_report)
+
     result = InferenceJobResult(
         samples=processed,
         output_dir=str(run_dir),
@@ -268,6 +382,7 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
         model_fps=_fps(processed, timing["model"]),
         postprocess_fps=_fps(processed, timing["post"]),
         save_fps=_fps(processed, timing["save"]),
+        output_health=output_health_report,
     )
 
     result_dict = dict(result.__dict__)
@@ -311,6 +426,10 @@ def _run_video_compare_job(
     is_shard: bool,
     dataset_id: int,
 ) -> InferenceJobResult:
+    run_dir = workspace.runs_dir / (str(run_id) if run_id is not None else f"inference_{job_id:06d}")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_run_metadata(run_dir, job, db.get_model(int(job["payload"]["model_id"])), db.get_dataset(dataset_id) if dataset_id else None)
+
     db.update_job_progress(job_id, 0, len(samples))
     if run_id is not None:
         db.mark_run_started(run_id, "running")
@@ -318,10 +437,6 @@ def _run_video_compare_job(
             db.update_run_progress_from_jobs(run_id, "running")
         else:
             db.update_run_progress(run_id, 0, len(samples), "running")
-
-    run_dir = workspace.runs_dir / (str(run_id) if run_id is not None else f"inference_{job_id:06d}")
-    run_dir.mkdir(parents=True, exist_ok=True)
-    _write_run_metadata(run_dir, job, db.get_model(int(job["payload"]["model_id"])), db.get_dataset(dataset_id) if dataset_id else None)
 
     processed = 0
     video_groups: dict[str, dict[str, Any]] = {}
@@ -488,6 +603,13 @@ def _raise_if_canceled(db: Database, run_id: int | None, job_id: int) -> None:
         db.cancel_job(job_id, error)
         db.cancel_run(run_id, error)
         raise RunCanceled("用户取消了 Run")
+    if run["status"] == "failed":
+        # A sibling shard already failed the run (multi_cuda/multi_npu). Stop
+        # this shard instead of burning device time toward a run that is
+        # already terminal.
+        error = {"message": "sibling shard failed the run", "type": "RunCanceled"}
+        db.cancel_job(job_id, error)
+        raise RunCanceled("sibling shard failed the run")
 
 
 def _collect_video_frame(
@@ -881,6 +1003,7 @@ def _iter_prefetched_batches(
             gt_future = pool.submit(_load_gts, [row.get("gt_path") for row in batch_rows])
         return batch_rows, img0_future, img1_future, gt_future
 
+    clean_exit = False
     try:
         cursor = 0
         while cursor < len(samples) and len(pending) < max_ahead:
@@ -902,8 +1025,12 @@ def _iter_prefetched_batches(
                 cursor = end
 
             yield batch_rows, img0_cpu, img1_cpu, gt_cpu_list, wait_seconds
+        clean_exit = True
     finally:
-        pool.shutdown(wait=False, cancel_futures=True)
+        # On normal completion there is nothing left in flight, so waiting is
+        # free. On early exit (exception/cancel raised into this generator)
+        # cancel outstanding work and don't block on it.
+        pool.shutdown(wait=clean_exit, cancel_futures=not clean_exit)
 
 
 class _AsyncSavePipeline:
@@ -977,8 +1104,13 @@ class _AsyncSavePipeline:
             if not pending:
                 return
             for future in pending:
+                # _save_sample already catches its own exceptions and records
+                # them via _record_sample_error, so a future.exception() here
+                # means the save task itself crashed outside that try/except
+                # (e.g. a bug in _on_sample_done). Surface those, since they
+                # are not otherwise recorded anywhere.
                 exc = future.exception()
-                if exc is not None and not isinstance(exc, Exception):
+                if exc is not None:
                     raise exc
 
     def shutdown(self) -> None:

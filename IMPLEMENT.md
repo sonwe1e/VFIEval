@@ -1,5 +1,31 @@
 # IMPLEMENT
 
+## [2026-07-02 15:35] Runtime Output Diagnostics and Shard Failure Cleanup
+
+Discussed:
+- A completed run showed checkpoint loading success, but flow/mask previews still looked missing or empty.
+- Local inspection showed the test checkpoint model produced zero flow and constant masks by design, so the platform needed runtime evidence that separates "checkpoint loaded" from "outputs are useful".
+
+Implemented:
+- Added `output_health` stats to completed model-inference results, computed from real inference frame bundles already on CPU.
+- Wrote the same diagnostics to `logs/output_health.log` and surfaced the summary in Run Detail.
+- Canceled queued sibling shard jobs after a run fails, and made already-running sibling shards stop at the next cancellation check.
+- Created run directories and metadata before marking inference jobs as running, closing a cleanup race where UI could see `running` before `output_dir` existed.
+- Added a request body size guard and generic 500 responses so raw server exception text is not sent to clients.
+
+Files changed:
+- `src/vfieval/pipeline/inference.py`
+- `src/vfieval/db.py`
+- `src/vfieval/server.py`
+- `src/vfieval/web/app.js`
+- `tests/test_v3_file_flow.py`
+- `AGENTS.md`
+- `CHANGELOG.md`
+- `IMPLEMENT.md`
+
+Status:
+- Complete. Targeted tests and diff hygiene checks passed.
+
 ## [2026-07-01 23:20] Repository Layout and Git Rules
 
 Discussed:

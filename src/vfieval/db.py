@@ -24,6 +24,66 @@ def _loads(text: str | None) -> Any:
     return json.loads(text)
 
 
+def _combine_output_health(reports: Iterable[dict[str, Any] | None]) -> dict[str, Any] | None:
+    valid = [report for report in reports if isinstance(report, dict)]
+    if not valid:
+        return None
+    total_samples = sum(int(report.get("samples") or 0) for report in valid)
+    weight_total = sum(int(report.get("samples") or 0) or 1 for report in valid)
+    stats: dict[str, dict[str, float | int]] = {}
+    for name in ("flowt_0", "flowt_1"):
+        weighted_abs_mean = 0.0
+        abs_max = 0.0
+        nan_count = 0
+        for report in valid:
+            shard_samples = int(report.get("samples") or 0) or 1
+            shard_stats = ((report.get("stats") or {}).get(name) or {})
+            weighted_abs_mean += float(shard_stats.get("abs_mean") or 0.0) * shard_samples
+            abs_max = max(abs_max, float(shard_stats.get("abs_max") or 0.0))
+            nan_count += int(shard_stats.get("nan_count") or 0)
+        stats[name] = {
+            "abs_mean": float(weighted_abs_mean / weight_total),
+            "abs_max": float(abs_max),
+            "nan_count": nan_count,
+        }
+    for name in ("mask0", "mask1"):
+        weighted_mean = 0.0
+        std = 0.0
+        nan_count = 0
+        for report in valid:
+            shard_samples = int(report.get("samples") or 0) or 1
+            shard_stats = ((report.get("stats") or {}).get(name) or {})
+            weighted_mean += float(shard_stats.get("mean") or 0.0) * shard_samples
+            std = max(std, float(shard_stats.get("std") or 0.0))
+            nan_count += int(shard_stats.get("nan_count") or 0)
+        stats[name] = {
+            "mean": float(weighted_mean / weight_total),
+            "std": float(std),
+            "nan_count": nan_count,
+        }
+    flow_flat = all(float(stats[name]["abs_max"]) < 1e-4 for name in ("flowt_0", "flowt_1"))
+    mask_flat = all(float(stats[name]["std"]) < 1e-3 for name in ("mask0", "mask1"))
+    has_nan = any(int(stats[name]["nan_count"]) > 0 for name in stats)
+    warnings: list[str] = []
+    seen: set[str] = set()
+    for report in valid:
+        for warning in report.get("warnings") or []:
+            warning_text = str(warning)
+            if warning_text in seen:
+                continue
+            seen.add(warning_text)
+            warnings.append(warning_text)
+    return {
+        "stats": stats,
+        "warnings": warnings,
+        "flow_flat": flow_flat,
+        "mask_flat": mask_flat,
+        "has_nan": has_nan,
+        "samples": total_samples,
+        "shards": len(valid),
+    }
+
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
@@ -1010,6 +1070,21 @@ class Database:
                 """,
                 (_json(error), now, now, run_id),
             )
+            # Cancel sibling shard jobs that have not started yet so a worker
+            # never claims them once the run is already known to have failed.
+            # Already-running shards notice via the run-status check each
+            # batch (_raise_if_canceled) and stop themselves.
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'canceled',
+                    error_json = ?,
+                    finished_at = ?
+                WHERE status = 'queued'
+                  AND id IN (SELECT job_id FROM run_jobs WHERE run_id = ?)
+                """,
+                (_json({"message": "sibling shard failed the run"}), now, run_id),
+            )
 
     def request_run_cancel(self, run_id: int) -> None:
         now = utc_ts()
@@ -1176,6 +1251,7 @@ class Database:
             return False
 
         run = self.get_run(run_id)
+        output_health = _combine_output_health((job.get("result") or {}).get("output_health") for job in jobs)
         result = {
             "samples": sum(int(job.get("result", {}).get("samples") or 0) for job in jobs),
             "output_dir": (run.get("metadata") or {}).get("output_dir"),
@@ -1189,6 +1265,8 @@ class Database:
                 for job in jobs
             ],
         }
+        if output_health is not None:
+            result["output_health"] = output_health
         artifact_summary = self.summarize_run_artifacts(run_id)
         metrics = list(run.get("metrics") or [])
         if metrics:
