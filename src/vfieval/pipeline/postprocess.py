@@ -115,6 +115,30 @@ def backward_warp(image: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
     return F.grid_sample(image, normalized, mode="bilinear", padding_mode="border", align_corners=True)
 
 
+def resize_bundle(bundle: dict[str, torch.Tensor], height: int, width: int) -> dict[str, torch.Tensor]:
+    """Resize every tensor in a composed bundle to (height, width).
+
+    Flow tensors are in pixel units, so resizing scales their displacement
+    magnitudes to match the new resolution. RGB/mask tensors are resized
+    directly. Tensors already at the target size are returned unchanged.
+    """
+    resized: dict[str, torch.Tensor] = {}
+    for name, tensor in bundle.items():
+        if not isinstance(tensor, torch.Tensor) or tensor.ndim != 4:
+            resized[name] = tensor
+            continue
+        src_h, src_w = int(tensor.shape[-2]), int(tensor.shape[-1])
+        if (src_h, src_w) == (height, width):
+            resized[name] = tensor
+            continue
+        out = F.interpolate(tensor, size=(height, width), mode="bilinear", align_corners=True)
+        if name in ("flowt_0", "flowt_1"):
+            scale = out.new_tensor([float(width) / float(src_w), float(height) / float(src_h)]).view(1, 2, 1, 1)
+            out = out * scale
+        resized[name] = out
+    return resized
+
+
 def compose_interpolated(
     img0: torch.Tensor,
     img1: torch.Tensor,
@@ -135,3 +159,85 @@ def compose_interpolated(
         "blend": blended.clamp(0.0, 1.0),
         "pred": pred.clamp(0.0, 1.0),
     }
+
+
+def _resize_to(tensor: torch.Tensor, height: int, width: int, *, mode: str = "bilinear") -> torch.Tensor:
+    if tuple(tensor.shape[-2:]) == (height, width):
+        return tensor
+    align = None if mode == "nearest" else True
+    return F.interpolate(tensor, size=(height, width), mode=mode, align_corners=align)
+
+
+def compose_interpolated_native(
+    img0: torch.Tensor,
+    img1: torch.Tensor,
+    outputs: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Compose the interpolated frame at the model's native flow resolution.
+
+    The default :func:`compose_interpolated` upsamples flow/mask to the input
+    resolution before warping, so warp/blend/compose all run at full size. When
+    the model emits flow/mask at a much smaller resolution (e.g. 208x448 for a
+    832x1792 input) this is wasteful: the extra detail is synthesized by the
+    upsampler, not the model. This variant instead downsamples the RGB inputs to
+    the flow resolution, so warp/compose run at native size. Outputs are at the
+    native flow resolution and can be resized once for visualization.
+    """
+    validate_model_outputs(outputs, img0)
+    flow0 = outputs["flowt_0"]
+    flow1 = outputs["flowt_1"]
+    height, width = int(flow0.shape[-2]), int(flow0.shape[-1])
+    # flow1 usually matches flow0; rescale (and rescale displacements) if not.
+    if tuple(flow1.shape[-2:]) != (height, width):
+        src_h, src_w = int(flow1.shape[-2]), int(flow1.shape[-1])
+        flow1 = _resize_to(flow1, height, width)
+        scale = flow1.new_tensor([float(width) / float(src_w), float(height) / float(src_h)]).view(1, 2, 1, 1)
+        flow1 = flow1 * scale
+    img0r = _resize_to(img0, height, width)
+    img1r = _resize_to(img1, height, width)
+    warp0 = backward_warp(img0r, flow0)
+    warp1 = backward_warp(img1r, flow1)
+    mask0 = torch.sigmoid(_resize_to(outputs["mask0"], height, width))
+    mask1 = torch.sigmoid(_resize_to(outputs["mask1"], height, width))
+    blended = mask0 * warp0 + (1.0 - mask0) * warp1
+    pred = mask1 * img1r + (1.0 - mask1) * blended
+    return {
+        "warp0": warp0.clamp(0.0, 1.0),
+        "warp1": warp1.clamp(0.0, 1.0),
+        "mask0": mask0,
+        "mask1": mask1,
+        "blend": blended.clamp(0.0, 1.0),
+        "pred": pred.clamp(0.0, 1.0),
+        "flowt_0": flow0,
+        "flowt_1": flow1,
+    }
+
+
+_BUNDLE_RGB_KEYS = ("pred", "warp0", "warp1", "blend")
+_BUNDLE_MASK_KEYS = ("mask0", "mask1")
+_BUNDLE_FLOW_KEYS = ("flowt_0", "flowt_1")
+
+
+def resize_bundle(bundle: dict[str, torch.Tensor], height: int, width: int) -> dict[str, torch.Tensor]:
+    """Resize a composed bundle to a target visualization resolution.
+
+    RGB and mask tensors are bilinearly resized. Flow tensors are resized and
+    their pixel displacements rescaled so the flow color visualization keeps a
+    consistent magnitude at the new resolution.
+    """
+    resized: dict[str, torch.Tensor] = {}
+    for key, tensor in bundle.items():
+        if not isinstance(tensor, torch.Tensor):
+            resized[key] = tensor
+            continue
+        if tuple(tensor.shape[-2:]) == (height, width):
+            resized[key] = tensor
+            continue
+        if key in _BUNDLE_FLOW_KEYS:
+            src_h, src_w = int(tensor.shape[-2]), int(tensor.shape[-1])
+            flow = _resize_to(tensor, height, width)
+            scale = flow.new_tensor([float(width) / float(src_w), float(height) / float(src_h)]).view(1, 2, 1, 1)
+            resized[key] = flow * scale
+        else:
+            resized[key] = _resize_to(tensor, height, width)
+    return resized

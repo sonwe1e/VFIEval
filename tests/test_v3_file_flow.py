@@ -823,6 +823,7 @@ class Model:
                 device="cpu",
                 precision="fp32",
                 metrics=[],
+                metadata={"visualize_height": size[1], "visualize_width": size[0]},
             )
 
             run_worker(db, workspace, WorkerOptions(role="inference", once=True, worker_id="preview-test-worker"))

@@ -66,6 +66,7 @@ const state = {
   sampleAbortController: null,
   timelineAbortController: null,
   compareGridColumns: 3,
+  slotSelectionBySample: {},
 };
 
 const $ = (id) => document.getElementById(id);
@@ -618,6 +619,8 @@ function payloadFromForm() {
       ? Array.from(state.selectedNpuDevices)
       : Array.from(state.selectedCudaDevices),
     precision: data.precision || "auto",
+    visualize_height: data.visualize_height ? Number(data.visualize_height) : null,
+    visualize_width: data.visualize_width ? Number(data.visualize_width) : null,
     batch_size: Number(data.batch_size || 1),
     batch_size_per_device: Number(data.batch_size_per_device || data.batch_size || 1),
     frame_step: Number(data.frame_step || 1),
@@ -1621,6 +1624,50 @@ function renderCompareLayers(sample) {
   `;
 }
 
+function sampleLayerOptions(run) {
+  const groups = previewGroupsForRun(run);
+  const options = [];
+  for (const group of Object.values(groups)) {
+    for (const [kind, label] of group.items) {
+      options.push([kind, label]);
+    }
+  }
+  return options;
+}
+
+function slotSelection(sampleId, options) {
+  const stored = state.slotSelectionBySample[sampleId];
+  if (stored) return stored;
+  const kinds = options.map(([kind]) => kind);
+  const left = kinds.includes("gt") ? "gt" : kinds[0] || "pred";
+  const right = kinds.includes("pred") ? "pred" : (kinds[1] || kinds[0] || "pred");
+  return { left, right };
+}
+
+function renderBigSlot(sample, options, slot, selectedKind) {
+  const optionHtml = options
+    .map(([kind, label]) => `<option value="${escapeHtml(kind)}" ${kind === selectedKind ? "selected" : ""}>${escapeHtml(label)}</option>`)
+    .join("");
+  const artifact = sample.artifacts?.[selectedKind];
+  const label = (options.find(([kind]) => kind === selectedKind) || [selectedKind, selectedKind])[1];
+  let body;
+  if (!artifact) {
+    body = "<p class=\"muted\">暂无</p>";
+  } else {
+    const url = artifact.original_url || artifact.preview_url;
+    const href = artifact.original_url || url;
+    body = `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(url)}" alt="${escapeHtml(label)}" loading="lazy"></a>`;
+  }
+  return `
+    <div class="big-slot">
+      <div class="big-slot-head">
+        <select data-slot="${escapeHtml(slot)}" data-slot-sample="${escapeHtml(sample.sample_id)}">${optionHtml}</select>
+      </div>
+      <div class="big-slot-body">${body}</div>
+    </div>
+  `;
+}
+
 function renderSamplePreview(sample) {
   const detail = sampleDetail(sample.sample_id);
   if (!detail && sample.has_artifacts !== false) {
@@ -1657,8 +1704,8 @@ function renderSamplePreview(sample) {
       }
     : sample;
   const groups = previewGroupsForRun(state.selectedRun);
-  const groupKey = state.selectedArtifactGroupBySample[payload.sample_id] || "images";
-  const group = groups[groupKey] || groups.images;
+  const options = sampleLayerOptions(state.selectedRun);
+  const selection = slotSelection(payload.sample_id, options);
   const loadState = detail
     ? (payload.load_error
         ? `<div class="message error"><p><strong>样本产物加载失败</strong>: ${escapeHtml(payload.load_error)}</p></div>`
@@ -1672,13 +1719,9 @@ function renderSamplePreview(sample) {
       ${renderSampleMetrics(payload)}
     </div>
     ${loadState}
-    <div class="artifact-tabs">
-      ${Object.entries(groups).map(([key, value]) => `
-        <button class="secondary ${key === groupKey ? "active" : ""}" data-artifact-group="${escapeHtml(key)}" data-artifact-sample="${escapeHtml(payload.sample_id)}" type="button">${escapeHtml(value.label)}</button>
-      `).join("")}
-    </div>
-    <div class="preview-grid">
-      ${group.items.map(([kind, label]) => renderPreviewSlot(payload, kind, label)).join("")}
+    <div class="big-slots">
+      ${renderBigSlot(payload, options, "left", selection.left)}
+      ${renderBigSlot(payload, options, "right", selection.right)}
     </div>
     ${renderCompareLayers(payload)}
     ${renderExtraArtifacts(payload)}
@@ -1958,6 +2001,15 @@ document.addEventListener("change", (event) => {
     loadRunVideoTimeline(state.selectedRun.id, videoName, { metric: metricSelect.value })
       .then(() => renderRunDetail())
       .catch((error) => toast(error.message));
+    return;
+  }
+  const slotSelect = event.target.closest("[data-slot]");
+  if (slotSelect) {
+    const sampleId = slotSelect.dataset.slotSample;
+    const options = sampleLayerOptions(state.selectedRun);
+    const current = slotSelection(sampleId, options);
+    state.slotSelectionBySample[sampleId] = { ...current, [slotSelect.dataset.slot]: slotSelect.value };
+    renderRunDetail();
     return;
   }
   const range = event.target.closest("[data-sample-range]");

@@ -7,16 +7,17 @@
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
-    <header class="app-header">
-      <div>
-        <h1>VFIEval</h1>
-        <p>以模型文件、视频文件夹或现有 GT/Pred 输入为入口，完成本地评测闭环。</p>
-      </div>
-      <nav class="nav" aria-label="主导航">
-        <button class="nav-item active" data-view="create" type="button">新建任务</button>
-        <button class="nav-item" data-view="runs" type="button">运行记录</button>
-      </nav>
-    </header>
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="sidebar-brand">
+          <h1>VFIEval</h1>
+          <p>本地视频插帧评测</p>
+        </div>
+        <nav class="nav" aria-label="主导航">
+          <button class="nav-item active" data-view="create" type="button">新建任务</button>
+          <button class="nav-item" data-view="runs" type="button">运行记录</button>
+        </nav>
+      </aside>
 
     <main class="shell">
       <section id="view-create" class="view active">
@@ -30,74 +31,104 @@
           </label>
 
           <div class="mode-section" data-mode-section="model_inference">
-            <label>
-              <span>模型文件</span>
-              <select name="model_file"></select>
-            </label>
-            <label>
-              <span>权重</span>
-              <select name="checkpoint"></select>
-            </label>
-            <label>
-              <span>视频集</span>
-              <select name="video_group"></select>
-            </label>
-            <label>
-              <span>输出分辨率</span>
-              <select name="resolution_mode">
-                <option value="original">原始</option>
-                <option value="720p">720p</option>
-                <option value="custom">自定义</option>
-              </select>
-            </label>
-            <label class="custom-size">
-              <span>高度</span>
-              <input name="height" type="number" min="1" placeholder="H">
-            </label>
-            <label class="custom-size">
-              <span>宽度</span>
-              <input name="width" type="number" min="1" placeholder="W">
-            </label>
-            <label>
-              <span>设备</span>
-              <select name="device">
-                <option value="auto">auto</option>
-                <option value="cuda">cuda</option>
-                <option value="npu">npu</option>
-                <option value="cpu">cpu</option>
-              </select>
-            </label>
-            <label>
-              <span>执行模式</span>
-              <select name="execution_mode">
-                <option value="single">单设备</option>
-                <option value="multi_cuda">多卡 CUDA</option>
-                <option value="multi_npu">多卡 NPU</option>
-              </select>
-            </label>
-            <label>
-              <span>精度</span>
-              <select name="precision">
-                <option value="auto">auto</option>
-                <option value="fp32">fp32</option>
-                <option value="fp16">fp16</option>
-                <option value="bf16">bf16</option>
-              </select>
-            </label>
+            <fieldset class="field-group">
+              <legend>模型</legend>
+              <div class="field-grid">
+                <label>
+                  <span>模型文件</span>
+                  <select name="model_file"></select>
+                </label>
+                <label>
+                  <span>权重</span>
+                  <select name="checkpoint"></select>
+                </label>
+              </div>
+            </fieldset>
+
+            <fieldset class="field-group">
+              <legend>输入</legend>
+              <div class="field-grid">
+                <label>
+                  <span>视频集</span>
+                  <select name="video_group"></select>
+                </label>
+                <label>
+                  <span>输出分辨率</span>
+                  <select name="resolution_mode">
+                    <option value="original">原始</option>
+                    <option value="720p">720p</option>
+                    <option value="custom">自定义</option>
+                  </select>
+                </label>
+                <label class="custom-size">
+                  <span>高度</span>
+                  <input name="height" type="number" min="1" placeholder="H">
+                </label>
+                <label class="custom-size">
+                  <span>宽度</span>
+                  <input name="width" type="number" min="1" placeholder="W">
+                </label>
+              </div>
+            </fieldset>
+
+            <fieldset class="field-group">
+              <legend>执行</legend>
+              <div class="field-grid">
+                <label>
+                  <span>设备</span>
+                  <select name="device">
+                    <option value="auto">auto</option>
+                    <option value="cuda">cuda</option>
+                    <option value="npu">npu</option>
+                    <option value="cpu">cpu</option>
+                  </select>
+                </label>
+                <label>
+                  <span>执行模式</span>
+                  <select name="execution_mode">
+                    <option value="single">单设备</option>
+                    <option value="multi_cuda">多卡 CUDA</option>
+                    <option value="multi_npu" selected>多卡 NPU</option>
+                  </select>
+                </label>
+              </div>
+            </fieldset>
           </div>
 
           <div class="mode-section mode-compare" data-mode-section="video_compare" hidden>
-            <label>
-              <span>对齐方式</span>
-              <select name="align_mode">
-                <option value="strict">strict</option>
-              </select>
-            </label>
+            <fieldset class="field-group">
+              <legend>对比</legend>
+              <div class="field-grid">
+                <label>
+                  <span>对齐方式</span>
+                  <select name="align_mode">
+                    <option value="strict">strict</option>
+                  </select>
+                </label>
+              </div>
+            </fieldset>
           </div>
 
           <details class="advanced">
             <summary>高级设置</summary>
             <div class="advanced-grid" data-mode-section="model_inference">
+              <label>
+                <span>精度</span>
+                <select name="precision">
+                  <option value="auto">auto</option>
+                  <option value="fp32" selected>fp32</option>
+                  <option value="fp16">fp16</option>
+                  <option value="bf16">bf16</option>
+                </select>
+              </label>
+              <label>
+                <span>可视化高度</span>
+                <input name="visualize_height" type="number" min="1" value="384">
+              </label>
+              <label>
+                <span>可视化宽度</span>
+                <input name="visualize_width" type="number" min="1" value="832">
+              </label>
               <label>
                 <span>Batch Size</span>
                 <input name="batch_size" type="number" min="1" value="1">
@@ -142,6 +173,7 @@
         <section id="run-detail" class="panel"></section>
       </section>
     </main>
+    </div>
 
     <div id="toast" role="status"></div>
     <script src="/app.js"></script>

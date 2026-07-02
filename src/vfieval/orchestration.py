@@ -27,6 +27,8 @@ def create_inference_jobs_for_run(db: Database, run_id: int) -> list[int]:
     execution_mode = str(metadata.get("execution_mode") or run.get("device") or "single")
     devices = [str(device) for device in (metadata.get("devices") or [run.get("device") or "cpu"])]
     batch_size = int(run.get("batch_size") or 1)
+    visualize_height = metadata.get("visualize_height")
+    visualize_width = metadata.get("visualize_width")
     samples = db.list_samples(dataset_id)
     if not samples:
         raise ValueError("decoded dataset has no samples")
@@ -44,6 +46,8 @@ def create_inference_jobs_for_run(db: Database, run_id: int) -> list[int]:
             devices=devices,
             batch_size_per_device=batch_size,
             samples=samples,
+            visualize_height=visualize_height,
+            visualize_width=visualize_width,
         )
     else:
         payload = {
@@ -56,6 +60,8 @@ def create_inference_jobs_for_run(db: Database, run_id: int) -> list[int]:
             "device": str(run.get("device") or "cpu"),
             "precision": precision,
             "metrics": metrics,
+            "visualize_height": visualize_height,
+            "visualize_width": visualize_width,
         }
         job_ids = [
             db.add_run_job(
@@ -152,6 +158,8 @@ def _create_inference_shards(
     devices: list[str],
     batch_size_per_device: int,
     samples: list[dict[str, Any]],
+    visualize_height: int | None = None,
+    visualize_width: int | None = None,
 ) -> list[int]:
     partitions = partition_samples_by_video(samples, devices)
     job_ids: list[int] = []
@@ -172,6 +180,8 @@ def _create_inference_shards(
             "sample_ids": sample_ids,
             "shard_index": shard_index,
             "shard_count": len(devices),
+            "visualize_height": visualize_height,
+            "visualize_width": visualize_width,
         }
         job_ids.append(
             db.add_run_job(

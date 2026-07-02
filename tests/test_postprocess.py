@@ -9,7 +9,14 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from vfieval.pipeline.postprocess import backward_warp, compose_interpolated, normalize_model_outputs, validate_model_outputs
+from vfieval.pipeline.postprocess import (
+    backward_warp,
+    compose_interpolated,
+    compose_interpolated_native,
+    normalize_model_outputs,
+    resize_bundle,
+    validate_model_outputs,
+)
 
 
 class PostprocessTests(unittest.TestCase):
@@ -91,6 +98,66 @@ class PostprocessTests(unittest.TestCase):
         flow = torch.zeros((2, 2, 5, 7), dtype=torch.float32)
         warped = backward_warp(image, flow)
         self.assertTrue(torch.allclose(warped, image, atol=1e-6))
+
+    def test_native_compose_matches_upsampled_compose_for_zero_flow(self) -> None:
+        # With zero flow and constant masks, composing at native resolution and
+        # composing after upsampling produce the same interpolated frame (the
+        # only difference between the two paths is where the RGB resize happens).
+        img0 = torch.zeros((1, 3, 8, 12), dtype=torch.float32)
+        img1 = torch.ones((1, 3, 8, 12), dtype=torch.float32)
+        outputs = {
+            "flowt_0": torch.zeros((1, 2, 4, 6), dtype=torch.float32),
+            "flowt_1": torch.zeros((1, 2, 4, 6), dtype=torch.float32),
+            "mask0": torch.zeros((1, 1, 4, 6), dtype=torch.float32),
+            "mask1": torch.zeros((1, 1, 4, 6), dtype=torch.float32),
+        }
+
+        native = compose_interpolated_native(img0, img1, outputs)
+
+        self.assertEqual(tuple(native["pred"].shape), (1, 3, 4, 6))
+        self.assertTrue(torch.allclose(native["blend"], torch.full((1, 3, 4, 6), 0.5)))
+        self.assertTrue(torch.allclose(native["pred"], torch.full((1, 3, 4, 6), 0.75)))
+        self.assertEqual(tuple(native["flowt_0"].shape), (1, 2, 4, 6))
+
+    def test_native_compose_handles_mismatched_flow1_resolution(self) -> None:
+        img0 = torch.zeros((1, 3, 8, 8), dtype=torch.float32)
+        img1 = torch.ones((1, 3, 8, 8), dtype=torch.float32)
+        outputs = {
+            "flowt_0": torch.zeros((1, 2, 4, 4), dtype=torch.float32),
+            "flowt_1": torch.zeros((1, 2, 2, 2), dtype=torch.float32),
+            "mask0": torch.zeros((1, 1, 4, 4), dtype=torch.float32),
+            "mask1": torch.zeros((1, 1, 2, 2), dtype=torch.float32),
+        }
+
+        native = compose_interpolated_native(img0, img1, outputs)
+
+        # Everything is composed at flowt_0's resolution (4x4).
+        for key in ("pred", "warp0", "warp1", "blend", "mask0", "mask1", "flowt_0", "flowt_1"):
+            self.assertEqual(tuple(native[key].shape[-2:]), (4, 4), key)
+
+    def test_resize_bundle_scales_flow_displacements(self) -> None:
+        bundle = {
+            "pred": torch.zeros((1, 3, 4, 6), dtype=torch.float32),
+            "warp0": torch.zeros((1, 3, 4, 6), dtype=torch.float32),
+            "warp1": torch.zeros((1, 3, 4, 6), dtype=torch.float32),
+            "blend": torch.zeros((1, 3, 4, 6), dtype=torch.float32),
+            "mask0": torch.full((1, 1, 4, 6), 0.5, dtype=torch.float32),
+            "mask1": torch.full((1, 1, 4, 6), 0.5, dtype=torch.float32),
+            "flowt_0": torch.ones((1, 2, 4, 6), dtype=torch.float32),
+            "flowt_1": torch.ones((1, 2, 4, 6), dtype=torch.float32),
+        }
+
+        resized = resize_bundle(bundle, 8, 12)
+
+        self.assertEqual(tuple(resized["pred"].shape), (1, 3, 8, 12))
+        # width doubled (6->12) so x displacement scales x2; height doubled too.
+        self.assertTrue(torch.allclose(resized["flowt_0"][:, 0], torch.full((1, 8, 12), 2.0)))
+        self.assertTrue(torch.allclose(resized["flowt_0"][:, 1], torch.full((1, 8, 12), 2.0)))
+
+    def test_resize_bundle_is_noop_when_already_target_size(self) -> None:
+        bundle = {"pred": torch.rand((1, 3, 4, 6), dtype=torch.float32)}
+        resized = resize_bundle(bundle, 4, 6)
+        self.assertIs(resized["pred"], bundle["pred"])
 
 
 if __name__ == "__main__":

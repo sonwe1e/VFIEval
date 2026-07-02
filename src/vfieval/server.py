@@ -41,6 +41,7 @@ from vfieval.file_inputs import (
 from vfieval.metrics import METRIC_NAMES
 from vfieval.metrics.health import metrics_health
 from vfieval.orchestration import start_decode_worker
+from vfieval.pipeline.inference import DEFAULT_VISUALIZE_HEIGHT, DEFAULT_VISUALIZE_WIDTH
 from vfieval.worker import WorkerOptions, detect_capabilities, run_worker
 
 
@@ -785,6 +786,7 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
     video_infos = preflight.get("video_group", {}).get("videos", [])
     selected_videos = [str(name) for name in preflight.get("video_group", {}).get("selected_videos", [])]
     height, width = resolve_run_dimensions(body, video_infos)
+    visualize_height, visualize_width = _resolve_visualize_dimensions(body, height, width)
     execution_mode = str(body.get("execution_mode") or "single")
     devices = _resolve_execution_devices(body, execution_mode)
     requested_device = str(body.get("device") or "auto")
@@ -844,6 +846,8 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
             "resolution_mode": body.get("resolution_mode") or "original",
             "height": height,
             "width": width,
+            "visualize_height": visualize_height,
+            "visualize_width": visualize_width,
             "batch_size": int(body.get("batch_size") or 1),
             "batch_size_per_device": int(body.get("batch_size_per_device") or body.get("batch_size") or 1),
             "device": body.get("device") or "auto",
@@ -861,6 +865,8 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         "video_group": video_folder.name,
         "execution_mode": execution_mode,
         "devices": devices,
+        "visualize_height": visualize_height,
+        "visualize_width": visualize_width,
         "npu_devices": devices if execution_mode == "multi_npu" else [],
         "reference_key": reference_key,
         "reference_config": reference_config,
@@ -1086,6 +1092,21 @@ def _checkpoint_relative(workspace: WorkspaceConfig, checkpoint_path: Path | Non
     from vfieval.file_inputs import checkpoints_dir
 
     return checkpoint_path.resolve().relative_to(checkpoints_dir(workspace)).as_posix()
+
+
+def _resolve_visualize_dimensions(body: dict, height: int, width: int) -> tuple[int, int]:
+    """Resolution at which visual artifacts (PNGs) are saved for the run.
+
+    Defaults to 832x384 and is clamped to the inference resolution so display
+    artifacts never upscale beyond what the model actually produced.
+    """
+    raw_h = body.get("visualize_height")
+    raw_w = body.get("visualize_width")
+    vis_h = int(raw_h) if raw_h else DEFAULT_VISUALIZE_HEIGHT
+    vis_w = int(raw_w) if raw_w else DEFAULT_VISUALIZE_WIDTH
+    if vis_h <= 0 or vis_w <= 0:
+        vis_h, vis_w = DEFAULT_VISUALIZE_HEIGHT, DEFAULT_VISUALIZE_WIDTH
+    return min(vis_h, int(height)), min(vis_w, int(width))
 
 
 def _resolve_execution_devices(body: dict, execution_mode: str) -> list[str]:

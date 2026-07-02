@@ -17,6 +17,53 @@ from vfieval.worker import WorkerOptions, run_worker
 
 
 class EndToEndTests(unittest.TestCase):
+    def test_inference_saves_artifacts_at_visualization_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_root = root / "dataset"
+            for folder in ("img0", "img1", "gt"):
+                (dataset_root / folder).mkdir(parents=True)
+            size = (256, 128)
+            for idx in range(2):
+                name = f"sample{idx:03d}.png"
+                Image.new("RGB", size, (idx, 0, 0)).save(dataset_root / "img0" / name)
+                Image.new("RGB", size, (0, idx, 0)).save(dataset_root / "img1" / name)
+                Image.new("RGB", size, (0, 0, idx)).save(dataset_root / "gt" / name)
+
+            workspace = WorkspaceConfig.from_root(root / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("dummy", "dummy", None, size[1], size[0])
+            dataset_id = db.create_dataset("viz", str(dataset_root), has_gt=True)
+            self.assertEqual(scan_triplet_dataset(db, dataset_id), 2)
+
+            vis_w, vis_h = 64, 32
+            job_id = db.create_job(
+                "inference",
+                {
+                    "model_id": model_id,
+                    "dataset_id": dataset_id,
+                    "height": size[1],
+                    "width": size[0],
+                    "batch_size": 2,
+                    "device": "cpu",
+                    "precision": "fp32",
+                    "metrics": [],
+                    "visualize_height": vis_h,
+                    "visualize_width": vis_w,
+                },
+            )
+
+            run_worker(db, workspace, WorkerOptions(role="inference", once=True, worker_id="viz-inference"))
+            self.assertEqual(db.get_job(job_id)["status"], "completed")
+
+            for kind in ("pred", "gt", "difference"):
+                artifacts = db.list_artifacts(job_id=job_id, kind=kind)
+                self.assertTrue(artifacts, kind)
+                with Image.open(artifacts[0]["path"]) as image:
+                    self.assertEqual(image.size, (vis_w, vis_h), kind)
+
     def test_dummy_inference_and_unavailable_metric(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

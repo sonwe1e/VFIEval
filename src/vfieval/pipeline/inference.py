@@ -22,11 +22,18 @@ from vfieval.db import Database
 from vfieval.devices import autocast_context, resolve_torch_device
 from vfieval.models import load_flow_mask_model
 from vfieval.pipeline.io import batch_tensors, load_rgb_tensor, resize_batch
-from vfieval.pipeline.postprocess import compose_interpolated, normalize_model_outputs
-from vfieval.pipeline.visualize import save_difference, save_extra_tensor, save_preview_image
+from vfieval.pipeline.postprocess import (
+    compose_interpolated,
+    compose_interpolated_native,
+    normalize_model_outputs,
+    resize_bundle,
+)
+from vfieval.pipeline.visualize import save_difference, save_extra_tensor, save_preview_image, save_rgb_tensor
 
 
 VALID_PRECISIONS = {"fp32", "fp16", "bf16"}
+DEFAULT_VISUALIZE_HEIGHT = 384
+DEFAULT_VISUALIZE_WIDTH = 832
 CORE_OUTPUTS = {"flowt_0", "flowt_1", "mask0", "mask1"}
 BUNDLE_KEYS = ("pred", "warp0", "warp1", "blend", "mask0", "mask1", "flowt_0", "flowt_1")
 
@@ -248,6 +255,7 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
         raise ValueError("height and width must be positive")
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
+    visualize_height, visualize_width = _resolve_visualize_size(payload, height, width)
 
     samples = db.list_samples(dataset_id)
     sample_ids = payload.get("sample_ids")
@@ -325,20 +333,24 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
             img1 = img1_cpu.to(device, non_blocking=True)
             with torch.no_grad(), _autocast_context(device, precision):
                 outputs = model.predict(img0, img1, 0.5)
-            normalized_outputs = normalize_model_outputs(outputs, img0)
             timing["model"] += time.perf_counter() - t1
 
             t2 = time.perf_counter()
-            composed = compose_interpolated(img0, img1, normalized_outputs)
+            # Compose at the model's native flow/mask resolution, then resize the
+            # whole bundle once to the visualization resolution. This keeps warp,
+            # blend and PNG encoding off the full inference resolution, which is
+            # the CPU-side work that otherwise leaves the device idle.
+            composed = compose_interpolated_native(img0, img1, outputs)
+            composed_viz = resize_bundle(composed, visualize_height, visualize_width)
             bundle_cpu = {
-                "pred": composed["pred"].detach().to("cpu"),
-                "warp0": composed["warp0"].detach().to("cpu"),
-                "warp1": composed["warp1"].detach().to("cpu"),
-                "blend": composed["blend"].detach().to("cpu"),
-                "mask0": composed["mask0"].detach().to("cpu"),
-                "mask1": composed["mask1"].detach().to("cpu"),
-                "flowt_0": normalized_outputs["flowt_0"].detach().to("cpu"),
-                "flowt_1": normalized_outputs["flowt_1"].detach().to("cpu"),
+                "pred": composed_viz["pred"].detach().to("cpu"),
+                "warp0": composed_viz["warp0"].detach().to("cpu"),
+                "warp1": composed_viz["warp1"].detach().to("cpu"),
+                "blend": composed_viz["blend"].detach().to("cpu"),
+                "mask0": composed_viz["mask0"].detach().to("cpu"),
+                "mask1": composed_viz["mask1"].detach().to("cpu"),
+                "flowt_0": composed_viz["flowt_0"].detach().to("cpu"),
+                "flowt_1": composed_viz["flowt_1"].detach().to("cpu"),
             }
             output_health.update(bundle_cpu)
             extra_cpu: dict[str, torch.Tensor] = {}
@@ -502,6 +514,35 @@ def _run_video_compare_job(
     return result
 
 
+def _resolve_visualize_size(payload: dict[str, Any], height: int, width: int) -> tuple[int, int]:
+    """Resolution at which visual artifacts (PNGs) are saved.
+
+    Defaults to 832x384 so the save pool encodes small images regardless of the
+    full inference resolution. The visualization size is clamped to never exceed
+    the inference resolution (upscaling artifacts for display wastes disk and CPU
+    without adding information).
+    """
+    raw_h = payload.get("visualize_height")
+    raw_w = payload.get("visualize_width")
+    vis_h = int(raw_h) if raw_h else DEFAULT_VISUALIZE_HEIGHT
+    vis_w = int(raw_w) if raw_w else DEFAULT_VISUALIZE_WIDTH
+    if vis_h <= 0 or vis_w <= 0:
+        vis_h, vis_w = DEFAULT_VISUALIZE_HEIGHT, DEFAULT_VISUALIZE_WIDTH
+    vis_h = min(vis_h, height)
+    vis_w = min(vis_w, width)
+    return vis_h, vis_w
+
+
+def _resize_chw(tensor: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    """Resize a CHW RGB tensor to (height, width) via bilinear interpolation."""
+    if tuple(tensor.shape[-2:]) == (height, width):
+        return tensor
+    resized = torch.nn.functional.interpolate(
+        tensor.unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False
+    )
+    return resized.squeeze(0)
+
+
 def _fps(count: int, seconds: float) -> float:
     if seconds <= 0:
         return 0.0
@@ -617,6 +658,7 @@ def _collect_video_frame(
     sample: dict[str, Any],
     pred_path: Path,
     diff_path: Path | None,
+    gt_path: Path | None = None,
 ) -> None:
     metadata = sample.get("metadata") or {}
     if metadata.get("source_type") != "video":
@@ -631,12 +673,16 @@ def _collect_video_frame(
         },
     )
     frame_order = int(metadata.get("frame_index") or metadata.get("sample_index") or len(group["frames"]))
+    # Prefer the visualization-resolution GT written alongside pred so pred/gt
+    # video frames share dimensions (VMAF requires matched sizes). Fall back to
+    # the original decoded GT when no resized copy was produced.
+    resolved_gt = Path(gt_path) if gt_path is not None else (Path(sample["gt_path"]) if sample.get("gt_path") else None)
     group["frames"].append(
         {
             "order": frame_order,
             "sample_name": sample["name"],
             "pred_path": Path(pred_path),
-            "gt_path": Path(sample["gt_path"]) if sample.get("gt_path") else None,
+            "gt_path": resolved_gt,
             "diff_path": Path(diff_path) if diff_path else None,
         }
     )
@@ -1144,9 +1190,18 @@ class _AsyncSavePipeline:
                 _add_image_artifact_with_preview(self._db, job_id, sample_id, kind, path, {"sample": sample_name})
 
             diff_path = None
+            gt_path = None
             if gt_tensor is not None and row.get("gt_path"):
+                # pred is saved at the visualization resolution; match GT to it
+                # so the difference map and the pred/gt video pair (VMAF input)
+                # share dimensions.
+                pred_h, pred_w = int(bundle["pred"].shape[-2]), int(bundle["pred"].shape[-1])
+                if tuple(gt_tensor.shape[-2:]) != (pred_h, pred_w):
+                    gt_tensor = _resize_chw(gt_tensor, pred_h, pred_w)
+                gt_path = sample_dir / "gt.png"
+                save_rgb_tensor(gt_tensor, gt_path)
                 _add_image_artifact_with_preview(
-                    self._db, job_id, sample_id, "gt", Path(row["gt_path"]), {"sample": sample_name}
+                    self._db, job_id, sample_id, "gt", gt_path, {"sample": sample_name}
                 )
                 diff_path = sample_dir / "difference.png"
                 save_difference(bundle["pred"], gt_tensor, diff_path)
@@ -1154,7 +1209,7 @@ class _AsyncSavePipeline:
                     self._db, job_id, sample_id, "difference", diff_path, {"sample": sample_name}
                 )
             with self._lock:
-                _collect_video_frame(self._video_groups, row, paths["pred"], diff_path)
+                _collect_video_frame(self._video_groups, row, paths["pred"], diff_path, gt_path)
         except Exception as exc:
             _record_sample_error(self._db, job_id, sample_id, sample_name, exc)
 

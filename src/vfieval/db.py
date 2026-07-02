@@ -781,6 +781,11 @@ class Database:
                 "precision": precision,
                 "metrics": metrics,
             }
+            meta = metadata or {}
+            if meta.get("visualize_height") is not None:
+                payload["visualize_height"] = meta.get("visualize_height")
+            if meta.get("visualize_width") is not None:
+                payload["visualize_width"] = meta.get("visualize_width")
             job_cur = conn.execute(
                 """
                 INSERT INTO jobs(kind, status, payload_json, progress_total, created_at)
