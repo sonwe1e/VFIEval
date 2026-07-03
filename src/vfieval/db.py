@@ -1187,6 +1187,19 @@ class Database:
                 (now, now, run_id),
             )
 
+    def rename_run(self, run_id: int, name: str) -> None:
+        now = utc_ts()
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE runs
+                SET name = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (name, now, run_id),
+            )
+
     def mark_run_artifacts_cleaned(self, run_id: int) -> None:
         now = utc_ts()
         job_ids = self.run_inference_job_ids(run_id)

@@ -1233,21 +1233,49 @@ def _resolve_command_executable(base_dir: Path, token: str) -> tuple[str | None,
     return None, None, f"metric driver executable is not available: {token}"
 
 
+def _run_ffmpeg_probe(args: list[str]) -> str:
+    """Run an ffmpeg introspection command and return combined stdout+stderr.
+
+    ffmpeg writes most of its help/filter listings to stderr, and on some builds
+    the text stream is not valid UTF-8 (localized banners, etc.), so decode
+    defensively rather than letting a UnicodeDecodeError bubble up.
+    """
+    completed = subprocess.run(
+        args,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    parts = []
+    for raw in (completed.stdout, completed.stderr):
+        if not raw:
+            continue
+        parts.append(raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw))
+    return "\n".join(parts)
+
+
 def _inspect_ffmpeg_filters(ffmpeg_path: str) -> dict[str, Any]:
-    try:
-        completed = subprocess.run(
-            [ffmpeg_path, "-hide_banner", "-filters"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except Exception as exc:
-        return {"available": False, "reason": f"failed to inspect ffmpeg filters: {exc}"}
-    output = f"{completed.stdout}\n{completed.stderr}"
-    if "libvmaf" not in output:
-        return {"available": False, "reason": "ffmpeg is present but libvmaf filter is not available"}
-    return {"available": True, "reason": None}
+    # Different ffmpeg builds surface libvmaf in different places. `-filters`
+    # lists it for most builds, but some minimal/static builds only reveal it
+    # through the per-filter help. Probe both and treat a hit from either as
+    # available so a working libvmaf is not reported as missing.
+    probes = (
+        [ffmpeg_path, "-hide_banner", "-filters"],
+        [ffmpeg_path, "-hide_banner", "-h", "filter=libvmaf"],
+    )
+    last_error: str | None = None
+    for args in probes:
+        try:
+            output = _run_ffmpeg_probe(args)
+        except Exception as exc:
+            last_error = f"failed to inspect ffmpeg filters: {exc}"
+            continue
+        lowered = output.lower()
+        if "libvmaf" in lowered and "unknown filter" not in lowered:
+            return {"available": True, "reason": None}
+    if last_error:
+        return {"available": False, "reason": last_error}
+    return {"available": False, "reason": "ffmpeg is present but libvmaf filter is not available"}
 
 
 def _placeholder_manifest(metric_name: str) -> dict[str, Any]:

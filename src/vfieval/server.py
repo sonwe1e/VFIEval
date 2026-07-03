@@ -318,6 +318,26 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     run_id = int(match.group(1))
                     retry = _retry_run_metrics(db, run_id)
                     return self._json(retry, status=HTTPStatus.CREATED)
+                match = re.fullmatch(r"/api/runs/(\d+)/rename", path)
+                if match:
+                    run_id = int(match.group(1))
+                    name = str(body.get("name") or "").strip()
+                    if not name:
+                        return self._error(HTTPStatus.BAD_REQUEST, "name must not be empty")
+                    db.rename_run(run_id, name)
+                    return self._json({"run_id": run_id, "run": db.get_run(run_id)})
+                if path == "/api/runs/batch-delete":
+                    raw_ids = body.get("run_ids") or []
+                    if not isinstance(raw_ids, list) or not raw_ids:
+                        return self._error(HTTPStatus.BAD_REQUEST, "run_ids must be a non-empty list")
+                    deleted = []
+                    for raw in raw_ids:
+                        run_id = int(raw)
+                        if db.get_run(run_id)["status"] not in TERMINAL_RUN_STATUSES:
+                            db.request_run_cancel(run_id)
+                        db.soft_delete_run(run_id)
+                        deleted.append(run_id)
+                    return self._json({"deleted": deleted, "count": len(deleted)})
                 if path == "/api/jobs":
                     kind = body["kind"]
                     if kind not in {"decode", "inference", "metric"}:
@@ -791,7 +811,7 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
     devices = _resolve_execution_devices(body, execution_mode)
     requested_device = str(body.get("device") or "auto")
     is_multi = execution_mode in {"multi_cuda", "multi_npu"}
-    device, precision = normalize_device_precision(devices[0] if is_multi else requested_device, str(body.get("precision") or "auto"))
+    device, precision = normalize_device_precision(devices[0] if is_multi else requested_device, str(body.get("precision") or "fp32"))
     checkpoint_path = resolve_checkpoint(workspace, body.get("checkpoint"), model_path.name)
     checkpoint_relative = _checkpoint_relative(workspace, checkpoint_path)
     selection_hash = _selection_hash(selected_videos, frame_step, max_frames)
@@ -853,7 +873,7 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
             "device": body.get("device") or "auto",
             "devices": devices,
             "execution_mode": execution_mode,
-            "precision": body.get("precision") or "auto",
+            "precision": body.get("precision") or "fp32",
             "checkpoint": body.get("checkpoint") or "none",
             "frame_step": frame_step,
             "max_frames": max_frames,

@@ -919,6 +919,25 @@ th {
   padding: 0;
 }
 
+.sample-controls.window-nav {
+  grid-template-columns: auto 1fr auto;
+  justify-items: center;
+  margin-bottom: 8px;
+}
+
+.runs-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.runs-select-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .sample-meta {
   display: flex;
   flex-wrap: wrap;
@@ -998,6 +1017,16 @@ th {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 12px;
+}
+
+.big-slots.stacked {
+  grid-template-columns: 1fr;
+}
+
+.big-slots-head {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 8px;
 }
 
 .big-slot {

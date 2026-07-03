@@ -12,6 +12,7 @@ const STATUS_LABELS = {
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "canceled"]);
 const METRICS = ["lpips_vit_patch", "lpips_convnext", "vmaf", "cgvqm"];
+const TIMELINE_WINDOW_SIZE = 1000;
 const PREVIEW_GROUPS_MODEL = {
   images: { label: "图像", items: [["gt", "GT"], ["pred", "Pred"], ["difference", "Diff"]] },
   flow: { label: "Flow", items: [["flowt_0", "Flow t->0"], ["flowt_1", "Flow t->1"]] },
@@ -35,6 +36,7 @@ const state = {
   metricSummary: null,
   runVideosPage: null,
   runVideoTimelines: {},
+  timelineWindowStartByVideo: {},
   sampleDetails: {},
   sampleDetailLoading: {},
   selectedVideosByGroup: {},
@@ -68,6 +70,8 @@ const state = {
   timelineAbortController: null,
   compareGridColumns: 3,
   slotSelectionBySample: {},
+  compareSlotLayout: "side",
+  selectedRunIds: new Set(),
 };
 
 const $ = (id) => document.getElementById(id);
@@ -998,15 +1002,36 @@ function pathBasename(value) {
 }
 
 function renderRuns() {
-  $("runs-table").innerHTML = table(state.runs, [
+  // Drop selections for runs that are no longer in the list (e.g. refreshed away).
+  const liveIds = new Set(state.runs.map((run) => Number(run.id)));
+  for (const id of Array.from(state.selectedRunIds)) {
+    if (!liveIds.has(Number(id))) state.selectedRunIds.delete(id);
+  }
+  const allSelected = state.runs.length > 0 && state.runs.every((run) => state.selectedRunIds.has(Number(run.id)));
+  const selectedCount = state.selectedRunIds.size;
+  const toolbar = `
+    <div class="runs-toolbar">
+      <label class="runs-select-all">
+        <input type="checkbox" data-runs-select-all ${allSelected ? "checked" : ""}>
+        <span>全选</span>
+      </label>
+      <button class="secondary danger" data-runs-batch-delete type="button" ${selectedCount ? "" : "disabled"}>批量删除${selectedCount ? ` (${selectedCount})` : ""}</button>
+    </div>
+  `;
+  const rows = table(state.runs, [
+    {
+      label: "",
+      render: (run) => `<input type="checkbox" data-run-select="${run.id}" ${state.selectedRunIds.has(Number(run.id)) ? "checked" : ""}>`,
+    },
     { label: "Run", render: (run) => `#${escapeHtml(run.id)}` },
+    { label: "名称", render: (run) => escapeHtml(run.name || "-") },
     { label: "状态", render: (run) => statusBadge(run.status) },
     { label: "类型", render: (run) => escapeHtml(run.metadata?.run_type || "model_inference") },
     { label: "来源", render: (run) => escapeHtml(runSourceLabel(run)) },
     { label: "进度", render: (run) => `${escapeHtml(run.progress_current || 0)}/${escapeHtml(run.progress_total || 0)}` },
-    { label: "输出", render: (run) => escapeHtml(run.metadata?.output_dir || run.result?.output_dir || "-") },
     { label: "操作", render: (run) => `<button class="view-detail-btn" data-run-id="${run.id}" type="button">查看详情 →</button>` },
   ], { rowAttrs: (run) => `data-run-id="${run.id}" class="clickable-row"` });
+  $("runs-table").innerHTML = toolbar + rows;
 }
 
 async function loadRunVideosPage(runId, page = 1) {
@@ -1237,16 +1262,20 @@ function renderDecodePanel(run) {
 
 async function loadRunVideoTimeline(runId, videoName, options = {}) {
   const metric = options.metric || state.selectedMetricByRun[runId] || "";
-  const windowStart = Number(options.windowStart ?? 0);
+  const windowKey = `${runId}:${videoName}`;
+  const windowStart = Number(
+    options.windowStart ?? state.timelineWindowStartByVideo[windowKey] ?? 0,
+  );
   if (state.timelineAbortController) state.timelineAbortController.abort();
   const controller = new AbortController();
   state.timelineAbortController = controller;
   try {
     const payload = await api(
-      `/api/runs/${runId}/videos/${encodeURIComponent(videoName)}/timeline?bucket_count=160&window_start=${windowStart}&window_size=300${metric ? `&metric=${encodeURIComponent(metric)}` : ""}`,
+      `/api/runs/${runId}/videos/${encodeURIComponent(videoName)}/timeline?bucket_count=160&window_start=${windowStart}&window_size=${TIMELINE_WINDOW_SIZE}${metric ? `&metric=${encodeURIComponent(metric)}` : ""}`,
       { signal: controller.signal },
     );
-    state.runVideoTimelines[`${runId}:${videoName}`] = payload;
+    state.runVideoTimelines[windowKey] = payload;
+    state.timelineWindowStartByVideo[windowKey] = Number(payload.window_start || 0);
     return payload;
   } catch (error) {
     if (error.name === "AbortError") return state.runVideoTimelines[`${runId}:${videoName}`] || null;
@@ -1285,6 +1314,7 @@ function renderRunDetail() {
       </div>
       <div class="actions">
         ${statusBadge(run.status)}
+        <button class="secondary" data-rename-run="${run.id}" type="button">重命名</button>
         <button class="secondary" data-cancel-run="${run.id}" ${TERMINAL_STATUSES.has(run.status) ? "disabled" : ""} type="button">取消</button>
         <button class="secondary" data-retry-run="${run.id}" type="button">重试</button>
         <button class="secondary danger" data-delete-run="${run.id}" type="button">删除记录</button>
@@ -1566,15 +1596,41 @@ function renderVideoMasterControls(video) {
   `;
 }
 
+function renderTimelineWindowNav(video) {
+  const total = Number(video.sample_count || 0);
+  const windowStart = Number(video.window_start || 0);
+  const windowSize = Number(video.window_size || TIMELINE_WINDOW_SIZE);
+  const shown = (video.samples || []).length;
+  // Only surface window navigation when the video has more samples than fit in
+  // a single window; otherwise the whole timeline is already on screen.
+  if (total <= shown && windowStart === 0) return "";
+  const windowEnd = windowStart + shown;
+  const hasPrev = windowStart > 0;
+  const hasNext = windowEnd < total;
+  const prevStart = Math.max(0, windowStart - windowSize);
+  const nextStart = windowStart + windowSize;
+  return `
+    <div class="sample-controls window-nav">
+      <button class="secondary" data-window-start="${prevStart}" ${hasPrev ? "" : "disabled"} type="button">← 上一段</button>
+      <span class="muted">帧 ${windowStart + 1}–${windowEnd} / 共 ${total}</span>
+      <button class="secondary" data-window-start="${nextStart}" ${hasNext ? "" : "disabled"} type="button">下一段 →</button>
+    </div>
+  `;
+}
+
 function renderFrameRegion(video, selectedIndex, metricName) {
   const samples = video.samples || [];
   const sample = samples[selectedIndex] || null;
+  const windowStart = Number(video.window_start || 0);
+  const globalIndex = windowStart + selectedIndex;
+  const total = Number(video.sample_count || samples.length);
   // The slider element sits between the two updatable containers and is never
   // rewritten on frame change, so dragging it stays smooth. Only #frame-chart,
   // #frame-preview and the counter are refreshed in place; the <video> players
   // live outside #frame-region entirely and never reload.
   return `
     ${renderMetricToolbar(video, metricName)}
+    ${renderTimelineWindowNav(video)}
     <div id="frame-chart">
       ${renderMetricChart(video, selectedIndex, metricName)}
       ${renderWorstSamples(video, metricName)}
@@ -1583,7 +1639,7 @@ function renderFrameRegion(video, selectedIndex, metricName) {
       <button class="secondary" data-sample-step="-1" type="button">上一帧</button>
       <input data-sample-range="${escapeHtml(video.video_name)}" type="range" min="0" max="${Math.max(0, samples.length - 1)}" value="${selectedIndex}">
       <button class="secondary" data-sample-step="1" type="button">下一帧</button>
-      <span class="muted" id="frame-counter">${selectedIndex + 1}/${samples.length || 0}</span>
+      <span class="muted" id="frame-counter">${globalIndex + 1}/${total || 0}</span>
     </div>
     <div id="frame-preview">
       ${sample ? renderSamplePreview(sample) : "<p class=\"muted\">没有样本。</p>"}
@@ -1635,7 +1691,9 @@ function updateFrameRegion() {
   if (!chart || !preview) return false;
   chart.innerHTML = `${renderMetricChart(video, selectedIndex, metricName)}${renderWorstSamples(video, metricName)}`;
   preview.innerHTML = samples[selectedIndex] ? renderSamplePreview(samples[selectedIndex]) : "<p class=\"muted\">没有样本。</p>";
-  if (counter) counter.textContent = `${selectedIndex + 1}/${samples.length || 0}`;
+  const windowStart = Number(video.window_start || 0);
+  const total = Number(video.sample_count || samples.length);
+  if (counter) counter.textContent = `${windowStart + selectedIndex + 1}/${total || 0}`;
   // Only sync the slider's value when the change did not originate from the
   // slider itself; overwriting it mid-drag would fight the pointer.
   if (slider && Number(slider.value) !== selectedIndex) slider.value = String(selectedIndex);
@@ -1847,7 +1905,13 @@ function renderSamplePreview(sample) {
       ${renderSampleMetrics(payload)}
     </div>
     ${loadState}
-    <div class="big-slots">
+    <div class="big-slots-head">
+      <div class="segmented">
+        <button class="secondary ${state.compareSlotLayout === "side" ? "active" : ""}" data-slot-layout="side" type="button">左右</button>
+        <button class="secondary ${state.compareSlotLayout === "stack" ? "active" : ""}" data-slot-layout="stack" type="button">上下</button>
+      </div>
+    </div>
+    <div class="big-slots ${state.compareSlotLayout === "stack" ? "stacked" : ""}">
       ${renderBigSlot(payload, options, "left", selection.left)}
       ${renderBigSlot(payload, options, "right", selection.right)}
     </div>
@@ -1935,6 +1999,43 @@ async function deleteRun(runId) {
   if (!state.selectedRun) {
     renderEmptyRunDetail();
   }
+}
+
+async function renameRun(runId) {
+  const run = state.runs.find((item) => Number(item.id) === Number(runId)) || state.selectedRun;
+  const current = run?.name || "";
+  const next = window.prompt("重命名运行记录", current);
+  if (next === null) return;
+  const trimmed = next.trim();
+  if (!trimmed || trimmed === current) return;
+  const updated = await api(`/api/runs/${runId}/rename`, {
+    method: "POST",
+    body: JSON.stringify({ name: trimmed }),
+  });
+  toast(`已重命名为 ${updated.run?.name || trimmed}`);
+  if (Number(state.selectedRun?.id) === Number(runId)) {
+    state.selectedRun = updated.run || state.selectedRun;
+  }
+  await refreshRunsOnly();
+  if (Number(state.selectedRun?.id) === Number(runId)) renderRunDetail();
+}
+
+async function batchDeleteRuns() {
+  const ids = Array.from(state.selectedRunIds);
+  if (!ids.length) return;
+  if (!window.confirm(`确认删除选中的 ${ids.length} 条运行记录？`)) return;
+  const result = await api(`/api/runs/batch-delete`, {
+    method: "POST",
+    body: JSON.stringify({ run_ids: ids }),
+  });
+  const deleted = new Set((result.deleted || []).map(Number));
+  if (state.selectedRun && deleted.has(Number(state.selectedRun.id))) {
+    state.selectedRun = null;
+  }
+  state.selectedRunIds.clear();
+  toast(`已删除 ${result.deleted?.length || 0} 条记录`);
+  await refreshRunsOnly();
+  if (!state.selectedRun) renderEmptyRunDetail();
 }
 
 async function cleanupRunArtifacts(runId) {
@@ -2204,6 +2305,27 @@ document.addEventListener("click", async (event) => {
     schedulePreflight(0);
     return;
   }
+  const runSelect = event.target.closest("[data-run-select]");
+  if (runSelect) {
+    // Toggle without opening the detail view; the checkbox lives inside a
+    // clickable row so stopPropagation is not enough — handle it first.
+    const id = Number(runSelect.dataset.runSelect);
+    if (runSelect.checked) state.selectedRunIds.add(id);
+    else state.selectedRunIds.delete(id);
+    renderRuns();
+    return;
+  }
+  const selectAll = event.target.closest("[data-runs-select-all]");
+  if (selectAll) {
+    if (selectAll.checked) state.runs.forEach((run) => state.selectedRunIds.add(Number(run.id)));
+    else state.selectedRunIds.clear();
+    renderRuns();
+    return;
+  }
+  if (event.target.closest("[data-runs-batch-delete]")) {
+    await batchDeleteRuns();
+    return;
+  }
   const runButton = event.target.closest("[data-run-id]");
   if (runButton) {
     await selectRun(Number(runButton.dataset.runId));
@@ -2229,6 +2351,11 @@ document.addEventListener("click", async (event) => {
     await cleanupRunArtifacts(Number(cleanupButton.dataset.cleanupRun));
     return;
   }
+  const renameButton = event.target.closest("[data-rename-run]");
+  if (renameButton) {
+    await renameRun(Number(renameButton.dataset.renameRun));
+    return;
+  }
   const runVideosPage = event.target.closest("[data-run-videos-page]");
   if (runVideosPage && state.selectedRun) {
     await loadRunVideosPage(state.selectedRun.id, Number(runVideosPage.dataset.runVideosPage));
@@ -2238,6 +2365,12 @@ document.addEventListener("click", async (event) => {
   const gridColumns = event.target.closest("[data-compare-grid-columns]");
   if (gridColumns) {
     state.compareGridColumns = Number(gridColumns.dataset.compareGridColumns || 3);
+    if (!updateFrameRegion()) renderRunDetail();
+    return;
+  }
+  const slotLayout = event.target.closest("[data-slot-layout]");
+  if (slotLayout) {
+    state.compareSlotLayout = slotLayout.dataset.slotLayout === "stack" ? "stack" : "side";
     if (!updateFrameRegion()) renderRunDetail();
     return;
   }
@@ -2260,6 +2393,16 @@ document.addEventListener("click", async (event) => {
       await loadRunVideoTimeline(state.selectedRun.id, videoTab.dataset.runVideo);
     }
     renderRunDetail();
+    return;
+  }
+  const windowNav = event.target.closest("[data-window-start]");
+  if (windowNav && state.selectedRun) {
+    const videoName = state.selectedVideoByRun[state.selectedRun.id];
+    const nextStart = Math.max(0, Number(windowNav.dataset.windowStart || 0));
+    await loadRunVideoTimeline(state.selectedRun.id, videoName, { windowStart: nextStart });
+    // Reset the in-window selection to the first frame of the new window.
+    state.selectedSampleByVideo[`${state.selectedRun.id}:${videoName}`] = 0;
+    if (!updateFrameRegion()) renderRunDetail();
     return;
   }
   const stepButton = event.target.closest("[data-sample-step]");
