@@ -21,6 +21,10 @@
 
     <main class="shell">
       <section id="view-create" class="view active">
+        <div class="view-head">
+          <h2>新建任务</h2>
+          <p class="muted">配置模型推理或双视频对比，确认选择后开始运行。</p>
+        </div>
         <form id="infer-form" class="panel infer-grid">
           <label class="wide-field">
             <span>Run 类型</span>
@@ -123,11 +127,11 @@
               </label>
               <label>
                 <span>可视化高度</span>
-                <input name="visualize_height" type="number" min="1" value="384">
+                <input name="visualize_height" type="number" min="1" value="832">
               </label>
               <label>
                 <span>可视化宽度</span>
-                <input name="visualize_width" type="number" min="1" value="832">
+                <input name="visualize_width" type="number" min="1" value="1792">
               </label>
               <label>
                 <span>Batch Size</span>

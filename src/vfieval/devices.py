@@ -122,6 +122,30 @@ def resolve_torch_device(device_name: str) -> torch.device:
     return torch.device(normalized)
 
 
+def tune_for_inference(device: torch.device) -> None:
+    """Enable device-level throughput knobs for the inference hot loop.
+
+    All of these are safe for a forward-only workload: cuDNN autotuning picks
+    the fastest conv algorithm once the (fixed) input size is seen, and TF32
+    trades a few mantissa bits for a large matmul/conv speedup on Ampere+ GPUs.
+    Called once per job before the batch loop; the settings are process-global
+    but idempotent.
+    """
+    if device.type == "cuda":
+        try:
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
+    elif device.type == "npu":
+        # torch_npu honours cudnn.benchmark for its conv autotuning cache.
+        try:
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+
+
 def autocast_context(device: torch.device, precision: str):
     if precision == "fp32":
         return nullcontext()

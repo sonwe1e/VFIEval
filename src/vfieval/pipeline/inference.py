@@ -20,7 +20,7 @@ from PIL import Image
 
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
-from vfieval.devices import autocast_context, resolve_torch_device
+from vfieval.devices import autocast_context, resolve_torch_device, tune_for_inference
 from vfieval.models import load_flow_mask_model
 from vfieval.pipeline.io import batch_tensors, load_rgb_tensor, resize_batch
 from vfieval.pipeline.postprocess import (
@@ -31,8 +31,8 @@ from vfieval.pipeline.visualize import save_difference, save_extra_tensor, save_
 
 
 VALID_PRECISIONS = {"fp32", "fp16", "bf16"}
-DEFAULT_VISUALIZE_HEIGHT = 384
-DEFAULT_VISUALIZE_WIDTH = 832
+DEFAULT_VISUALIZE_HEIGHT = 832
+DEFAULT_VISUALIZE_WIDTH = 1792
 # Above this max edge a downscaled preview thumbnail is worth its extra encode;
 # at or below it the saved artifact is already small enough to display directly,
 # so skipping the preview removes redundant save-pool work on long videos.
@@ -301,6 +301,7 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
         metadata=model_row.get("metadata") or {},
     )
     model_load_report = _extract_model_load_report(model)
+    tune_for_inference(device)
 
     if model_load_report is not None:
         _write_model_load_log(run_dir, model_load_report)
@@ -541,10 +542,10 @@ def _run_video_compare_job(
 def _resolve_visualize_size(payload: dict[str, Any], height: int, width: int) -> tuple[int, int]:
     """Resolution at which visual artifacts (PNGs) are saved.
 
-    Defaults to 832x384 so the save pool encodes small images regardless of the
-    full inference resolution. The visualization size is clamped to never exceed
-    the inference resolution (upscaling artifacts for display wastes disk and CPU
-    without adding information).
+    Defaults to 832x1792 (H x W) so display artifacts keep full detail. The
+    visualization size is clamped to never exceed the inference resolution
+    (upscaling artifacts for display wastes disk and CPU without adding
+    information).
     """
     raw_h = payload.get("visualize_height")
     raw_w = payload.get("visualize_width")

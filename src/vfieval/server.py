@@ -1097,8 +1097,8 @@ def _checkpoint_relative(workspace: WorkspaceConfig, checkpoint_path: Path | Non
 def _resolve_visualize_dimensions(body: dict, height: int, width: int) -> tuple[int, int]:
     """Resolution at which visual artifacts (PNGs) are saved for the run.
 
-    Defaults to 832x384 and is clamped to the inference resolution so display
-    artifacts never upscale beyond what the model actually produced.
+    Defaults to 832x1792 (H x W) and is clamped to the inference resolution so
+    display artifacts never upscale beyond what the model actually produced.
     """
     raw_h = body.get("visualize_height")
     raw_w = body.get("visualize_width")

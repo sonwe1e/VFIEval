@@ -45,6 +45,7 @@ const state = {
   selectedVideoByRun: {},
   selectedSampleByVideo: {},
   selectedMetricByRun: {},
+  runMetaCollapsed: false,
   selectedArtifactGroupBySample: {},
   expandedExtraArtifactsBySample: {},
   selectedCudaDevices: new Set(),
@@ -903,12 +904,13 @@ function renderPreflight() {
   `;
 }
 
-function table(rows, columns) {
+function table(rows, columns, options = {}) {
   if (!rows?.length) return "<p class=\"muted\">暂无数据。</p>";
+  const rowAttrs = typeof options.rowAttrs === "function" ? options.rowAttrs : null;
   return `
     <table>
       <thead><tr>${columns.map((column) => `<th>${column.label}</th>`).join("")}</tr></thead>
-      <tbody>${rows.map((row) => `<tr>${columns.map((column) => `<td>${column.render(row)}</td>`).join("")}</tr>`).join("")}</tbody>
+      <tbody>${rows.map((row) => `<tr ${rowAttrs ? rowAttrs(row) : ""}>${columns.map((column) => `<td>${column.render(row)}</td>`).join("")}</tr>`).join("")}</tbody>
     </table>
   `;
 }
@@ -997,13 +999,14 @@ function pathBasename(value) {
 
 function renderRuns() {
   $("runs-table").innerHTML = table(state.runs, [
-    { label: "Run", render: (run) => `<button class="link-button" data-run-id="${run.id}" type="button">#${run.id}</button>` },
+    { label: "Run", render: (run) => `#${escapeHtml(run.id)}` },
     { label: "状态", render: (run) => statusBadge(run.status) },
     { label: "类型", render: (run) => escapeHtml(run.metadata?.run_type || "model_inference") },
     { label: "来源", render: (run) => escapeHtml(runSourceLabel(run)) },
     { label: "进度", render: (run) => `${escapeHtml(run.progress_current || 0)}/${escapeHtml(run.progress_total || 0)}` },
     { label: "输出", render: (run) => escapeHtml(run.metadata?.output_dir || run.result?.output_dir || "-") },
-  ]);
+    { label: "操作", render: (run) => `<button class="view-detail-btn" data-run-id="${run.id}" type="button">查看详情 →</button>` },
+  ], { rowAttrs: (run) => `data-run-id="${run.id}" class="clickable-row"` });
 }
 
 async function loadRunVideosPage(runId, page = 1) {
@@ -1288,22 +1291,25 @@ function renderRunDetail() {
         <button class="secondary" data-cleanup-run="${run.id}" ${TERMINAL_STATUSES.has(run.status) && !run.artifact_cleaned_at ? "" : "disabled"} type="button">清理产物</button>
       </div>
     </div>
-    <div class="summary-grid">
-      <div><span>Run 类型</span><strong>${escapeHtml(run.metadata?.run_type || "model_inference")}</strong></div>
-      <div><span>进度</span><strong>${escapeHtml(run.progress_current || 0)}/${escapeHtml(run.progress_total || 0)}</strong></div>
-      <div><span>推理阶段</span><strong>${escapeHtml(renderInferencePhase(run))}</strong></div>
-      <div><span>评测阶段</span><strong>${escapeHtml(renderMetricPhase(run))}</strong></div>
-      <div><span>输出目录</span><strong>${escapeHtml(run.metadata?.output_dir || run.result?.output_dir || "-")}</strong></div>
-      <div><span>产物数</span><strong>${escapeHtml(run.artifact_summary?.total || 0)}</strong></div>
-    </div>
-    ${renderRunError(run)}
-    ${renderCleanedArtifactsNotice(run)}
-    ${renderModelLoadReport(run)}
-    ${renderOutputHealthReport(run)}
-    ${renderDecodePanel(run)}
-    <div class="message"><p><strong>Execution</strong>: ${runExecutionTarget(run)}</p></div>
-    ${renderPortableMetricHealthTable(run.metadata?.metric_health || {})}
-    ${renderRunJobs(run)}
+    <details class="run-meta" ${state.runMetaCollapsed ? "" : "open"}>
+      <summary>记录详情</summary>
+      <div class="summary-grid">
+        <div><span>Run 类型</span><strong>${escapeHtml(run.metadata?.run_type || "model_inference")}</strong></div>
+        <div><span>进度</span><strong>${escapeHtml(run.progress_current || 0)}/${escapeHtml(run.progress_total || 0)}</strong></div>
+        <div><span>推理阶段</span><strong>${escapeHtml(renderInferencePhase(run))}</strong></div>
+        <div><span>评测阶段</span><strong>${escapeHtml(renderMetricPhase(run))}</strong></div>
+        <div><span>输出目录</span><strong>${escapeHtml(run.metadata?.output_dir || run.result?.output_dir || "-")}</strong></div>
+        <div><span>产物数</span><strong>${escapeHtml(run.artifact_summary?.total || 0)}</strong></div>
+      </div>
+      ${renderRunError(run)}
+      ${renderCleanedArtifactsNotice(run)}
+      ${renderModelLoadReport(run)}
+      ${renderOutputHealthReport(run)}
+      ${renderDecodePanel(run)}
+      <div class="message"><p><strong>Execution</strong>: ${runExecutionTarget(run)}</p></div>
+      ${renderPortableMetricHealthTable(run.metadata?.metric_health || {})}
+      ${renderRunJobs(run)}
+    </details>
     <div class="run-workspace">
       <aside class="video-tabs">
         <h3>视频</h3>
@@ -1526,7 +1532,6 @@ function renderVideoPlayer(label, artifactId) {
     <div class="video-artifact">
       <span>${escapeHtml(label)}</span>
       <video controls playsinline preload="metadata" src="${escapeHtml(url)}" onerror="this.outerHTML='<p class=\\'muted\\'>浏览器无法播放此视频格式。</p>'"></video>
-      <a class="small-video-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer">open</a>
     </div>
   `;
 }
@@ -1561,13 +1566,40 @@ function renderVideoMasterControls(video) {
   `;
 }
 
+function renderFrameRegion(video, selectedIndex, metricName) {
+  const samples = video.samples || [];
+  const sample = samples[selectedIndex] || null;
+  // The slider element sits between the two updatable containers and is never
+  // rewritten on frame change, so dragging it stays smooth. Only #frame-chart,
+  // #frame-preview and the counter are refreshed in place; the <video> players
+  // live outside #frame-region entirely and never reload.
+  return `
+    ${renderMetricToolbar(video, metricName)}
+    <div id="frame-chart">
+      ${renderMetricChart(video, selectedIndex, metricName)}
+      ${renderWorstSamples(video, metricName)}
+    </div>
+    <div class="sample-controls">
+      <button class="secondary" data-sample-step="-1" type="button">上一帧</button>
+      <input data-sample-range="${escapeHtml(video.video_name)}" type="range" min="0" max="${Math.max(0, samples.length - 1)}" value="${selectedIndex}">
+      <button class="secondary" data-sample-step="1" type="button">下一帧</button>
+      <span class="muted" id="frame-counter">${selectedIndex + 1}/${samples.length || 0}</span>
+    </div>
+    <div id="frame-preview">
+      ${sample ? renderSamplePreview(sample) : "<p class=\"muted\">没有样本。</p>"}
+    </div>
+  `;
+}
+
 function renderVideoTimeline(video) {
   const samples = video.samples || [];
   const key = `${state.selectedRun.id}:${video.video_name}`;
   const selectedIndex = Math.min(Number(state.selectedSampleByVideo[key] || 0), Math.max(0, samples.length - 1));
   state.selectedSampleByVideo[key] = selectedIndex;
-  const sample = samples[selectedIndex] || null;
   const metricName = selectedMetric(video);
+  // The video players live outside #frame-region so that stepping through
+  // frames only re-renders the frame-dependent chart/preview and never
+  // recreates the <video> elements (which would reload and stutter playback).
   return `
     <div class="panel-head compact-head">
       <div>
@@ -1579,17 +1611,35 @@ function renderVideoTimeline(video) {
       </div>
     </div>
     ${renderVideoArtifacts(video)}
-    ${renderMetricToolbar(video, metricName)}
-    ${renderMetricChart(video, selectedIndex, metricName)}
-    ${renderWorstSamples(video, metricName)}
-    <div class="sample-controls">
-      <button class="secondary" data-sample-step="-1" type="button">上一帧</button>
-      <input data-sample-range="${escapeHtml(video.video_name)}" type="range" min="0" max="${Math.max(0, samples.length - 1)}" value="${selectedIndex}">
-      <button class="secondary" data-sample-step="1" type="button">下一帧</button>
-      <span class="muted">${selectedIndex + 1}/${samples.length || 0}</span>
+    <div id="frame-region" data-frame-region="${escapeHtml(video.video_name)}">
+      ${renderFrameRegion(video, selectedIndex, metricName)}
     </div>
-    ${sample ? renderSamplePreview(sample) : "<p class=\"muted\">没有样本。</p>"}
   `;
+}
+
+function updateFrameRegion() {
+  const region = document.getElementById("frame-region");
+  if (!region || !state.selectedRun) return false;
+  const videoName = state.selectedVideoByRun[state.selectedRun.id];
+  const video = videoName ? state.runVideoTimelines[`${state.selectedRun.id}:${videoName}`] : null;
+  if (!video || region.dataset.frameRegion !== videoName) return false;
+  const samples = video.samples || [];
+  const key = `${state.selectedRun.id}:${videoName}`;
+  const selectedIndex = Math.min(Number(state.selectedSampleByVideo[key] || 0), Math.max(0, samples.length - 1));
+  state.selectedSampleByVideo[key] = selectedIndex;
+  const metricName = selectedMetric(video);
+  const chart = region.querySelector("#frame-chart");
+  const preview = region.querySelector("#frame-preview");
+  const counter = region.querySelector("#frame-counter");
+  const slider = region.querySelector("[data-sample-range]");
+  if (!chart || !preview) return false;
+  chart.innerHTML = `${renderMetricChart(video, selectedIndex, metricName)}${renderWorstSamples(video, metricName)}`;
+  preview.innerHTML = samples[selectedIndex] ? renderSamplePreview(samples[selectedIndex]) : "<p class=\"muted\">没有样本。</p>";
+  if (counter) counter.textContent = `${selectedIndex + 1}/${samples.length || 0}`;
+  // Only sync the slider's value when the change did not originate from the
+  // slider itself; overwriting it mid-drag would fight the pointer.
+  if (slider && Number(slider.value) !== selectedIndex) slider.value = String(selectedIndex);
+  return true;
 }
 
 function sampleDetail(sampleId) {
@@ -1613,7 +1663,9 @@ async function loadSampleDetail(sampleId) {
   } finally {
     if (state.sampleAbortController === controller) state.sampleAbortController = null;
     delete state.sampleDetailLoading[key];
-    renderRunDetail();
+    // Prefer an in-place frame update so late-arriving sample detail does not
+    // recreate the video players; fall back to a full render if unavailable.
+    if (!updateFrameRegion()) renderRunDetail();
   }
 }
 
@@ -1810,7 +1862,10 @@ function setSampleIndex(videoName, index) {
   if (!video) return;
   const max = Math.max(0, (video.samples || []).length - 1);
   state.selectedSampleByVideo[`${state.selectedRun.id}:${videoName}`] = Math.max(0, Math.min(max, index));
-  renderRunDetail();
+  // Update only the frame-dependent region so the video players are not
+  // recreated (which would reload and stutter). Fall back to a full render if
+  // the region is not on the page (e.g. video not yet rendered).
+  if (!updateFrameRegion()) renderRunDetail();
 }
 
 function activeVideoElements() {
@@ -2075,7 +2130,7 @@ document.addEventListener("change", (event) => {
     state.selectedMetricByRun[state.selectedRun.id] = metricSelect.value;
     const videoName = metricSelect.dataset.metricSelect;
     loadRunVideoTimeline(state.selectedRun.id, videoName, { metric: metricSelect.value })
-      .then(() => renderRunDetail())
+      .then(() => { if (!updateFrameRegion()) renderRunDetail(); })
       .catch((error) => toast(error.message));
     return;
   }
@@ -2085,7 +2140,7 @@ document.addEventListener("change", (event) => {
     const options = sampleLayerOptions(state.selectedRun);
     const current = slotSelection(sampleId, options);
     state.slotSelectionBySample[sampleId] = { ...current, [slotSelect.dataset.slot]: slotSelect.value };
-    renderRunDetail();
+    if (!updateFrameRegion()) renderRunDetail();
     return;
   }
   const range = event.target.closest("[data-sample-range]");
@@ -2183,7 +2238,7 @@ document.addEventListener("click", async (event) => {
   const gridColumns = event.target.closest("[data-compare-grid-columns]");
   if (gridColumns) {
     state.compareGridColumns = Number(gridColumns.dataset.compareGridColumns || 3);
-    renderRunDetail();
+    if (!updateFrameRegion()) renderRunDetail();
     return;
   }
   if (event.target.closest("[data-master-video-play]")) {
@@ -2233,14 +2288,14 @@ document.addEventListener("click", async (event) => {
   const artifactGroup = event.target.closest("[data-artifact-group]");
   if (artifactGroup) {
     state.selectedArtifactGroupBySample[artifactGroup.dataset.artifactSample] = artifactGroup.dataset.artifactGroup;
-    renderRunDetail();
+    if (!updateFrameRegion()) renderRunDetail();
     return;
   }
   const extraToggle = event.target.closest("[data-extra-toggle]");
   if (extraToggle) {
     const sampleId = extraToggle.dataset.extraToggle;
     state.expandedExtraArtifactsBySample[sampleId] = !state.expandedExtraArtifactsBySample[sampleId];
-    renderRunDetail();
+    if (!updateFrameRegion()) renderRunDetail();
     return;
   }
   const chart = event.target.closest("[data-chart-video]");
@@ -2265,6 +2320,15 @@ document.addEventListener("mouseout", (event) => {
     highlightTimelineFrame(null);
   }
 });
+
+// `toggle` does not bubble, so capture it to persist the run-meta collapse
+// state across the 2s poll re-render of a running run.
+document.addEventListener("toggle", (event) => {
+  const details = event.target;
+  if (details instanceof HTMLDetailsElement && details.classList.contains("run-meta")) {
+    state.runMetaCollapsed = !details.open;
+  }
+}, true);
 
 function startRunsPoll() {
   setInterval(() => {

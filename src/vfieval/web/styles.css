@@ -65,6 +65,37 @@ button.secondary,
   color: var(--accent);
 }
 
+.view-head {
+  margin-bottom: 12px;
+}
+
+.view-head h2 {
+  font-size: 20px;
+}
+
+.clickable-row {
+  cursor: pointer;
+}
+
+.clickable-row:hover {
+  background: var(--accent-soft);
+}
+
+.view-detail-btn {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.view-detail-btn:hover {
+  filter: brightness(1.05);
+}
+
 input,
 select {
   width: 100%;
@@ -433,6 +464,26 @@ summary {
   overflow-wrap: anywhere;
 }
 
+.run-meta {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-top: 12px;
+}
+
+.run-meta > summary {
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.run-meta[open] > summary {
+  margin-bottom: 10px;
+}
+
+.run-meta > .summary-grid {
+  margin-top: 0;
+}
+
 .ok-text {
   color: var(--ok);
   font-weight: 700;
@@ -643,18 +694,6 @@ th {
   min-width: 0;
 }
 
-.small-video-link {
-  display: inline-flex;
-  min-height: 30px;
-  align-items: center;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 5px 8px;
-  color: var(--accent);
-  text-decoration: none;
-  background: #fff;
-}
-
 .video-artifact {
   display: grid;
   gap: 6px;
@@ -674,12 +713,6 @@ th {
   display: block;
   background: #111;
   border-radius: 6px;
-}
-
-.video-artifact .small-video-link {
-  min-height: 28px;
-  padding: 4px 7px;
-  font-size: 12px;
 }
 
 .video-artifact-strip {
@@ -993,7 +1026,7 @@ th {
 .big-slot-body img {
   width: 100%;
   height: auto;
-  max-height: 70vh;
+  max-height: 88vh;
   object-fit: contain;
   display: block;
 }
