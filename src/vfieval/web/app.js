@@ -1693,13 +1693,21 @@ function renderCompareLayers(sample) {
   `;
 }
 
-function sampleLayerOptions(run) {
+function sampleLayerOptions(run, sample) {
   const groups = previewGroupsForRun(run);
   const options = [];
   for (const group of Object.values(groups)) {
     for (const [kind, label] of group.items) {
       options.push([kind, label]);
     }
+  }
+  // When a sample's artifacts are loaded, hide layers that were not saved
+  // (e.g. warp/blend when save_warp_blend was off) so the slot pickers only
+  // offer kinds that actually resolve to an image.
+  const artifacts = sample?.artifacts;
+  if (artifacts && Object.keys(artifacts).length) {
+    const present = options.filter(([kind]) => artifacts[kind]);
+    if (present.length) return present;
   }
   return options;
 }
@@ -1772,8 +1780,7 @@ function renderSamplePreview(sample) {
         load_error: detail.load_error,
       }
     : sample;
-  const groups = previewGroupsForRun(state.selectedRun);
-  const options = sampleLayerOptions(state.selectedRun);
+  const options = sampleLayerOptions(state.selectedRun, payload);
   const selection = slotSelection(payload.sample_id, options);
   const loadState = detail
     ? (payload.load_error

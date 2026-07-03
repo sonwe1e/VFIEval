@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -304,8 +305,17 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
     if model_load_report is not None:
         _write_model_load_log(run_dir, model_load_report)
 
-    save_workers = max(1, int(payload.get("save_workers") or min(8, os.cpu_count() or 4)))
-    prefetch_workers = max(1, int(payload.get("prefetch_workers") or 2))
+    # Decode and save pools scale with the cores actually available to this
+    # shard. NPU shards are independent processes and CUDA shards are threads in
+    # one process, so dividing by shard_count keeps the machine-wide thread
+    # count near the core count either way. The 48 ceiling is where GIL
+    # contention flattens the return on PIL/numpy/torch decode threads (they all
+    # release the GIL, but the glue between them does not).
+    cores = os.cpu_count() or 8
+    per_shard = max(1, cores // max(1, shard_count))
+    prefetch_workers = _resolve_pool_size(payload.get("prefetch_workers"), per_shard, lo=8, hi=48)
+    save_workers = _resolve_pool_size(payload.get("save_workers"), per_shard, lo=8, hi=48)
+    save_warp_blend = bool(payload.get("save_warp_blend", False))
     pipeline = _AsyncSavePipeline(
         db=db,
         job_id=job_id,
@@ -338,7 +348,7 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
             timing["model"] += time.perf_counter() - t1
 
             t2 = time.perf_counter()
-            # Compose at the visualization resolution: downscale the (near
+            # Compose pred at the visualization resolution: downscale the (near
             # full-res) source frames to viz size, upsample the model's low-res
             # flow/mask to match, then warp. Warping sharp sources keeps pred
             # crisp (warping the model's native 208x448 pixels would blur it),
@@ -346,18 +356,24 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
             # on-device work and the PNG payload small.
             img0_viz = _resize_to_device(img0, visualize_height, visualize_width)
             img1_viz = _resize_to_device(img1, visualize_height, visualize_width)
-            normalized_viz = normalize_model_outputs(outputs, img0_viz)
-            composed_viz = compose_interpolated(img0_viz, img1_viz, normalized_viz)
+            composed_viz = compose_interpolated(img0_viz, img1_viz, outputs)
+            # pred is the evaluation artifact and is always saved at viz res.
+            # flow/mask are stored at the model's *native* output resolution —
+            # they are upsampled anyway before warping, so persisting the small
+            # native tensors and letting the UI upscale for display saves disk
+            # proportional to (viz / native) squared. warp/blend are diagnostic
+            # only and are materialized to CPU (and saved) solely on request.
             bundle_cpu = {
                 "pred": composed_viz["pred"].detach().to("cpu"),
-                "warp0": composed_viz["warp0"].detach().to("cpu"),
-                "warp1": composed_viz["warp1"].detach().to("cpu"),
-                "blend": composed_viz["blend"].detach().to("cpu"),
-                "mask0": composed_viz["mask0"].detach().to("cpu"),
-                "mask1": composed_viz["mask1"].detach().to("cpu"),
-                "flowt_0": normalized_viz["flowt_0"].detach().to("cpu"),
-                "flowt_1": normalized_viz["flowt_1"].detach().to("cpu"),
+                "mask0": torch.sigmoid(outputs["mask0"]).detach().to("cpu"),
+                "mask1": torch.sigmoid(outputs["mask1"]).detach().to("cpu"),
+                "flowt_0": outputs["flowt_0"].detach().to("cpu"),
+                "flowt_1": outputs["flowt_1"].detach().to("cpu"),
             }
+            if save_warp_blend:
+                bundle_cpu["warp0"] = composed_viz["warp0"].detach().to("cpu")
+                bundle_cpu["warp1"] = composed_viz["warp1"].detach().to("cpu")
+                bundle_cpu["blend"] = composed_viz["blend"].detach().to("cpu")
             output_health.update(bundle_cpu)
             extra_cpu: dict[str, torch.Tensor] = {}
             for name, tensor in outputs.items():
@@ -549,6 +565,20 @@ def _resize_chw(tensor: torch.Tensor, height: int, width: int) -> torch.Tensor:
         tensor.unsqueeze(0), size=(height, width), mode="bilinear", align_corners=False
     )
     return resized.squeeze(0)
+
+
+def _resolve_pool_size(override: Any, per_shard: int, *, lo: int, hi: int) -> int:
+    """Resolve a worker-pool size from an optional payload override.
+
+    An explicit payload value wins (still clamped to >= 1). Otherwise the pool
+    scales with the cores available to this shard, bounded to [lo, hi].
+    """
+    if override:
+        try:
+            return max(1, int(override))
+        except (TypeError, ValueError):
+            pass
+    return max(lo, min(hi, int(per_shard)))
 
 
 def _resize_to_device(tensor: torch.Tensor, height: int, width: int) -> torch.Tensor:
@@ -1022,8 +1052,7 @@ def _load_rgb_cpu(path: str, height: int, width: int) -> torch.Tensor:
     return tensor.squeeze(0)
 
 
-def _load_batch_cpu(paths: list[str], height: int, width: int) -> torch.Tensor:
-    tensors = [_load_rgb_cpu(path, height, width) for path in paths]
+def _stack_pinned(tensors: list[torch.Tensor]) -> torch.Tensor:
     stacked = torch.stack(tensors, dim=0)
     if torch.cuda.is_available():
         try:
@@ -1031,6 +1060,43 @@ def _load_batch_cpu(paths: list[str], height: int, width: int) -> torch.Tensor:
         except Exception:
             pass
     return stacked
+
+
+class _FrameDecodeCache:
+    """Path-keyed decode pool that submits one task per distinct image.
+
+    Video triplets overlap heavily — img1 of frame N is img0 of frame N+1, and
+    a sample's GT is often a neighbouring source frame — so the same PNG would
+    otherwise be decoded two or three times. Keying inflight futures by
+    (path, height, width) collapses those to a single decode. Every worker
+    pulls one image at a time, so a large pool stays saturated instead of a few
+    workers each grinding through a whole batch serially.
+
+    The inflight map is a bounded LRU. Eviction only drops entries whose batch
+    has already been consumed; a re-decode after eviction is a correctness-safe
+    cache miss, never wrong data.
+    """
+
+    def __init__(self, pool: ThreadPoolExecutor, height: int, width: int, capacity: int) -> None:
+        self._pool = pool
+        self._height = height
+        self._width = width
+        self._capacity = max(1, capacity)
+        self._inflight: "OrderedDict[tuple[str, int, int], Future]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def submit(self, path: str) -> Future:
+        key = (path, self._height, self._width)
+        with self._lock:
+            future = self._inflight.get(key)
+            if future is not None:
+                self._inflight.move_to_end(key)
+                return future
+            future = self._pool.submit(_load_rgb_cpu, path, self._height, self._width)
+            self._inflight[key] = future
+            while len(self._inflight) > self._capacity:
+                self._inflight.popitem(last=False)
+            return future
 
 
 def _iter_prefetched_batches(
@@ -1043,35 +1109,35 @@ def _iter_prefetched_batches(
 ):
     """Yield (batch_rows, img0_cpu, img1_cpu, gt_cpu_list, wait_seconds) tuples.
 
-    Prefetches up to 2 batches ahead on a small CPU pool so PIL decode and
-    resize overlap with device compute. wait_seconds is how long the main
-    loop blocked waiting for the next batch to arrive.
+    Decode runs one task per distinct image on a pool sized to the shard's core
+    budget, prefetching up to 3 batches ahead so PIL decode and resize overlap
+    device compute. A path-keyed cache collapses the img0/img1/gt overlap in
+    video triplets to a single decode. wait_seconds is how long the main loop
+    blocked assembling the next batch (waiting on outstanding decode futures).
     """
     if not samples:
         return
     workers = max(1, int(workers or 1))
+    max_ahead = 3
     pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="vfi-prefetch")
-    pending: list[tuple[list[dict[str, Any]], Future, Future, Future | None]] = []
-    max_ahead = 2
+    # The working set is the distinct images across the batches held in flight
+    # (each triplet touches up to 3). Keep generous headroom so overlapping
+    # frames survive from one batch to the next.
+    cache = _FrameDecodeCache(pool, height, width, capacity=(max_ahead + 1) * batch_size * 3 + batch_size)
+    # Each pending entry holds the per-image futures for one batch.
+    pending: list[tuple[list[dict[str, Any]], list[Future], list[Future], list[Future | None]]] = []
 
-    def _submit(batch_rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], Future, Future, Future | None]:
-        img0_paths = [row["img0_path"] for row in batch_rows]
-        img1_paths = [row["img1_path"] for row in batch_rows]
-        img0_future = pool.submit(_load_batch_cpu, img0_paths, height, width)
-        img1_future = pool.submit(_load_batch_cpu, img1_paths, height, width)
-        gt_future: Future | None = None
-        if has_gt and any(row.get("gt_path") for row in batch_rows):
-            def _load_gts(paths: list[str | None]) -> list[torch.Tensor | None]:
-                loaded: list[torch.Tensor | None] = []
-                for path in paths:
-                    if not path:
-                        loaded.append(None)
-                        continue
-                    loaded.append(_load_rgb_cpu(path, height, width))
-                return loaded
-
-            gt_future = pool.submit(_load_gts, [row.get("gt_path") for row in batch_rows])
-        return batch_rows, img0_future, img1_future, gt_future
+    def _submit(batch_rows: list[dict[str, Any]]):
+        img0_futures = [cache.submit(row["img0_path"]) for row in batch_rows]
+        img1_futures = [cache.submit(row["img1_path"]) for row in batch_rows]
+        gt_futures: list[Future | None] = []
+        if has_gt:
+            for row in batch_rows:
+                gt_path = row.get("gt_path")
+                gt_futures.append(cache.submit(gt_path) if gt_path else None)
+        else:
+            gt_futures = [None] * len(batch_rows)
+        return batch_rows, img0_futures, img1_futures, gt_futures
 
     clean_exit = False
     try:
@@ -1082,11 +1148,11 @@ def _iter_prefetched_batches(
             cursor = end
 
         while pending:
-            batch_rows, img0_future, img1_future, gt_future = pending.pop(0)
+            batch_rows, img0_futures, img1_futures, gt_futures = pending.pop(0)
             wait_start = time.perf_counter()
-            img0_cpu = img0_future.result()
-            img1_cpu = img1_future.result()
-            gt_cpu_list = gt_future.result() if gt_future is not None else [None] * len(batch_rows)
+            img0_cpu = _stack_pinned([future.result() for future in img0_futures])
+            img1_cpu = _stack_pinned([future.result() for future in img1_futures])
+            gt_cpu_list = [future.result() if future is not None else None for future in gt_futures]
             wait_seconds = time.perf_counter() - wait_start
 
             if cursor < len(samples):
@@ -1281,22 +1347,24 @@ def _save_visual_bundle_from_cpu(bundle: dict[str, torch.Tensor], sample_dir: Pa
     sample_dir.mkdir(parents=True, exist_ok=True)
     from vfieval.pipeline.visualize import save_rgb_tensor, save_mask, save_flow
 
-    paths = {
-        "pred": sample_dir / "pred.png",
-        "warp0": sample_dir / "warp0.png",
-        "warp1": sample_dir / "warp1.png",
-        "blend": sample_dir / "blend.png",
-        "mask0": sample_dir / "mask0.png",
-        "mask1": sample_dir / "mask1.png",
-        "flowt_0": sample_dir / "flowt_0.png",
-        "flowt_1": sample_dir / "flowt_1.png",
+    # Only the keys present in the bundle are saved: warp0/warp1/blend are
+    # omitted unless save_warp_blend was requested, and pred is always present.
+    savers = {
+        "pred": save_rgb_tensor,
+        "warp0": save_rgb_tensor,
+        "warp1": save_rgb_tensor,
+        "blend": save_rgb_tensor,
+        "mask0": save_mask,
+        "mask1": save_mask,
+        "flowt_0": save_flow,
+        "flowt_1": save_flow,
     }
-    save_rgb_tensor(bundle["pred"], paths["pred"])
-    save_rgb_tensor(bundle["warp0"], paths["warp0"])
-    save_rgb_tensor(bundle["warp1"], paths["warp1"])
-    save_rgb_tensor(bundle["blend"], paths["blend"])
-    save_mask(bundle["mask0"], paths["mask0"])
-    save_mask(bundle["mask1"], paths["mask1"])
-    save_flow(bundle["flowt_0"], paths["flowt_0"])
-    save_flow(bundle["flowt_1"], paths["flowt_1"])
+    paths: dict[str, Path] = {}
+    for kind, saver in savers.items():
+        tensor = bundle.get(kind)
+        if tensor is None:
+            continue
+        path = sample_dir / f"{kind}.png"
+        saver(tensor, path)
+        paths[kind] = path
     return paths
