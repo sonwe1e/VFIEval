@@ -612,20 +612,14 @@ def _compare_gt_sources(db: Database, workspace: WorkspaceConfig, query: dict[st
     text_filter = str(query.get("q", [""])[0] or "").strip().lower()
     page, page_size = _source_pagination(query)
 
-    # Candidates are typed lazily: ("group", group_name, path) rows need a
-    # (potentially expensive) video_summary decode, so we only materialise the
-    # ones on the requested page. ("run_gt", row) rows are already-resolved
-    # gt_video artifacts whose metadata carries frame_count/width/height, so
-    # they are cheap and stored inline. Run GTs come first because they are the
-    # only GTs guaranteed to align with a pred (same run trims/downscales both
-    # sides identically) — which is exactly what Compare needs.
-    candidates: list[tuple[str, object]] = []
-
-    # Run-resident GT videos — the aligned partner of each pred_video artifact.
-    if not group_filter:
-        for run_gt in _compare_run_gt_rows(db, workspace, text_filter):
-            candidates.append(("run_gt", run_gt))
-
+    # GT is a property of the source clip, not of each run: a clip inferred by
+    # two runs used to surface two byte-identical "Run GT" cards. Compare now
+    # lists each ``videos/`` clip once and reconstructs the pred-aligned GT from
+    # the source clip using the pred's recorded ``source_frame_indices`` (see
+    # datasets._select_track_reference). So the picker enumerates source clips
+    # only — one card per clip. video_summary decode is deferred to the
+    # requested page so listing stays cheap.
+    candidates: list[tuple[str, Path]] = []
     root = videos_dir(workspace)
     if root.exists():
         for folder in sorted(path for path in root.iterdir() if path.is_dir()):
@@ -637,15 +631,11 @@ def _compare_gt_sources(db: Database, workspace: WorkspaceConfig, query: dict[st
                 searchable = f"{folder.name}/{path.name}".lower()
                 if text_filter and text_filter not in searchable:
                     continue
-                candidates.append(("group", (folder.name, path)))
+                candidates.append((folder.name, path))
     total = len(candidates)
     start = (page - 1) * page_size
     rows: list[dict[str, object]] = []
-    for kind, payload in candidates[start : start + page_size]:
-        if kind == "run_gt":
-            rows.append(payload)  # type: ignore[arg-type]
-            continue
-        group_name, path = payload  # type: ignore[misc]
+    for group_name, path in candidates[start : start + page_size]:
         video = video_summary(workspace, path, exact=False)
         rows.append(
             {
@@ -664,60 +654,6 @@ def _compare_gt_sources(db: Database, workspace: WorkspaceConfig, query: dict[st
             }
         )
     return _source_page_payload(rows, page, page_size, total, query=query)
-
-
-def _compare_run_gt_rows(db: Database, workspace: WorkspaceConfig, text_filter: str) -> list[dict[str, object]]:
-    """Enumerate ``gt_video`` artifacts from completed runs as GT sources.
-
-    These are the interpolation ground-truth videos each run emits alongside its
-    pred_video. Because both are cut from the same trimmed/downscaled frame list,
-    a run's GT is guaranteed to align with that run's pred — unlike a raw
-    ``videos/`` source clip, which keeps its full resolution and frame count.
-    """
-    rows: list[dict[str, object]] = []
-    for run in db.list_runs(limit=10000):
-        if run.get("deleted_at") is not None or run.get("artifact_cleaned_at") is not None:
-            continue
-        if str(run.get("status") or "") not in COMPARE_SOURCE_RUN_STATUSES:
-            continue
-        for artifact in db.list_run_artifacts(int(run["id"]), kind="gt_video"):
-            metadata = artifact.get("metadata") or {}
-            path = Path(str(artifact["path"])).resolve()
-            video = str(metadata.get("video_name") or path.stem)
-            searchable = f"{run.get('name') or ''} {video}".lower()
-            if text_filter and text_filter not in searchable:
-                continue
-            row = {
-                "kind": "run_gt",
-                "run_id": int(run["id"]),
-                "run_name": run.get("name"),
-                "artifact_id": int(artifact["id"]),
-                "artifact_kind": "gt_video",
-                "video": video,
-                "video_name": Path(video).stem,
-                "path": str(path),
-                "frame_count": int(metadata.get("frames") or 0),
-                "width": _optional_int(metadata.get("width")),
-                "height": _optional_int(metadata.get("height")),
-                "fps": metadata.get("fps"),
-                "created_at": artifact.get("created_at"),
-            }
-            if (not row["frame_count"] or not row["width"] or not row["height"]) and path.exists():
-                try:
-                    info = inspect_video(path, workspace, exact=True)
-                    row.update(
-                        {
-                            "frame_count": int(row["frame_count"] or info.get("frame_count") or 0),
-                            "width": int(row["width"] or info.get("width") or 0),
-                            "height": int(row["height"] or info.get("height") or 0),
-                            "fps": row["fps"] or info.get("fps"),
-                        }
-                    )
-                except Exception:
-                    pass
-            rows.append(row)
-    rows.sort(key=lambda item: (str(item.get("video") or ""), str(item.get("run_name") or ""), int(item["artifact_id"])))
-    return rows
 
 
 def _compare_pred_sources(
@@ -1116,6 +1052,13 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
             "width": int(track.get("width") or 0),
             "height": int(track.get("height") or 0),
             "needs_downscale": bool((int(track.get("width") or 0), int(track.get("height") or 0)) != (target_width, target_height)),
+            # Source-clip mapping (present on preds produced after the
+            # source-clip-GT change) lets the compare scan reconstruct a
+            # pred-aligned GT from the source clip. Legacy preds lack these and
+            # fall back to trim-to-common alignment against the reference.
+            "source_video_path": track.get("source_video_path"),
+            "source_frame_indices": track.get("source_frame_indices"),
+            "frame_step": track.get("frame_step"),
         }
         for index, track in enumerate(distorted_tracks)
     ]

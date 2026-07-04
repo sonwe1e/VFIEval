@@ -68,7 +68,8 @@ class CompareMultitrackTests(unittest.TestCase):
                 diff_videos = db.list_run_artifacts(run_id, kind="diff_video")
                 gt_videos = db.list_run_artifacts(run_id, kind="gt_video")
                 self.assertEqual(len(pred_videos), 2)
-                self.assertEqual(len(diff_videos), 2)
+                # Video compare no longer produces diff artifacts.
+                self.assertEqual(len(diff_videos), 0)
                 self.assertEqual(len(gt_videos), 1)
                 pred_paths = {Path(row["path"]).relative_to(workspace.runs_dir / str(run_id)).as_posix() for row in pred_videos}
                 self.assertIn("videos/clip/ModelA/pred.mp4", pred_paths)
@@ -283,6 +284,74 @@ class CompareMultitrackTests(unittest.TestCase):
                 self.assertEqual(len(pred_videos), 2)
                 labels = {row["metadata"].get("compare_track_label") for row in pred_videos}
                 self.assertEqual(len(labels), 2, labels)
+            finally:
+                stop_server(server, thread)
+
+
+    def test_source_frame_indices_reconstruct_pred_aligned_gt(self) -> None:
+        # Source-clip GT: the pred carries source_frame_indices, so Compare
+        # selects exactly those source frames as its GT (head-offset) instead of
+        # keeping a per-run gt_video. A 5-frame source clip inferred at step 1
+        # yields a 4-frame pred whose frame i approximates source_frames[i+1];
+        # so the aligned GT is source_frames[1:5] and every sample's GT must
+        # match the source frame at index+1 — never the tail-trimmed source[i].
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": tmp}, clear=False):
+            from PIL import Image as _Image
+            workspace, db = make_workspace(tmp)
+            gt_path = Path(tmp) / "videos" / "anime" / "clip.mp4"
+            pred_path = workspace.root / "pred.mp4"
+            gt_path.parent.mkdir(parents=True, exist_ok=True)
+            # Distinct per-frame colors so we can prove which source frame the GT
+            # sample resolved to. Source has 5 frames, pred has 4 (N-step, step=1).
+            source_colors = [(i * 40, 0, 0) for i in range(5)]
+            pred_colors = [(0, (i + 1) * 40, 0) for i in range(4)]
+            write_mp4(gt_path, source_colors, size=(8, 8))
+            write_mp4(pred_path, pred_colors, size=(8, 8))
+            pred_run = add_completed_pred_run(
+                db,
+                workspace,
+                "Pred",
+                pred_path,
+                video_name="clip",
+                sample_count=4,
+                size=(8, 8),
+                source_video_path=gt_path,
+                source_frame_indices=[1, 2, 3, 4],
+                frame_step=1,
+            )
+
+            payload = {
+                "run_type": "video_compare",
+                "reference": {"kind": "video_group", "group": "anime", "video": "clip.mp4"},
+                "distorted": [{"kind": "run_artifact", "run_id": pred_run, "video": "clip", "label": "Pred"}],
+                "metrics": [],
+            }
+            server, thread, base_url = start_server(db, workspace)
+            try:
+                preflight = post_json(base_url, "/api/preflight", payload)
+                self.assertTrue(preflight["ok"], preflight)
+                with patch("vfieval.server._start_local_inference_worker", return_value=None):
+                    created = post_json(base_url, "/api/runs", payload)
+                run_id = int(created["run_id"])
+                job_id = int(db.get_run(run_id)["inference_job_id"])
+                run_inference_job(db, workspace, job_id)
+
+                run = db.get_run(run_id)
+                self.assertEqual(run["status"], "completed", run)
+                # 4 pred frames → 4 samples (source_frames[1:5]), not the 5 the
+                # raw clip would give under a naive head-of-source pairing.
+                samples = db.list_samples(int(run["dataset_id"]))
+                self.assertEqual(len(samples), 4)
+                # Each sample's GT must be source_frames[index+1]. Verify by
+                # color: sample i's GT red channel ≈ (i+1)*40. MP4 is lossy so we
+                # allow a small delta — but the correct frame (i+1)*40 and the
+                # tail-trim wrong frame i*40 differ by 40, far outside the delta,
+                # so this still proves indexed (not tail-trim) selection.
+                for sample in samples:
+                    frame_index = int((sample["metadata"] or {}).get("frame_index"))
+                    with _Image.open(sample["gt_path"]) as img:
+                        red = img.convert("RGB").getpixel((0, 0))[0]
+                    self.assertAlmostEqual(red, (frame_index + 1) * 40, delta=8, msg=sample["name"])
             finally:
                 stop_server(server, thread)
 

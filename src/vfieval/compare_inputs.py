@@ -180,6 +180,15 @@ def _resolve_run_artifact_descriptor(
             "track_label": label,
             "track_run_id": run_id,
             "artifact_metadata": metadata,
+            # Source-clip mapping (present on preds produced after the
+            # source-clip-GT change). Compare uses these to head-offset the
+            # source clip into a pred-aligned GT instead of relying on a
+            # per-run gt_video copy. Legacy preds lack them and fall back.
+            "source_video_path": metadata.get("source_video_path"),
+            "source_video_group": metadata.get("source_video_group"),
+            "source_video_file": metadata.get("source_video_file"),
+            "source_frame_indices": metadata.get("source_frame_indices"),
+            "frame_step": metadata.get("frame_step"),
         }
     )
     return info

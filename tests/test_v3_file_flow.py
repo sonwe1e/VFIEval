@@ -1607,7 +1607,7 @@ class Model:
                 sample_detail = _get(base_url, f"/api/runs/{run_id}/samples/{sample['sample_id']}")
                 self.assertIn("gt", sample_detail["artifacts"])
                 self.assertIn("pred", sample_detail["artifacts"])
-                self.assertIn("difference", sample_detail["artifacts"])
+                self.assertNotIn("difference", sample_detail["artifacts"])
                 self.assertNotIn("flowt_0", sample_detail["artifacts"])
                 self.assertNotIn("mask0", sample_detail["artifacts"])
             finally:
@@ -1655,7 +1655,7 @@ class Model:
                 sample_detail = _get(base_url, f"/api/runs/{run_id}/samples/{sample['sample_id']}")
                 self.assertIn("gt", sample_detail["artifacts"])
                 self.assertIn("pred", sample_detail["artifacts"])
-                self.assertIn("difference", sample_detail["artifacts"])
+                self.assertNotIn("difference", sample_detail["artifacts"])
                 self.assertNotIn("flowt_0", sample_detail["artifacts"])
                 self.assertNotIn("mask0", sample_detail["artifacts"])
                 self.assertNotIn("warp0", sample_detail["artifacts"])

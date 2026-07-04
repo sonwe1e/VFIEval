@@ -20,7 +20,7 @@ const PREVIEW_GROUPS_MODEL = {
   warp: { label: "Warp", items: [["warp0", "Warp0"], ["warp1", "Warp1"], ["blend", "Blend"]] },
 };
 const PREVIEW_GROUPS_COMPARE = {
-  images: PREVIEW_GROUPS_MODEL.images,
+  images: { label: "图像", items: [["gt", "GT"], ["pred", "Pred"]] },
 };
 
 const state = {
@@ -71,7 +71,7 @@ const state = {
   comparePreflightTimer: null,
   comparePreflightPayloadKey: "",
   comparePreflightAbortController: null,
-  sampleAbortController: null,
+  sampleAbortControllers: {},
   timelineAbortController: null,
   compareGridColumns: 3,
   slotSelectionBySample: {},
@@ -168,10 +168,62 @@ function groupByName(name) {
   return state.videoGroups.find((item) => item.name === name) || null;
 }
 
+function isCompareRun(run) {
+  return (run?.metadata?.run_type || "model_inference") === "video_compare";
+}
+
 function previewGroupsForRun(run) {
-  return (run?.metadata?.run_type || "model_inference") === "video_compare"
+  return isCompareRun(run)
     ? PREVIEW_GROUPS_COMPARE
     : PREVIEW_GROUPS_MODEL;
+}
+
+function currentVideoTimeline() {
+  if (!state.selectedRun) return null;
+  const videoName = state.selectedVideoByRun[state.selectedRun.id];
+  return videoName ? state.runVideoTimelines[`${state.selectedRun.id}:${videoName}`] : null;
+}
+
+// Multi-track compare stores one sample per (track, frame): the same frame
+// index appears once per pred track, all sharing GT. Group siblings so the
+// frame viewer can show GT + every pred track side by side in one row.
+function compareFrameSiblings(video, sample) {
+  if (!video || !sample) return sample ? [sample] : [];
+  const frame = Number(sample.frame_index);
+  const siblings = (video.samples || []).filter((row) => Number(row.frame_index) === frame);
+  if (!siblings.length) return [sample];
+  return siblings.sort((left, right) =>
+    Number(left.track_index ?? 0) - Number(right.track_index ?? 0)
+    || String(left.track_label || "").localeCompare(String(right.track_label || "")),
+  );
+}
+
+// Index of the first sample belonging to the next/previous distinct frame,
+// so compare stepping advances by frame rather than by track.
+function compareStepIndex(video, currentIndex, direction) {
+  const samples = video.samples || [];
+  const current = samples[currentIndex];
+  if (!current) return currentIndex;
+  const currentFrame = Number(current.frame_index);
+  if (direction > 0) {
+    for (let index = currentIndex + 1; index < samples.length; index += 1) {
+      if (Number(samples[index].frame_index) !== currentFrame) return index;
+    }
+    return currentIndex;
+  }
+  let target = currentIndex;
+  for (let index = currentIndex - 1; index >= 0; index -= 1) {
+    if (Number(samples[index].frame_index) !== currentFrame) {
+      const prevFrame = Number(samples[index].frame_index);
+      // Walk back to the first sample of that previous frame.
+      target = index;
+      for (let back = index - 1; back >= 0 && Number(samples[back].frame_index) === prevFrame; back -= 1) {
+        target = back;
+      }
+      return target;
+    }
+  }
+  return currentIndex;
 }
 
 function metricHealthBadge(name) {
@@ -425,11 +477,9 @@ function videoSelectionPager(page, groupName) {
 }
 
 function compareGtKey(row) {
-  // Run-resident GT videos (kind "run_gt") are keyed by artifact so two runs of
-  // the same clip stay distinct. Raw videos/ clips key on group::video.
-  if (row.kind === "run_gt") {
-    return `run_gt::${row.run_id}::${row.artifact_id}`;
-  }
+  // GT is always a source clip now (one card per videos/ clip). The pred-aligned
+  // GT is reconstructed backend-side from the pred's recorded source frame
+  // indices, so there is no per-run GT card to disambiguate.
   return `${row.group || ""}::${row.video || ""}`;
 }
 
@@ -459,8 +509,12 @@ function compareCompatibility(gt, predRow) {
   const reasons = [];
   const gtFrames = Number(gt.frame_count || 0);
   const predFrames = Number(predRow.frame_count || 0);
-  if (gtFrames && predFrames && gtFrames !== predFrames) {
-    reasons.push(`帧数 ${predFrames} ≠ ${gtFrames} → 按短边对齐`);
+  // GT is now the source clip (N frames); a pred is the interpolated subset
+  // (N-step frames), so pred < gt is the expected relationship — the backend
+  // reconstructs the aligned GT from the pred's recorded source frame indices.
+  // Only a pred with MORE frames than the source clip is genuinely anomalous.
+  if (gtFrames && predFrames && predFrames > gtFrames) {
+    reasons.push(`帧数 ${predFrames} > 源片段 ${gtFrames} → 按短边对齐`);
   }
   const gtW = Number(gt.width || 0);
   const gtH = Number(gt.height || 0);
@@ -661,18 +715,9 @@ function comparePayloadFromForm() {
   let reference;
   let distortedRows;
   if (gt) {
-    // A run-resident GT resolves via its gt_video artifact (aligned with that
-    // run's pred); a raw videos/ clip resolves via group + file name.
-    reference = gt.kind === "run_gt"
-      ? {
-          kind: "run_artifact",
-          run_id: Number(gt.run_id),
-          artifact_id: Number(gt.artifact_id),
-          artifact_kind: "gt_video",
-          video: gt.video,
-          label: gt.video || "GT",
-        }
-      : { kind: "video_group", group: gt.group, video: gt.video };
+    // GT is always a source clip now; the backend reconstructs each pred's
+    // aligned GT from the clip using the pred's recorded source_frame_indices.
+    reference = { kind: "video_group", group: gt.group, video: gt.video };
     distortedRows = predRows;
   } else {
     const head = predRows[0];
@@ -964,23 +1009,18 @@ function renderPreflight() {
 
 function renderCompareGtCards(gtRows) {
   if (!gtRows.length) return "<p class=\"muted\">videos/ 下暂无可用 GT。</p>";
+  // GT is always a source clip now. The backend reconstructs the pred-aligned
+  // GT subset from this clip using each pred's recorded source_frame_indices,
+  // so one card per clip is enough — no per-run GT duplicates.
   return gtRows.map((row) => {
     const key = compareGtKey(row);
     const active = state.selectedCompareGtKey === key;
-    // Run GTs are the aligned partner of a pred; label them by run so the user
-    // can pick the GT that matches the pred they want to compare against.
-    const isRunGt = row.kind === "run_gt";
-    const title = isRunGt
-      ? `#${escapeHtml(row.run_id)} ${escapeHtml(row.run_name || "")} · ${escapeHtml(row.video || "GT")}`
-      : `${escapeHtml(row.group)}/${escapeHtml(row.video)}`;
-    const originBadge = isRunGt
-      ? "<span class=\"compat-badge compat-ok\">Run GT</span>"
-      : "<span class=\"compat-badge\">videos/</span>";
+    const title = `${escapeHtml(row.group)}/${escapeHtml(row.video)}`;
     return `
       <label class="source-card${active ? " selected" : ""}">
         <input type="radio" name="compare_gt_pick" data-compare-gt="${escapeHtml(key)}" ${active ? "checked" : ""}>
         <span class="source-card-body">
-          <span class="source-card-title">${title} ${originBadge}</span>
+          <span class="source-card-title">${title} <span class="compat-badge">videos/</span></span>
           <span class="source-card-meta">
             <span>${escapeHtml(row.frame_count || 0)} 帧</span>
             <span>${escapeHtml(row.width || "-")}×${escapeHtml(row.height || "-")}</span>
@@ -2024,7 +2064,7 @@ function renderFrameRegion(video, selectedIndex, metricName) {
       <span class="muted" id="frame-counter">${globalIndex + 1}/${total || 0}</span>
     </div>
     <div id="frame-preview">
-      ${sample ? renderSamplePreview(sample) : "<p class=\"muted\">没有样本。</p>"}
+      ${sample ? renderSamplePreview(sample, video) : "<p class=\"muted\">没有样本。</p>"}
     </div>
   `;
 }
@@ -2072,7 +2112,7 @@ function updateFrameRegion() {
   const slider = region.querySelector("[data-sample-range]");
   if (!chart || !preview) return false;
   chart.innerHTML = `${renderMetricChart(video, selectedIndex, metricName)}${renderWorstSamples(video, metricName)}`;
-  preview.innerHTML = samples[selectedIndex] ? renderSamplePreview(samples[selectedIndex]) : "<p class=\"muted\">没有样本。</p>";
+  preview.innerHTML = samples[selectedIndex] ? renderSamplePreview(samples[selectedIndex], video) : "<p class=\"muted\">没有样本。</p>";
   const windowStart = Number(video.window_start || 0);
   const total = Number(video.sample_count || samples.length);
   if (counter) counter.textContent = `${windowStart + selectedIndex + 1}/${total || 0}`;
@@ -2092,16 +2132,18 @@ async function loadSampleDetail(sampleId) {
   const key = `${state.selectedRun.id}:${sampleId}`;
   if (state.sampleDetails[key] || state.sampleDetailLoading[key]) return;
   state.sampleDetailLoading[key] = true;
-  if (state.sampleAbortController) state.sampleAbortController.abort();
+  // Each sample gets its own abort controller so sibling loads in a compare
+  // frame group (GT + predA + predB share a frame) do not cancel each other.
+  if (state.sampleAbortControllers[key]) state.sampleAbortControllers[key].abort();
   const controller = new AbortController();
-  state.sampleAbortController = controller;
+  state.sampleAbortControllers[key] = controller;
   try {
     state.sampleDetails[key] = await api(`/api/runs/${state.selectedRun.id}/samples/${sampleId}`, { signal: controller.signal });
   } catch (error) {
     if (error.name === "AbortError") return;
     state.sampleDetails[key] = { sample_id: sampleId, artifacts: {}, extra_artifacts: [], load_error: error.message };
   } finally {
-    if (state.sampleAbortController === controller) state.sampleAbortController = null;
+    if (state.sampleAbortControllers[key] === controller) delete state.sampleAbortControllers[key];
     delete state.sampleDetailLoading[key];
     // Prefer an in-place frame update so late-arriving sample detail does not
     // recreate the video players; fall back to a full render if unavailable.
@@ -2237,7 +2279,86 @@ function renderBigSlot(sample, options, slot, selectedKind) {
   `;
 }
 
-function renderSamplePreview(sample) {
+function comparePreviewPayload(sample) {
+  // Merge loaded detail (artifacts, files) over the timeline sample so a slot
+  // can render as soon as its own detail arrives, independent of siblings.
+  const detail = sampleDetail(sample.sample_id);
+  if (!detail && sample.has_artifacts !== false) {
+    loadSampleDetail(sample.sample_id);
+  }
+  if (!detail) return { ...sample, _loading: sample.has_artifacts !== false };
+  return {
+    ...detail,
+    ...sample,
+    artifacts: detail.artifacts || sample.artifacts || {},
+    extra_artifacts: detail.extra_artifacts || sample.extra_artifacts || [],
+    compare_layers: detail.compare_layers || sample.compare_layers || [],
+    sample_files: detail.sample_files || sample.sample_files || {},
+    load_error: detail.load_error,
+    _loading: false,
+  };
+}
+
+function renderCompareTrackSlot(payload) {
+  const label = payload.track_label || `run-${payload.track_index ?? "-"}`;
+  let body;
+  if (payload._loading) {
+    body = "<div class=\"sample-loading skeleton-card\" aria-busy=\"true\"><span></span><span></span></div>";
+  } else if (payload.load_error) {
+    body = `<p class="muted">加载失败: ${escapeHtml(payload.load_error)}</p>`;
+  } else {
+    const artifact = payload.artifacts?.pred;
+    if (!artifact) {
+      body = "<p class=\"muted\">暂无</p>";
+    } else {
+      const url = artifact.original_url || artifact.preview_url;
+      const href = artifact.original_url || url;
+      body = `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(url)}" alt="${escapeHtml(label)}" loading="lazy"></a>`;
+    }
+  }
+  return `
+    <div class="big-slot">
+      <div class="big-slot-head"><strong class="compare-track-title">${escapeHtml(label)}</strong>${renderSampleMetrics(payload)}</div>
+      <div class="big-slot-body">${body}</div>
+    </div>
+  `;
+}
+
+function renderCompareGtSlot(sample) {
+  // GT is shared across tracks; use the img0/gt sample file so it renders even
+  // before any track's detail has loaded (compare gt == reference frame).
+  const url = sample.sample_files?.gt || `/api/sample-files/${sample.sample_id}/gt`;
+  return `
+    <div class="big-slot compare-gt-slot">
+      <div class="big-slot-head"><strong class="compare-track-title">GT</strong></div>
+      <div class="big-slot-body"><a href="${escapeHtml(url)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(url)}" alt="GT" loading="lazy"></a></div>
+    </div>
+  `;
+}
+
+function renderCompareFrameGroup(video, sample) {
+  const tracks = compareFrameSiblings(video, sample);
+  const gtPayload = comparePreviewPayload(tracks[0]);
+  const trackPayloads = tracks.map((item) => comparePreviewPayload(item));
+  const columns = tracks.length + 1;
+  return `
+    <div class="sample-meta">
+      <strong>frame ${escapeHtml(sample.frame_index)}</strong>
+      <span>${sample.timestamp === null || sample.timestamp === undefined ? "-" : `${formatNumber(sample.timestamp)}s`}</span>
+      <span class="muted">${escapeHtml(tracks.length)} 条轨道 + GT</span>
+    </div>
+    <div class="big-slots compare-row" style="--compare-slot-columns: ${escapeHtml(columns)}">
+      ${renderCompareGtSlot(gtPayload)}
+      ${trackPayloads.map((payload) => renderCompareTrackSlot(payload)).join("")}
+    </div>
+    ${trackPayloads.flatMap((payload) => (payload.compare_layers?.length ? [renderCompareLayers(payload)] : [])).join("")}
+  `;
+}
+
+function renderSamplePreview(sample, video) {
+  if (video && isCompareRun(state.selectedRun)) {
+    return renderCompareFrameGroup(video, sample);
+  }
   const detail = sampleDetail(sample.sample_id);
   if (!detail && sample.has_artifacts !== false) {
     loadSampleDetail(sample.sample_id);
@@ -2957,7 +3078,18 @@ document.addEventListener("click", async (event) => {
   if (stepButton && state.selectedRun) {
     const videoName = state.selectedVideoByRun[state.selectedRun.id];
     const key = `${state.selectedRun.id}:${videoName}`;
-    setSampleIndex(videoName, Number(state.selectedSampleByVideo[key] || 0) + Number(stepButton.dataset.sampleStep));
+    const currentIndex = Number(state.selectedSampleByVideo[key] || 0);
+    const direction = Number(stepButton.dataset.sampleStep);
+    // Compare runs store one sample per (track, frame), so a naive ±1 step
+    // would move between tracks of the same frame. Step by distinct frame.
+    if (isCompareRun(state.selectedRun)) {
+      const video = state.runVideoTimelines[key];
+      if (video) {
+        setSampleIndex(videoName, compareStepIndex(video, currentIndex, direction));
+        return;
+      }
+    }
+    setSampleIndex(videoName, currentIndex + direction);
     return;
   }
   const statusDot = event.target.closest("[data-sample-jump]");

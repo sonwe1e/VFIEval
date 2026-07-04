@@ -1212,6 +1212,23 @@ th {
   grid-template-columns: 1fr;
 }
 
+/* Compare frame group: GT + one column per pred track, side by side. */
+.big-slots.compare-row {
+  --compare-slot-columns: 3;
+  grid-template-columns: repeat(var(--compare-slot-columns), minmax(0, 1fr));
+}
+
+.big-slots.compare-row.stacked {
+  grid-template-columns: 1fr;
+}
+
+.compare-track-title {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .big-slots-head {
   display: flex;
   justify-content: flex-end;
@@ -1451,6 +1468,7 @@ th {
   .sample-controls,
   .metric-toolbar,
   .big-slots,
+  .big-slots.compare-row,
   .compare-source-grid {
     grid-template-columns: 1fr;
   }

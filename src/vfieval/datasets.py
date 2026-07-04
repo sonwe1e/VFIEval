@@ -398,6 +398,40 @@ def _align_compare_frames(
     return reference_frame, distorted_frame
 
 
+def _select_track_reference(
+    reference_frames: list[Path],
+    reference_timestamps: list[float | None],
+    source_frame_indices: Any,
+    distorted_count: int,
+) -> tuple[list[Path], list[float | None], str]:
+    """Pick a pred-aligned GT subset from the source clip for one track.
+
+    A run's pred approximates ``source_frames[gt_index]`` for each sample, so the
+    ordered ``source_frame_indices`` (the recorded ``gt_index`` list) map pred
+    frame ``i`` onto the correct source frame. Selecting those frames yields a GT
+    that lines up head-to-head with the pred — unlike the legacy tail-trim, which
+    drops the clip's tail and leaves a ``frame_step`` offset.
+
+    Returns fresh lists (never the shared ``reference_frames``) so the caller can
+    trim them per track without corrupting the source for later tracks. Falls
+    back to ``strict_trim`` (copies of the full source) when a track has no
+    recorded mapping — i.e. a pred produced before this change.
+    """
+    indices = [int(value) for value in source_frame_indices] if source_frame_indices else []
+    if not indices:
+        return list(reference_frames), list(reference_timestamps), "strict_trim"
+    # Guard against a mapping that points past the source clip (e.g. the clip was
+    # re-decoded at a different length); fall back rather than IndexError.
+    if any(index < 0 or index >= len(reference_frames) for index in indices):
+        return list(reference_frames), list(reference_timestamps), "strict_trim"
+    selected_frames = [reference_frames[index] for index in indices]
+    selected_timestamps = [
+        reference_timestamps[index] if index < len(reference_timestamps) else None
+        for index in indices
+    ]
+    return selected_frames, selected_timestamps, "indexed"
+
+
 def _scan_multitrack_compare_dataset(
     db: Database,
     workspace: WorkspaceConfig,
@@ -434,14 +468,34 @@ def _scan_multitrack_compare_dataset(
             distorted_path,
             f"compare_distorted_{track_index}",
         )
-        validate_strict_decoded_alignment(
+        # A pred does not approximate source frame i; it approximates
+        # source_frames[gt_index]. When the track carries source_frame_indices,
+        # select exactly those source frames as this track's GT so pred[i] lines
+        # up with reference[i] (head-offset, not the legacy tail-trim). Legacy
+        # preds lack the mapping and fall back to strict trim-to-common.
+        track_reference_frames, track_reference_timestamps, alignment_mode = _select_track_reference(
             reference_frames=reference_frames,
-            distorted_frames=distorted_frames,
-            reference_fps=reference_fps,
-            distorted_fps=distorted_fps,
             reference_timestamps=reference_timestamps,
-            distorted_timestamps=distorted_timestamps,
+            source_frame_indices=track.get("source_frame_indices"),
+            distorted_count=len(distorted_frames),
         )
+        if alignment_mode == "strict_trim":
+            validate_strict_decoded_alignment(
+                reference_frames=track_reference_frames,
+                distorted_frames=distorted_frames,
+                reference_fps=reference_fps,
+                distorted_fps=distorted_fps,
+                reference_timestamps=track_reference_timestamps,
+                distorted_timestamps=distorted_timestamps,
+            )
+        else:
+            # Indexed selection already made the lists equal-length; guard the
+            # tail so a zip below never silently drops frames.
+            common = min(len(track_reference_frames), len(distorted_frames))
+            del track_reference_frames[common:]
+            del track_reference_timestamps[common:]
+            del distorted_frames[common:]
+            del distorted_timestamps[common:]
         scanned_tracks.append(
             {
                 "track_label": track_label,
@@ -450,9 +504,10 @@ def _scan_multitrack_compare_dataset(
                 "artifact_id": track.get("artifact_id"),
                 "distorted_path": str(distorted_path),
                 "frame_count": len(distorted_frames),
+                "alignment_mode": alignment_mode,
             }
         )
-        for frame_index, (reference_frame, distorted_frame) in enumerate(zip(reference_frames, distorted_frames)):
+        for frame_index, (reference_frame, distorted_frame) in enumerate(zip(track_reference_frames, distorted_frames)):
             reference_frame, distorted_frame = _align_compare_frames(
                 workspace=workspace,
                 reference_frame=reference_frame,
@@ -461,7 +516,7 @@ def _scan_multitrack_compare_dataset(
                 target_h=target_h,
                 downscale_mode=downscale_mode,
             )
-            sample_index = track_index * len(reference_frames) + frame_index
+            sample_index = track_index * len(track_reference_frames) + frame_index
             db.add_sample(
                 dataset_id=dataset_id,
                 name=f"{video_token}__{track_token}__{frame_index:06d}",
@@ -484,7 +539,7 @@ def _scan_multitrack_compare_dataset(
                     "compare_track_run_id": track.get("track_run_id"),
                     "compare_track_artifact_id": track.get("artifact_id"),
                     "timestamps": {
-                        "gt": reference_timestamps[frame_index] if frame_index < len(reference_timestamps) else None,
+                        "gt": track_reference_timestamps[frame_index] if frame_index < len(track_reference_timestamps) else None,
                         "pred": distorted_timestamps[frame_index] if frame_index < len(distorted_timestamps) else None,
                     },
                 },

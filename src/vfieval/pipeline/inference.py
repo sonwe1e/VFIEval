@@ -485,14 +485,11 @@ def _run_video_compare_job(
             sample_dir.mkdir(parents=True, exist_ok=True)
             gt_output_path = _copy_compare_image(Path(row["gt_path"]), sample_dir / "gt.png")
             pred_output_path = _copy_compare_image(Path(row["img1_path"]), sample_dir / "pred.png")
-            diff_output_path = sample_dir / "difference.png"
-            save_difference(load_rgb_tensor(pred_output_path), load_rgb_tensor(gt_output_path), diff_output_path)
 
             artifact_metadata = {"sample": row["name"], **_compare_track_metadata(row)}
             _add_image_artifact_with_preview(db, job_id, int(row["id"]), "gt", gt_output_path, artifact_metadata)
             _add_image_artifact_with_preview(db, job_id, int(row["id"]), "pred", pred_output_path, artifact_metadata)
-            _add_image_artifact_with_preview(db, job_id, int(row["id"]), "difference", diff_output_path, artifact_metadata)
-            _collect_compare_frame(video_groups, row, gt_output_path, pred_output_path, diff_output_path)
+            _collect_compare_frame(video_groups, row, gt_output_path, pred_output_path)
         except RunCanceled:
             raise
         except Exception as exc:
@@ -725,6 +722,11 @@ def _collect_video_frame(
             "video_name": metadata.get("video_name") or sanitize_name(video_key),
             "fps": float(metadata.get("fps") or 24.0),
             "frames": [],
+            # Source-clip identity so Compare can reconstruct a pred-aligned GT
+            # from the decode cache instead of storing a per-run GT copy.
+            "source_video_path": metadata.get("video_path"),
+            "source_video_group": metadata.get("video_group"),
+            "source_video_file": metadata.get("video_file"),
         },
     )
     frame_order = int(metadata.get("frame_index") or metadata.get("sample_index") or len(group["frames"]))
@@ -739,6 +741,10 @@ def _collect_video_frame(
             "pred_path": Path(pred_path),
             "gt_path": resolved_gt,
             "diff_path": Path(diff_path) if diff_path else None,
+            # gt_index is the source-clip frame this pred approximates
+            # (pred[i] ≈ source_frames[gt_index]); Compare uses the ordered
+            # list of these to head-offset the source clip into an aligned GT.
+            "source_frame_index": metadata.get("gt_index"),
         }
     )
 
@@ -748,7 +754,6 @@ def _collect_compare_frame(
     sample: dict[str, Any],
     gt_path: Path,
     pred_path: Path,
-    diff_path: Path,
 ) -> None:
     metadata = sample.get("metadata") or {}
     video_key = str(metadata.get("compare_group") or metadata.get("video_name") or "compare")
@@ -767,7 +772,6 @@ def _collect_compare_frame(
             "sample_name": sample["name"],
             "pred_path": Path(pred_path),
             "gt_path": Path(gt_path),
-            "diff_path": Path(diff_path),
             "track_label": metadata.get("compare_track_label"),
             "track_key": metadata.get("compare_track_key"),
             "track_run_id": metadata.get("compare_track_run_id"),
@@ -799,6 +803,7 @@ def _write_video_artifacts(
         pred_video_path = video_dir / "pred.mp4"
         _write_mp4(pred_frame_paths, pred_video_path, fps)
         pred_metadata = _video_artifact_metadata(group["video_name"], frames, pred_frame_paths, fps)
+        pred_metadata.update(_source_mapping_metadata(group, frames))
         db.add_artifact(
             job_id,
             None,
@@ -908,28 +913,12 @@ def _write_multitrack_compare_video_artifacts(
             {**_video_artifact_metadata(group["video_name"], ordered, pred_frame_paths, fps), **track_metadata},
         )
 
-        diff_video_path = None
-        diff_paths = [Path(frame["diff_path"]) for frame in ordered if frame.get("diff_path") is not None]
-        if len(diff_paths) == len(ordered):
-            diff_frame_paths = _copy_ordered_frames(diff_paths, track_dir / "diff_frames")
-            diff_video_path = track_dir / "diff.mp4"
-            _write_mp4(diff_frame_paths, diff_video_path, fps)
-            db.add_artifact(
-                job_id,
-                None,
-                "diff_video",
-                str(diff_video_path),
-                "video/mp4",
-                {**_video_artifact_metadata(group["video_name"], ordered, diff_frame_paths, fps), **track_metadata},
-            )
-
         manifest_tracks.append(
             {
                 "track_label": track_label,
                 "track_key": track_key,
                 "frames": len(ordered),
                 "pred_video": str(pred_video_path.resolve()),
-                "diff_video": str(diff_video_path.resolve()) if diff_video_path else None,
                 "compare_track_run_id": ordered[0].get("track_run_id"),
                 "compare_track_artifact_id": ordered[0].get("track_artifact_id"),
             }
@@ -961,6 +950,36 @@ def _video_artifact_metadata(
         except Exception:
             pass
     return metadata
+
+
+def _source_mapping_metadata(
+    group: dict[str, Any],
+    frames: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Source-clip mapping so Compare can reconstruct a pred-aligned GT.
+
+    ``pred[i] ≈ source_frames[source_frame_indices[i]]``, so Compare can select
+    ``source_frames[indices]`` from the raw ``videos/`` clip (decode cache)
+    instead of relying on a per-run ``gt.mp4`` copy. The indices are ordered by
+    the same frame order used to assemble ``pred.mp4``. Returns an empty dict
+    when the source identity or per-frame indices are unavailable (e.g. legacy
+    samples), so callers fall back to the stored ``gt_video``.
+    """
+    source_path = group.get("source_video_path")
+    if not source_path:
+        return {}
+    indices = [frame.get("source_frame_index") for frame in frames]
+    if any(index is None for index in indices):
+        return {}
+    mapping: dict[str, Any] = {
+        "source_video_path": str(source_path),
+        "source_frame_indices": [int(index) for index in indices],
+    }
+    if group.get("source_video_group") is not None:
+        mapping["source_video_group"] = group.get("source_video_group")
+    if group.get("source_video_file") is not None:
+        mapping["source_video_file"] = group.get("source_video_file")
+    return mapping
 
 
 def _copy_ordered_frames(frame_paths: list[Path], output_dir: Path) -> list[Path]:
