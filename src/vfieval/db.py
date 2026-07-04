@@ -265,7 +265,6 @@ CREATE TABLE IF NOT EXISTS run_feedback (
 );
 
 CREATE INDEX IF NOT EXISTS idx_run_feedback_run ON run_feedback(run_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_run_feedback_video ON run_feedback(video, model_name, checkpoint);
 """
 
 
@@ -336,7 +335,6 @@ class Database:
                 updated_at REAL
             );
             CREATE INDEX IF NOT EXISTS idx_run_feedback_run ON run_feedback(run_id, created_at);
-            CREATE INDEX IF NOT EXISTS idx_run_feedback_video ON run_feedback(video, model_name, checkpoint);
             """
         )
         feedback_columns = {row["name"] for row in conn.execute("PRAGMA table_info(run_feedback)").fetchall()}
@@ -349,6 +347,10 @@ class Database:
         }.items():
             if name not in feedback_columns:
                 conn.execute(f"ALTER TABLE run_feedback ADD COLUMN {name} {definition}")
+        # Create after the ALTER so the columns exist on pre-existing tables.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_run_feedback_video ON run_feedback(video, model_name, checkpoint)"
+        )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(datasets)").fetchall()}
         dataset_columns = {
             "source_type": "TEXT NOT NULL DEFAULT 'frames'",
