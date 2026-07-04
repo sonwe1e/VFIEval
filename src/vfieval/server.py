@@ -17,7 +17,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from vfieval.config import WorkspaceConfig
-from vfieval.datasets import scan_dataset
+from vfieval.datasets import _sample_token, scan_dataset
 from vfieval.db import Database
 from vfieval.file_inputs import (
     DECODE_STRATEGY_VERSION,
@@ -34,6 +34,7 @@ from vfieval.file_inputs import (
     resolve_model_file,
     resolve_run_dimensions,
     resolve_video_group,
+    resolve_video_selection,
     thumbnail_path,
     video_summary,
     videos_dir,
@@ -127,6 +128,12 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                             include_deleted=query.get("include_deleted", ["0"])[0] in {"1", "true", "yes"},
                         )
                     )
+                if path == "/api/feedback":
+                    return self._json(_feedback_overview(db))
+                match = re.fullmatch(r"/api/runs/(\d+)/feedback", path)
+                if match:
+                    run_id = int(match.group(1))
+                    return self._json({"run_id": run_id, "feedback": db.list_run_feedback(run_id)})
                 match = re.fullmatch(r"/api/runs/(\d+)/samples/(\d+)", path)
                 if match:
                     return self._json(_run_sample_payload(db, int(match.group(1)), int(match.group(2))))
@@ -326,6 +333,14 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                         return self._error(HTTPStatus.BAD_REQUEST, "name must not be empty")
                     db.rename_run(run_id, name)
                     return self._json({"run_id": run_id, "run": db.get_run(run_id)})
+                match = re.fullmatch(r"/api/runs/(\d+)/feedback", path)
+                if match:
+                    run_id = int(match.group(1))
+                    try:
+                        created = _create_run_feedback(db, run_id, body)
+                    except ValueError as exc:
+                        return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
+                    return self._json(created, status=HTTPStatus.CREATED)
                 if path == "/api/runs/batch-delete":
                     raw_ids = body.get("run_ids") or []
                     if not isinstance(raw_ids, list) or not raw_ids:
@@ -379,6 +394,14 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
         def do_DELETE(self) -> None:
             try:
                 parsed = urlparse(self.path)
+                match = re.fullmatch(r"/api/runs/(\d+)/feedback/(\d+)", parsed.path)
+                if match:
+                    run_id = int(match.group(1))
+                    feedback_id = int(match.group(2))
+                    removed = db.delete_run_feedback(run_id, feedback_id)
+                    if not removed:
+                        return self._error(HTTPStatus.NOT_FOUND, "feedback not found")
+                    return self._json({"run_id": run_id, "feedback_id": feedback_id, "deleted": True})
                 match = re.fullmatch(r"/api/runs/(\d+)", parsed.path)
                 if not match:
                     return self._error(HTTPStatus.NOT_FOUND, "not found")
@@ -571,7 +594,7 @@ def _compare(db: Database, query: dict[str, list[str]]) -> dict:
 
 def _compare_sources(db: Database, workspace: WorkspaceConfig, source_type: str, query: dict[str, list[str]]) -> dict:
     if source_type == "gt":
-        return _compare_gt_sources(workspace, query)
+        return _compare_gt_sources(db, workspace, query)
     if source_type == "pred":
         run_id = _optional_int(query.get("run_id", [None])[0])
         return _compare_pred_sources(db, workspace, query, run_id)
@@ -584,12 +607,26 @@ def _compare_sources(db: Database, workspace: WorkspaceConfig, source_type: str,
     raise ValueError(f"unsupported compare source type: {source_type}")
 
 
-def _compare_gt_sources(workspace: WorkspaceConfig, query: dict[str, list[str]]) -> dict:
+def _compare_gt_sources(db: Database, workspace: WorkspaceConfig, query: dict[str, list[str]]) -> dict:
     group_filter = str(query.get("group", [""])[0] or "").strip()
     text_filter = str(query.get("q", [""])[0] or "").strip().lower()
     page, page_size = _source_pagination(query)
+
+    # Candidates are typed lazily: ("group", group_name, path) rows need a
+    # (potentially expensive) video_summary decode, so we only materialise the
+    # ones on the requested page. ("run_gt", row) rows are already-resolved
+    # gt_video artifacts whose metadata carries frame_count/width/height, so
+    # they are cheap and stored inline. Run GTs come first because they are the
+    # only GTs guaranteed to align with a pred (same run trims/downscales both
+    # sides identically) — which is exactly what Compare needs.
+    candidates: list[tuple[str, object]] = []
+
+    # Run-resident GT videos — the aligned partner of each pred_video artifact.
+    if not group_filter:
+        for run_gt in _compare_run_gt_rows(db, workspace, text_filter):
+            candidates.append(("run_gt", run_gt))
+
     root = videos_dir(workspace)
-    candidates: list[tuple[str, Path]] = []
     if root.exists():
         for folder in sorted(path for path in root.iterdir() if path.is_dir()):
             if group_filter and folder.name != group_filter:
@@ -600,11 +637,15 @@ def _compare_gt_sources(workspace: WorkspaceConfig, query: dict[str, list[str]])
                 searchable = f"{folder.name}/{path.name}".lower()
                 if text_filter and text_filter not in searchable:
                     continue
-                candidates.append((folder.name, path))
+                candidates.append(("group", (folder.name, path)))
     total = len(candidates)
     start = (page - 1) * page_size
     rows: list[dict[str, object]] = []
-    for group_name, path in candidates[start : start + page_size]:
+    for kind, payload in candidates[start : start + page_size]:
+        if kind == "run_gt":
+            rows.append(payload)  # type: ignore[arg-type]
+            continue
+        group_name, path = payload  # type: ignore[misc]
         video = video_summary(workspace, path, exact=False)
         rows.append(
             {
@@ -623,6 +664,60 @@ def _compare_gt_sources(workspace: WorkspaceConfig, query: dict[str, list[str]])
             }
         )
     return _source_page_payload(rows, page, page_size, total, query=query)
+
+
+def _compare_run_gt_rows(db: Database, workspace: WorkspaceConfig, text_filter: str) -> list[dict[str, object]]:
+    """Enumerate ``gt_video`` artifacts from completed runs as GT sources.
+
+    These are the interpolation ground-truth videos each run emits alongside its
+    pred_video. Because both are cut from the same trimmed/downscaled frame list,
+    a run's GT is guaranteed to align with that run's pred — unlike a raw
+    ``videos/`` source clip, which keeps its full resolution and frame count.
+    """
+    rows: list[dict[str, object]] = []
+    for run in db.list_runs(limit=10000):
+        if run.get("deleted_at") is not None or run.get("artifact_cleaned_at") is not None:
+            continue
+        if str(run.get("status") or "") not in COMPARE_SOURCE_RUN_STATUSES:
+            continue
+        for artifact in db.list_run_artifacts(int(run["id"]), kind="gt_video"):
+            metadata = artifact.get("metadata") or {}
+            path = Path(str(artifact["path"])).resolve()
+            video = str(metadata.get("video_name") or path.stem)
+            searchable = f"{run.get('name') or ''} {video}".lower()
+            if text_filter and text_filter not in searchable:
+                continue
+            row = {
+                "kind": "run_gt",
+                "run_id": int(run["id"]),
+                "run_name": run.get("name"),
+                "artifact_id": int(artifact["id"]),
+                "artifact_kind": "gt_video",
+                "video": video,
+                "video_name": Path(video).stem,
+                "path": str(path),
+                "frame_count": int(metadata.get("frames") or 0),
+                "width": _optional_int(metadata.get("width")),
+                "height": _optional_int(metadata.get("height")),
+                "fps": metadata.get("fps"),
+                "created_at": artifact.get("created_at"),
+            }
+            if (not row["frame_count"] or not row["width"] or not row["height"]) and path.exists():
+                try:
+                    info = inspect_video(path, workspace, exact=True)
+                    row.update(
+                        {
+                            "frame_count": int(row["frame_count"] or info.get("frame_count") or 0),
+                            "width": int(row["width"] or info.get("width") or 0),
+                            "height": int(row["height"] or info.get("height") or 0),
+                            "fps": row["fps"] or info.get("fps"),
+                        }
+                    )
+                except Exception:
+                    pass
+            rows.append(row)
+    rows.sort(key=lambda item: (str(item.get("video") or ""), str(item.get("run_name") or ""), int(item["artifact_id"])))
+    return rows
 
 
 def _compare_pred_sources(
@@ -800,11 +895,23 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         raise ValueError(f"unsupported metrics: {', '.join(unsupported)}")
 
     model_path = resolve_model_file(workspace, str(body["model_file"]))
-    video_folder = resolve_video_group(workspace, str(body["video_group"]))
+    selection = resolve_video_selection(workspace, body)
+    groups = selection["groups"]
+    multi_group = selection["multi_group"]
+    # Multi-group runs root the dataset at videos/ and carry group-qualified
+    # "group/file" selections so same-named clips never collide; single-group
+    # runs keep rooting at the group folder with bare file names so existing
+    # datasets, caches, and reference keys are byte-for-byte unchanged.
+    if multi_group:
+        dataset_root = str(videos_dir(workspace))
+        group_label = " + ".join(groups)
+    else:
+        dataset_root = str(resolve_video_group(workspace, selection["primary_group"]))
+        group_label = selection["primary_group"]
     frame_step = max(1, int(body.get("frame_step") or 1))
     max_frames = _optional_int(body.get("max_frames"))
     video_infos = preflight.get("video_group", {}).get("videos", [])
-    selected_videos = [str(name) for name in preflight.get("video_group", {}).get("selected_videos", [])]
+    selected_videos = [str(name) for name in selection["selected_videos"]]
     height, width = resolve_run_dimensions(body, video_infos)
     visualize_height, visualize_width = _resolve_visualize_dimensions(body, height, width)
     execution_mode = str(body.get("execution_mode") or "single")
@@ -817,7 +924,7 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
     selection_hash = _selection_hash(selected_videos, frame_step, max_frames)
     model_record_name = model_path.name if checkpoint_relative is None else f"{model_path.name} [{checkpoint_relative}]"
     reference_config = _reference_config(
-        video_group=video_folder.name,
+        video_group=group_label,
         selected_videos=selected_videos,
         frame_step=frame_step,
         max_frames=max_frames,
@@ -842,14 +949,16 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         },
     )
     dataset_id = db.upsert_dataset(
-        name=f"video:{video_folder.name}:{selection_hash}",
-        root_path=str(video_folder),
+        name=f"video:{group_label}:{selection_hash}",
+        root_path=dataset_root,
         has_gt=True,
         source_type="video",
         decode_mode="video_gt_triplets",
         metadata={
             "source": "folder",
-            "video_group": video_folder.name,
+            "video_group": group_label,
+            "video_groups": groups,
+            "multi_group": multi_group,
             "frame_step": frame_step,
             "max_frames": max_frames,
             "video_glob": "*",
@@ -862,7 +971,8 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         "request": {
             "run_type": "model_inference",
             "model_file": model_path.name,
-            "video_group": video_folder.name,
+            "video_group": group_label,
+            "video_groups": groups,
             "resolution_mode": body.get("resolution_mode") or "original",
             "height": height,
             "width": width,
@@ -882,7 +992,9 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         },
         "model_file": model_path.name,
         "checkpoint": checkpoint_relative,
-        "video_group": video_folder.name,
+        "video_group": group_label,
+        "video_groups": groups,
+        "multi_group": multi_group,
         "execution_mode": execution_mode,
         "devices": devices,
         "visualize_height": visualize_height,
@@ -897,7 +1009,7 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
     }
     if body.get("retry_of_run_id") is not None:
         metadata["retry_of_run_id"] = int(body["retry_of_run_id"])
-    name = body.get("name") or f"{model_path.stem} / {video_folder.name}"
+    name = body.get("name") or _default_run_name(model_path, checkpoint_relative, body.get("checkpoint"), group_label)
     output_dir = str(workspace.runs_dir / str(db.next_run_id()))
     run_id = db.create_run(
         name=name,
@@ -919,7 +1031,8 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         {
             "run_id": run_id,
             "dataset_id": dataset_id,
-            "video_group": video_folder.name,
+            "video_group": group_label,
+            "video_groups": groups,
             "selected_videos": selected_videos,
             "video_count": len(selected_videos),
             "total_frames": total_decode_frames,
@@ -931,6 +1044,31 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
     db.update_run_progress(run_id, 0, total_decode_frames, "decoding")
     start_decode_worker(db, workspace)
     return {"run_id": run_id, "run": db.get_run(run_id), "preflight": preflight}
+
+
+def _dedupe_track_labels(distorted_tracks: list[dict[str, Any]]) -> list[str]:
+    """Return per-track labels that stay distinct after `_sample_token`.
+
+    Track labels drive sample names (`{video}__{label}__{frame}`) and per-track
+    artifact directories, so two tracks whose labels collapse to the same
+    sanitized token would overwrite each other. Any track whose token has
+    already been used (or whose label is blank) is suffixed with its 1-based
+    position so every track keeps a unique, human-readable label.
+    """
+    labels: list[str] = []
+    seen: set[str] = set()
+    for index, track in enumerate(distorted_tracks):
+        base = str(track.get("track_label") or track.get("label") or "").strip()
+        if not base:
+            base = f"pred{index + 1}"
+        label = base
+        # If the sanitized token is taken, suffix with the 1-based position. The
+        # position is unique per track, so one bump always resolves the clash.
+        if _sample_token(label) in seen:
+            label = f"{base}#{index + 1}"
+        seen.add(_sample_token(label))
+        labels.append(label)
+    return labels
 
 
 def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: dict) -> dict:
@@ -950,27 +1088,50 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
         distorted_tracks = [dict(preflight["distorted"])]
     reference_path = str(reference.get("path") or "")
     distorted_path = str(distorted_tracks[0].get("path") if distorted_tracks else "")
-    width = int(preflight.get("alignment", {}).get("width") or 0)
-    height = int(preflight.get("alignment", {}).get("height") or 0)
+    # The compare target dimensions — downscale the higher-resolution side so GT
+    # and every pred track share one resolution before evaluation & viz. Width/
+    # height feed the (dummy) model record; target_width/target_height drive the
+    # per-frame rescale in sample assembly.
+    alignment = preflight.get("alignment") or {}
+    width = int(alignment.get("width") or 0)
+    height = int(alignment.get("height") or 0)
+    target_width = int(alignment.get("target_width") or 0)
+    target_height = int(alignment.get("target_height") or 0)
     video_name = Path(reference_path).stem
+    # Track labels become sample-name tokens (`{video}__{label}__{frame}`) and
+    # per-track artifact directories (`videos/{video}/{label}/`). Two selected
+    # preds can carry the same label — e.g. two runs sharing an auto-generated
+    # name, or labels that only differ in characters `_sample_token` collapses.
+    # Left unqualified they collide on `UNIQUE(dataset_id, name)` and the later
+    # track silently overwrites the earlier one (multiple preds appear as one).
+    # Disambiguate on the sanitized token so every track keeps a distinct label.
+    unique_labels = _dedupe_track_labels(distorted_tracks)
     compare_tracks = [
         {
             "distorted_path": str(track.get("path") or ""),
-            "track_label": str(track.get("track_label") or track.get("label") or f"pred{index + 1}"),
+            "track_label": unique_labels[index],
             "track_run_id": track.get("run_id") or track.get("track_run_id"),
             "artifact_id": track.get("artifact_id"),
             "video_name": track.get("video_name") or track.get("video"),
+            "width": int(track.get("width") or 0),
+            "height": int(track.get("height") or 0),
+            "needs_downscale": bool((int(track.get("width") or 0), int(track.get("height") or 0)) != (target_width, target_height)),
         }
         for index, track in enumerate(distorted_tracks)
     ]
+    reference_needs_downscale = bool((width, height) != (target_width, target_height))
+    effective_frame_count = int(alignment.get("frame_count") or 0)
     reference_config = {
         "run_type": "video_compare",
         "reference_path": reference_path,
         "distorted_tracks": compare_tracks,
         "align_mode": "strict",
-        "frame_count": int(preflight.get("alignment", {}).get("frame_count") or 0),
+        "frame_count": effective_frame_count,
         "width": width,
         "height": height,
+        "target_width": target_width,
+        "target_height": target_height,
+        "reference_needs_downscale": reference_needs_downscale,
     }
     reference_key = _reference_key(reference_config)
     compare_tag = reference_key[:12]
@@ -978,8 +1139,10 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
         name="video_compare",
         adapter="dummy",
         checkpoint_path=None,
-        input_height=height,
-        input_width=width,
+        # Compare emits artifacts at the common target resolution (higher-res
+        # side downscaled), so record that as the run's working resolution.
+        input_height=target_height or height,
+        input_width=target_width or width,
         metadata={"source": "compare", "run_type": "video_compare"},
     )
     dataset_id = db.upsert_dataset(
@@ -995,6 +1158,14 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
             "align_mode": "strict",
             "compare_tag": compare_tag,
             "video_name": video_name,
+            # Common compare resolution: the higher-resolution side is downscaled
+            # to this per frame assembly so GT and every pred track share size.
+            "compare_target_width": target_width,
+            "compare_target_height": target_height,
+            "reference_needs_downscale": reference_needs_downscale,
+            # Post-alignment frame count after trim-to-common. Sample assembly
+            # crops decoded frames to this length.
+            "compare_effective_frame_count": effective_frame_count,
         },
     )
     samples = scan_dataset(db, workspace, dataset_id)
@@ -1010,6 +1181,10 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
         "align_mode": "strict",
         "reference_key": reference_key,
         "reference_config": reference_config,
+        "compare_target_width": target_width,
+        "compare_target_height": target_height,
+        "reference_needs_downscale": reference_needs_downscale,
+        "compare_effective_frame_count": effective_frame_count,
         "metric_health": preflight.get("metrics", {}).get("health", {}),
         "request": {
             "run_type": "video_compare",
@@ -1027,8 +1202,8 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
         name=body.get("name") or f"compare / {Path(reference_path).stem}",
         model_id=model_id,
         dataset_id=dataset_id,
-        height=height,
-        width=width,
+        height=target_height or height,
+        width=target_width or width,
         batch_size=1,
         device="cpu",
         precision="fp32",
@@ -1112,6 +1287,26 @@ def _checkpoint_relative(workspace: WorkspaceConfig, checkpoint_path: Path | Non
     from vfieval.file_inputs import checkpoints_dir
 
     return checkpoint_path.resolve().relative_to(checkpoints_dir(workspace)).as_posix()
+
+
+def _default_run_name(
+    model_path: Path,
+    checkpoint_relative: str | None,
+    checkpoint_request: Any,
+    video_group: str,
+) -> str:
+    """Compose the default run name as model-checkpoint-videogroup.
+
+    The checkpoint segment prefers the resolved weight file stem; it falls back
+    to the raw request ("auto"/"none") so a run created without a checkpoint
+    still reads clearly.
+    """
+    if checkpoint_relative:
+        checkpoint_label = Path(checkpoint_relative).stem
+    else:
+        request = str(checkpoint_request or "none").strip().lower()
+        checkpoint_label = request if request in {"auto", "none"} else "none"
+    return f"{model_path.stem}-{checkpoint_label}-{video_group}"
 
 
 def _resolve_visualize_dimensions(body: dict, height: int, width: int) -> tuple[int, int]:
@@ -1348,7 +1543,48 @@ METRIC_STATUSES = ("pending", "running", "completed", "unavailable", "failed", "
 def _run_detail(db: Database, run_id: int) -> dict:
     run = db.get_run(run_id)
     run["jobs"] = db.list_run_jobs(run_id)
+    run["feedback"] = db.list_run_feedback(run_id)
     return run
+
+
+def _create_run_feedback(db: Database, run_id: int, body: dict) -> dict:
+    """Validate and persist one feedback entry for a run.
+
+    A submission needs at least a rating or a non-empty issue — a blank form
+    should not create a row. Rating, when present, is clamped to the 1–5 scale.
+    """
+    db.get_run(run_id)  # 404s via the caller if the run does not exist.
+    username = str(body.get("username") or "").strip()[:120]
+    issue = str(body.get("issue") or "").strip()
+    rating_raw = body.get("rating")
+    rating: int | None = None
+    if rating_raw not in {None, ""}:
+        try:
+            rating = int(rating_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("rating must be an integer between 1 and 5") from exc
+        if rating < 1 or rating > 5:
+            raise ValueError("rating must be between 1 and 5")
+    if rating is None and not issue:
+        raise ValueError("feedback requires a rating or an issue")
+    feedback_id = db.add_run_feedback(run_id, username, rating, issue)
+    return {
+        "run_id": run_id,
+        "feedback_id": feedback_id,
+        "feedback": db.list_run_feedback(run_id),
+    }
+
+
+def _feedback_overview(db: Database) -> dict:
+    """Aggregate run feedback for the statistics tab.
+
+    Wraps ``db.feedback_stats`` (overall + per-user + per-run rollups) and adds
+    the 1–5 rating distribution and a recent-entries feed the UI renders as a
+    log of who reviewed what, the score they gave, and the issue they raised.
+    """
+    stats = db.feedback_stats()
+    stats["recent"] = db.list_all_feedback(limit=100)
+    return stats
 
 
 def _run_timeline(db: Database, run_id: int) -> dict:

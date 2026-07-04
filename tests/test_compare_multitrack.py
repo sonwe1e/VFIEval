@@ -88,6 +88,204 @@ class CompareMultitrackTests(unittest.TestCase):
             finally:
                 stop_server(server, thread)
 
+    def test_compare_with_mismatched_frame_count_aligns_to_min(self) -> None:
+        # Regression for "帧数 11 ≠ 12; 分辨率 832x384 ≠ 96x64": GT is the source
+        # clip (12 frames @ 16×8), Pred is 11 frames (N-step) @ 8×8. The backend
+        # trims both to min(len) and down-samples the higher-res side, so the
+        # compare run completes and pred_video / gt_video share one length and
+        # one resolution.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": tmp}, clear=False):
+            from PIL import Image as _Image
+            workspace, db = make_workspace(tmp)
+            gt_path = Path(tmp) / "videos" / "anime" / "clip-gt.mp4"
+            pred_path = workspace.root / "pred.mp4"
+            gt_path.parent.mkdir(parents=True, exist_ok=True)
+            # GT: 12 frames at 16x8  —  the "full" source clip
+            gt_colors = [(i * 10, 20, 30) for i in range(12)]
+            pred_colors = [(30, i * 10, 50) for i in range(11)]
+            write_mp4(gt_path, gt_colors, size=(16, 8))           # 12 frames, res 16x8
+            write_mp4(pred_path, pred_colors, size=(8, 8))       # 11 frames, res 8x8
+            _gt_probe = __import__("vfieval.file_inputs", fromlist=["inspect_video"]).inspect_video(
+                gt_path, workspace, exact=True
+            )
+            _pred_probe = __import__("vfieval.file_inputs", fromlist=["inspect_video"]).inspect_video(
+                pred_path, workspace, exact=True
+            )
+            self.assertEqual(_gt_probe["frame_count"], 12)
+            self.assertEqual(_pred_probe["frame_count"], 11)
+            pred_run = add_completed_pred_run(
+                db, workspace, "Pred", pred_path, video_name="clip", sample_count=11, size=(8, 8)
+            )
+
+            payload = {
+                "run_type": "video_compare",
+                "reference": {"kind": "video_group", "group": "anime", "video": "clip-gt.mp4"},
+                "distorted": [{"kind": "run_artifact", "run_id": pred_run, "video": "clip", "label": "Pred"}],
+                "metrics": [],
+            }
+            server, thread, base_url = start_server(db, workspace)
+            try:
+                preflight = post_json(base_url, "/api/preflight", payload)
+                self.assertTrue(preflight["ok"], preflight)
+                # Aligned frame count should be the smaller side (11).
+                self.assertEqual(preflight["alignment"]["frame_count"], 11)
+                warnings = preflight.get("warnings") or []
+                frame_warning = next((w for w in warnings if w.get("type") == "CompareFrameCountMismatch"), None)
+                self.assertIsNotNone(frame_warning, [w.get("type") for w in warnings])
+
+                with patch("vfieval.server._start_local_inference_worker", return_value=None):
+                    created = post_json(base_url, "/api/runs", payload)
+                run_id = int(created["run_id"])
+                job_id = int(db.get_run(run_id)["inference_job_id"])
+                run_inference_job(db, workspace, job_id)
+
+                run = db.get_run(run_id)
+                self.assertEqual(run["status"], "completed", run)
+                samples = db.list_samples(int(run["dataset_id"]))
+                self.assertEqual(len(samples), 11)  # aligned frame count
+
+                pred_video = db.list_run_artifacts(run_id, kind="pred_video")
+                gt_video = db.list_run_artifacts(run_id, kind="gt_video")
+                self.assertEqual(len(pred_video), 1)
+                self.assertEqual(len(gt_video), 1)
+                pred_path_str = pred_video[0]["path"]
+                gt_path_str = gt_video[0]["path"]
+                # Pred/gt frame PNGs are under <run>/videos/<sanitized_video>/<track>/pred_frames|gt_frames/*.png
+                # e.g. videos/clip-gt/Pred/pred_frames/000000.png (track label sanitized).
+                run_dir = workspace.runs_dir / str(run_id)
+                produced = list(run_dir.rglob("pred_frames/*.png")) + list(run_dir.rglob("gt_frames/*.png"))
+                self.assertGreaterEqual(len(produced), 11, produced[:10])
+                # Pred frames must be at most pred native resolution (8x8 here).
+                pred_frame_files = list(run_dir.rglob("pred_frames/*.png"))
+                self.assertEqual(len(pred_frame_files), 11)
+                for png in pred_frame_files:
+                    with _Image.open(png) as img:
+                        self.assertLessEqual(img.size[0], 8)
+                        self.assertLessEqual(img.size[1], 8)
+                # GT frames must have been downscaled to the common target (8x8).
+                gt_frame_files = list(run_dir.rglob("gt_frames/*.png"))
+                self.assertEqual(len(gt_frame_files), 11)
+                for png in gt_frame_files:
+                    with _Image.open(png) as img:
+                        self.assertEqual(img.size, (8, 8))
+            finally:
+                stop_server(server, thread)
+
+
+    def test_compare_with_mismatched_resolution_downscales_higher_side(self) -> None:
+        # When GT and Pred have different resolutions, the higher one is
+        # per-frame downscaled to min(W) x min(H) before samples/MP4s are built,
+        # so downstream VMAF / visualization see equal-size frames.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": tmp}, clear=False):
+            from PIL import Image as _Image
+            workspace, db = make_workspace(tmp)
+            gt_path = Path(tmp) / "videos" / "anime" / "clip-gt.mp4"
+            pred_path = workspace.root / "pred.mp4"
+            gt_path.parent.mkdir(parents=True, exist_ok=True)
+            # GT 16x8, Pred 8x8: GT is the higher-res side on the W axis.
+            write_mp4(gt_path, [(10, 20, 30)] * 3, size=(16, 8))
+            write_mp4(pred_path, [(30, 20, 10)] * 3, size=(8, 8))
+            pred_run = add_completed_pred_run(
+                db, workspace, "PredHigh", pred_path, video_name="clip", sample_count=3, size=(8, 8)
+            )
+
+            payload = {
+                "run_type": "video_compare",
+                "reference": {"kind": "video_group", "group": "anime", "video": "clip-gt.mp4"},
+                "distorted": [{"kind": "run_artifact", "run_id": pred_run, "video": "clip", "label": "Pred"}],
+                "metrics": [],
+            }
+            server, thread, base_url = start_server(db, workspace)
+            try:
+                preflight = post_json(base_url, "/api/preflight", payload)
+                self.assertTrue(preflight["ok"], preflight)
+                # target is min(16,8) x min(8,8) = 8x8
+                self.assertEqual(preflight["alignment"]["target_width"], 8)
+                self.assertEqual(preflight["alignment"]["target_height"], 8)
+                self.assertTrue(preflight["alignment"]["reference_needs_downscale"])
+                warning = next((w for w in preflight.get("warnings", []) if w.get("type") == "CompareResolutionMismatch"), None)
+                self.assertIsNotNone(warning, preflight.get("warnings"))
+
+                with patch("vfieval.server._start_local_inference_worker", return_value=None):
+                    created = post_json(base_url, "/api/runs", payload)
+                run_id = int(created["run_id"])
+                job_id = int(db.get_run(run_id)["inference_job_id"])
+                run_inference_job(db, workspace, job_id)
+
+                samples = db.list_samples(int(db.get_run(run_id)["dataset_id"]))
+                self.assertEqual(len(samples), 3)
+                # All sample frames (gt and pred) must now share the target dims.
+                pred_pngs = [
+                    a for a in db.list_artifacts(job_id=job_id, kind="pred")
+                ]
+                gt_pngs = [
+                    a for a in db.list_artifacts(job_id=job_id, kind="gt")
+                ]
+                self.assertEqual(len(pred_pngs), 3)
+                self.assertEqual(len(gt_pngs), 3)
+                sample_dir = workspace.root / "compare_cache"
+                self.assertTrue(sample_dir.exists())
+                # Each gt frame should have been cached (downscaled from 16x8 to 8x8).
+                cached = list(sample_dir.glob("*.png"))
+                self.assertGreaterEqual(len(cached), 3)
+                for png in cached:
+                    with _Image.open(png) as img:
+                        self.assertEqual(img.size, (8, 8))
+            finally:
+                stop_server(server, thread)
+
+
+    def test_two_preds_sharing_a_label_do_not_collapse(self) -> None:
+        # Regression: two selected preds that resolve to the same track label
+        # (e.g. two runs sharing an auto-generated name) used to collide on the
+        # sample name / artifact dir and the second silently overwrote the
+        # first, so the compare showed one GT and one pred instead of two preds.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": tmp}, clear=False):
+            workspace, db = make_workspace(tmp)
+            gt_path = Path(tmp) / "videos" / "anime" / "clip.mp4"
+            pred_a_path = workspace.root / "pred-a.mp4"
+            pred_b_path = workspace.root / "pred-b.mp4"
+            gt_path.parent.mkdir(parents=True, exist_ok=True)
+            write_mp4(gt_path, [(0, 0, 0), (20, 0, 0), (40, 0, 0)])
+            write_mp4(pred_a_path, [(0, 0, 0), (0, 20, 0), (0, 40, 0)])
+            write_mp4(pred_b_path, [(0, 0, 0), (0, 0, 20), (0, 0, 40)])
+            run_a = add_completed_pred_run(db, workspace, "ModelA", pred_a_path)
+            run_b = add_completed_pred_run(db, workspace, "ModelB", pred_b_path)
+
+            # Both tracks intentionally carry the SAME label.
+            payload = {
+                "run_type": "video_compare",
+                "reference": {"kind": "video_group", "group": "anime", "video": "clip.mp4"},
+                "distorted": [
+                    {"kind": "run_artifact", "run_id": run_a, "video": "clip", "label": "Model"},
+                    {"kind": "run_artifact", "run_id": run_b, "video": "clip", "label": "Model"},
+                ],
+                "metrics": [],
+            }
+
+            server, thread, base_url = start_server(db, workspace)
+            try:
+                preflight = post_json(base_url, "/api/preflight", payload)
+                self.assertTrue(preflight["ok"], preflight)
+                with patch("vfieval.server._start_local_inference_worker", return_value=None):
+                    created = post_json(base_url, "/api/runs", payload)
+                run_id = int(created["run_id"])
+                job_id = int(db.get_run(run_id)["inference_job_id"])
+                run_inference_job(db, workspace, job_id)
+
+                run = db.get_run(run_id)
+                self.assertEqual(run["status"], "completed", run)
+                # Two tracks × 3 frames = 6 samples; a collision would drop to 3.
+                samples = db.list_samples(int(run["dataset_id"]))
+                self.assertEqual(len(samples), 6)
+                # Both preds must survive as distinct artifacts.
+                pred_videos = db.list_run_artifacts(run_id, kind="pred_video")
+                self.assertEqual(len(pred_videos), 2)
+                labels = {row["metadata"].get("compare_track_label") for row in pred_videos}
+                self.assertEqual(len(labels), 2, labels)
+            finally:
+                stop_server(server, thread)
+
 
 if __name__ == "__main__":
     unittest.main()

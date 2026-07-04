@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -24,8 +25,70 @@ from vfieval.db import Database
 from vfieval.file_inputs import VIDEO_SUFFIXES, decode_cache_dir, decode_cache_key
 
 
+def _frame_downscale_copy(
+    workspace: WorkspaceConfig,
+    src_path: Path,
+    target_w: int,
+    target_h: int,
+) -> Path:
+    """LANCZOS-downscale a single frame to ``(target_w, target_h)`` and cache
+    the result under ``<workspace>/compare_cache``, keyed by source path +
+    mtime/size + target size. Returns the path to the cached PNG.
+
+    Only ever downscales — sources already at or below the target are copied
+    through unchanged so we never upscale. Used in compare sample assembly so
+    GT and Pred tracks share one resolution before evaluation & visualization:
+    the higher-resolution side is downscaled to ``min(W) x min(H)``.
+    """
+    src_path = src_path.resolve()
+    stat = src_path.stat()
+    key_data = (
+        str(src_path).replace("\\", "/"),
+        int(stat.st_size),
+        int(stat.st_mtime_ns),
+        int(target_w),
+        int(target_h),
+    )
+    cache_key = hashlib.sha256("|".join(str(item) for item in key_data).encode("utf-8")).hexdigest()
+    cache_dir = workspace.root / "compare_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    out_path = cache_dir / f"{cache_key}.png"
+    if out_path.exists():
+        return out_path
+    with Image.open(src_path).convert("RGB") as image:
+        src_w, src_h = image.size
+        if src_w <= target_w and src_h <= target_h:
+            image.save(out_path)
+            return out_path
+        image.resize((target_w, target_h), Image.LANCZOS).save(out_path)
+    return out_path
+
+
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+class VideoEntry:
+    """A decode target plus the identity it carries into the sample timeline.
+
+    Single-group runs keep the historical identity (``display_name`` = file
+    stem, ``video_file`` = file name). Multi-group runs qualify both with the
+    group name (e.g. ``anime/clip01`` and ``anime/clip01.mp4``) so a clip that
+    exists under several ``videos/`` groups never collides in the run timeline
+    or artifact layout.
+    """
+
+    __slots__ = ("path", "display_name", "video_file", "group")
+
+    def __init__(self, path: Path, display_name: str, video_file: str, group: str | None = None) -> None:
+        self.path = path
+        self.display_name = display_name
+        self.video_file = video_file
+        self.group = group
+
+    @property
+    def sample_token(self) -> str:
+        return _sample_token(self.display_name)
 
 
 def scan_dataset(
@@ -96,9 +159,10 @@ def scan_video_dataset(
     video_glob = str(metadata.get("video_glob") or "*")
     selected_videos = metadata.get("selected_videos")
 
-    videos = _find_videos(Path(dataset["root_path"]), video_glob, selected_videos)
-    if not videos:
+    entries = _resolve_video_entries(Path(dataset["root_path"]), video_glob, selected_videos)
+    if not entries:
         raise FileNotFoundError(f"no videos found under {dataset['root_path']}")
+    videos = [entry.path for entry in entries]
 
     decoded_root = workspace.root / "decode_cache"
     decoded_root.mkdir(parents=True, exist_ok=True)
@@ -112,7 +176,8 @@ def scan_video_dataset(
     cache_miss_videos: list[str] = []
     lock = Lock()
 
-    def decode_one(video_index: int, video_path: Path) -> tuple[str, list[Path], float, list[float], dict[str, Any]]:
+    def decode_one(video_index: int, entry: "VideoEntry") -> tuple[str, list[Path], float, list[float], dict[str, Any]]:
+        video_path = entry.path
         cache_key = decode_cache_key(video_path, decode_mode, frame_step, max_frames)
         local_cache_hit = False
 
@@ -126,16 +191,16 @@ def scan_video_dataset(
                 if event.get("event") == "cache_hit" and not local_cache_hit:
                     local_cache_hit = True
                     cache_hits += 1
-                    cache_hit_videos.append(video_path.name)
+                    cache_hit_videos.append(entry.display_name)
                 elif event.get("event") == "cache_miss" and not event.get("_cache_miss_counted"):
                     event["_cache_miss_counted"] = True
                     cache_misses += 1
-                    cache_miss_videos.append(video_path.name)
+                    cache_miss_videos.append(entry.display_name)
                 payload = {
                     **event,
                     "video_index": video_index,
-                    "video_count": len(videos),
-                    "video_name": video_path.name,
+                    "video_count": len(entries),
+                    "video_name": entry.display_name,
                     "decoded_frames": sum(progress_counts),
                     "cache_hits": cache_hits,
                     "cache_misses": cache_misses,
@@ -156,27 +221,27 @@ def scan_video_dataset(
         )
         return cache_key, frames, fps, timestamps, decode_info
 
-    worker_count = _decode_worker_count(len(videos), metadata)
+    worker_count = _decode_worker_count(len(entries), metadata)
     if worker_count > 1:
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            futures = {executor.submit(decode_one, index, path): index for index, path in enumerate(videos)}
+            futures = {executor.submit(decode_one, index, entry): index for index, entry in enumerate(entries)}
             for future in as_completed(futures):
                 decode_results[futures[future]] = future.result()
     else:
-        for video_index, video_path in enumerate(videos):
-            decode_results[video_index] = decode_one(video_index, video_path)
+        for video_index, entry in enumerate(entries):
+            decode_results[video_index] = decode_one(video_index, entry)
 
-    for video_index, video_path in enumerate(videos):
+    for video_index, entry in enumerate(entries):
         result = decode_results[video_index]
         if result is None:
-            raise RuntimeError(f"video decode did not produce a result: {video_path.name}")
+            raise RuntimeError(f"video decode did not produce a result: {entry.path.name}")
         cache_key, frames, fps, timestamps, decode_info = result
         decoded_frames += len(frames)
         if decode_mode == "video_gt_triplets":
             added += _add_video_triplets(
                 db,
                 dataset_id,
-                video_path,
+                entry,
                 video_index,
                 frames,
                 frame_step,
@@ -188,7 +253,7 @@ def scan_video_dataset(
             added += _add_video_pairs(
                 db,
                 dataset_id,
-                video_path,
+                entry,
                 video_index,
                 frames,
                 frame_step,
@@ -202,13 +267,13 @@ def scan_video_dataset(
     db.update_dataset_scan_info(
         dataset_id,
         str(decoded_root),
-        video_count=len(videos),
+        video_count=len(entries),
         frame_count=decoded_frames,
         metadata={
             "frame_step": frame_step,
             "max_frames": max_frames,
             "video_glob": video_glob,
-            "selected_videos": [path.name for path in videos],
+            "selected_videos": [entry.video_file for entry in entries],
             "decode_mode": decode_mode,
             "decode_backend": decode_backend,
         },
@@ -228,6 +293,17 @@ def scan_compare_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: i
     if align_mode != "strict":
         raise ValueError("compare datasets currently only support strict alignment")
 
+    # Common compare resolution: per-axis min of GT and Pred. The
+    # higher-resolution side is downscaled here per frame so the two tracks
+    # share one size for evaluation & visualization downstream.
+    target_w = _optional_positive_int(metadata.get("compare_target_width"))
+    target_h = _optional_positive_int(metadata.get("compare_target_height"))
+    downscale_mode = "none"
+    if target_w is not None and target_h is not None and target_w > 0 and target_h > 0:
+        # Image-size inspection happens per-frame below; defer the decision on
+        # which side to downscale until we see actual decoded sizes.
+        downscale_mode = "enabled"
+
     reference_frames, reference_fps, reference_timestamps = _load_compare_source_frames(workspace, reference_path, "compare_reference")
     distorted_frames, distorted_fps, distorted_timestamps = _load_compare_source_frames(workspace, distorted_path, "compare_distorted")
     validate_strict_decoded_alignment(
@@ -242,14 +318,14 @@ def scan_compare_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: i
     compare_name = compare_video_name(reference_path, distorted_path)
     added = 0
     for frame_index, (reference_frame, distorted_frame) in enumerate(zip(reference_frames, distorted_frames)):
-        reference_size = image_size(reference_frame)
-        distorted_size = image_size(distorted_frame)
-        if reference_size != distorted_size:
-            raise ValueError(
-                "strict compare requires matching frame dimensions: "
-                f"{reference_frame.name}={reference_size[0]}x{reference_size[1]} vs "
-                f"{distorted_frame.name}={distorted_size[0]}x{distorted_size[1]}"
-            )
+        reference_frame, distorted_frame = _align_compare_frames(
+            workspace=workspace,
+            reference_frame=reference_frame,
+            distorted_frame=distorted_frame,
+            target_w=target_w,
+            target_h=target_h,
+            downscale_mode=downscale_mode,
+        )
         name = f"compare_{compare_name}_{frame_index:06d}"
         db.add_sample(
             dataset_id=dataset_id,
@@ -287,9 +363,39 @@ def scan_compare_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: i
             "video_name": compare_name,
             "reference_frame_count": len(reference_frames),
             "distorted_frame_count": len(distorted_frames),
+            **({"compare_target_width": target_w, "compare_target_height": target_h, "downscale_mode": downscale_mode} if target_w else {}),
         },
     )
     return added
+
+
+def _align_compare_frames(
+    workspace: WorkspaceConfig,
+    reference_frame: Path,
+    distorted_frame: Path,
+    target_w: int | None,
+    target_h: int | None,
+    downscale_mode: str,
+) -> tuple[Path, Path]:
+    """Resolve frame-level dimension alignment for the two compare sides.
+
+    When ``downscale_mode == "enabled"`` and ``target_w``/``target_h`` are set,
+    the higher-resolution side is LANCZOS-downscaled to ``(target_w, target_h)``
+    (per-axis min of the two sides' native resolution as computed in
+    ``preflight_run``). If both sides already match the target (or targets are
+    unset), the frames pass through unchanged.
+    """
+    if downscale_mode != "enabled" or target_w is None or target_h is None:
+        return reference_frame, distorted_frame
+    ref_size = image_size(reference_frame)
+    dist_size = image_size(distorted_frame)
+    if ref_size == dist_size and ref_size == (target_w, target_h):
+        return reference_frame, distorted_frame
+    if ref_size != (target_w, target_h):
+        reference_frame = _frame_downscale_copy(workspace, reference_frame, target_w, target_h)
+    if dist_size != (target_w, target_h):
+        distorted_frame = _frame_downscale_copy(workspace, distorted_frame, target_w, target_h)
+    return reference_frame, distorted_frame
 
 
 def _scan_multitrack_compare_dataset(
@@ -305,6 +411,13 @@ def _scan_multitrack_compare_dataset(
     tracks = list(metadata.get("compare_tracks") or [])
     if not tracks:
         raise ValueError("multi-track compare dataset requires at least one track")
+
+    # Per-axis min of GT and every pred track — the shared compare resolution.
+    target_w = _optional_positive_int(metadata.get("compare_target_width"))
+    target_h = _optional_positive_int(metadata.get("compare_target_height"))
+    downscale_mode = "none"
+    if target_w is not None and target_h is not None and target_w > 0 and target_h > 0:
+        downscale_mode = "enabled"
 
     reference_frames, reference_fps, reference_timestamps = _load_compare_source_frames(workspace, reference_path, "compare_reference")
     video_name = str(metadata.get("video_name") or reference_path.stem)
@@ -340,14 +453,14 @@ def _scan_multitrack_compare_dataset(
             }
         )
         for frame_index, (reference_frame, distorted_frame) in enumerate(zip(reference_frames, distorted_frames)):
-            reference_size = image_size(reference_frame)
-            distorted_size = image_size(distorted_frame)
-            if reference_size != distorted_size:
-                raise ValueError(
-                    f"track {track_label}: strict compare requires matching frame dimensions: "
-                    f"{reference_frame.name}={reference_size[0]}x{reference_size[1]} vs "
-                    f"{distorted_frame.name}={distorted_size[0]}x{distorted_size[1]}"
-                )
+            reference_frame, distorted_frame = _align_compare_frames(
+                workspace=workspace,
+                reference_frame=reference_frame,
+                distorted_frame=distorted_frame,
+                target_w=target_w,
+                target_h=target_h,
+                downscale_mode=downscale_mode,
+            )
             sample_index = track_index * len(reference_frames) + frame_index
             db.add_sample(
                 dataset_id=dataset_id,
@@ -390,6 +503,7 @@ def _scan_multitrack_compare_dataset(
             "reference_frame_count": len(reference_frames),
             "track_count": len(scanned_tracks),
             "compare_tracks": scanned_tracks,
+            **({"compare_target_width": target_w, "compare_target_height": target_h, "downscale_mode": downscale_mode} if target_w else {}),
         },
     )
     return added
@@ -398,7 +512,7 @@ def _scan_multitrack_compare_dataset(
 def _add_video_triplets(
     db: Database,
     dataset_id: int,
-    video_path: Path,
+    entry: "VideoEntry",
     video_index: int,
     frames: list[Path],
     frame_step: int,
@@ -409,10 +523,20 @@ def _add_video_triplets(
     added = 0
     if len(frames) < 2 * frame_step + 1:
         return 0
-    for sample_index, img0_index in enumerate(range(0, len(frames) - 2 * frame_step)):
+    # Produce N-step samples (one interpolated frame per adjacent source pair)
+    # so the predicted video is N-1 frames long — matching the visualization
+    # and comparison expectation. Interior samples keep the symmetric triple
+    # (img0=i, gt=i+step, img1=i+2*step). Boundary samples clamp the trailing
+    # anchor to the last frame; the boundary sample's pred is a blend between
+    # the last two source frames (no true midpoint GT exists). gt_path here
+    # points at ``frames[gt_index]`` (= the clamped last source frame) so
+    # gt_video stays frame-aligned with pred_video; a metadata flag marks the
+    # sample as clamped so its GT is understood as an approximation.
+    for sample_index, img0_index in enumerate(range(0, len(frames) - frame_step)):
         gt_index = img0_index + frame_step
-        img1_index = img0_index + 2 * frame_step
-        name = f"{video_index:03d}_{video_path.stem}_{sample_index:06d}"
+        img1_index = min(img0_index + 2 * frame_step, len(frames) - 1)
+        is_clamped_boundary = img0_index + 2 * frame_step > len(frames) - 1
+        name = f"{video_index:03d}_{entry.sample_token}_{sample_index:06d}"
         db.add_sample(
             dataset_id=dataset_id,
             name=name,
@@ -420,7 +544,7 @@ def _add_video_triplets(
             img1_path=str(frames[img1_index]),
             gt_path=str(frames[gt_index]),
             metadata=_video_sample_metadata(
-                video_path,
+                entry,
                 "video_gt_triplets",
                 video_index,
                 sample_index,
@@ -430,6 +554,7 @@ def _add_video_triplets(
                 fps,
                 timestamps,
                 cache_key,
+                clamped_boundary=is_clamped_boundary,
             ),
         )
         added += 1
@@ -439,7 +564,7 @@ def _add_video_triplets(
 def _add_video_pairs(
     db: Database,
     dataset_id: int,
-    video_path: Path,
+    entry: "VideoEntry",
     video_index: int,
     frames: list[Path],
     frame_step: int,
@@ -452,7 +577,7 @@ def _add_video_pairs(
         return 0
     for sample_index, img0_index in enumerate(range(0, len(frames) - frame_step)):
         img1_index = img0_index + frame_step
-        name = f"{video_index:03d}_{video_path.stem}_{sample_index:06d}"
+        name = f"{video_index:03d}_{entry.sample_token}_{sample_index:06d}"
         db.add_sample(
             dataset_id=dataset_id,
             name=name,
@@ -460,7 +585,7 @@ def _add_video_pairs(
             img1_path=str(frames[img1_index]),
             gt_path=None,
             metadata=_video_sample_metadata(
-                video_path,
+                entry,
                 "video_pairs",
                 video_index,
                 sample_index,
@@ -474,6 +599,66 @@ def _add_video_pairs(
         )
         added += 1
     return added
+
+
+def _resolve_video_entries(
+    root: Path,
+    video_glob: str,
+    selected_videos: Any = None,
+) -> list["VideoEntry"]:
+    """Resolve selected videos into decode entries carrying their identity.
+
+    Two shapes are supported:
+
+    - Single-group runs: ``root`` is a ``videos/<group>`` folder and each
+      selected entry is a bare file name. Identity stays historical
+      (display_name = file stem) so existing runs and caches are unaffected.
+    - Multi-group runs: ``root`` is the ``videos/`` directory and each selected
+      entry is ``"<group>/<file>"``. Identity is qualified with the group so
+      same-named clips across groups never collide.
+
+    ``selected_videos=None`` falls back to the historical directory scan.
+    """
+    if selected_videos is None:
+        return [
+            VideoEntry(path, path.stem, path.name, None)
+            for path in _find_videos(root, video_glob, None)
+        ]
+    raw_names = [str(item) for item in selected_videos]
+    if not raw_names:
+        raise ValueError("selected_videos must contain at least one video")
+    multi_group = any("/" in name or "\\" in name for name in raw_names)
+    entries: list[VideoEntry] = []
+    root_resolved = root.resolve()
+    for raw in raw_names:
+        normalized = raw.replace("\\", "/")
+        parts = [part for part in normalized.split("/") if part]
+        if multi_group:
+            if len(parts) != 2:
+                raise ValueError(f"multi-group video selection must be 'group/file': {raw}")
+            group, file_name = parts
+            if Path(file_name).name != file_name or Path(group).name != group:
+                raise ValueError(f"invalid multi-group video selection: {raw}")
+            path = (root / group / file_name).resolve()
+            display_name = f"{group}/{Path(file_name).stem}"
+            video_file = f"{group}/{file_name}"
+            group_name: str | None = group
+        else:
+            file_name = parts[-1] if parts else raw
+            if Path(file_name).name != file_name:
+                raise ValueError(f"selected video must be a file name: {raw}")
+            path = (root / file_name).resolve()
+            display_name = Path(file_name).stem
+            video_file = file_name
+            group_name = None
+        try:
+            path.relative_to(root_resolved)
+        except ValueError:
+            raise ValueError(f"selected video resolved outside the dataset root: {raw}")
+        if not path.is_file() or path.suffix.lower() not in VIDEO_SUFFIXES:
+            raise FileNotFoundError(f"selected video not found: {raw}")
+        entries.append(VideoEntry(path, display_name, video_file, group_name))
+    return entries
 
 
 def _find_videos(root: Path, video_glob: str, selected_videos: Any = None) -> list[Path]:
@@ -592,7 +777,7 @@ def _decode_video_cached(
             "width": width,
             "height": height,
             "duration_seconds": float(timestamps[-1]) if timestamps else (len(frames) / fps if fps > 0 else 0.0),
-            "valid_triplets": max(0, len(frames) - 2 * frame_step) if decode_mode == "video_gt_triplets" else max(0, len(frames) - frame_step),
+            "valid_triplets": max(0, len(frames) - frame_step),
             "decode_status": "completed",
             "decode_mode": decode_mode,
             "frame_step": frame_step,
@@ -800,7 +985,7 @@ def _frame_size(path: Path) -> tuple[int, int]:
 
 
 def _video_sample_metadata(
-    video_path: Path,
+    entry: "VideoEntry",
     decode_mode: str,
     video_index: int,
     sample_index: int,
@@ -810,13 +995,17 @@ def _video_sample_metadata(
     fps: float,
     timestamps: list[float],
     cache_key: str,
+    *,
+    clamped_boundary: bool = False,
 ) -> dict[str, Any]:
+    video_path = entry.path
     metadata: dict[str, Any] = {
         "source_type": "video",
         "decode_mode": decode_mode,
         "video_index": video_index,
-        "video_name": video_path.stem,
-        "video_file": video_path.name,
+        "video_name": entry.display_name,
+        "video_file": entry.video_file,
+        "video_group": entry.group,
         "video_path": str(video_path.resolve()),
         "sample_index": sample_index,
         "img0_index": img0_index,
@@ -833,7 +1022,10 @@ def _video_sample_metadata(
         metadata["frame_index"] = gt_index
         metadata["timestamps"]["gt"] = timestamps[gt_index] if gt_index < len(timestamps) else None
     else:
+        # video_pairs path: no GT frame exists, report frame position as img0.
         metadata["frame_index"] = img0_index
+    if clamped_boundary:
+        metadata["clamped_boundary"] = True
     return metadata
 
 

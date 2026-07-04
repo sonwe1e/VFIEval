@@ -28,8 +28,13 @@ set/metrics/
 # Local tool and environment state
 .env*
 .agents/
+.serena/
 .claude/settings.local.json
 *.backup.*
+
+# Local scratch artifacts
+failure.png
+set.zip
 
 # Python and build outputs
 __pycache__/

@@ -408,7 +408,8 @@ class Model:
                 run = _wait_for_run(base_url, run_id)
                 self.assertEqual(run["status"], "completed", run)
                 output_health = run["result"]["output_health"]
-                self.assertEqual(output_health["samples"], 2)
+                # N - frame_step = 4 - 1 = 3 samples after the triplet count fix.
+                self.assertEqual(output_health["samples"], 3)
                 self.assertTrue(output_health["flow_flat"])
                 self.assertTrue(output_health["mask_flat"])
                 self.assertTrue(output_health["warnings"])
@@ -487,7 +488,8 @@ class Model:
                 )
                 timeline = _get(base_url, f"/api/runs/{run_id}/timeline")
                 self.assertEqual(len(timeline["videos"]), 1)
-                self.assertEqual(len(timeline["videos"][0]["samples"]), 2)
+                # N - frame_step = 4 - 1 = 3 samples after the triplet count fix.
+                self.assertEqual(len(timeline["videos"][0]["samples"]), 3)
                 first_sample = timeline["videos"][0]["samples"][0]
                 self.assertNotIn("artifacts", first_sample)
                 self.assertNotIn("sample_files", first_sample)
@@ -515,7 +517,8 @@ class Model:
                 self.assertEqual(summary["metrics"]["lpips_vit_patch"]["worst_sample_id"], int(sample["id"]))
 
                 run_videos = _get(base_url, f"/api/runs/{run_id}/videos")
-                self.assertEqual(run_videos["videos"][0]["sample_count"], 2)
+                # N - frame_step = 4 - 1 = 3 samples after the triplet count fix.
+                self.assertEqual(run_videos["videos"][0]["sample_count"], 3)
                 run_video_name = run_videos["videos"][0]["video_name"]
                 video_timeline = _get(base_url, f"/api/runs/{run_id}/videos/{urllib.parse.quote(run_video_name)}/timeline?bucket_count=2&window_size=1")
                 self.assertEqual(len(video_timeline["samples"]), 1)
@@ -692,7 +695,9 @@ class Model:
                 self.assertTrue(run["metadata"]["metric_health"]["lpips_vit_patch"]["manifest_path"].endswith("lpips_vit_patch\\manifest.json"))
 
                 summary = _get(base_url, f"/api/runs/{run_id}/metric-summary")
-                self.assertEqual(summary["metrics"]["lpips_vit_patch"]["unavailable"], 2)
+                # N - frame_step = 4 - 1 = 3 samples after the triplet count fix
+                # (one interpolated frame per adjacent source pair).
+                self.assertEqual(summary["metrics"]["lpips_vit_patch"]["unavailable"], 3)
                 self.assertIn("lpips_vit_patch metric is missing_weights", summary["metrics"]["lpips_vit_patch"]["reasons"][0])
 
                 timeline = _get(base_url, f"/api/runs/{run_id}/timeline")
@@ -700,7 +705,7 @@ class Model:
                     sample["metrics"]["lpips_vit_patch"]["status"]
                     for sample in timeline["videos"][0]["samples"]
                 ]
-                self.assertEqual(statuses, ["unavailable", "unavailable"])
+                self.assertEqual(statuses, ["unavailable", "unavailable", "unavailable"])
             finally:
                 server.shutdown()
                 server.server_close()
@@ -1658,7 +1663,10 @@ class Model:
             finally:
                 stop_server(server, thread)
 
-    def test_video_compare_preflight_rejects_mismatched_frame_counts(self) -> None:
+    def test_video_compare_preflight_aligns_mismatched_frame_counts(self) -> None:
+        # Misaligned frame counts are no longer hard-rejected: preflight should
+        # succeed and surface the effective (min) aligned frame count through
+        # alignment.frame_count plus an informational warning.
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": tmp}, clear=False):
             workspace, db = make_workspace(tmp)
             gt_path = Path(tmp) / "videos" / "anime" / "clip.mp4"
@@ -1678,8 +1686,10 @@ class Model:
                     "align_mode": "strict",
                 },
             )
-            self.assertFalse(result["ok"])
-            self.assertIn("matching frame counts", result["errors"][0]["message"])
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["alignment"]["frame_count"], 2)  # min(3, 2)
+            frame_warnings = [w for w in result.get("warnings", []) if w.get("type") == "CompareFrameCountMismatch"]
+            self.assertEqual(len(frame_warnings), 1, result.get("warnings"))
 
     def test_video_compare_rejects_raw_string_descriptors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

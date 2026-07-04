@@ -224,7 +224,7 @@ class DecodeProgressTests(unittest.TestCase):
             )
             with patch("vfieval.datasets._decode_video", side_effect=fake_decode) as decode_video:
                 first_result = run_decode_job(db, workspace, first_job)
-            self.assertEqual(first_result["samples"], 3)
+            self.assertEqual(first_result["samples"], 4)  # N - frame_step = 5 - 1 = 4
             decode_video.assert_called_once()
 
             second_run = db.create_run("second", model_id, dataset_id, 8, 8, 1, "cpu", "fp32", [], create_inference_job=False)
@@ -243,7 +243,7 @@ class DecodeProgressTests(unittest.TestCase):
             ffmpeg_decode.assert_not_called()
             opencv_decode.assert_not_called()
             second_job_row = db.get_job(second_job)
-            self.assertEqual(second_result["samples"], 3)
+            self.assertEqual(second_result["samples"], 4)  # N - frame_step = 5 - 1 = 4
             self.assertEqual(second_job_row["result"]["phase"], "indexing_cached_frames")
             self.assertEqual(second_job_row["result"]["backend"], "cache")
             self.assertEqual(second_job_row["result"]["cache_hits"], 1)

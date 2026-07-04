@@ -20,6 +20,9 @@ python -m unittest tests.test_end_to_end
 # Compare-flow tests (V13)
 python -m unittest tests.test_compare_multitrack tests.test_compare_sources_api tests.test_db_indices
 
+# Run feedback tests (V13)
+python -m unittest tests.test_run_feedback
+
 # Start the server (main development workflow)
 $env:PYTHONPATH='src'
 python -m vfieval.cli init --workspace .vfieval
@@ -57,7 +60,7 @@ Set `$env:PYTHONPATH='src'` before running any vfieval commands outside of `pip 
 
 - **Model Adapter** (`src/vfieval/models/loader.py`) — Loads models from `file:path.py` (user model files in `models/`), `module:factory`, or `"dummy"`. User models define `class Model` with `infer(img0, img1)` returning a dict or 4-tuple of `(flowt_0, flowt_1, mask0, mask1)`.
 
-- **Database** (`src/vfieval/db.py`) — Single SQLite file at `.vfieval/vfieval.sqlite` with WAL mode. Tables: models, datasets, samples, jobs, artifacts, metric_results, metric_cache, experiments, runs, run_jobs, workers.
+- **Database** (`src/vfieval/db.py`) — Single SQLite file at `.vfieval/vfieval.sqlite` with WAL mode. Tables: models, datasets, samples, jobs, artifacts, metric_results, metric_cache, experiments, runs, run_jobs, workers, run_feedback.
 
 - **WorkspaceConfig** (`src/vfieval/config.py`) — Resolves all paths under `.vfieval/` (db, artifacts, runs, tmp).
 
@@ -136,6 +139,22 @@ Descriptor resolution lives in `compare_inputs.resolve_compare_descriptor(worksp
   - `idx_metric_results_sample` on `metric_results(sample_id, metric_name)`
   - `idx_run_jobs_device` on `run_jobs(device)`
 - Sample- and video-level handlers use `db.list_artifacts_by_sample`, `db.list_metrics_by_sample`, and `db.list_samples_by_video`. `/api/runs/{id}/timeline` remains as a compatibility/debug endpoint and returns `X-Deprecated: use /videos`.
+
+### Multi-Group Inference (V13)
+
+One inference task can span multiple `videos/` groups. `datasets._resolve_video_entries` / `VideoEntry` and `file_inputs.resolve_video_selection` accept either a single `video_group` (legacy) or a `video_groups` list. Single-group runs stay byte-identical to legacy behavior — dataset root is the group folder, clip names stay bare — so cache and reference keys remain compatible. Only multi-group runs root at `videos/` and qualify clips as `group/file`. The infer form sends `video_group` (single) or `video_groups` (multi); the frontend uses a `#video-group-picker` multi-checkbox with per-group video tables. Default run name is `model-checkpoint-videogroup` (`server._default_run_name`).
+
+### Run Feedback + Statistics (V13)
+
+Runs carry user feedback (rating 1–5 and/or free-text issue). Table `run_feedback` (id, run_id FK CASCADE, username, rating INT nullable, issue TEXT, metadata_json, created_at) is in both SCHEMA and `_migrate`, indexed by `idx_run_feedback_run(run_id, created_at)`.
+
+- DB methods: `add_run_feedback`, `list_run_feedback(run_id)`, `delete_run_feedback(run_id, feedback_id)` (scoped by run_id), `list_all_feedback`, `feedback_stats` (overall + rating_distribution + by_user + by_run).
+- Server: `_create_run_feedback` validates rating 1–5 and requires a rating or issue; `_feedback_overview` wraps `feedback_stats` and adds recent entries. Routes: `POST/GET /api/runs/{id}/feedback`, `DELETE /api/runs/{id}/feedback/{fid}`, `GET /api/feedback`. `_run_detail` includes `run["feedback"]`.
+- Frontend: `renderRunFeedback` panel in run detail, a "统计" nav view (`#view-stats`) with `loadStats`/`renderStats`, plus `submitRunFeedback`/`deleteRunFeedback`. Tests in `tests/test_run_feedback.py`.
+
+### Compare Track-Label Dedup (V13)
+
+Sample names are `{video_token}__{track_token}__{frame}` with `UNIQUE(dataset_id, name)` + `INSERT OR REPLACE`. Two selected preds sharing a sanitized track token silently overwrote each other (symptom: 1 GT + 1 pred instead of 2). `server._dedupe_track_labels(distorted_tracks)` bumps colliding labels to `{base}#{index+1}` (dedup on the sanitized token, not the raw label) before building `compare_tracks`. Regression test in `tests/test_compare_multitrack.py`.
 
 ## Testing Notes
 

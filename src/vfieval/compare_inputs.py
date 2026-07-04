@@ -207,21 +207,28 @@ def _positive_int(value: Any, message: str) -> int:
     return number
 
 
-def validate_strict_alignment(reference: dict[str, Any], distorted: dict[str, Any]) -> None:
-    if int(reference.get("frame_count") or 0) != int(distorted.get("frame_count") or 0):
-        raise ValueError(
-            "strict compare requires matching frame counts: "
-            f"{reference.get('frame_count')} vs {distorted.get('frame_count')}"
-        )
-    if (int(reference.get("width") or 0), int(reference.get("height") or 0)) != (
-        int(distorted.get("width") or 0),
-        int(distorted.get("height") or 0),
-    ):
-        raise ValueError(
-            "strict compare requires matching frame dimensions: "
-            f"{reference.get('width')}x{reference.get('height')} vs "
-            f"{distorted.get('width')}x{distorted.get('height')}"
-        )
+def validate_strict_alignment(reference: dict[str, Any], distorted: dict[str, Any]) -> dict[str, Any]:
+    """Validate reference/distorted alignment for ``strict`` compare.
+
+    Frame counts are allowed to differ (common for VFI comparisons, where GT is
+    the source clip with ``N`` frames and Pred with ``N-step`` frames). The
+    effective, aligned frame count is ``min(ref_fc, dist_fc)`` — decoded-frame
+    lists are trimmed to that length before sample assembly.
+
+    Resolution is allowed to differ too: the higher-resolution side is
+    downscaled per-frame to the common ``target_width`` x ``target_height``
+    (per-axis min) before evaluation and visualization.
+
+    fps must still match — it is not affected by frame sampling or scaling.
+
+    Returns the resolved alignment metadata including ``effective_frame_count``
+    and ``target_width``/``target_height``.
+    """
+    ref_fc = int(reference.get("frame_count") or 0)
+    dist_fc = int(distorted.get("frame_count") or 0)
+    # Common frame count is the shorter side. Decoded-frame lists are trimmed to
+    # this downstream in validate_strict_decoded_alignment / scan_compare_*.
+    effective_frame_count = min(ref_fc, dist_fc) if ref_fc and dist_fc else max(ref_fc, dist_fc)
     reference_fps = reference.get("fps")
     distorted_fps = distorted.get("fps")
     if reference_fps is not None and distorted_fps is not None:
@@ -230,6 +237,34 @@ def validate_strict_alignment(reference: dict[str, Any], distorted: dict[str, An
                 "strict compare requires matching fps metadata: "
                 f"{reference_fps} vs {distorted_fps}"
             )
+    ref_w = int(reference.get("width") or 0)
+    ref_h = int(reference.get("height") or 0)
+    dist_w = int(distorted.get("width") or 0)
+    dist_h = int(distorted.get("height") or 0)
+    # Common target is the smaller of each axis. The higher-resolution side is
+    # downscaled to this size before evaluation/visualization; the lower side is
+    # never upscaled (downscaling only — preserves detail, matches VMAF's
+    # equal-size requirement).
+    target_w = min(ref_w, dist_w) if ref_w and dist_w else max(ref_w, dist_w)
+    target_h = min(ref_h, dist_h) if ref_h and dist_h else max(ref_h, dist_h)
+    return {
+        # Original clip counts, useful for the UI badge ("帧数 X ≠ Y → 已对齐Z帧").
+        "frame_count": ref_fc,
+        "track_frame_count": dist_fc,
+        # Length that downstream sample assembly actually uses.
+        "effective_frame_count": effective_frame_count,
+        "reference_needs_trim": ref_fc > effective_frame_count,
+        "distorted_needs_trim": dist_fc > effective_frame_count,
+        "width": ref_w,
+        "height": ref_h,
+        "track_width": dist_w,
+        "track_height": dist_h,
+        "target_width": target_w,
+        "target_height": target_h,
+        "reference_needs_downscale": (ref_w, ref_h) != (target_w, target_h),
+        "distorted_needs_downscale": (dist_w, dist_h) != (target_w, target_h),
+        "fps": reference_fps if reference_fps is not None else distorted_fps,
+    }
 
 
 def validate_strict_decoded_alignment(
@@ -240,11 +275,21 @@ def validate_strict_decoded_alignment(
     reference_timestamps: list[float | None],
     distorted_timestamps: list[float | None],
 ) -> None:
+    # GT (N source frames) and Pred (typically N-step inferred frames) rarely
+    # share a length. Trim both decoded-frame lists to their common min length
+    # so downstream iteration always stays in lockstep. The leading frames are
+    # kept — for step=1 this matches the natural "pred[i] ≈ source[i+1]" layout.
+    common = min(len(reference_frames), len(distorted_frames))
+    if common == 0:
+        raise ValueError("strict compare requires at least one aligned frame on each side")
     if len(reference_frames) != len(distorted_frames):
-        raise ValueError(
-            "strict compare requires matching frame counts: "
-            f"{len(reference_frames)} vs {len(distorted_frames)}"
-        )
+        del reference_frames[common:]
+        del distorted_frames[common:]
+        # Timestamps frame-indexed with the frames; stay in lockstep.
+        if reference_timestamps is not None and len(reference_timestamps) > common:
+            del reference_timestamps[common:]
+        if distorted_timestamps is not None and len(distorted_timestamps) > common:
+            del distorted_timestamps[common:]
     if reference_fps is not None and distorted_fps is not None:
         if abs(float(reference_fps) - float(distorted_fps)) > 1e-6:
             raise ValueError(

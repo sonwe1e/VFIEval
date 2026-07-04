@@ -74,7 +74,7 @@ METRIC_REQUIREMENTS = {
         ),
     },
     "cgvqm": {
-        "packages": ("numpy", "scipy", "av"),
+        "packages": ("torch", "torchvision", "numpy", "av"),
         "granularity": "video",
         "supports_timeline": False,
         "requires_video_input": True,
@@ -473,11 +473,7 @@ def _manifest_command_health(
     manifest_error: str | None,
 ) -> dict[str, Any]:
     expected_paths = [str(manifest_path.resolve())]
-    missing_packages = [
-        package
-        for package in requirement.get("packages", ())
-        if importlib.util.find_spec(package) is None
-    ]
+    missing_packages = _missing_packages(requirement.get("packages", ()))
     if missing_packages:
         return _status(
             metric_name,
@@ -753,12 +749,8 @@ def _feature_metric_health(
                 extra=_feature_status_extra(requirement, manifest_path, manifest, weights_path=weights_path, repo_dir=repo_dir),
             )
 
-    missing_packages = [
-        package
-        for package in requirement.get("packages", ())
-        if importlib.util.find_spec(package) is None
-    ]
-    if weights_path.suffix.lower() == ".safetensors" and importlib.util.find_spec("safetensors") is None:
+    missing_packages = _missing_packages(requirement.get("packages", ()))
+    if weights_path.suffix.lower() == ".safetensors" and _missing_packages(("safetensors",)):
         missing_packages.append("safetensors")
     if missing_packages:
         return _status(
@@ -840,16 +832,16 @@ def _cgvqm_health(
             extra=_cgvqm_status_extra(requirement, manifest_path, manifest, repo_dir=repo_dir, weights_path=weights_path),
         )
 
-    missing_packages = [
-        package
-        for package in requirement.get("packages", ())
-        if importlib.util.find_spec(package) is None
-    ]
+    missing_packages = _missing_packages(requirement.get("packages", ()))
     if missing_packages:
         return _status(
             metric_name,
             STATUS_MISSING_DEPENDENCY,
-            f"missing Python package: {', '.join(missing_packages)}",
+            (
+                f"missing Python package(s): {', '.join(missing_packages)}. "
+                f"Install them into the VFIEval environment (e.g. pip install {' '.join(missing_packages)}). "
+                "These are Python dependencies, not bundled assets — packaging set/ (set.zip) does not carry them."
+            ),
             requirement,
             manifest_path=manifest_path,
             expected_paths=expected_paths,
@@ -1354,6 +1346,25 @@ def _placeholder_manifest(metric_name: str) -> dict[str, Any]:
         "env": {},
         "notes": "Replace this placeholder with a real manifest, driver, and metric assets before production evaluation.",
     }
+
+
+def _missing_packages(packages: tuple[str, ...]) -> list[str]:
+    """Return the import-missing packages from `packages`.
+
+    `importlib.util.find_spec` can raise (e.g. ModuleNotFoundError for a parent
+    package, ValueError for odd specs) rather than returning None, so treat any
+    failure to locate a spec as "missing" instead of letting it bubble up and
+    crash the whole health check.
+    """
+    missing: list[str] = []
+    for package in packages:
+        try:
+            found = importlib.util.find_spec(package) is not None
+        except Exception:
+            found = False
+        if not found:
+            missing.append(package)
+    return missing
 
 
 def _command_file_paths(command: list[str]) -> list[str]:

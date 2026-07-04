@@ -229,6 +229,120 @@ def resolve_selected_videos(workspace: WorkspaceConfig, video_group: str, select
     return resolved
 
 
+def resolve_video_selection(workspace: WorkspaceConfig, payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the run payload's group/video selection into one structure.
+
+    Accepts two shapes:
+
+    - Multi-group: ``video_groups`` is a list of group names and
+      ``selected_videos`` is a list of ``"group/file"`` entries (or omitted to
+      take every video in each listed group).
+    - Single-group (legacy): ``video_group`` is one name and ``selected_videos``
+      is a list of bare file names (or omitted for the whole group).
+
+    Returns a dict with ``groups`` (ordered, de-duplicated), ``primary_group``,
+    ``multi_group``, ``entries`` (``{group, video_file, path, qualified}``), and
+    ``selected_videos`` — the exact list to persist in dataset metadata: bare
+    file names for single-group runs (so decode roots at the group folder and
+    caches stay identical), or ``"group/file"`` for multi-group runs.
+    """
+    raw_groups = payload.get("video_groups")
+    if raw_groups is None:
+        single = str(payload.get("video_group") or "").strip()
+        group_names = [single] if single else []
+    else:
+        group_names = [str(name).strip() for name in raw_groups if str(name).strip()]
+    # Preserve order while dropping duplicates.
+    group_names = list(dict.fromkeys(group_names))
+    if not group_names:
+        raise ValueError("至少选择一个视频集")
+
+    multi_group = len(group_names) > 1
+    videos_root = videos_dir(workspace)
+
+    # Index every video available across the selected groups.
+    available: dict[str, list[str]] = {}
+    for group in group_names:
+        folder = resolve_video_group(workspace, group)
+        available[group] = [path.name for path in _iter_videos(folder)]
+
+    raw_selection = payload.get("selected_videos")
+    if isinstance(raw_selection, str):
+        raw_selection = [part.strip() for part in raw_selection.split(",") if part.strip()]
+    if raw_selection is None:
+        # Key omitted entirely → take the whole group(s).
+        selection = None
+    else:
+        # An explicit list (even empty) means the caller chose specific videos;
+        # an empty list is an error, not a whole-group shortcut.
+        selection = [str(item) for item in raw_selection]
+
+    entries: list[dict[str, Any]] = []
+    if selection is None:
+        # Whole-group selection across every listed group.
+        for group in group_names:
+            for name in available[group]:
+                entries.append(_video_selection_entry(videos_root, group, name, multi_group))
+    else:
+        for raw in selection:
+            group, file_name = _split_video_selection(raw, group_names, multi_group)
+            if file_name not in available.get(group, []):
+                raise FileNotFoundError(f"选中的视频不存在或不支持: {raw}")
+            entries.append(_video_selection_entry(videos_root, group, file_name, multi_group))
+
+    if not entries:
+        raise ValueError("至少选择一个视频")
+
+    return {
+        "groups": group_names,
+        "primary_group": group_names[0],
+        "multi_group": multi_group,
+        "entries": entries,
+        "selected_videos": [entry["qualified"] for entry in entries],
+    }
+
+
+def _split_video_selection(raw: str, group_names: list[str], multi_group: bool) -> tuple[str, str]:
+    normalized = str(raw).replace("\\", "/")
+    parts = [part for part in normalized.split("/") if part]
+    if multi_group:
+        if len(parts) != 2:
+            raise ValueError(f"多视频集选择必须是 'group/file': {raw}")
+        group, file_name = parts
+        if group not in group_names:
+            raise ValueError(f"视频选择引用了未选择的视频集: {raw}")
+    else:
+        group = group_names[0]
+        file_name = parts[-1] if parts else str(raw)
+    if Path(file_name).name != file_name:
+        raise ValueError(f"视频选择只能使用文件名: {raw}")
+    return group, file_name
+
+
+def _video_selection_entry(videos_root: Path, group: str, file_name: str, multi_group: bool) -> dict[str, Any]:
+    folder = resolve_video_group_root(videos_root, group)
+    path = (folder / file_name).resolve()
+    _ensure_child(path, folder, "视频不在视频集目录下")
+    qualified = f"{group}/{file_name}" if multi_group else file_name
+    return {
+        "group": group,
+        "video_file": file_name,
+        "path": path,
+        "qualified": qualified,
+        "display_name": f"{group}/{Path(file_name).stem}" if multi_group else Path(file_name).stem,
+    }
+
+
+def resolve_video_group_root(videos_root: Path, video_group: str) -> Path:
+    if Path(video_group).name != video_group:
+        raise ValueError("视频集必须是 videos/ 下的一级文件夹")
+    path = (videos_root / video_group).resolve()
+    _ensure_child(path, videos_root, "视频集不在 videos/ 目录下")
+    if not path.is_dir():
+        raise FileNotFoundError(f"视频集不存在: {video_group}")
+    return path
+
+
 def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, Any]) -> dict[str, Any]:
     if str(payload.get("run_type") or "model_inference") == "video_compare":
         from vfieval.compare_inputs import (
@@ -279,7 +393,7 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
                 distorted = resolve_compare_descriptor(workspace, db, descriptor, role="distorted")
                 track_label = str(distorted.get("track_label") or distorted.get("label") or f"pred{track_index + 1}")
                 try:
-                    validate_strict_alignment(reference, distorted)
+                    track_alignment = validate_strict_alignment(reference, distorted)
                     distorted_frames, distorted_fps, distorted_timestamps = _load_compare_source_frames(
                         workspace,
                         Path(str(distorted["path"])),
@@ -302,17 +416,77 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
                         "track_label": track_label,
                         "frame_count": len(distorted_frames),
                         "fps": distorted_fps,
+                        "alignment": track_alignment,
                     }
                 )
                 distorted_tracks.append(track)
+            # The common downscale target across all tracks is the per-axis min of
+            # every source's dimensions. The frame-level rescale in sample
+            # assembly uses this so GT and every track's pred share one size.
+            target_w = int(reference["width"])
+            target_h = int(reference["height"])
+            for track in distorted_tracks:
+                target_w = min(target_w, int(track.get("width") or 0))
+                target_h = min(target_h, int(track.get("height") or 0))
+            reference_needs_downscale = (int(reference["width"]), int(reference["height"])) != (target_w, target_h)
+            for track in distorted_tracks:
+                reference_reported = reference_needs_downscale
+                track_reported = (int(track.get("width") or 0), int(track.get("height") or 0)) != (target_w, target_h)
+                track["alignment"] = {
+                    **(track.get("alignment") or {}),
+                    "reference_target_width": target_w,
+                    "reference_target_height": target_h,
+                    "reference_needs_downscale": reference_reported,
+                    "distorted_needs_downscale": track_reported,
+                }
             result["reference"] = reference
             result["distorted"] = distorted_tracks[0] if distorted_tracks else {}
             result["distorted_tracks"] = distorted_tracks
+            ref_w0 = int(reference["width"])
+            ref_h0 = int(reference["height"])
+            if reference_needs_downscale or any(
+                (int(track.get("width") or 0), int(track.get("height") or 0)) != (target_w, target_h)
+                for track in distorted_tracks
+            ):
+                result["warnings"].append(
+                    {
+                        "title": "分辨率不一致，将按短边降采样",
+                        "message": (
+                            f"GT {ref_w0}x{ref_h0} 与 pred 分辨率不一致，"
+                            f"较高分辨率一侧将降采样到 {target_w}x{target_h} 用于评测和可视化"
+                        ),
+                        "type": "CompareResolutionMismatch",
+                        "details": {"target_width": target_w, "target_height": target_h},
+                    }
+                )
+            # effective post-trim frame count = len(reference_frames) after
+            # validate_strict_decoded_alignment trimmed both to common length.
+            aligned_frame_count = len(reference_frames)
+            original_ref_frame_count = int(reference.get("frame_count") or 0)
+            if original_ref_frame_count and aligned_frame_count != original_ref_frame_count:
+                result["warnings"].append(
+                    {
+                        "title": "帧数不一致，将按短边对齐",
+                        "message": (
+                            f"GT {original_ref_frame_count} 帧与 pred {aligned_frame_count} 帧不一致，"
+                            f"已对齐到 {aligned_frame_count} 帧用于评测和可视化"
+                        ),
+                        "type": "CompareFrameCountMismatch",
+                        "details": {
+                            "reference_frame_count": original_ref_frame_count,
+                            "aligned_frame_count": aligned_frame_count,
+                        },
+                    }
+                )
             result["alignment"] = {
                 "mode": "strict",
-                "frame_count": len(reference_frames),
-                "width": int(reference["width"]),
-                "height": int(reference["height"]),
+                "frame_count": aligned_frame_count,
+                "reference_frame_count": original_ref_frame_count,
+                "width": ref_w0,
+                "height": ref_h0,
+                "target_width": target_w,
+                "target_height": target_h,
+                "reference_needs_downscale": reference_needs_downscale,
                 "fps": reference_fps if reference_fps is not None else (distorted_tracks[0].get("fps") if distorted_tracks else None),
                 "track_count": len(distorted_tracks),
                 "verified_with": "decoded_frames",
@@ -427,15 +601,20 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
         result["model"] = {"name": model_file, "interface_ok": False, "tested_devices": tested_devices}
         result["errors"].append(_error("模型检查失败", exc))
 
-    video_folder: Path | None = None
     video_infos: list[dict[str, Any]] = []
     try:
-        video_folder = resolve_video_group(workspace, video_group)
-        video_paths = resolve_selected_videos(workspace, video_group, payload.get("selected_videos"))
-        if not video_paths:
+        selection = resolve_video_selection(workspace, payload)
+        entries = selection["entries"]
+        if not entries:
             raise FileNotFoundError("视频集中没有支持的视频文件")
-        for video_path in video_paths:
+        for entry in entries:
+            video_path = entry["path"]
             info = inspect_video(video_path, workspace, exact=True)
+            # Carry the qualified identity so multi-group selections stay
+            # unambiguous in the preflight table (same file name in two groups).
+            info["name"] = entry["display_name"]
+            info["group"] = entry["group"]
+            info["video_file"] = entry["video_file"]
             info["valid_triplets"] = _valid_triplets(info["frame_count"], frame_step, max_frames)
             info["triplets"] = info["valid_triplets"]
             info["cache_key"] = decode_cache_key(video_path, "video_gt_triplets", frame_step, max_frames)
@@ -447,11 +626,13 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
             raise RuntimeError(f"视频无法解码: {', '.join(bad)}")
         if short:
             raise RuntimeError(f"视频帧数不足 3 帧: {', '.join(short)}")
+        groups = selection["groups"]
         result["video_group"] = {
-            "name": video_folder.name,
-            "path": str(video_folder),
+            "name": " + ".join(groups) if selection["multi_group"] else selection["primary_group"],
+            "groups": groups,
+            "multi_group": selection["multi_group"],
             "video_count": len(video_infos),
-            "selected_videos": [path.name for path in video_paths],
+            "selected_videos": selection["selected_videos"],
             "frame_count": sum(int(info["frame_count"]) for info in video_infos),
             "duration_seconds": sum(float(info.get("duration_seconds") or 0.0) for info in video_infos),
             "triplets": sum(int(info["triplets"]) for info in video_infos),
@@ -1179,8 +1360,18 @@ def _optional_positive_int(value: Any) -> int | None:
 
 
 def _valid_triplets(frame_count: int, frame_step: int, max_frames: int | None) -> int:
+    # One interpolated frame per adjacent source pair (N-step samples). This
+    # now matches _add_video_triplets, so the predicted video is N-step frames
+    # long — previously it was N-2*step, which lost the boundary samples. The
+    # last sample is a clamped boundary pair with no strict GT; every earlier
+    # sample is a symmetric triple. Threshold for "ok to run" is at least one
+    # strict triple (>= 2*step+1 frames), so the count is clamped to zero below
+    # that floor (matches the inner-loop guard in _add_video_triplets).
     effective = min(int(frame_count or 0), max_frames or int(frame_count or 0))
-    return max(0, effective - 2 * max(1, int(frame_step or 1)))
+    step = max(1, int(frame_step or 1))
+    if effective < 2 * step + 1:
+        return 0
+    return max(0, effective - step)
 
 
 def _parse_rate(value: Any) -> float | None:

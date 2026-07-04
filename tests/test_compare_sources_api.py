@@ -66,6 +66,39 @@ class CompareSourcesApiTests(unittest.TestCase):
             finally:
                 stop_server(server, thread)
 
+    def test_compare_gt_sources_include_run_resident_gt_videos(self) -> None:
+        # A run's own gt_video is the only GT guaranteed to align with that run's
+        # pred (same trim/downscale), so the GT picker must surface it alongside
+        # raw videos/ clips. Regression for the "pred can't be compared against
+        # anything aligned" report.
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": tmp}, clear=False):
+            workspace, db = make_workspace(tmp)
+            gt_path = Path(tmp) / "videos" / "anime" / "clip.mp4"
+            gt_path.parent.mkdir(parents=True, exist_ok=True)
+            write_mp4(gt_path, [(0, 0, 0), (20, 0, 0), (40, 0, 0)])
+            pred_path = workspace.root / "pred-a.mp4"
+            run_gt_path = workspace.root / "run-a-gt.mp4"
+            write_mp4(pred_path, [(0, 0, 0), (0, 20, 0), (0, 40, 0)])
+            write_mp4(run_gt_path, [(0, 0, 0), (0, 20, 0), (0, 40, 0)])
+            run_id = add_completed_pred_run(
+                db, workspace, "ModelA", pred_path, gt_video_path=run_gt_path
+            )
+
+            server, thread, base_url = start_server(db, workspace)
+            try:
+                gt_sources = get_json(base_url, "/api/compare-sources/gt")["sources"]
+                run_gt = [row for row in gt_sources if row.get("kind") == "run_gt"]
+                self.assertEqual(len(run_gt), 1)
+                self.assertEqual(run_gt[0]["run_id"], run_id)
+                self.assertEqual(run_gt[0]["artifact_kind"], "gt_video")
+                self.assertGreater(run_gt[0]["artifact_id"], 0)
+                # Raw videos/ GT is still enumerated.
+                self.assertTrue(any(row.get("kind") == "video_group" for row in gt_sources))
+                # Run GTs are listed first (they are the aligned option).
+                self.assertEqual(gt_sources[0]["kind"], "run_gt")
+            finally:
+                stop_server(server, thread)
+
     def test_compare_sources_support_pagination_and_filters(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": tmp}, clear=False):
             workspace, db = make_workspace(tmp)

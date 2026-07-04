@@ -40,6 +40,7 @@ const state = {
   sampleDetails: {},
   sampleDetailLoading: {},
   selectedVideosByGroup: {},
+  selectedGroups: new Set(),
   videoPages: {},
   videoPageQuery: {},
   videoPageSort: {},
@@ -66,12 +67,18 @@ const state = {
   compareTrackLabels: {},
   preflightAbortController: null,
   preflightPayloadKey: "",
+  comparePreflight: null,
+  comparePreflightTimer: null,
+  comparePreflightPayloadKey: "",
+  comparePreflightAbortController: null,
   sampleAbortController: null,
   timelineAbortController: null,
   compareGridColumns: 3,
   slotSelectionBySample: {},
   compareSlotLayout: "side",
   selectedRunIds: new Set(),
+  feedbackUsername: "",
+  feedbackStats: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -137,9 +144,27 @@ function currentRunType() {
   return $("infer-form").elements.run_type?.value || "model_inference";
 }
 
+function selectedGroupNames() {
+  // Preserve catalog order so the merged run and default name are deterministic.
+  return state.videoGroups
+    .map((item) => item.name)
+    .filter((name) => state.selectedGroups.has(name));
+}
+
+function primaryGroupName() {
+  return selectedGroupNames()[0] || "";
+}
+
+function isMultiGroup() {
+  return selectedGroupNames().length > 1;
+}
+
 function currentGroup() {
-  if (currentRunType() !== "model_inference") return null;
-  const name = $("infer-form").elements.video_group.value;
+  const name = primaryGroupName();
+  return state.videoGroups.find((item) => item.name === name) || null;
+}
+
+function groupByName(name) {
   return state.videoGroups.find((item) => item.name === name) || null;
 }
 
@@ -190,45 +215,65 @@ function renderMetricOptions() {
 }
 
 function renderModeSections() {
-  const runType = currentRunType();
   document.querySelectorAll("[data-mode-section]").forEach((item) => {
-    item.hidden = item.dataset.modeSection !== runType;
+    item.hidden = item.dataset.modeSection !== "model_inference";
   });
-  $("video-selection").hidden = runType !== "model_inference";
   $("video-selection").hidden = false;
 }
 
 function renderOptions() {
   const form = $("infer-form");
   const previousModel = form.elements.model_file.value;
-  const previousGroup = form.elements.video_group.value;
   const previousCheckpoint = form.elements.checkpoint?.value || "none";
   const previousDevice = form.elements.device?.value || "auto";
 
   form.elements.model_file.innerHTML = state.modelFiles
     .map((item) => `<option value="${escapeHtml(item.name)}">${escapeHtml(item.name)}</option>`)
     .join("");
-  form.elements.video_group.innerHTML = state.videoGroups
-    .map((item) => `<option value="${escapeHtml(item.name)}">${escapeHtml(item.name)} (${item.video_count})</option>`)
-    .join("");
 
   form.elements.model_file.value = state.modelFiles.some((item) => item.name === previousModel)
     ? previousModel
     : (state.modelFiles.some((item) => item.name === "test_average.py") ? "test_average.py" : state.modelFiles[0]?.name || "");
-  form.elements.video_group.value = state.videoGroups.some((item) => item.name === previousGroup)
-    ? previousGroup
-    : (state.videoGroups.some((item) => item.name === "test_style") ? "test_style" : state.videoGroups[0]?.name || "");
 
   if (!form.elements.run_type.value) {
     form.elements.run_type.value = "model_inference";
   }
 
+  // Drop any previously-selected groups that no longer exist, then default to
+  // one group so the form is usable on first load.
+  const available = new Set(state.videoGroups.map((item) => item.name));
+  for (const name of Array.from(state.selectedGroups)) {
+    if (!available.has(name)) state.selectedGroups.delete(name);
+  }
+  if (!state.selectedGroups.size && state.videoGroups.length) {
+    const initial = state.videoGroups.some((item) => item.name === "test_style")
+      ? "test_style"
+      : state.videoGroups[0].name;
+    state.selectedGroups.add(initial);
+  }
+
   renderCheckpointOptions(previousCheckpoint);
   renderSingleDeviceOptions(previousDevice);
   renderDeviceOptions();
-  ensureVideoSelection(form.elements.video_group.value);
+  renderGroupPicker();
+  for (const name of selectedGroupNames()) ensureVideoSelection(name);
   renderCustomSizeVisibility();
   renderModeSections();
+}
+
+function renderGroupPicker() {
+  const host = $("video-group-picker");
+  if (!host) return;
+  if (!state.videoGroups.length) {
+    host.innerHTML = "<p class=\"muted\">videos/ 下没有可用的视频集。</p>";
+    return;
+  }
+  host.innerHTML = state.videoGroups.map((item) => `
+    <label class="check-item">
+      <input type="checkbox" data-group-toggle="${escapeHtml(item.name)}" ${state.selectedGroups.has(item.name) ? "checked" : ""}>
+      <span>${escapeHtml(item.name)} (${escapeHtml(item.video_count)})</span>
+    </label>
+  `).join("");
 }
 
 function renderCheckpointOptions(previousValue = null) {
@@ -327,13 +372,34 @@ function ensureVideoSelection(groupName) {
   return state.selectedVideosByGroup[groupName];
 }
 
-function selectedVideoNames() {
-  const group = currentGroup();
+function groupVideoNames(groupName) {
+  const group = groupByName(groupName);
   if (!group) return [];
-  const page = state.videoPages[group.name];
-  const names = page?.all_video_names || (group.videos || []).map((video) => video.name);
-  const selected = ensureVideoSelection(group.name);
+  const page = state.videoPages[groupName];
+  return page?.all_video_names || (group.videos || []).map((video) => video.name);
+}
+
+function selectedVideoNamesForGroup(groupName) {
+  const names = groupVideoNames(groupName);
+  const selected = ensureVideoSelection(groupName);
   return names.filter((name) => selected.has(name));
+}
+
+function selectedVideoNames() {
+  // Single-group runs keep bare file names (byte-identical caches/reference keys);
+  // multi-group runs qualify every selection as "group/file".
+  const groups = selectedGroupNames();
+  if (!groups.length) return [];
+  if (groups.length === 1) {
+    return selectedVideoNamesForGroup(groups[0]);
+  }
+  const qualified = [];
+  for (const name of groups) {
+    for (const video of selectedVideoNamesForGroup(name)) {
+      qualified.push(`${name}/${video}`);
+    }
+  }
+  return qualified;
 }
 
 async function loadVideoGroupPage(groupName, page = 1) {
@@ -346,18 +412,24 @@ async function loadVideoGroupPage(groupName, page = 1) {
   renderVideoSelection();
 }
 
-function videoSelectionPager(page) {
+function videoSelectionPager(page, groupName) {
   if (!page || Number(page.total_pages || 1) <= 1) return "";
+  const g = escapeHtml(groupName);
   return `
     <div class="pager video-page-pager">
-      <button class="secondary" data-video-page="${Number(page.page || 1) - 1}" ${Number(page.page || 1) <= 1 ? "disabled" : ""} type="button">上一页</button>
+      <button class="secondary" data-video-page="${Number(page.page || 1) - 1}" data-video-group="${g}" ${Number(page.page || 1) <= 1 ? "disabled" : ""} type="button">上一页</button>
       <span class="muted">第 ${escapeHtml(page.page || 1)} / ${escapeHtml(page.total_pages || 1)} 页，筛选 ${escapeHtml(page.filtered_count || 0)} / ${escapeHtml(page.video_count || 0)} 个视频</span>
-      <button class="secondary" data-video-page="${Number(page.page || 1) + 1}" ${Number(page.page || 1) >= Number(page.total_pages || 1) ? "disabled" : ""} type="button">下一页</button>
+      <button class="secondary" data-video-page="${Number(page.page || 1) + 1}" data-video-group="${g}" ${Number(page.page || 1) >= Number(page.total_pages || 1) ? "disabled" : ""} type="button">下一页</button>
     </div>
   `;
 }
 
 function compareGtKey(row) {
+  // Run-resident GT videos (kind "run_gt") are keyed by artifact so two runs of
+  // the same clip stay distinct. Raw videos/ clips key on group::video.
+  if (row.kind === "run_gt") {
+    return `run_gt::${row.run_id}::${row.artifact_id}`;
+  }
   return `${row.group || ""}::${row.video || ""}`;
 }
 
@@ -375,6 +447,29 @@ function selectedComparePredRows() {
 function compareTrackLabel(row) {
   const artifactId = Number(row.artifact_id);
   return state.compareTrackLabels[artifactId] || row.compare_track_label || row.run_name || `run-${row.run_id}`;
+}
+
+// Compare warns on frame-count / size mismatches; they are no longer hard
+// blockers because the backend trims both tracks to their common min frame
+// count and downscales the higher-resolution side to min(W)×min(H). Reasons
+// are surfaced as an informational tooltip ("按短边对齐 / 降采样") so the
+// user knows what the backend will do, not that the selection is rejected.
+function compareCompatibility(gt, predRow) {
+  if (!gt) return null;
+  const reasons = [];
+  const gtFrames = Number(gt.frame_count || 0);
+  const predFrames = Number(predRow.frame_count || 0);
+  if (gtFrames && predFrames && gtFrames !== predFrames) {
+    reasons.push(`帧数 ${predFrames} ≠ ${gtFrames} → 按短边对齐`);
+  }
+  const gtW = Number(gt.width || 0);
+  const gtH = Number(gt.height || 0);
+  const predW = Number(predRow.width || 0);
+  const predH = Number(predRow.height || 0);
+  if (gtW && gtH && predW && predH && (gtW !== predW || gtH !== predH)) {
+    reasons.push(`分辨率 ${predW}x${predH} ≠ ${gtW}x${gtH} → 按短边降采样`);
+  }
+  return { ok: reasons.length === 0, reasons };
 }
 
 function ensureCompareSelection() {
@@ -420,159 +515,98 @@ async function loadCompareSources(options = {}) {
   state.compareSourcesMeta.pred = predPayload;
   state.compareSourcesLoaded = true;
   ensureCompareSelection();
-  renderVideoSelection();
+  renderCompareSelection();
+}
+
+function renderGroupVideoTable(groupName) {
+  const group = groupByName(groupName);
+  if (!group) return "";
+  const page = state.videoPages[groupName];
+  if (!page) {
+    return `
+      <section class="group-video-block" data-group-block="${escapeHtml(groupName)}">
+        <div class="panel-head">
+          <div>
+            <h3>${escapeHtml(groupName)}</h3>
+            <p class="muted">只加载了分组摘要（${escapeHtml(group.video_count)} 个视频）。打开列表后再筛选、翻页。</p>
+          </div>
+          <button class="secondary" data-load-video-page="${escapeHtml(groupName)}" type="button">加载视频列表</button>
+        </div>
+      </section>
+    `;
+  }
+  const selected = ensureVideoSelection(groupName);
+  const query = state.videoPageQuery[groupName] || "";
+  const sort = state.videoPageSort[groupName] || "name";
+  return `
+    <section class="group-video-block" data-group-block="${escapeHtml(groupName)}">
+      <div class="panel-head">
+        <div>
+          <h3>${escapeHtml(groupName)}</h3>
+          <p class="muted">默认全选；筛选、翻页和排序都在服务端执行。</p>
+        </div>
+        <div class="actions">
+          <span class="muted">${selected.size}/${page.video_count} 已选</span>
+          <button class="secondary" data-video-select="all-filtered" data-group="${escapeHtml(groupName)}" type="button">全选筛选</button>
+          <button class="secondary" data-video-select="none-filtered" data-group="${escapeHtml(groupName)}" type="button">清空筛选</button>
+          <button class="secondary" data-video-select="invert-filtered" data-group="${escapeHtml(groupName)}" type="button">反选筛选</button>
+        </div>
+      </div>
+      <div class="video-tools">
+        <label>
+          <span>搜索视频</span>
+          <input data-video-query data-group="${escapeHtml(groupName)}" value="${escapeHtml(query)}" placeholder="文件名">
+        </label>
+        <label>
+          <span>排序</span>
+          <select data-video-sort data-group="${escapeHtml(groupName)}">
+            ${[
+              ["name", "名称"],
+              ["-name", "名称倒序"],
+              ["frame_count", "帧数"],
+              ["-frame_count", "帧数倒序"],
+              ["duration", "时长"],
+              ["-duration", "时长倒序"],
+              ["resolution", "分辨率"],
+              ["-resolution", "分辨率倒序"],
+              ["triplets", "Triplets"],
+              ["-triplets", "Triplets 倒序"],
+            ].map(([value, label]) => `<option value="${escapeHtml(value)}" ${sort === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
+          </select>
+        </label>
+      </div>
+      <div class="table compact-table">${table(page.videos || [], [
+        { label: "", render: (row) => `<input type="checkbox" data-video-name="${escapeHtml(row.name)}" data-group="${escapeHtml(groupName)}" ${selected.has(row.name) ? "checked" : ""}>` },
+        { label: "视频", render: (row) => escapeHtml(row.name) },
+        { label: "帧数", render: (row) => escapeHtml(row.frame_count) },
+        { label: "Triplets", render: (row) => escapeHtml(row.valid_triplets ?? 0) },
+        { label: "FPS", render: (row) => formatNumber(row.fps) },
+        { label: "分辨率", render: (row) => `${escapeHtml(row.width)}x${escapeHtml(row.height)}` },
+        { label: "缓存", render: (row) => escapeHtml(row.cache_status || "-") },
+      ])}</div>
+      ${videoSelectionPager(page, groupName)}
+    </section>
+  `;
 }
 
 function renderVideoSelection() {
-  if (currentRunType() !== "model_inference") {
-    ensureCompareSelection();
-    if (!state.compareSourcesLoaded) {
-      $("video-selection").innerHTML = `
-        <div class="panel-head">
-          <div>
-            <h2>Compare sources</h2>
-            <p class="muted">选择一个 GT 和至少一个 Pred track。</p>
-          </div>
-          <button class="secondary" data-refresh-compare-sources type="button">加载来源</button>
-        </div>
-        <div class="timeline-skeleton" aria-busy="true"><span></span><span></span><span></span></div>
-      `;
-      return;
-    }
-    const gtRows = state.compareSources.gt || [];
-    const predRows = state.compareSources.pred || [];
-    const selectedPreds = state.selectedComparePredArtifacts;
-    const selectedLayerCount = state.selectedCompareLayerKinds.size;
-    const estimatedLayers = selectedPreds.size * selectedLayerCount;
-    $("video-selection").innerHTML = `
-      <div class="panel-head">
-        <div>
-          <h2>Compare sources</h2>
-          <p class="muted">GT 来自 videos/，Pred 来自已完成 Run 的 pred_video 产物。</p>
-        </div>
-        <div class="metric-summary">
-          <span>GT ${escapeHtml(state.compareSourcesMeta.gt?.filtered_count ?? gtRows.length)}</span>
-          <span>Pred ${escapeHtml(state.compareSourcesMeta.pred?.filtered_count ?? predRows.length)}</span>
-          <span>Selected ${escapeHtml(selectedPreds.size)}</span>
-        </div>
-      </div>
-      <div class="compare-source-grid">
-        <section>
-          <h3>GT</h3>
-          <div class="source-tools">
-            <label>
-              <span>搜索</span>
-              <input data-compare-query="gt" value="${escapeHtml(state.compareGtQuery)}" placeholder="group 或文件名">
-            </label>
-          </div>
-          <div class="table compact-table">${table(gtRows, [
-            { label: "", render: (row) => `<input type="radio" name="compare_gt_pick" data-compare-gt="${escapeHtml(compareGtKey(row))}" ${state.selectedCompareGtKey === compareGtKey(row) ? "checked" : ""}>` },
-            { label: "Video", render: (row) => `${escapeHtml(row.group)}/${escapeHtml(row.video)}` },
-            { label: "Frames", render: (row) => escapeHtml(row.frame_count || 0) },
-            { label: "Size", render: (row) => `${escapeHtml(row.width || "-")}x${escapeHtml(row.height || "-")}` },
-            { label: "FPS", render: (row) => formatNumber(row.fps) },
-          ])}</div>
-          ${compareSourcePager(state.compareSourcesMeta.gt, "gt")}
-        </section>
-        <section>
-          <h3>Pred tracks</h3>
-          <div class="source-tools">
-            <label>
-              <span>搜索</span>
-              <input data-compare-query="pred" value="${escapeHtml(state.comparePredQuery)}" placeholder="Run、视频或 track">
-            </label>
-          </div>
-          <div class="table compact-table">${table(predRows, [
-            { label: "", render: (row) => `<input type="checkbox" data-compare-pred="${escapeHtml(row.artifact_id)}" ${selectedPreds.has(Number(row.artifact_id)) ? "checked" : ""}>` },
-            { label: "Run", render: (row) => `#${escapeHtml(row.run_id)} ${escapeHtml(row.run_name || "")}` },
-            { label: "Video", render: (row) => escapeHtml(row.video || "-") },
-            { label: "Frames", render: (row) => escapeHtml(row.frame_count || 0) },
-            { label: "Track", render: (row) => `<input data-compare-track-label="${escapeHtml(row.artifact_id)}" value="${escapeHtml(compareTrackLabel(row))}">` },
-          ])}</div>
-          ${compareSourcePager(state.compareSourcesMeta.pred, "pred")}
-        </section>
-      </div>
-      <details class="compare-layer-picker">
-        <summary>Extra layers (${escapeHtml(estimatedLayers)} previews)</summary>
-        <div class="checkbox-row">
-          ${["flowt_0", "flowt_1", "mask0", "mask1", "warp0", "warp1", "blend"].map((kind) => `
-            <label class="check-item">
-              <input type="checkbox" data-compare-layer-kind="${escapeHtml(kind)}" ${state.selectedCompareLayerKinds.has(kind) ? "checked" : ""}>
-              <span>${escapeHtml(kind)}</span>
-            </label>
-          `).join("")}
-        </div>
-      </details>
-    `;
+  const groups = selectedGroupNames();
+  if (!groups.length) {
+    $("video-selection").innerHTML = "<p class=\"muted\">先选择一个或多个视频集。</p>";
     return;
   }
-  const group = currentGroup();
-  const page = group ? state.videoPages[group.name] : null;
-  if (!group) {
-    $("video-selection").innerHTML = "<p class=\"muted\">先选择一个视频集。</p>";
-    return;
-  }
-  if (!page) {
-    $("video-selection").innerHTML = `
-      <div class="panel-head">
-        <div>
-          <h2>视频选择</h2>
-          <p class="muted">当前只加载了分组摘要。打开列表后再筛选、翻页和预检查。</p>
-        </div>
-        <button class="secondary" data-load-video-page type="button">加载视频列表</button>
-      </div>
-    `;
-    return;
-  }
-  const selected = ensureVideoSelection(group.name);
-  const query = state.videoPageQuery[group.name] || "";
-  const sort = state.videoPageSort[group.name] || "name";
+  const totalSelected = groups.reduce((sum, name) => sum + selectedVideoNamesForGroup(name).length, 0);
+  const multi = groups.length > 1;
   $("video-selection").innerHTML = `
     <div class="panel-head">
       <div>
         <h2>视频选择</h2>
-        <p class="muted">默认全选；筛选、翻页和排序都在服务端执行。</p>
-      </div>
-      <div class="actions">
-        <span class="muted">${selected.size}/${page.video_count} 已选</span>
-        <button class="secondary" data-video-select="all-filtered" type="button">全选筛选</button>
-        <button class="secondary" data-video-select="none-filtered" type="button">清空筛选</button>
-        <button class="secondary" data-video-select="invert-filtered" type="button">反选筛选</button>
+        <p class="muted">${multi
+          ? `已合并 ${groups.length} 个视频集，视频以“视频集/文件名”限定，共 ${totalSelected} 个已选。`
+          : `默认全选；筛选、翻页和排序都在服务端执行，共 ${totalSelected} 个已选。`}</p>
       </div>
     </div>
-    <div class="video-tools">
-      <label>
-        <span>搜索视频</span>
-        <input data-video-query value="${escapeHtml(query)}" placeholder="文件名">
-      </label>
-      <label>
-        <span>排序</span>
-        <select data-video-sort>
-          ${[
-            ["name", "名称"],
-            ["-name", "名称倒序"],
-            ["frame_count", "帧数"],
-            ["-frame_count", "帧数倒序"],
-            ["duration", "时长"],
-            ["-duration", "时长倒序"],
-            ["resolution", "分辨率"],
-            ["-resolution", "分辨率倒序"],
-            ["triplets", "Triplets"],
-            ["-triplets", "Triplets 倒序"],
-          ].map(([value, label]) => `<option value="${escapeHtml(value)}" ${sort === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}
-        </select>
-      </label>
-    </div>
-    <div class="table compact-table">${table(page.videos || [], [
-      { label: "", render: (row) => `<input type="checkbox" data-video-name="${escapeHtml(row.name)}" ${selected.has(row.name) ? "checked" : ""}>` },
-      { label: "视频", render: (row) => escapeHtml(row.name) },
-      { label: "帧数", render: (row) => escapeHtml(row.frame_count) },
-      { label: "Triplets", render: (row) => escapeHtml(row.valid_triplets ?? 0) },
-      { label: "FPS", render: (row) => formatNumber(row.fps) },
-      { label: "分辨率", render: (row) => `${escapeHtml(row.width)}x${escapeHtml(row.height)}` },
-      { label: "缓存", render: (row) => escapeHtml(row.cache_status || "-") },
-    ])}</div>
-    ${videoSelectionPager(page)}
+    ${groups.map((name) => renderGroupVideoTable(name)).join("")}
   `;
 }
 
@@ -582,38 +616,16 @@ function selectedMetrics() {
 
 function payloadFromForm() {
   const data = formData($("infer-form"));
-  if ((data.run_type || "model_inference") === "video_compare") {
-    const gt = selectedCompareGt();
-    const predRows = selectedComparePredRows();
-    if (!gt || !predRows.length) {
-      return null;
-    }
-    return {
-      run_type: "video_compare",
-      reference: { kind: "video_group", group: gt.group, video: gt.video },
-      distorted: predRows.map((row) => ({
-        kind: "run_artifact",
-        run_id: Number(row.run_id),
-        video: row.video,
-        artifact_id: Number(row.artifact_id),
-        label: row.track_label || compareTrackLabel(row),
-      })),
-      extra_layers: state.selectedCompareLayerKinds.size
-        ? predRows.map((row) => ({
-            source: "run_artifact",
-            run_id: Number(row.run_id),
-            kinds: Array.from(state.selectedCompareLayerKinds),
-          }))
-        : [],
-      align_mode: data.align_mode || "strict",
-      metrics: selectedMetrics(),
-    };
-  }
+  const groups = selectedGroupNames();
+  const multi = groups.length > 1;
   return {
     run_type: "model_inference",
     model_file: data.model_file,
     checkpoint: data.checkpoint || "none",
-    video_group: data.video_group,
+    // Single-group runs keep the legacy `video_group` field (byte-identical
+    // caches/reference keys); multi-group runs send `video_groups`.
+    video_group: multi ? undefined : (groups[0] || ""),
+    video_groups: multi ? groups : undefined,
     selected_videos: selectedVideoNames(),
     resolution_mode: data.resolution_mode || "original",
     height: data.height ? Number(data.height) : null,
@@ -634,6 +646,71 @@ function payloadFromForm() {
   };
 }
 
+function comparePayloadFromForm() {
+  const data = formData($("compare-form"));
+  const gt = selectedCompareGt();
+  const predRows = selectedComparePredRows();
+  // GT is optional (preds-only comparison); need at least 2 tracks total.
+  const trackCount = predRows.length + (gt ? 1 : 0);
+  if (trackCount < 2) {
+    return null;
+  }
+  // With a GT selected, it is the reference and every pred is a distorted
+  // track. Without a GT (preds-only comparison), promote the first pred to the
+  // reference role — the backend accepts a run_artifact as reference.
+  let reference;
+  let distortedRows;
+  if (gt) {
+    // A run-resident GT resolves via its gt_video artifact (aligned with that
+    // run's pred); a raw videos/ clip resolves via group + file name.
+    reference = gt.kind === "run_gt"
+      ? {
+          kind: "run_artifact",
+          run_id: Number(gt.run_id),
+          artifact_id: Number(gt.artifact_id),
+          artifact_kind: "gt_video",
+          video: gt.video,
+          label: gt.video || "GT",
+        }
+      : { kind: "video_group", group: gt.group, video: gt.video };
+    distortedRows = predRows;
+  } else {
+    const head = predRows[0];
+    reference = {
+      kind: "run_artifact",
+      run_id: Number(head.run_id),
+      video: head.video,
+      artifact_id: Number(head.artifact_id),
+      label: head.track_label || compareTrackLabel(head),
+    };
+    distortedRows = predRows.slice(1);
+  }
+  return {
+    run_type: "video_compare",
+    reference,
+    distorted: distortedRows.map((row) => ({
+      kind: "run_artifact",
+      run_id: Number(row.run_id),
+      video: row.video,
+      artifact_id: Number(row.artifact_id),
+      label: row.track_label || compareTrackLabel(row),
+    })),
+    extra_layers: state.selectedCompareLayerKinds.size
+      ? distortedRows.map((row) => ({
+          source: "run_artifact",
+          run_id: Number(row.run_id),
+          kinds: Array.from(state.selectedCompareLayerKinds),
+        }))
+      : [],
+    align_mode: data.align_mode || "strict",
+    metrics: compareSelectedMetrics(),
+  };
+}
+
+function compareSelectedMetrics() {
+  return Array.from(document.querySelectorAll("#compare-metrics-options input[name='compare_metrics']:checked")).map((item) => item.value);
+}
+
 function schedulePreflight(delay = 600) {
   clearTimeout(state.preflightTimer);
   state.preflightTimer = setTimeout(() => runPreflight().catch(renderPreflightError), delay);
@@ -647,13 +724,16 @@ async function runPreflight(options = {}) {
     renderPreflight();
     return;
   }
-  if (payload.run_type !== "video_compare" && (!payload.model_file || !payload.video_group)) {
+  const groups = selectedGroupNames();
+  if (!payload.model_file || !groups.length) {
     state.preflight = null;
     state.preflightPayloadKey = "";
     renderPreflight();
     return;
   }
-  if (payload.run_type !== "video_compare" && !state.videoPages[payload.video_group]) {
+  // Every selected group must have its video list loaded before preflight so the
+  // selection is real, not just the summary count.
+  if (groups.some((name) => !state.videoPages[name])) {
     state.preflight = null;
     state.preflightPayloadKey = "";
     renderPreflight();
@@ -828,7 +908,7 @@ function renderMessages(kind, items) {
 function renderPreflight() {
   const result = state.preflight;
   const start = $("start-run");
-  if (currentRunType() === "model_inference" && (!state.modelFiles.length || !state.videoGroups.length)) {
+  if (!state.modelFiles.length || !state.videoGroups.length) {
     start.disabled = true;
     $("preflight").innerHTML = `
       <h2>准备输入</h2>
@@ -838,41 +918,15 @@ function renderPreflight() {
   }
   if (!result) {
     start.disabled = true;
-    const group = currentGroup();
-    if (currentRunType() === "model_inference" && group && !state.videoPages[group.name]) {
+    const groups = selectedGroupNames();
+    if (groups.length && groups.every((name) => !state.videoPages[name])) {
       $("preflight").innerHTML = "<p class=\"muted\">加载视频列表并确认选择后会自动预检查。</p>";
       return;
     }
-    $("preflight").innerHTML = currentRunType() === "video_compare"
-      ? "<p class=\"muted\">选择一个 GT 和至少一个 Pred 后会自动预检查。</p>"
-      : "<p class=\"muted\">选择模型和视频后会自动预检查。</p>";
+    $("preflight").innerHTML = "<p class=\"muted\">选择模型和视频后会自动预检查。</p>";
     return;
   }
   start.disabled = !result.ok;
-
-  if (result.run_type === "video_compare") {
-    const tracks = result.distorted_tracks || (result.distorted ? [result.distorted] : []);
-    const trackLabels = tracks.map((track) => track.track_label || track.label || track.name).filter(Boolean).join(", ");
-    $("preflight").innerHTML = `
-      <div class="panel-head">
-        <h2>运行前预检查</h2>
-        ${result.ok ? "<span class=\"ok-text\">通过</span>" : "<span class=\"bad-text\">未通过</span>"}
-      </div>
-      <div class="summary-grid">
-        <div><span>模式</span><strong>video_compare</strong></div>
-        <div><span>GT</span><strong>${escapeHtml(result.reference?.name || "-")}</strong></div>
-        <div><span>Pred</span><strong>${escapeHtml(`${tracks.length || 0} track(s)`)}</strong></div>
-        <div><span>Tracks</span><strong>${escapeHtml(trackLabels || "-")}</strong></div>
-        <div><span>帧数</span><strong>${escapeHtml(result.alignment?.frame_count ?? "-")}</strong></div>
-        <div><span>分辨率</span><strong>${escapeHtml(`${result.alignment?.width || "-"}x${result.alignment?.height || "-"}`)}</strong></div>
-        <div><span>FPS</span><strong>${formatNumber(result.alignment?.fps)}</strong></div>
-      </div>
-      ${renderMessages("errors", result.errors || [])}
-      ${renderMessages("warnings", result.warnings || [])}
-      ${renderPortableMetricHealthTable(result.metrics?.health || {})}
-    `;
-    return;
-  }
 
   const videos = result.video_group?.videos || [];
   $("preflight").innerHTML = `
@@ -908,6 +962,265 @@ function renderPreflight() {
   `;
 }
 
+function renderCompareGtCards(gtRows) {
+  if (!gtRows.length) return "<p class=\"muted\">videos/ 下暂无可用 GT。</p>";
+  return gtRows.map((row) => {
+    const key = compareGtKey(row);
+    const active = state.selectedCompareGtKey === key;
+    // Run GTs are the aligned partner of a pred; label them by run so the user
+    // can pick the GT that matches the pred they want to compare against.
+    const isRunGt = row.kind === "run_gt";
+    const title = isRunGt
+      ? `#${escapeHtml(row.run_id)} ${escapeHtml(row.run_name || "")} · ${escapeHtml(row.video || "GT")}`
+      : `${escapeHtml(row.group)}/${escapeHtml(row.video)}`;
+    const originBadge = isRunGt
+      ? "<span class=\"compat-badge compat-ok\">Run GT</span>"
+      : "<span class=\"compat-badge\">videos/</span>";
+    return `
+      <label class="source-card${active ? " selected" : ""}">
+        <input type="radio" name="compare_gt_pick" data-compare-gt="${escapeHtml(key)}" ${active ? "checked" : ""}>
+        <span class="source-card-body">
+          <span class="source-card-title">${title} ${originBadge}</span>
+          <span class="source-card-meta">
+            <span>${escapeHtml(row.frame_count || 0)} 帧</span>
+            <span>${escapeHtml(row.width || "-")}×${escapeHtml(row.height || "-")}</span>
+            <span>${formatNumber(row.fps)} fps</span>
+          </span>
+        </span>
+      </label>
+    `;
+  }).join("");
+}
+
+function renderComparePredCards(predRows, selectedPreds) {
+  if (!predRows.length) return "<p class=\"muted\">暂无已完成 Run 的 pred 产物。</p>";
+  const gt = selectedCompareGt();
+  return predRows.map((row) => {
+    const artifactId = Number(row.artifact_id);
+    const active = selectedPreds.has(artifactId);
+    const compat = compareCompatibility(gt, row);
+    const badge = compat
+      ? (compat.ok
+          ? "<span class=\"compat-badge compat-ok\">对齐</span>"
+          : `<span class="compat-badge compat-warn" title="${escapeHtml(compat.reasons.join("；"))}">将对齐</span>`)
+      : "";
+    const warning = compat && !compat.ok
+      ? `<span class="source-card-warn">${escapeHtml(compat.reasons.join("；"))}</span>`
+      : "";
+    // "incompatible" keeps the CSS hook; it no longer blocks checkbox/submit —
+    // it is just a visual hint that the backend will normalise the pair.
+    return `
+      <div class="source-card${active ? " selected" : ""}${compat && !compat.ok ? " incompatible" : ""}">
+        <label class="source-card-pick">
+          <input type="checkbox" data-compare-pred="${escapeHtml(row.artifact_id)}" ${active ? "checked" : ""}>
+          <span class="source-card-body">
+            <span class="source-card-title">#${escapeHtml(row.run_id)} ${escapeHtml(row.run_name || "")} ${badge}</span>
+            <span class="source-card-meta">
+              <span>${escapeHtml(row.video || "-")}</span>
+              <span>${escapeHtml(row.frame_count || 0)} 帧</span>
+              <span>${escapeHtml(row.width || "-")}×${escapeHtml(row.height || "-")}</span>
+            </span>
+            ${warning}
+          </span>
+        </label>
+        <label class="source-card-track">
+          <span>Track</span>
+          <input data-compare-track-label="${escapeHtml(row.artifact_id)}" value="${escapeHtml(compareTrackLabel(row))}">
+        </label>
+      </div>
+    `;
+  }).join("");
+}
+
+function renderCompareSelection() {
+  ensureCompareSelection();
+  if (!state.compareSourcesLoaded) {
+    $("compare-selection").innerHTML = `
+      <div class="panel-head">
+        <div>
+          <h2>对比来源</h2>
+          <p class="muted">选择一个 GT 和至少一个 Pred，或至少两个 Pred（可留空 GT）。</p>
+        </div>
+        <button class="secondary" data-refresh-compare-sources type="button">加载来源</button>
+      </div>
+      <div class="timeline-skeleton" aria-busy="true"><span></span><span></span><span></span></div>
+    `;
+    return;
+  }
+  const gtRows = state.compareSources.gt || [];
+  const predRows = state.compareSources.pred || [];
+  const selectedPreds = state.selectedComparePredArtifacts;
+  const selectedLayerCount = state.selectedCompareLayerKinds.size;
+  const estimatedLayers = selectedPreds.size * selectedLayerCount;
+  const trackCount = selectedPreds.size + (state.selectedCompareGtKey ? 1 : 0);
+  $("compare-selection").innerHTML = `
+    <div class="panel-head">
+      <div>
+        <h2>对比来源</h2>
+        <p class="muted">GT 来自 videos/，Pred 来自已完成 Run 的 pred_video 产物。GT 可留空做纯预测对比。</p>
+      </div>
+      <div class="metric-summary">
+        <span>GT ${escapeHtml(state.compareSourcesMeta.gt?.filtered_count ?? gtRows.length)}</span>
+        <span>Pred ${escapeHtml(state.compareSourcesMeta.pred?.filtered_count ?? predRows.length)}</span>
+        <span>已选 ${escapeHtml(trackCount)} 条轨道</span>
+      </div>
+    </div>
+    <div class="compare-source-grid">
+      <section class="compare-source-col">
+        <div class="compare-col-head">
+          <h3>GT（可选）</h3>
+          <button class="secondary" data-compare-gt-clear type="button">清除 GT</button>
+        </div>
+        <div class="source-tools">
+          <label>
+            <span>搜索</span>
+            <input data-compare-query="gt" value="${escapeHtml(state.compareGtQuery)}" placeholder="group 或文件名">
+          </label>
+        </div>
+        <div class="source-card-list">${renderCompareGtCards(gtRows)}</div>
+        ${compareSourcePager(state.compareSourcesMeta.gt, "gt")}
+      </section>
+      <section class="compare-source-col">
+        <div class="compare-col-head">
+          <h3>Pred tracks</h3>
+        </div>
+        <div class="source-tools">
+          <label>
+            <span>搜索</span>
+            <input data-compare-query="pred" value="${escapeHtml(state.comparePredQuery)}" placeholder="Run、视频或 track">
+          </label>
+        </div>
+        <div class="source-card-list">${renderComparePredCards(predRows, selectedPreds)}</div>
+        ${compareSourcePager(state.compareSourcesMeta.pred, "pred")}
+      </section>
+    </div>
+    <details class="compare-layer-picker">
+      <summary>Extra layers (${escapeHtml(estimatedLayers)} previews)</summary>
+      <div class="checkbox-row">
+        ${["flowt_0", "flowt_1", "mask0", "mask1", "warp0", "warp1", "blend"].map((kind) => `
+          <label class="check-item">
+            <input type="checkbox" data-compare-layer-kind="${escapeHtml(kind)}" ${state.selectedCompareLayerKinds.has(kind) ? "checked" : ""}>
+            <span>${escapeHtml(kind)}</span>
+          </label>
+        `).join("")}
+      </div>
+    </details>
+  `;
+}
+
+function renderCompareMetricOptions() {
+  const selected = new Set(compareSelectedMetrics());
+  $("compare-metrics-options").innerHTML = METRICS.map((name) => `
+    <label class="check-item">
+      <input type="checkbox" name="compare_metrics" value="${escapeHtml(name)}" ${selected.has(name) ? "checked" : ""}>
+      <span>${escapeHtml(name)} ${metricHealthBadge(name)}</span>
+    </label>
+  `).join("") + "<p class=\"muted metric-hint\">不可用指标会明确显示原因，不会被替换成其它分数。</p>";
+}
+
+function scheduleComparePreflight(delay = 600) {
+  clearTimeout(state.comparePreflightTimer);
+  state.comparePreflightTimer = setTimeout(() => runComparePreflight().catch(renderComparePreflightError), delay);
+}
+
+async function runComparePreflight(options = {}) {
+  const payload = comparePayloadFromForm();
+  if (!payload) {
+    state.comparePreflight = null;
+    state.comparePreflightPayloadKey = "";
+    renderComparePreflight();
+    return;
+  }
+  const payloadKey = stableStringify(payload);
+  if (!options.force && state.comparePreflight && state.comparePreflightPayloadKey === payloadKey) {
+    renderComparePreflight();
+    return;
+  }
+  if (state.comparePreflightAbortController) {
+    state.comparePreflightAbortController.abort();
+  }
+  const controller = new AbortController();
+  state.comparePreflightAbortController = controller;
+  try {
+    const result = await api("/api/preflight", {
+      method: "POST",
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    if (state.comparePreflightAbortController !== controller) return;
+    state.comparePreflight = result;
+    state.comparePreflightPayloadKey = payloadKey;
+    renderComparePreflight();
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    throw error;
+  } finally {
+    if (state.comparePreflightAbortController === controller) {
+      state.comparePreflightAbortController = null;
+    }
+  }
+}
+
+function renderComparePreflightError(error) {
+  state.comparePreflight = { ok: false, errors: [{ title: "预检查请求失败", message: error.message }], warnings: [] };
+  renderComparePreflight();
+}
+
+function renderComparePreflight() {
+  const result = state.comparePreflight;
+  const start = $("start-compare");
+  if (!result) {
+    start.disabled = true;
+    $("compare-preflight").innerHTML = state.compareSourcesLoaded
+      ? "<p class=\"muted\">选好 GT + Pred，或至少两个 Pred 后会自动预检查。</p>"
+      : "<p class=\"muted\">先加载对比来源。</p>";
+    return;
+  }
+  start.disabled = !result.ok;
+  const tracks = result.distorted_tracks || (result.distorted ? [result.distorted] : []);
+  const trackLabels = tracks.map((track) => track.track_label || track.label || track.name).filter(Boolean).join(", ");
+  $("compare-preflight").innerHTML = `
+    <div class="panel-head">
+      <h2>运行前预检查</h2>
+      ${result.ok ? "<span class=\"ok-text\">通过</span>" : "<span class=\"bad-text\">未通过</span>"}
+    </div>
+    <div class="summary-grid">
+      <div><span>模式</span><strong>video_compare</strong></div>
+      <div><span>参考</span><strong>${escapeHtml(result.reference?.name || "-")}</strong></div>
+      <div><span>对比轨道</span><strong>${escapeHtml(`${tracks.length || 0} track(s)`)}</strong></div>
+      <div><span>Tracks</span><strong>${escapeHtml(trackLabels || "-")}</strong></div>
+      <div><span>帧数</span><strong>${escapeHtml(result.alignment?.frame_count ?? "-")}</strong></div>
+      <div><span>分辨率</span><strong>${escapeHtml(`${result.alignment?.width || "-"}x${result.alignment?.height || "-"}`)}</strong></div>
+      <div><span>FPS</span><strong>${formatNumber(result.alignment?.fps)}</strong></div>
+    </div>
+    ${renderMessages("errors", result.errors || [])}
+    ${renderMessages("warnings", result.warnings || [])}
+    ${renderPortableMetricHealthTable(result.metrics?.health || {})}
+  `;
+}
+
+async function startCompareRun(event) {
+  event.preventDefault();
+  const payload = comparePayloadFromForm();
+  if (!payload) {
+    toast("请至少选择两条对比轨道（GT+Pred 或两个 Pred）");
+    return;
+  }
+  await runComparePreflight({ force: true });
+  if (!state.comparePreflight?.ok) {
+    toast("预检查未通过");
+    return;
+  }
+  const created = await api("/api/runs", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  toast(`Run #${created.run_id} 已开始`);
+  switchView("runs");
+  await refreshRunsOnly();
+  await selectRun(created.run_id);
+}
+
 function table(rows, columns, options = {}) {
   if (!rows?.length) return "<p class=\"muted\">暂无数据。</p>";
   const rowAttrs = typeof options.rowAttrs === "function" ? options.rowAttrs : null;
@@ -921,15 +1234,16 @@ function table(rows, columns, options = {}) {
 
 async function startRun(event) {
   event.preventDefault();
+  const groups = selectedGroupNames();
+  if (!groups.length) {
+    toast("请先选择至少一个视频集");
+    return;
+  }
+  if (!selectedVideoNames().length) {
+    toast("请先选择至少一个视频");
+    return;
+  }
   const payload = payloadFromForm();
-  if (!payload) {
-    toast("请先在选择器里选好 GT 和 Pred");
-    return;
-  }
-  if (payload.run_type !== "video_compare" && !state.videoPages[payload.video_group]) {
-    toast("请先加载视频列表并确认选择");
-    return;
-  }
   await runPreflight({ force: true });
   if (!state.preflight?.ok) {
     toast("预检查未通过");
@@ -1355,6 +1669,64 @@ function renderRunDetail() {
         ${video ? renderVideoTimeline(video) : (selectedVideoName ? "<div class=\"timeline-skeleton\" aria-busy=\"true\"><span></span><span></span><span></span></div>" : "<p class=\"muted\">暂无结果。</p>")}
       </section>
     </div>
+    ${renderRunFeedback(run)}
+  `;
+}
+
+function ratingStars(rating) {
+  const score = Number(rating);
+  if (!Number.isFinite(score) || score <= 0) return "<span class=\"muted\">未打分</span>";
+  const full = Math.max(0, Math.min(5, Math.round(score)));
+  return `<span class="rating-stars" title="${escapeHtml(score)}/5">${"★".repeat(full)}${"☆".repeat(5 - full)}</span>`;
+}
+
+function renderRunFeedback(run) {
+  const feedback = run.feedback || [];
+  const rated = feedback.filter((item) => item.rating !== null && item.rating !== undefined);
+  const mean = rated.length ? (rated.reduce((sum, item) => sum + Number(item.rating), 0) / rated.length) : null;
+  return `
+    <section class="feedback-panel">
+      <div class="panel-head">
+        <div>
+          <h3>评分与问题</h3>
+          <p class="muted">记录评审人、打分和提出的问题，可在“统计”页汇总查看。</p>
+        </div>
+        <div class="metric-summary">
+          <span>反馈 ${escapeHtml(feedback.length)}</span>
+          <span>平均分 ${mean === null ? "-" : formatNumber(mean)}</span>
+        </div>
+      </div>
+      <form class="feedback-form" data-feedback-form="${escapeHtml(run.id)}">
+        <label>
+          <span>用户名</span>
+          <input name="username" value="${escapeHtml(state.feedbackUsername || "")}" placeholder="你的名字" maxlength="80">
+        </label>
+        <label>
+          <span>评分</span>
+          <select name="rating">
+            <option value="">不打分</option>
+            ${[5, 4, 3, 2, 1].map((score) => `<option value="${score}">${score} 分</option>`).join("")}
+          </select>
+        </label>
+        <label class="wide-field">
+          <span>问题 / 备注</span>
+          <textarea name="issue" rows="2" placeholder="描述发现的问题或想记录的内容" maxlength="2000"></textarea>
+        </label>
+        <button type="submit">提交反馈</button>
+      </form>
+      <div class="feedback-list">
+        ${feedback.length ? feedback.map((item) => `
+          <article class="feedback-item">
+            <div class="feedback-item-head">
+              <strong>${escapeHtml(item.username || "匿名")}</strong>
+              ${ratingStars(item.rating)}
+              <button class="secondary danger feedback-delete" data-feedback-delete="${escapeHtml(item.id)}" data-feedback-run="${escapeHtml(run.id)}" type="button">删除</button>
+            </div>
+            ${item.issue ? `<p class="feedback-issue">${escapeHtml(item.issue)}</p>` : "<p class=\"muted\">无问题描述。</p>"}
+          </article>
+        `).join("") : "<p class=\"muted\">还没有反馈。</p>"}
+      </div>
+    </section>
   `;
 }
 
@@ -1483,23 +1855,32 @@ function renderMetricChart(video, selectedIndex, metricName) {
   const selectedY = selectedValue === null || !Number.isFinite(selectedValue)
     ? 46
     : 42 - (max === min ? 0.5 : (selectedValue - min) / (max - min)) * 30;
+  // The SVG stretches its 0..100 / 0..56 coordinate space to the container with
+  // preserveAspectRatio="none", so it can only carry shapes that tolerate
+  // non-uniform scaling (grid lines, the polyline, the vertical marker). The
+  // sample points are rendered as an absolutely-positioned HTML overlay instead:
+  // CSS-sized dots stay perfectly round no matter the container aspect ratio.
   return `
     <div class="chart" data-chart-video="${escapeHtml(video.video_name)}">
       <div class="chart-head">
         <strong>${escapeHtml(metricName)}</strong>
         <span class="muted">点击曲线定位当前帧</span>
       </div>
-      <svg class="metric-chart-svg" viewBox="0 0 100 56" preserveAspectRatio="none" role="img">
-        <g class="chart-grid">
-          <line x1="4" x2="96" y1="12" y2="12"></line>
-          <line x1="4" x2="96" y1="27" y2="27"></line>
-          <line x1="4" x2="96" y1="42" y2="42"></line>
-        </g>
-        <polyline class="metric-line" points="${points}" fill="none"></polyline>
-        <line class="current-marker" x1="${markerX.toFixed(2)}" x2="${markerX.toFixed(2)}" y1="8" y2="46"></line>
-        <circle class="selected-metric-point" cx="${markerX.toFixed(2)}" cy="${selectedY.toFixed(2)}" r="1.8"></circle>
-        ${renderMetricPoints(video.video_name, samples, metricName, min, max, selectedIndex)}
-      </svg>
+      <div class="chart-plot">
+        <svg class="metric-chart-svg" viewBox="0 0 100 56" preserveAspectRatio="none" role="img">
+          <g class="chart-grid">
+            <line x1="4" x2="96" y1="12" y2="12"></line>
+            <line x1="4" x2="96" y1="27" y2="27"></line>
+            <line x1="4" x2="96" y1="42" y2="42"></line>
+          </g>
+          <polyline class="metric-line" points="${points}" fill="none"></polyline>
+          <line class="current-marker" x1="${markerX.toFixed(2)}" x2="${markerX.toFixed(2)}" y1="8" y2="46"></line>
+        </svg>
+        <div class="chart-points">
+          <span class="selected-metric-point" style="left: ${markerX.toFixed(2)}%; top: ${((selectedY / 56) * 100).toFixed(2)}%"></span>
+          ${renderMetricPoints(video.video_name, samples, metricName, min, max, selectedIndex)}
+        </div>
+      </div>
       <div class="chart-scale">
         <span>min ${formatNumber(min)}</span>
         <span>max ${formatNumber(max)}</span>
@@ -1516,8 +1897,9 @@ function renderMetricPoints(videoName, samples, metricName, min, max, selectedIn
     const value = metric?.value;
     const normalized = status === "completed" && value !== null && max !== min ? (Number(value) - min) / (max - min) : 0.5;
     const y = status === "completed" ? 42 - normalized * 30 : 46;
+    const top = (y / 56) * 100;
     const selectedClass = index === selectedIndex ? " selected" : "";
-    return `<circle class="metric-point ${escapeHtml(status)}${selectedClass}" data-chart-video="${escapeHtml(videoName)}" data-chart-sample="${index}" data-frame-index="${escapeHtml(sample.frame_index)}" cx="${x.toFixed(2)}" cy="${y.toFixed(2)}" r="1.05"><title>${escapeHtml(status)} ${escapeHtml(value ?? metricReason(metric))}</title></circle>`;
+    return `<button class="metric-point ${escapeHtml(status)}${selectedClass}" data-chart-video="${escapeHtml(videoName)}" data-chart-sample="${index}" data-frame-index="${escapeHtml(sample.frame_index)}" style="left: ${x.toFixed(2)}%; top: ${top.toFixed(2)}%" type="button" title="${escapeHtml(status)} ${escapeHtml(value ?? metricReason(metric))}"></button>`;
   }).join("");
 }
 
@@ -2047,6 +2429,115 @@ async function cleanupRunArtifacts(runId) {
   }
 }
 
+async function submitRunFeedback(runId, form) {
+  const data = formData(form);
+  const username = String(data.username || "").trim();
+  const issue = String(data.issue || "").trim();
+  const rating = data.rating ? Number(data.rating) : null;
+  if (!issue && rating === null) {
+    toast("请至少填写评分或问题");
+    return;
+  }
+  // Remember the name so the reviewer doesn't retype it on every run.
+  state.feedbackUsername = username;
+  await api(`/api/runs/${runId}/feedback`, {
+    method: "POST",
+    body: JSON.stringify({ username, rating, issue }),
+  });
+  toast("反馈已提交");
+  if (Number(state.selectedRun?.id) === Number(runId)) {
+    await selectRun(runId, { quiet: true });
+  }
+}
+
+async function deleteRunFeedback(runId, feedbackId) {
+  await api(`/api/runs/${runId}/feedback/${feedbackId}`, { method: "DELETE" });
+  toast("反馈已删除");
+  if (Number(state.selectedRun?.id) === Number(runId)) {
+    await selectRun(runId, { quiet: true });
+  }
+}
+
+async function loadStats() {
+  state.feedbackStats = await api("/api/feedback");
+  renderStats();
+}
+
+function renderStats() {
+  const stats = state.feedbackStats;
+  const host = $("stats-content");
+  if (!host) return;
+  if (!stats) {
+    host.innerHTML = "<p class=\"muted\">正在加载统计数据...</p>";
+    return;
+  }
+  const distribution = stats.rating_distribution || {};
+  const maxCount = Math.max(1, ...[5, 4, 3, 2, 1].map((score) => Number(distribution[score] || 0)));
+  const byRun = stats.by_run || [];
+  const byUser = stats.by_user || [];
+  const recent = stats.recent || [];
+  host.innerHTML = `
+    <div class="summary-grid">
+      <div><span>反馈总数</span><strong>${escapeHtml(stats.total || 0)}</strong></div>
+      <div><span>打分数</span><strong>${escapeHtml(stats.rating_count || 0)}</strong></div>
+      <div><span>平均分</span><strong>${stats.average_rating === null || stats.average_rating === undefined ? "-" : formatNumber(stats.average_rating)}</strong></div>
+      <div><span>问题数</span><strong>${escapeHtml(stats.issue_count || 0)}</strong></div>
+    </div>
+    <section class="stats-block">
+      <h3>评分分布</h3>
+      <div class="rating-bars">
+        ${[5, 4, 3, 2, 1].map((score) => {
+          const count = Number(distribution[score] || 0);
+          const width = Math.round((count / maxCount) * 100);
+          return `
+            <div class="rating-bar-row">
+              <span class="rating-bar-label">${score} ★</span>
+              <span class="rating-bar-track"><span class="rating-bar-fill" style="width: ${width}%"></span></span>
+              <span class="rating-bar-count">${escapeHtml(count)}</span>
+            </div>
+          `;
+        }).join("")}
+      </div>
+    </section>
+    <section class="stats-block">
+      <h3>按用户</h3>
+      <div class="table compact-table">${table(byUser, [
+        { label: "用户名", render: (row) => escapeHtml(row.username || "匿名") },
+        { label: "反馈数", render: (row) => escapeHtml(row.count || 0) },
+        { label: "打分数", render: (row) => escapeHtml(row.rating_count || 0) },
+        { label: "平均分", render: (row) => row.average_rating === null || row.average_rating === undefined ? "-" : formatNumber(row.average_rating) },
+        { label: "问题数", render: (row) => escapeHtml(row.issues || 0) },
+      ])}</div>
+    </section>
+    <section class="stats-block">
+      <h3>按运行记录</h3>
+      <div class="table compact-table">${table(byRun, [
+        { label: "Run", render: (row) => `#${escapeHtml(row.run_id)}` },
+        { label: "名称", render: (row) => escapeHtml(row.run_name || "-") },
+        { label: "反馈数", render: (row) => escapeHtml(row.count || 0) },
+        { label: "平均分", render: (row) => row.average_rating === null || row.average_rating === undefined ? "-" : formatNumber(row.average_rating) },
+        { label: "问题数", render: (row) => escapeHtml(row.issues || 0) },
+        { label: "操作", render: (row) => `<button class="view-detail-btn" data-stats-run="${escapeHtml(row.run_id)}" type="button">查看 →</button>` },
+      ])}</div>
+    </section>
+    <section class="stats-block">
+      <h3>最近反馈</h3>
+      <div class="feedback-list">
+        ${recent.length ? recent.map((item) => `
+          <article class="feedback-item">
+            <div class="feedback-item-head">
+              <strong>${escapeHtml(item.username || "匿名")}</strong>
+              ${ratingStars(item.rating)}
+              <span class="muted">#${escapeHtml(item.run_id)} ${escapeHtml(item.run_name || "")}</span>
+            </div>
+            ${item.issue ? `<p class="feedback-issue">${escapeHtml(item.issue)}</p>` : "<p class=\"muted\">无问题描述。</p>"}
+          </article>
+        `).join("") : "<p class=\"muted\">还没有反馈。</p>"}
+      </div>
+    </section>
+  `;
+}
+
 function formatNumber(value) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
   return Number(value).toFixed(2);
@@ -2092,8 +2583,23 @@ async function refreshCatalog() {
 
 document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => {
   (async () => {
-    switchView(item.dataset.view);
-    if (item.dataset.view !== "runs") {
+    const view = item.dataset.view;
+    switchView(view);
+    if (view === "compare") {
+      renderCompareMetricOptions();
+      if (!state.compareSourcesLoaded) {
+        await loadCompareSources({ gtPage: 1, predPage: 1 });
+      } else {
+        renderCompareSelection();
+      }
+      scheduleComparePreflight(0);
+      return;
+    }
+    if (view === "stats") {
+      await loadStats();
+      return;
+    }
+    if (view !== "runs") {
       return;
     }
     if (!state.runs.length) {
@@ -2109,12 +2615,15 @@ document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("
   })().catch((error) => toast(error.message));
 }));
 $("infer-form").addEventListener("submit", (event) => startRun(event).catch((error) => toast(error.message)));
+$("compare-form").addEventListener("submit", (event) => startCompareRun(event).catch((error) => toast(error.message)));
 $("refresh").addEventListener("click", () => refreshRunsOnly().catch((error) => toast(error.message)));
 $("refresh-files").addEventListener("click", () => refreshCatalog().then(() => toast("文件列表已刷新")).catch((error) => toast(error.message)));
+$("refresh-compare-sources").addEventListener("click", () => loadCompareSources({ gtPage: 1, predPage: 1 }).then(() => scheduleComparePreflight(0)).then(() => toast("对比来源已刷新")).catch((error) => toast(error.message)));
+$("refresh-stats").addEventListener("click", () => loadStats().then(() => toast("统计数据已刷新")).catch((error) => toast(error.message)));
 $("infer-form").addEventListener("input", () => schedulePreflight());
+$("compare-form").addEventListener("input", () => scheduleComparePreflight());
 
 $("infer-form").addEventListener("change", async (event) => {
-  renderModeSections();
   renderCustomSizeVisibility();
   if (event.target.name === "model_file") {
     renderCheckpointOptions();
@@ -2123,27 +2632,30 @@ $("infer-form").addEventListener("change", async (event) => {
     renderSingleDeviceOptions($("infer-form").elements.device.value || "auto");
     renderDeviceOptions();
   }
-  if (event.target.name === "run_type") {
-    if (currentRunType() === "model_inference") {
-      await loadVideoGroupPage($("infer-form").elements.video_group.value);
-    } else {
-      await loadCompareSources({ gtPage: 1, predPage: 1 });
-    }
-  }
-  if (event.target.name === "video_group" && currentRunType() === "model_inference") {
-    ensureVideoSelection(event.target.value);
-    await loadVideoGroupPage(event.target.value);
-  }
   schedulePreflight(0);
 });
 
 document.addEventListener("change", (event) => {
+  const groupToggle = event.target.closest("[data-group-toggle]");
+  if (groupToggle) {
+    const name = groupToggle.dataset.groupToggle;
+    if (groupToggle.checked) {
+      state.selectedGroups.add(name);
+      ensureVideoSelection(name);
+      loadVideoGroupPage(name, 1).then(() => schedulePreflight(0)).catch((error) => toast(error.message));
+    } else {
+      state.selectedGroups.delete(name);
+    }
+    renderVideoSelection();
+    schedulePreflight(0);
+    return;
+  }
   const compareGt = event.target.closest("[data-compare-gt]");
   if (compareGt) {
     state.selectedCompareGtKey = compareGt.dataset.compareGt;
     state.selectedComparePredArtifacts = new Set();
     state.comparePredPage = 1;
-    loadCompareSources({ predPage: 1 }).then(() => schedulePreflight(0)).catch((error) => toast(error.message));
+    loadCompareSources({ predPage: 1 }).then(() => scheduleComparePreflight(0)).catch((error) => toast(error.message));
     return;
   }
   const comparePred = event.target.closest("[data-compare-pred]");
@@ -2151,8 +2663,8 @@ document.addEventListener("change", (event) => {
     const artifactId = Number(comparePred.dataset.comparePred);
     if (comparePred.checked) state.selectedComparePredArtifacts.add(artifactId);
     else state.selectedComparePredArtifacts.delete(artifactId);
-    renderVideoSelection();
-    schedulePreflight(0);
+    renderCompareSelection();
+    scheduleComparePreflight(0);
     return;
   }
   const compareLayerKind = event.target.closest("[data-compare-layer-kind]");
@@ -2160,8 +2672,8 @@ document.addEventListener("change", (event) => {
     const kind = compareLayerKind.dataset.compareLayerKind;
     if (compareLayerKind.checked) state.selectedCompareLayerKinds.add(kind);
     else state.selectedCompareLayerKinds.delete(kind);
-    renderVideoSelection();
-    schedulePreflight(0);
+    renderCompareSelection();
+    scheduleComparePreflight(0);
     return;
   }
   const compareQuery = event.target.closest("[data-compare-query]");
@@ -2174,36 +2686,41 @@ document.addEventListener("change", (event) => {
       state.comparePredQuery = compareQuery.value || "";
       state.comparePredPage = 1;
     }
-    loadCompareSources().then(() => schedulePreflight(0)).catch((error) => toast(error.message));
+    loadCompareSources().then(() => scheduleComparePreflight(0)).catch((error) => toast(error.message));
     return;
   }
   const compareTrackLabel = event.target.closest("[data-compare-track-label]");
   if (compareTrackLabel) {
     state.compareTrackLabels[Number(compareTrackLabel.dataset.compareTrackLabel)] = compareTrackLabel.value || "";
-    schedulePreflight(0);
+    scheduleComparePreflight(0);
+    return;
+  }
+  const compareMetric = event.target.closest("#compare-metrics-options input[name='compare_metrics']");
+  if (compareMetric) {
+    scheduleComparePreflight(0);
     return;
   }
   const videoQuery = event.target.closest("[data-video-query]");
   if (videoQuery) {
-    const group = currentGroup();
-    if (!group) return;
-    state.videoPageQuery[group.name] = videoQuery.value || "";
-    loadVideoGroupPage(group.name, 1).then(() => schedulePreflight(0)).catch((error) => toast(error.message));
+    const name = videoQuery.dataset.group;
+    if (!name) return;
+    state.videoPageQuery[name] = videoQuery.value || "";
+    loadVideoGroupPage(name, 1).then(() => schedulePreflight(0)).catch((error) => toast(error.message));
     return;
   }
   const videoSort = event.target.closest("[data-video-sort]");
   if (videoSort) {
-    const group = currentGroup();
-    if (!group) return;
-    state.videoPageSort[group.name] = videoSort.value || "name";
-    loadVideoGroupPage(group.name, 1).then(() => schedulePreflight(0)).catch((error) => toast(error.message));
+    const name = videoSort.dataset.group;
+    if (!name) return;
+    state.videoPageSort[name] = videoSort.value || "name";
+    loadVideoGroupPage(name, 1).then(() => schedulePreflight(0)).catch((error) => toast(error.message));
     return;
   }
   const videoCheckbox = event.target.closest("[data-video-name]");
   if (videoCheckbox) {
-    const group = currentGroup();
-    if (!group) return;
-    const selected = ensureVideoSelection(group.name);
+    const name = videoCheckbox.dataset.group;
+    if (!name) return;
+    const selected = ensureVideoSelection(name);
     if (videoCheckbox.checked) selected.add(videoCheckbox.dataset.videoName);
     else selected.delete(videoCheckbox.dataset.videoName);
     renderVideoSelection();
@@ -2250,17 +2767,48 @@ document.addEventListener("change", (event) => {
   }
 });
 
+document.addEventListener("submit", (event) => {
+  const feedbackForm = event.target.closest("[data-feedback-form]");
+  if (feedbackForm) {
+    event.preventDefault();
+    submitRunFeedback(Number(feedbackForm.dataset.feedbackForm), feedbackForm).catch((error) => toast(error.message));
+  }
+});
+
 document.addEventListener("click", async (event) => {
-  if (event.target.closest("[data-load-video-page]")) {
-    const group = currentGroup();
-    if (!group) return;
-    await loadVideoGroupPage(group.name, 1);
+  const feedbackDelete = event.target.closest("[data-feedback-delete]");
+  if (feedbackDelete) {
+    await deleteRunFeedback(Number(feedbackDelete.dataset.feedbackRun), Number(feedbackDelete.dataset.feedbackDelete));
+    return;
+  }
+  const statsRun = event.target.closest("[data-stats-run]");
+  if (statsRun) {
+    switchView("runs");
+    await selectRun(Number(statsRun.dataset.statsRun));
+    return;
+  }
+  const loadVideoPageBtn = event.target.closest("[data-load-video-page]");
+  if (loadVideoPageBtn) {
+    const groupName = loadVideoPageBtn.dataset.loadVideoPage || primaryGroupName();
+    if (!groupName) return;
+    await loadVideoGroupPage(groupName, 1);
     schedulePreflight(0);
     return;
   }
   if (event.target.closest("[data-refresh-compare-sources]")) {
     await loadCompareSources({ gtPage: 1, predPage: 1 });
-    schedulePreflight(0);
+    scheduleComparePreflight(0);
+    return;
+  }
+  if (event.target.closest("[data-refresh-compare-sources]")) {
+    await loadCompareSources({ gtPage: 1, predPage: 1 });
+    scheduleComparePreflight(0);
+    return;
+  }
+  if (event.target.closest("[data-compare-gt-clear]")) {
+    state.selectedCompareGtKey = "";
+    renderCompareSelection();
+    scheduleComparePreflight(0);
     return;
   }
   const comparePage = event.target.closest("[data-compare-page]");
@@ -2271,35 +2819,35 @@ document.addEventListener("click", async (event) => {
     } else {
       await loadCompareSources({ predPage: page });
     }
-    schedulePreflight(0);
+    scheduleComparePreflight(0);
     return;
   }
   const videoPage = event.target.closest("[data-video-page]");
   if (videoPage) {
-    const group = currentGroup();
-    if (!group) return;
-    await loadVideoGroupPage(group.name, Number(videoPage.dataset.videoPage || 1));
+    const groupName = videoPage.dataset.videoGroup;
+    if (!groupName) return;
+    await loadVideoGroupPage(groupName, Number(videoPage.dataset.videoPage || 1));
     schedulePreflight(0);
     return;
   }
   const videoSelect = event.target.closest("[data-video-select]");
   if (videoSelect) {
-    const group = currentGroup();
-    if (!group) return;
-    const page = state.videoPages[group.name];
+    const groupName = videoSelect.dataset.group;
+    if (!groupName) return;
+    const page = state.videoPages[groupName];
     const names = page?.filtered_video_names || page?.all_video_names || [];
-    const selected = ensureVideoSelection(group.name);
+    const selected = ensureVideoSelection(groupName);
     if (videoSelect.dataset.videoSelect === "all-filtered") {
-      state.selectedVideosByGroup[group.name] = new Set([...selected, ...names]);
+      state.selectedVideosByGroup[groupName] = new Set([...selected, ...names]);
     } else if (videoSelect.dataset.videoSelect === "none-filtered") {
-      state.selectedVideosByGroup[group.name] = new Set(Array.from(selected).filter((name) => !names.includes(name)));
+      state.selectedVideosByGroup[groupName] = new Set(Array.from(selected).filter((name) => !names.includes(name)));
     } else {
       const next = new Set(selected);
       for (const name of names) {
         if (next.has(name)) next.delete(name);
         else next.add(name);
       }
-      state.selectedVideosByGroup[group.name] = next;
+      state.selectedVideosByGroup[groupName] = next;
     }
     renderVideoSelection();
     schedulePreflight(0);

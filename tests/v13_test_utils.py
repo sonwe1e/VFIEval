@@ -49,6 +49,7 @@ def add_completed_pred_run(
     sample_count: int = 3,
     size: tuple[int, int] = (8, 8),
     fps: float = 5.0,
+    gt_video_path: Path | None = None,
 ) -> int:
     model_id = db.upsert_model(f"model-{name}", "dummy", None, size[1], size[0], {"source": "test"})
     dataset_root = workspace.root / f"dataset-{name}"
@@ -83,6 +84,15 @@ def add_completed_pred_run(
         "video/mp4",
         {"video_name": video_name, "frames": sample_count, "width": size[0], "height": size[1], "fps": fps},
     )
+    if gt_video_path is not None:
+        db.add_artifact(
+            job_id,
+            None,
+            "gt_video",
+            str(gt_video_path),
+            "video/mp4",
+            {"video_name": video_name, "frames": sample_count, "width": size[0], "height": size[1], "fps": fps},
+        )
     flow_path = workspace.root / f"{name}-flow.png"
     mask_path = workspace.root / f"{name}-mask.png"
     Image.new("RGB", size, (10, 20, 30)).save(flow_path)

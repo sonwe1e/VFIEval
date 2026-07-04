@@ -11,11 +11,13 @@
       <aside class="sidebar">
         <div class="sidebar-brand">
           <h1>VFIEval</h1>
-          <p>本地视频插帧评测</p>
+          <p>本地视频插帧评测 <a class="brand-author" href="https://github.com/sonwe1e" target="_blank" rel="noreferrer">@sonwe1e</a></p>
         </div>
         <nav class="nav" aria-label="主导航">
           <button class="nav-item active" data-view="create" type="button">新建任务</button>
+          <button class="nav-item" data-view="compare" type="button">视频对比</button>
           <button class="nav-item" data-view="runs" type="button">运行记录</button>
+          <button class="nav-item" data-view="stats" type="button">评分统计</button>
         </nav>
       </aside>
 
@@ -23,16 +25,10 @@
       <section id="view-create" class="view active">
         <div class="view-head">
           <h2>新建任务</h2>
-          <p class="muted">配置模型推理或双视频对比，确认选择后开始运行。</p>
+          <p class="muted">配置模型推理，可多选视频集合并为一个任务，确认选择后开始运行。</p>
         </div>
         <form id="infer-form" class="panel infer-grid">
-          <label class="wide-field">
-            <span>Run 类型</span>
-            <select name="run_type">
-              <option value="model_inference">模型推理</option>
-              <option value="video_compare">双视频对比</option>
-            </select>
-          </label>
+          <input type="hidden" name="run_type" value="model_inference">
 
           <div class="mode-section" data-mode-section="model_inference">
             <fieldset class="field-group">
@@ -52,9 +48,10 @@
             <fieldset class="field-group">
               <legend>输入</legend>
               <div class="field-grid">
-                <label>
-                  <span>视频集</span>
-                  <select name="video_group"></select>
+                <label class="wide-field">
+                  <span>视频集（可多选合并为一个任务）</span>
+                  <div id="video-group-picker" class="group-picker"></div>
+                  <select name="video_group" hidden></select>
                 </label>
                 <label>
                   <span>输出分辨率</span>
@@ -93,20 +90,6 @@
                     <option value="single">单设备</option>
                     <option value="multi_cuda">多卡 CUDA</option>
                     <option value="multi_npu" selected>多卡 NPU</option>
-                  </select>
-                </label>
-              </div>
-            </fieldset>
-          </div>
-
-          <div class="mode-section mode-compare" data-mode-section="video_compare" hidden>
-            <fieldset class="field-group">
-              <legend>对比</legend>
-              <div class="field-grid">
-                <label>
-                  <span>对齐方式</span>
-                  <select name="align_mode">
-                    <option value="strict">strict</option>
                   </select>
                 </label>
               </div>
@@ -166,6 +149,37 @@
         <section id="preflight" class="panel preflight"></section>
       </section>
 
+      <section id="view-compare" class="view">
+        <div class="view-head">
+          <h2>视频对比</h2>
+          <p class="muted">从服务器已有资源里挑选 GT 与预测结果，任意两两或三三对比。GT 可留空做纯预测对比。</p>
+        </div>
+        <form id="compare-form" class="panel infer-grid">
+          <fieldset class="field-group">
+            <legend>对齐方式</legend>
+            <div class="field-grid">
+              <label>
+                <span>对齐方式</span>
+                <select name="align_mode">
+                  <option value="strict">strict</option>
+                </select>
+              </label>
+            </div>
+          </fieldset>
+          <details class="advanced">
+            <summary>可选指标</summary>
+            <div class="metric-options">
+              <div id="compare-metrics-options" class="checkbox-row"></div>
+            </div>
+          </details>
+          <button id="refresh-compare-sources" class="secondary" type="button">刷新对比来源</button>
+          <button id="start-compare" type="submit" disabled>开始对比</button>
+        </form>
+
+        <section id="compare-selection" class="panel video-selection"></section>
+        <section id="compare-preflight" class="panel preflight"></section>
+      </section>
+
       <section id="view-runs" class="view">
         <section class="panel">
           <div class="panel-head">
@@ -175,6 +189,19 @@
           <div id="runs-table" class="table"></div>
         </section>
         <section id="run-detail" class="panel"></section>
+      </section>
+
+      <section id="view-stats" class="view">
+        <section class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>评分统计</h2>
+              <p class="muted">汇总各运行记录的用户评分与提出的问题。</p>
+            </div>
+            <button id="refresh-stats" class="secondary" type="button">刷新</button>
+          </div>
+          <div id="stats-content"></div>
+        </section>
       </section>
     </main>
     </div>

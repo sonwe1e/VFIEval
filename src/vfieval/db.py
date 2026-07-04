@@ -243,6 +243,18 @@ CREATE TABLE IF NOT EXISTS run_jobs (
 CREATE INDEX IF NOT EXISTS idx_run_jobs_run_role ON run_jobs(run_id, role, shard_index);
 CREATE INDEX IF NOT EXISTS idx_run_jobs_job ON run_jobs(job_id);
 CREATE INDEX IF NOT EXISTS idx_run_jobs_device ON run_jobs(device);
+
+CREATE TABLE IF NOT EXISTS run_feedback (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    username TEXT NOT NULL DEFAULT '',
+    rating INTEGER,
+    issue TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_feedback_run ON run_feedback(run_id, created_at);
 """
 
 
@@ -298,6 +310,16 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_run_jobs_device ON run_jobs(device);
             CREATE INDEX IF NOT EXISTS idx_artifacts_sample ON artifacts(sample_id, kind);
             CREATE INDEX IF NOT EXISTS idx_metric_results_sample ON metric_results(sample_id, metric_name);
+            CREATE TABLE IF NOT EXISTS run_feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                username TEXT NOT NULL DEFAULT '',
+                rating INTEGER,
+                issue TEXT NOT NULL DEFAULT '',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_run_feedback_run ON run_feedback(run_id, created_at);
             """
         )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(datasets)").fetchall()}
@@ -1199,6 +1221,132 @@ class Database:
                 """,
                 (name, now, run_id),
             )
+
+    def add_run_feedback(
+        self,
+        run_id: int,
+        username: str,
+        rating: int | None,
+        issue: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> int:
+        now = utc_ts()
+        with self.connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO run_feedback(run_id, username, rating, issue, metadata_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    username,
+                    int(rating) if rating is not None else None,
+                    issue,
+                    _json(metadata),
+                    now,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def list_run_feedback(self, run_id: int) -> list[dict[str, Any]]:
+        rows = self.query(
+            "SELECT * FROM run_feedback WHERE run_id = ? ORDER BY created_at DESC, id DESC",
+            (run_id,),
+        )
+        for row in rows:
+            row["metadata"] = _loads(row.pop("metadata_json", None))
+        return rows
+
+    def delete_run_feedback(self, run_id: int, feedback_id: int) -> bool:
+        with self.connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM run_feedback WHERE id = ? AND run_id = ?",
+                (feedback_id, run_id),
+            )
+            return cur.rowcount > 0
+
+    def list_all_feedback(self, limit: int = 1000) -> list[dict[str, Any]]:
+        """All feedback joined to its run, newest first — powers the stats tab."""
+        rows = self.query(
+            """
+            SELECT
+                f.*,
+                r.name AS run_name,
+                r.status AS run_status,
+                r.deleted_at AS run_deleted_at
+            FROM run_feedback f
+            LEFT JOIN runs r ON r.id = f.run_id
+            ORDER BY f.created_at DESC, f.id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        for row in rows:
+            row["metadata"] = _loads(row.pop("metadata_json", None))
+        return rows
+
+    def feedback_stats(self) -> dict[str, Any]:
+        """Aggregate feedback counts/averages overall, per-user, and per-run."""
+        entries = self.list_all_feedback(limit=100000)
+        total = len(entries)
+        ratings = [int(row["rating"]) for row in entries if row.get("rating") is not None]
+        issue_count = sum(1 for row in entries if str(row.get("issue") or "").strip())
+        distribution = {str(score): 0 for score in range(1, 6)}
+        for score in ratings:
+            key = str(score)
+            if key in distribution:
+                distribution[key] += 1
+        by_user: dict[str, dict[str, Any]] = {}
+        by_run: dict[int, dict[str, Any]] = {}
+        for row in entries:
+            username = str(row.get("username") or "匿名")
+            user_bucket = by_user.setdefault(
+                username, {"username": username, "count": 0, "ratings": [], "issues": 0}
+            )
+            user_bucket["count"] += 1
+            if row.get("rating") is not None:
+                user_bucket["ratings"].append(int(row["rating"]))
+            if str(row.get("issue") or "").strip():
+                user_bucket["issues"] += 1
+            run_id = row.get("run_id")
+            if run_id is not None:
+                run_bucket = by_run.setdefault(
+                    int(run_id),
+                    {
+                        "run_id": int(run_id),
+                        "run_name": row.get("run_name"),
+                        "count": 0,
+                        "ratings": [],
+                        "issues": 0,
+                    },
+                )
+                run_bucket["count"] += 1
+                if row.get("rating") is not None:
+                    run_bucket["ratings"].append(int(row["rating"]))
+                if str(row.get("issue") or "").strip():
+                    run_bucket["issues"] += 1
+
+        def _finalize(bucket: dict[str, Any]) -> dict[str, Any]:
+            values = bucket.pop("ratings", [])
+            bucket["rating_count"] = len(values)
+            bucket["average_rating"] = round(sum(values) / len(values), 2) if values else None
+            return bucket
+
+        return {
+            "total": total,
+            "rating_count": len(ratings),
+            "average_rating": round(sum(ratings) / len(ratings), 2) if ratings else None,
+            "issue_count": issue_count,
+            "rating_distribution": distribution,
+            "by_user": sorted(
+                (_finalize(bucket) for bucket in by_user.values()),
+                key=lambda item: (-int(item["count"]), str(item["username"])),
+            ),
+            "by_run": sorted(
+                (_finalize(bucket) for bucket in by_run.values()),
+                key=lambda item: -int(item["run_id"]),
+            ),
+        }
 
     def mark_run_artifacts_cleaned(self, run_id: int) -> None:
         now = utc_ts()
