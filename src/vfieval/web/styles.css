@@ -1551,8 +1551,13 @@ th {
   font-size: 14px;
 }
 
-.feedback-item-head .feedback-delete {
+.feedback-item-head .feedback-edit {
   margin-left: auto;
+  padding: 2px 8px;
+  font-size: 12px;
+}
+
+.feedback-item-head .feedback-delete {
   padding: 2px 8px;
   font-size: 12px;
 }
@@ -1563,9 +1568,103 @@ th {
   word-break: break-word;
 }
 
+.feedback-context {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 13px;
+}
+
+.feedback-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.feedback-tag {
+  font-size: 12px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft, #e8f0ff);
+  color: var(--accent, #2454a6);
+}
+
+.feedback-item.editing {
+  border-color: var(--accent, #2454a6);
+}
+
+.feedback-edit-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.feedback-edit-form .wide-field {
+  grid-column: 1 / -1;
+}
+
+.feedback-edit-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.feedback-edit-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 8px;
+}
+
 .rating-stars {
   color: #f59e0b;
   letter-spacing: 1px;
+}
+
+.rating-value {
+  color: var(--muted);
+  font-size: 12px;
+  margin-left: 4px;
+}
+
+.stats-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding: 12px;
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 8px;
+  background: var(--panel-soft, #f8fafc);
+}
+
+.stats-filters label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.stats-group-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.stats-group-card {
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--panel-soft, #f8fafc);
+}
+
+.stats-group-card header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
 }
 
 .stats-block {

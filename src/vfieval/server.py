@@ -129,7 +129,15 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                         )
                     )
                 if path == "/api/feedback":
-                    return self._json(_feedback_overview(db))
+                    return self._json(
+                        _feedback_overview(
+                            db,
+                            dataset=(query.get("dataset", [None])[0] or None),
+                            model_name=(query.get("model", [None])[0] or None),
+                            checkpoint=(query.get("checkpoint", [None])[0] or None),
+                            video=(query.get("video", [None])[0] or None),
+                        )
+                    )
                 match = re.fullmatch(r"/api/runs/(\d+)/feedback", path)
                 if match:
                     run_id = int(match.group(1))
@@ -341,6 +349,17 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     except ValueError as exc:
                         return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
                     return self._json(created, status=HTTPStatus.CREATED)
+                match = re.fullmatch(r"/api/runs/(\d+)/feedback/(\d+)", path)
+                if match:
+                    run_id = int(match.group(1))
+                    feedback_id = int(match.group(2))
+                    try:
+                        updated = _update_run_feedback(db, run_id, feedback_id, body)
+                    except KeyError:
+                        return self._error(HTTPStatus.NOT_FOUND, "feedback not found")
+                    except ValueError as exc:
+                        return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
+                    return self._json(updated)
                 if path == "/api/runs/batch-delete":
                     raw_ids = body.get("run_ids") or []
                     if not isinstance(raw_ids, list) or not raw_ids:
@@ -1490,27 +1509,99 @@ def _run_detail(db: Database, run_id: int) -> dict:
     return run
 
 
+def _parse_feedback_rating(rating_raw: Any) -> float | None:
+    """Parse a rating on the 1.00–5.00 scale in 0.25 steps.
+
+    Returns ``None`` when no rating was supplied (blank/None). Raises
+    ``ValueError`` for out-of-range values or ones that do not fall on a quarter
+    step, so a slip like 3.3 is rejected rather than silently rounded.
+    """
+    if rating_raw in {None, ""}:
+        return None
+    try:
+        rating = float(rating_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("rating must be a number between 1 and 5 in steps of 0.25") from exc
+    if rating < 1 or rating > 5:
+        raise ValueError("rating must be between 1 and 5")
+    if abs(rating * 4 - round(rating * 4)) > 1e-6:
+        raise ValueError("rating must be in steps of 0.25")
+    return round(round(rating * 4) / 4, 2)
+
+
+def _feedback_context(db: Database, run_id: int, body: dict) -> dict[str, str]:
+    """Resolve the (video, track, model, checkpoint) a feedback row describes.
+
+    The client sends the video and — for compare runs — the pred track label it
+    is scoring. The model/checkpoint come from the client when a track is picked
+    (compare tracks each carry their own weight) and otherwise fall back to the
+    run's own model metadata, so a plain inference run still records what it ran.
+    """
+    run = db.get_run(run_id)
+    metadata = run.get("metadata") or {}
+    video = str(body.get("video") or "").strip()[:200]
+    track_label = str(body.get("track_label") or "").strip()[:200]
+    model_name = str(body.get("model_name") or "").strip()
+    checkpoint = str(body.get("checkpoint") or "").strip()
+    # Compare runs stitch several source runs together, one per pred track, each
+    # with its own weight. When the client names the track it is scoring, chase
+    # that track's source run so the row records the real model/checkpoint rather
+    # than the synthetic "video_compare" model the compare run itself carries.
+    if not model_name or not checkpoint:
+        track_run_id = body.get("track_run_id")
+        if track_run_id in (None, "") and track_label:
+            for track in metadata.get("distorted_tracks") or []:
+                if str(track.get("track_label") or "").strip() == track_label:
+                    track_run_id = track.get("track_run_id") or track.get("run_id")
+                    break
+        if track_run_id not in (None, ""):
+            try:
+                source_run = db.get_run(int(track_run_id))
+            except (KeyError, ValueError, TypeError):
+                source_run = None
+            if source_run is not None:
+                source_meta = source_run.get("metadata") or {}
+                if not model_name:
+                    model_name = str(source_meta.get("model_file") or source_run.get("model_name") or "").strip()
+                if not checkpoint:
+                    checkpoint = str(source_meta.get("checkpoint") or "").strip()
+    if not model_name:
+        model_name = str(metadata.get("model_file") or run.get("model_name") or "").strip()
+    if not checkpoint:
+        checkpoint = str(metadata.get("checkpoint") or "").strip()
+    return {
+        "video": video,
+        "track_label": track_label,
+        "model_name": model_name[:200],
+        "checkpoint": checkpoint[:200],
+    }
+
+
 def _create_run_feedback(db: Database, run_id: int, body: dict) -> dict:
     """Validate and persist one feedback entry for a run.
 
     A submission needs at least a rating or a non-empty issue — a blank form
-    should not create a row. Rating, when present, is clamped to the 1–5 scale.
+    should not create a row. Rating, when present, must fall on the 0.25-step
+    1–5 scale. The entry also records the video/track/model/checkpoint it scores
+    so the stats tab can group by content rather than only by run.
     """
     db.get_run(run_id)  # 404s via the caller if the run does not exist.
     username = str(body.get("username") or "").strip()[:120]
     issue = str(body.get("issue") or "").strip()
-    rating_raw = body.get("rating")
-    rating: int | None = None
-    if rating_raw not in {None, ""}:
-        try:
-            rating = int(rating_raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("rating must be an integer between 1 and 5") from exc
-        if rating < 1 or rating > 5:
-            raise ValueError("rating must be between 1 and 5")
+    rating = _parse_feedback_rating(body.get("rating"))
     if rating is None and not issue:
         raise ValueError("feedback requires a rating or an issue")
-    feedback_id = db.add_run_feedback(run_id, username, rating, issue)
+    context = _feedback_context(db, run_id, body)
+    feedback_id = db.add_run_feedback(
+        run_id,
+        username,
+        rating,
+        issue,
+        video=context["video"],
+        track_label=context["track_label"],
+        model_name=context["model_name"],
+        checkpoint=context["checkpoint"],
+    )
     return {
         "run_id": run_id,
         "feedback_id": feedback_id,
@@ -1518,15 +1609,87 @@ def _create_run_feedback(db: Database, run_id: int, body: dict) -> dict:
     }
 
 
-def _feedback_overview(db: Database) -> dict:
+def _update_run_feedback(db: Database, run_id: int, feedback_id: int, body: dict) -> dict:
+    """Patch an existing feedback entry so a mis-scored review can be corrected.
+
+    Only the fields present in the body change. ``rating`` may be set to a new
+    0.25-step value, or explicitly cleared by sending ``null``/``""``. The result
+    must still carry a rating or an issue, matching create-time validation.
+    """
+    existing = {int(row["id"]): row for row in db.list_run_feedback(run_id)}
+    current = existing.get(int(feedback_id))
+    if current is None:
+        raise KeyError("feedback not found")
+
+    kwargs: dict[str, Any] = {}
+    if "username" in body:
+        kwargs["username"] = str(body.get("username") or "").strip()[:120]
+    if "issue" in body:
+        kwargs["issue"] = str(body.get("issue") or "").strip()
+
+    rating_present = "rating" in body
+    if rating_present:
+        if body.get("rating") in {None, ""}:
+            kwargs["clear_rating"] = True
+        else:
+            kwargs["rating"] = _parse_feedback_rating(body.get("rating"))
+
+    # Guard against a patch that empties the row of both signals.
+    final_rating = (
+        None if kwargs.get("clear_rating")
+        else kwargs.get("rating", current.get("rating"))
+    )
+    final_issue = kwargs.get("issue", current.get("issue") or "")
+    if final_rating is None and not str(final_issue).strip():
+        raise ValueError("feedback requires a rating or an issue")
+
+    if not db.update_run_feedback(run_id, feedback_id, **kwargs):
+        raise ValueError("no feedback fields to update")
+    return {
+        "run_id": run_id,
+        "feedback_id": feedback_id,
+        "feedback": db.list_run_feedback(run_id),
+    }
+
+
+def _feedback_overview(
+    db: Database,
+    *,
+    dataset: str | None = None,
+    model_name: str | None = None,
+    checkpoint: str | None = None,
+    video: str | None = None,
+) -> dict:
     """Aggregate run feedback for the statistics tab.
 
-    Wraps ``db.feedback_stats`` (overall + per-user + per-run rollups) and adds
-    the 1–5 rating distribution and a recent-entries feed the UI renders as a
-    log of who reviewed what, the score they gave, and the issue they raised.
+    Wraps ``db.feedback_stats`` (overall + per-user/run/video/model/checkpoint
+    rollups) and adds the 0.25-step rating distribution, filter options, and a
+    recent-entries feed. The filter arguments narrow the population (dataset,
+    model, checkpoint, video) before aggregation.
     """
-    stats = db.feedback_stats()
-    stats["recent"] = db.list_all_feedback(limit=100)
+    stats = db.feedback_stats(
+        dataset=dataset or None,
+        model_name=model_name or None,
+        checkpoint=checkpoint or None,
+        video=video or None,
+    )
+    active = {"dataset": dataset, "model_name": model_name, "checkpoint": checkpoint, "video": video}
+    stats["filters"] = {k: v for k, v in active.items() if v}
+    stats["filter_options"] = db.feedback_filter_options()
+
+    def _keep(row: dict[str, Any]) -> bool:
+        if dataset and str(row.get("dataset_name") or "") != dataset:
+            return False
+        if model_name and str(row.get("model_name") or "") != model_name:
+            return False
+        if checkpoint and str(row.get("checkpoint") or "") != checkpoint:
+            return False
+        if video and str(row.get("video") or "") != video:
+            return False
+        return True
+
+    recent = [row for row in db.list_all_feedback(limit=100000) if _keep(row)]
+    stats["recent"] = recent[:100]
     return stats
 
 

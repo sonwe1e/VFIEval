@@ -79,6 +79,8 @@ const state = {
   selectedRunIds: new Set(),
   feedbackUsername: "",
   feedbackStats: null,
+  editingFeedback: null,
+  statsFilters: { dataset: "", model: "", checkpoint: "", video: "" },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -1709,64 +1711,163 @@ function renderRunDetail() {
         ${video ? renderVideoTimeline(video) : (selectedVideoName ? "<div class=\"timeline-skeleton\" aria-busy=\"true\"><span></span><span></span><span></span></div>" : "<p class=\"muted\">暂无结果。</p>")}
       </section>
     </div>
-    ${renderRunFeedback(run)}
+    ${renderRunFeedback(run, selectedVideoName, video)}
   `;
 }
 
 function ratingStars(rating) {
   const score = Number(rating);
   if (!Number.isFinite(score) || score <= 0) return "<span class=\"muted\">未打分</span>";
-  const full = Math.max(0, Math.min(5, Math.round(score)));
-  return `<span class="rating-stars" title="${escapeHtml(score)}/5">${"★".repeat(full)}${"☆".repeat(5 - full)}</span>`;
+  const clamped = Math.max(0, Math.min(5, score));
+  const full = Math.floor(clamped);
+  const hasHalf = clamped - full >= 0.25 && clamped - full < 0.875;
+  const rounded = clamped - full >= 0.875;
+  const fullCount = full + (rounded ? 1 : 0);
+  const half = hasHalf ? 1 : 0;
+  const empty = Math.max(0, 5 - fullCount - half);
+  return `<span class="rating-stars" title="${escapeHtml(formatRating(score))}/5">${"★".repeat(fullCount)}${half ? "⯨" : ""}${"☆".repeat(empty)} <span class="rating-value">${escapeHtml(formatRating(score))}</span></span>`;
 }
 
-function renderRunFeedback(run) {
+// Ratings use a 0.25 step; drop trailing zeros so 4.00 shows as "4" and 4.25 stays "4.25".
+function formatRating(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return "-";
+  return String(Math.round(num * 100) / 100);
+}
+
+// 1.00–5.00 in 0.25 increments, highest first for the dropdown.
+const RATING_OPTIONS = Array.from({ length: 17 }, (_, i) => (5 - i * 0.25));
+
+// Rating <select> options: blank ("不打分") plus 5.00 → 1.00 in 0.25 steps.
+// `selected` is a numeric value to pre-select when editing an existing entry.
+function ratingOptions(selected) {
+  const chosen = selected === null || selected === undefined || selected === ""
+    ? ""
+    : formatRating(selected);
+  const blank = `<option value="" ${chosen === "" ? "selected" : ""}>不打分</option>`;
+  const opts = RATING_OPTIONS.map((score) => {
+    const value = formatRating(score);
+    return `<option value="${value}" ${chosen === value ? "selected" : ""}>${value} 分</option>`;
+  }).join("");
+  return blank + opts;
+}
+
+// Compare runs expose pred tracks (each its own model/checkpoint); a single
+// inference run has none. The picker lets the reviewer say which pred they are
+// scoring so the row records the right weight for the stats tab.
+function feedbackTrackOptions(video) {
+  const tracks = (video && video.video_artifact_tracks) || [];
+  const labels = [];
+  const seen = new Set();
+  for (const track of tracks) {
+    const label = String(track.track_label || "").trim();
+    if (label && !seen.has(label)) {
+      seen.add(label);
+      labels.push(label);
+    }
+  }
+  return labels;
+}
+
+function renderRunFeedback(run, selectedVideoName, video) {
   const feedback = run.feedback || [];
   const rated = feedback.filter((item) => item.rating !== null && item.rating !== undefined);
   const mean = rated.length ? (rated.reduce((sum, item) => sum + Number(item.rating), 0) / rated.length) : null;
+  const videoName = selectedVideoName || "";
+  const trackLabels = feedbackTrackOptions(video);
+  const trackField = trackLabels.length ? `
+        <label>
+          <span>对比轨道</span>
+          <select name="track_label">
+            <option value="">整体 / 未指定</option>
+            ${trackLabels.map((label) => `<option value="${escapeHtml(label)}">${escapeHtml(label)}</option>`).join("")}
+          </select>
+        </label>` : "";
   return `
     <section class="feedback-panel">
       <div class="panel-head">
         <div>
           <h3>评分与问题</h3>
-          <p class="muted">记录评审人、打分和提出的问题，可在“统计”页汇总查看。</p>
+          <p class="muted">评分绑定当前视频${trackLabels.length ? "与所选对比轨道" : ""}，可在“统计”页按视频、模型、权重汇总。评分以 0.25 为分度。</p>
         </div>
         <div class="metric-summary">
           <span>反馈 ${escapeHtml(feedback.length)}</span>
-          <span>平均分 ${mean === null ? "-" : formatNumber(mean)}</span>
+          <span>平均分 ${mean === null ? "-" : formatRating(mean)}</span>
         </div>
       </div>
       <form class="feedback-form" data-feedback-form="${escapeHtml(run.id)}">
+        <input type="hidden" name="video" value="${escapeHtml(videoName)}">
+        <p class="feedback-context muted">评分对象：<strong>${escapeHtml(videoName || "（先选择一个视频）")}</strong></p>
         <label>
           <span>用户名</span>
           <input name="username" value="${escapeHtml(state.feedbackUsername || "")}" placeholder="你的名字" maxlength="80">
         </label>
         <label>
           <span>评分</span>
-          <select name="rating">
-            <option value="">不打分</option>
-            ${[5, 4, 3, 2, 1].map((score) => `<option value="${score}">${score} 分</option>`).join("")}
-          </select>
+          <select name="rating">${ratingOptions("")}</select>
         </label>
+        ${trackField}
         <label class="wide-field">
           <span>问题 / 备注</span>
           <textarea name="issue" rows="2" placeholder="描述发现的问题或想记录的内容" maxlength="2000"></textarea>
         </label>
-        <button type="submit">提交反馈</button>
+        <button type="submit" ${videoName ? "" : "disabled"}>提交反馈</button>
       </form>
       <div class="feedback-list">
-        ${feedback.length ? feedback.map((item) => `
-          <article class="feedback-item">
-            <div class="feedback-item-head">
-              <strong>${escapeHtml(item.username || "匿名")}</strong>
-              ${ratingStars(item.rating)}
-              <button class="secondary danger feedback-delete" data-feedback-delete="${escapeHtml(item.id)}" data-feedback-run="${escapeHtml(run.id)}" type="button">删除</button>
-            </div>
-            ${item.issue ? `<p class="feedback-issue">${escapeHtml(item.issue)}</p>` : "<p class=\"muted\">无问题描述。</p>"}
-          </article>
-        `).join("") : "<p class=\"muted\">还没有反馈。</p>"}
+        ${feedback.length ? feedback.map((item) => renderFeedbackItem(run, item)).join("") : "<p class=\"muted\">还没有反馈。</p>"}
       </div>
     </section>
+  `;
+}
+
+// One feedback row. When its id is in `state.editingFeedback`, render an inline
+// edit form instead of the static view so a mis-scored review can be corrected.
+function renderFeedbackItem(run, item) {
+  const context = [
+    item.video ? `视频 ${item.video}` : "",
+    item.track_label ? `轨道 ${item.track_label}` : "",
+    item.model_name ? `模型 ${item.model_name}` : "",
+    item.checkpoint ? `权重 ${item.checkpoint}` : "",
+  ].filter(Boolean).map((text) => `<span class="feedback-tag">${escapeHtml(text)}</span>`).join("");
+  const edited = item.updated_at && item.created_at && Number(item.updated_at) - Number(item.created_at) > 1
+    ? "<span class=\"muted\">（已编辑）</span>"
+    : "";
+  if (Number(state.editingFeedback) === Number(item.id)) {
+    return `
+      <article class="feedback-item editing">
+        <form class="feedback-edit-form" data-feedback-edit-form="${escapeHtml(item.id)}" data-feedback-run="${escapeHtml(run.id)}">
+          <label>
+            <span>用户名</span>
+            <input name="username" value="${escapeHtml(item.username || "")}" maxlength="80">
+          </label>
+          <label>
+            <span>评分</span>
+            <select name="rating">${ratingOptions(item.rating)}</select>
+          </label>
+          <label class="wide-field">
+            <span>问题 / 备注</span>
+            <textarea name="issue" rows="2" maxlength="2000">${escapeHtml(item.issue || "")}</textarea>
+          </label>
+          <div class="feedback-edit-actions">
+            <button type="submit">保存</button>
+            <button class="secondary" data-feedback-cancel-edit type="button">取消</button>
+          </div>
+        </form>
+      </article>
+    `;
+  }
+  return `
+    <article class="feedback-item">
+      <div class="feedback-item-head">
+        <strong>${escapeHtml(item.username || "匿名")}</strong>
+        ${ratingStars(item.rating)}
+        ${edited}
+        <button class="secondary feedback-edit" data-feedback-edit="${escapeHtml(item.id)}" data-feedback-run="${escapeHtml(run.id)}" type="button">编辑</button>
+        <button class="secondary danger feedback-delete" data-feedback-delete="${escapeHtml(item.id)}" data-feedback-run="${escapeHtml(run.id)}" type="button">删除</button>
+      </div>
+      ${context ? `<div class="feedback-tags">${context}</div>` : ""}
+      ${item.issue ? `<p class="feedback-issue">${escapeHtml(item.issue)}</p>` : "<p class=\"muted\">无问题描述。</p>"}
+    </article>
   `;
 }
 
@@ -2555,15 +2656,21 @@ async function submitRunFeedback(runId, form) {
   const username = String(data.username || "").trim();
   const issue = String(data.issue || "").trim();
   const rating = data.rating ? Number(data.rating) : null;
+  const video = String(data.video || "").trim();
+  const trackLabel = String(data.track_label || "").trim();
   if (!issue && rating === null) {
     toast("请至少填写评分或问题");
+    return;
+  }
+  if (!video) {
+    toast("请先选择要评分的视频");
     return;
   }
   // Remember the name so the reviewer doesn't retype it on every run.
   state.feedbackUsername = username;
   await api(`/api/runs/${runId}/feedback`, {
     method: "POST",
-    body: JSON.stringify({ username, rating, issue }),
+    body: JSON.stringify({ username, rating, issue, video, track_label: trackLabel }),
   });
   toast("反馈已提交");
   if (Number(state.selectedRun?.id) === Number(runId)) {
@@ -2571,8 +2678,30 @@ async function submitRunFeedback(runId, form) {
   }
 }
 
+async function submitFeedbackEdit(runId, feedbackId, form) {
+  const data = formData(form);
+  const username = String(data.username || "").trim();
+  const issue = String(data.issue || "").trim();
+  const rating = data.rating ? Number(data.rating) : null;
+  if (!issue && rating === null) {
+    toast("请至少填写评分或问题");
+    return;
+  }
+  await api(`/api/runs/${runId}/feedback/${feedbackId}`, {
+    method: "POST",
+    // Send rating explicitly (possibly null) so clearing it is honored.
+    body: JSON.stringify({ username, rating, issue }),
+  });
+  state.editingFeedback = null;
+  toast("反馈已更新");
+  if (Number(state.selectedRun?.id) === Number(runId)) {
+    await selectRun(runId, { quiet: true });
+  }
+}
+
 async function deleteRunFeedback(runId, feedbackId) {
   await api(`/api/runs/${runId}/feedback/${feedbackId}`, { method: "DELETE" });
+  if (Number(state.editingFeedback) === Number(feedbackId)) state.editingFeedback = null;
   toast("反馈已删除");
   if (Number(state.selectedRun?.id) === Number(runId)) {
     await selectRun(runId, { quiet: true });
@@ -2580,8 +2709,87 @@ async function deleteRunFeedback(runId, feedbackId) {
 }
 
 async function loadStats() {
-  state.feedbackStats = await api("/api/feedback");
+  const f = state.statsFilters || {};
+  const params = new URLSearchParams();
+  if (f.dataset) params.set("dataset", f.dataset);
+  if (f.model) params.set("model", f.model);
+  if (f.checkpoint) params.set("checkpoint", f.checkpoint);
+  if (f.video) params.set("video", f.video);
+  const qs = params.toString();
+  state.feedbackStats = await api(`/api/feedback${qs ? `?${qs}` : ""}`);
   renderStats();
+}
+
+// Render one 0.25-step rating histogram from a distribution map keyed by
+// "1.00".."5.00". Shared by the overall chart and per-group (video/checkpoint)
+// charts so they read the same.
+function renderRatingHistogram(distribution) {
+  const keys = Array.from({ length: 17 }, (_, i) => formatRatingKey(5 - i * 0.25));
+  const maxCount = Math.max(1, ...keys.map((key) => Number(distribution[key] || 0)));
+  return `
+    <div class="rating-bars">
+      ${keys.map((key) => {
+        const count = Number(distribution[key] || 0);
+        const width = Math.round((count / maxCount) * 100);
+        return `
+          <div class="rating-bar-row">
+            <span class="rating-bar-label">${escapeHtml(key)}</span>
+            <span class="rating-bar-track"><span class="rating-bar-fill" style="width: ${width}%"></span></span>
+            <span class="rating-bar-count">${escapeHtml(count)}</span>
+          </div>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+// The backend distribution is keyed on 0.25-step strings; keep the frontend key
+// format identical so lookups line up.
+function formatRatingKey(value) {
+  return Number(value).toFixed(2);
+}
+
+function statsFilterControls(options, filters) {
+  const select = (name, label, values, current) => `
+    <label>
+      <span>${escapeHtml(label)}</span>
+      <select data-stats-filter="${name}">
+        <option value="">全部</option>
+        ${values.map((value) => `<option value="${escapeHtml(value)}" ${String(current) === String(value) ? "selected" : ""}>${escapeHtml(value)}</option>`).join("")}
+      </select>
+    </label>
+  `;
+  return `
+    <section class="stats-filters">
+      ${select("dataset", "数据集", options.datasets || [], filters.dataset)}
+      ${select("model", "模型", options.models || [], filters.model)}
+      ${select("checkpoint", "权重", options.checkpoints || [], filters.checkpoint)}
+      ${select("video", "视频", options.videos || [], filters.video)}
+      <button class="secondary" data-stats-filter-reset type="button">清除筛选</button>
+    </section>
+  `;
+}
+
+// A collapsible per-group section: summary table plus one rating histogram per
+// group row, so "某个视频的评分分布" / "某个权重的评分分布" are both first-class.
+function renderGroupedDistributions(title, rows, labelFor) {
+  if (!rows.length) return "";
+  return `
+    <section class="stats-block">
+      <h3>${escapeHtml(title)}</h3>
+      <div class="stats-group-grid">
+        ${rows.map((row) => `
+          <article class="stats-group-card">
+            <header>
+              <strong>${escapeHtml(labelFor(row))}</strong>
+              <span class="muted">${escapeHtml(row.count || 0)} 条 · 均分 ${row.average_rating === null || row.average_rating === undefined ? "-" : formatRating(row.average_rating)}</span>
+            </header>
+            ${renderRatingHistogram(row.rating_distribution || {})}
+          </article>
+        `).join("")}
+      </div>
+    </section>
+  `;
 }
 
 function renderStats() {
@@ -2593,40 +2801,35 @@ function renderStats() {
     return;
   }
   const distribution = stats.rating_distribution || {};
-  const maxCount = Math.max(1, ...[5, 4, 3, 2, 1].map((score) => Number(distribution[score] || 0)));
   const byRun = stats.by_run || [];
   const byUser = stats.by_user || [];
+  const byVideo = stats.by_video || [];
+  const byCheckpoint = stats.by_checkpoint || [];
   const recent = stats.recent || [];
+  const options = stats.filter_options || {};
+  const filters = stats.filters || {};
   host.innerHTML = `
+    ${statsFilterControls(options, state.statsFilters)}
     <div class="summary-grid">
       <div><span>反馈总数</span><strong>${escapeHtml(stats.total || 0)}</strong></div>
       <div><span>打分数</span><strong>${escapeHtml(stats.rating_count || 0)}</strong></div>
-      <div><span>平均分</span><strong>${stats.average_rating === null || stats.average_rating === undefined ? "-" : formatNumber(stats.average_rating)}</strong></div>
+      <div><span>平均分</span><strong>${stats.average_rating === null || stats.average_rating === undefined ? "-" : formatRating(stats.average_rating)}</strong></div>
       <div><span>问题数</span><strong>${escapeHtml(stats.issue_count || 0)}</strong></div>
     </div>
+    ${Object.keys(filters).length ? `<p class="muted">已筛选：${Object.entries(filters).map(([k, v]) => `${escapeHtml(k)}=${escapeHtml(v)}`).join("， ")}</p>` : ""}
     <section class="stats-block">
-      <h3>评分分布</h3>
-      <div class="rating-bars">
-        ${[5, 4, 3, 2, 1].map((score) => {
-          const count = Number(distribution[score] || 0);
-          const width = Math.round((count / maxCount) * 100);
-          return `
-            <div class="rating-bar-row">
-              <span class="rating-bar-label">${score} ★</span>
-              <span class="rating-bar-track"><span class="rating-bar-fill" style="width: ${width}%"></span></span>
-              <span class="rating-bar-count">${escapeHtml(count)}</span>
-            </div>
-          `;
-        }).join("")}
-      </div>
+      <h3>总体评分分布（0.25 分度）</h3>
+      ${renderRatingHistogram(distribution)}
     </section>
+    ${renderGroupedDistributions("按视频的评分分布", byVideo, (row) => row.video || "（未指定）")}
+    ${renderGroupedDistributions("按模型 / 权重的评分分布", byCheckpoint, (row) => `${row.model_name || "?"} / ${row.checkpoint || "-"}`)}
     <section class="stats-block">
       <h3>按用户</h3>
       <div class="table compact-table">${table(byUser, [
         { label: "用户名", render: (row) => escapeHtml(row.username || "匿名") },
         { label: "反馈数", render: (row) => escapeHtml(row.count || 0) },
         { label: "打分数", render: (row) => escapeHtml(row.rating_count || 0) },
-        { label: "平均分", render: (row) => row.average_rating === null || row.average_rating === undefined ? "-" : formatNumber(row.average_rating) },
+        { label: "平均分", render: (row) => row.average_rating === null || row.average_rating === undefined ? "-" : formatRating(row.average_rating) },
         { label: "问题数", render: (row) => escapeHtml(row.issues || 0) },
       ])}</div>
     </section>
@@ -2636,7 +2839,7 @@ function renderStats() {
         { label: "Run", render: (row) => `#${escapeHtml(row.run_id)}` },
         { label: "名称", render: (row) => escapeHtml(row.run_name || "-") },
         { label: "反馈数", render: (row) => escapeHtml(row.count || 0) },
-        { label: "平均分", render: (row) => row.average_rating === null || row.average_rating === undefined ? "-" : formatNumber(row.average_rating) },
+        { label: "平均分", render: (row) => row.average_rating === null || row.average_rating === undefined ? "-" : formatRating(row.average_rating) },
         { label: "问题数", render: (row) => escapeHtml(row.issues || 0) },
         { label: "操作", render: (row) => `<button class="view-detail-btn" data-stats-run="${escapeHtml(row.run_id)}" type="button">查看 →</button>` },
       ])}</div>
@@ -2651,6 +2854,7 @@ function renderStats() {
               ${ratingStars(item.rating)}
               <span class="muted">#${escapeHtml(item.run_id)} ${escapeHtml(item.run_name || "")}</span>
             </div>
+            ${[item.video ? `视频 ${item.video}` : "", item.model_name ? `模型 ${item.model_name}` : "", item.checkpoint ? `权重 ${item.checkpoint}` : ""].filter(Boolean).length ? `<div class="feedback-tags">${[item.video ? `视频 ${item.video}` : "", item.model_name ? `模型 ${item.model_name}` : "", item.checkpoint ? `权重 ${item.checkpoint}` : ""].filter(Boolean).map((text) => `<span class="feedback-tag">${escapeHtml(text)}</span>`).join("")}</div>` : ""}
             ${item.issue ? `<p class="feedback-issue">${escapeHtml(item.issue)}</p>` : "<p class=\"muted\">无问题描述。</p>"}
           </article>
         `).join("") : "<p class=\"muted\">还没有反馈。</p>"}
@@ -2757,6 +2961,12 @@ $("infer-form").addEventListener("change", async (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  const statsFilter = event.target.closest("[data-stats-filter]");
+  if (statsFilter) {
+    state.statsFilters[statsFilter.dataset.statsFilter] = statsFilter.value || "";
+    loadStats().catch((error) => toast(error.message));
+    return;
+  }
   const groupToggle = event.target.closest("[data-group-toggle]");
   if (groupToggle) {
     const name = groupToggle.dataset.groupToggle;
@@ -2893,6 +3103,16 @@ document.addEventListener("submit", (event) => {
   if (feedbackForm) {
     event.preventDefault();
     submitRunFeedback(Number(feedbackForm.dataset.feedbackForm), feedbackForm).catch((error) => toast(error.message));
+    return;
+  }
+  const feedbackEditForm = event.target.closest("[data-feedback-edit-form]");
+  if (feedbackEditForm) {
+    event.preventDefault();
+    submitFeedbackEdit(
+      Number(feedbackEditForm.dataset.feedbackRun),
+      Number(feedbackEditForm.dataset.feedbackEditForm),
+      feedbackEditForm,
+    ).catch((error) => toast(error.message));
   }
 });
 
@@ -2900,6 +3120,24 @@ document.addEventListener("click", async (event) => {
   const feedbackDelete = event.target.closest("[data-feedback-delete]");
   if (feedbackDelete) {
     await deleteRunFeedback(Number(feedbackDelete.dataset.feedbackRun), Number(feedbackDelete.dataset.feedbackDelete));
+    return;
+  }
+  const feedbackEdit = event.target.closest("[data-feedback-edit]");
+  if (feedbackEdit) {
+    state.editingFeedback = Number(feedbackEdit.dataset.feedbackEdit);
+    renderRunDetail();
+    return;
+  }
+  const feedbackCancelEdit = event.target.closest("[data-feedback-cancel-edit]");
+  if (feedbackCancelEdit) {
+    state.editingFeedback = null;
+    renderRunDetail();
+    return;
+  }
+  const statsFilterReset = event.target.closest("[data-stats-filter-reset]");
+  if (statsFilterReset) {
+    state.statsFilters = { dataset: "", model: "", checkpoint: "", video: "" };
+    await loadStats().catch((error) => toast(error.message));
     return;
   }
   const statsRun = event.target.closest("[data-stats-run]");

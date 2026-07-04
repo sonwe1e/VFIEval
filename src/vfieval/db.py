@@ -24,6 +24,11 @@ def _loads(text: str | None) -> Any:
     return json.loads(text)
 
 
+def _rating_key(score: float) -> str:
+    """Canonical 0.25-step histogram key, e.g. 3.0 -> "3.00", 3.25 -> "3.25"."""
+    return f"{round(float(score) * 4) / 4:.2f}"
+
+
 def _combine_output_health(reports: Iterable[dict[str, Any] | None]) -> dict[str, Any] | None:
     valid = [report for report in reports if isinstance(report, dict)]
     if not valid:
@@ -248,13 +253,19 @@ CREATE TABLE IF NOT EXISTS run_feedback (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
     username TEXT NOT NULL DEFAULT '',
-    rating INTEGER,
+    rating REAL,
     issue TEXT NOT NULL DEFAULT '',
+    video TEXT NOT NULL DEFAULT '',
+    track_label TEXT NOT NULL DEFAULT '',
+    model_name TEXT NOT NULL DEFAULT '',
+    checkpoint TEXT NOT NULL DEFAULT '',
     metadata_json TEXT NOT NULL DEFAULT '{}',
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    updated_at REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_run_feedback_run ON run_feedback(run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_run_feedback_video ON run_feedback(video, model_name, checkpoint);
 """
 
 
@@ -314,14 +325,30 @@ class Database:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
                 username TEXT NOT NULL DEFAULT '',
-                rating INTEGER,
+                rating REAL,
                 issue TEXT NOT NULL DEFAULT '',
+                video TEXT NOT NULL DEFAULT '',
+                track_label TEXT NOT NULL DEFAULT '',
+                model_name TEXT NOT NULL DEFAULT '',
+                checkpoint TEXT NOT NULL DEFAULT '',
                 metadata_json TEXT NOT NULL DEFAULT '{}',
-                created_at REAL NOT NULL
+                created_at REAL NOT NULL,
+                updated_at REAL
             );
             CREATE INDEX IF NOT EXISTS idx_run_feedback_run ON run_feedback(run_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_run_feedback_video ON run_feedback(video, model_name, checkpoint);
             """
         )
+        feedback_columns = {row["name"] for row in conn.execute("PRAGMA table_info(run_feedback)").fetchall()}
+        for name, definition in {
+            "video": "TEXT NOT NULL DEFAULT ''",
+            "track_label": "TEXT NOT NULL DEFAULT ''",
+            "model_name": "TEXT NOT NULL DEFAULT ''",
+            "checkpoint": "TEXT NOT NULL DEFAULT ''",
+            "updated_at": "REAL",
+        }.items():
+            if name not in feedback_columns:
+                conn.execute(f"ALTER TABLE run_feedback ADD COLUMN {name} {definition}")
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(datasets)").fetchall()}
         dataset_columns = {
             "source_type": "TEXT NOT NULL DEFAULT 'frames'",
@@ -1226,27 +1253,80 @@ class Database:
         self,
         run_id: int,
         username: str,
-        rating: int | None,
+        rating: float | None,
         issue: str,
+        video: str = "",
+        track_label: str = "",
+        model_name: str = "",
+        checkpoint: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> int:
         now = utc_ts()
         with self.connection() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO run_feedback(run_id, username, rating, issue, metadata_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO run_feedback(
+                    run_id, username, rating, issue,
+                    video, track_label, model_name, checkpoint,
+                    metadata_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
                     username,
-                    int(rating) if rating is not None else None,
+                    float(rating) if rating is not None else None,
                     issue,
+                    video,
+                    track_label,
+                    model_name,
+                    checkpoint,
                     _json(metadata),
+                    now,
                     now,
                 ),
             )
             return int(cur.lastrowid)
+
+    def update_run_feedback(
+        self,
+        run_id: int,
+        feedback_id: int,
+        *,
+        username: str | None = None,
+        rating: float | None = None,
+        issue: str | None = None,
+        clear_rating: bool = False,
+    ) -> bool:
+        """Patch an existing feedback row. Only provided fields change.
+
+        ``clear_rating=True`` explicitly nulls the rating (distinct from leaving
+        ``rating`` as ``None`` to mean "unchanged").
+        """
+        sets: list[str] = []
+        params: list[Any] = []
+        if username is not None:
+            sets.append("username = ?")
+            params.append(username)
+        if issue is not None:
+            sets.append("issue = ?")
+            params.append(issue)
+        if clear_rating:
+            sets.append("rating = NULL")
+        elif rating is not None:
+            sets.append("rating = ?")
+            params.append(float(rating))
+        if not sets:
+            return False
+        sets.append("updated_at = ?")
+        params.append(utc_ts())
+        params.extend([feedback_id, run_id])
+        with self.connection() as conn:
+            cur = conn.execute(
+                f"UPDATE run_feedback SET {', '.join(sets)} WHERE id = ? AND run_id = ?",
+                tuple(params),
+            )
+            return cur.rowcount > 0
 
     def list_run_feedback(self, run_id: int) -> list[dict[str, Any]]:
         rows = self.query(
@@ -1265,17 +1345,27 @@ class Database:
             )
             return cur.rowcount > 0
 
-    def list_all_feedback(self, limit: int = 1000) -> list[dict[str, Any]]:
-        """All feedback joined to its run, newest first — powers the stats tab."""
+    def list_all_feedback(self, limit: int = 1000, include_deleted: bool = False) -> list[dict[str, Any]]:
+        """All feedback joined to its run + dataset context, newest first.
+
+        Runs whose records were deleted are excluded by default so the stats tab
+        only reflects live evaluations (matches the #26 "delete run → drop its
+        feedback from stats" expectation). Cleaning artifacts cascades the delete
+        at the DB level, but a soft-deleted run keeps its rows, so filter here.
+        """
+        deleted_clause = "" if include_deleted else "WHERE r.deleted_at IS NULL"
         rows = self.query(
-            """
+            f"""
             SELECT
                 f.*,
                 r.name AS run_name,
                 r.status AS run_status,
-                r.deleted_at AS run_deleted_at
+                r.deleted_at AS run_deleted_at,
+                d.name AS dataset_name
             FROM run_feedback f
             LEFT JOIN runs r ON r.id = f.run_id
+            LEFT JOIN datasets d ON d.id = r.dataset_id
+            {deleted_clause}
             ORDER BY f.created_at DESC, f.id DESC
             LIMIT ?
             """,
@@ -1285,46 +1375,93 @@ class Database:
             row["metadata"] = _loads(row.pop("metadata_json", None))
         return rows
 
-    def feedback_stats(self) -> dict[str, Any]:
-        """Aggregate feedback counts/averages overall, per-user, and per-run."""
+    def feedback_stats(
+        self,
+        *,
+        dataset: str | None = None,
+        model_name: str | None = None,
+        checkpoint: str | None = None,
+        video: str | None = None,
+    ) -> dict[str, Any]:
+        """Aggregate feedback overall and grouped by user/run/video/model/checkpoint.
+
+        Optional filters narrow the population before aggregation so the caller
+        can ask e.g. "only this dataset" or "only this checkpoint". Ratings use a
+        0.25 step, so the distribution histogram spans the 17 quarter-values from
+        1.00 to 5.00.
+        """
         entries = self.list_all_feedback(limit=100000)
+
+        def _keep(row: dict[str, Any]) -> bool:
+            if dataset and str(row.get("dataset_name") or "") != dataset:
+                return False
+            if model_name and str(row.get("model_name") or "") != model_name:
+                return False
+            if checkpoint and str(row.get("checkpoint") or "") != checkpoint:
+                return False
+            if video and str(row.get("video") or "") != video:
+                return False
+            return True
+
+        entries = [row for row in entries if _keep(row)]
         total = len(entries)
-        ratings = [int(row["rating"]) for row in entries if row.get("rating") is not None]
+        ratings = [float(row["rating"]) for row in entries if row.get("rating") is not None]
         issue_count = sum(1 for row in entries if str(row.get("issue") or "").strip())
-        distribution = {str(score): 0 for score in range(1, 6)}
+        distribution = {_rating_key(step / 4): 0 for step in range(4, 21)}
         for score in ratings:
-            key = str(score)
+            key = _rating_key(score)
             if key in distribution:
                 distribution[key] += 1
-        by_user: dict[str, dict[str, Any]] = {}
-        by_run: dict[int, dict[str, Any]] = {}
+
+        groups: dict[str, dict[Any, dict[str, Any]]] = {
+            "by_user": {},
+            "by_run": {},
+            "by_video": {},
+            "by_model": {},
+            "by_checkpoint": {},
+            "by_model_checkpoint": {},
+        }
+
+        def _bucket(dimension: str, key: Any, label: dict[str, Any]) -> dict[str, Any]:
+            store = groups[dimension]
+            if key not in store:
+                store[key] = {**label, "count": 0, "ratings": [], "issues": 0}
+            return store[key]
+
         for row in entries:
+            rating = float(row["rating"]) if row.get("rating") is not None else None
+            has_issue = bool(str(row.get("issue") or "").strip())
             username = str(row.get("username") or "匿名")
-            user_bucket = by_user.setdefault(
-                username, {"username": username, "count": 0, "ratings": [], "issues": 0}
-            )
-            user_bucket["count"] += 1
-            if row.get("rating") is not None:
-                user_bucket["ratings"].append(int(row["rating"]))
-            if str(row.get("issue") or "").strip():
-                user_bucket["issues"] += 1
+            video_name = str(row.get("video") or "").strip()
+            model = str(row.get("model_name") or "").strip()
+            ckpt = str(row.get("checkpoint") or "").strip() or "-"
+            targets = [
+                _bucket("by_user", username, {"username": username}),
+            ]
             run_id = row.get("run_id")
             if run_id is not None:
-                run_bucket = by_run.setdefault(
-                    int(run_id),
-                    {
-                        "run_id": int(run_id),
-                        "run_name": row.get("run_name"),
-                        "count": 0,
-                        "ratings": [],
-                        "issues": 0,
-                    },
+                targets.append(
+                    _bucket("by_run", int(run_id), {"run_id": int(run_id), "run_name": row.get("run_name")})
                 )
-                run_bucket["count"] += 1
-                if row.get("rating") is not None:
-                    run_bucket["ratings"].append(int(row["rating"]))
-                if str(row.get("issue") or "").strip():
-                    run_bucket["issues"] += 1
+            if video_name:
+                targets.append(_bucket("by_video", video_name, {"video": video_name}))
+            if model:
+                targets.append(_bucket("by_model", model, {"model_name": model}))
+                targets.append(_bucket("by_checkpoint", (model, ckpt), {"model_name": model, "checkpoint": ckpt}))
+                combo_key = (model, ckpt, video_name)
+                targets.append(
+                    _bucket(
+                        "by_model_checkpoint",
+                        combo_key,
+                        {"model_name": model, "checkpoint": ckpt, "video": video_name},
+                    )
+                )
+            for bucket in targets:
+                bucket["count"] += 1
+                if rating is not None:
+                    bucket["ratings"].append(rating)
+                if has_issue:
+                    bucket["issues"] += 1
 
         def _finalize(bucket: dict[str, Any]) -> dict[str, Any]:
             values = bucket.pop("ratings", [])
@@ -1339,13 +1476,56 @@ class Database:
             "issue_count": issue_count,
             "rating_distribution": distribution,
             "by_user": sorted(
-                (_finalize(bucket) for bucket in by_user.values()),
+                (_finalize(b) for b in groups["by_user"].values()),
                 key=lambda item: (-int(item["count"]), str(item["username"])),
             ),
             "by_run": sorted(
-                (_finalize(bucket) for bucket in by_run.values()),
+                (_finalize(b) for b in groups["by_run"].values()),
                 key=lambda item: -int(item["run_id"]),
             ),
+            "by_video": sorted(
+                (_finalize(b) for b in groups["by_video"].values()),
+                key=lambda item: (-int(item["count"]), str(item["video"])),
+            ),
+            "by_model": sorted(
+                (_finalize(b) for b in groups["by_model"].values()),
+                key=lambda item: (-int(item["count"]), str(item["model_name"])),
+            ),
+            "by_checkpoint": sorted(
+                (_finalize(b) for b in groups["by_checkpoint"].values()),
+                key=lambda item: (str(item["model_name"]), str(item["checkpoint"])),
+            ),
+            "by_model_checkpoint": sorted(
+                (_finalize(b) for b in groups["by_model_checkpoint"].values()),
+                key=lambda item: (str(item["video"]), str(item["model_name"]), str(item["checkpoint"])),
+            ),
+        }
+
+    def feedback_filter_options(self) -> dict[str, list[str]]:
+        """Distinct datasets/models/checkpoints/videos present in live feedback.
+
+        Powers the stats-tab filter dropdowns without the frontend having to
+        derive them from the full entry list.
+        """
+        entries = self.list_all_feedback(limit=100000)
+        datasets: set[str] = set()
+        models: set[str] = set()
+        checkpoints: set[str] = set()
+        videos: set[str] = set()
+        for row in entries:
+            if str(row.get("dataset_name") or "").strip():
+                datasets.add(str(row["dataset_name"]).strip())
+            if str(row.get("model_name") or "").strip():
+                models.add(str(row["model_name"]).strip())
+            if str(row.get("checkpoint") or "").strip():
+                checkpoints.add(str(row["checkpoint"]).strip())
+            if str(row.get("video") or "").strip():
+                videos.add(str(row["video"]).strip())
+        return {
+            "datasets": sorted(datasets),
+            "models": sorted(models),
+            "checkpoints": sorted(checkpoints),
+            "videos": sorted(videos),
         }
 
     def mark_run_artifacts_cleaned(self, run_id: int) -> None:
@@ -1355,6 +1535,10 @@ class Database:
             if job_ids:
                 placeholders = ",".join("?" for _ in job_ids)
                 conn.execute(f"DELETE FROM artifacts WHERE job_id IN ({placeholders})", tuple(job_ids))
+            # Feedback describes the visual results; once those are cleaned the
+            # scores are orphaned (the #26 case: results deleted but ratings
+            # lingered), so drop them alongside the artifacts.
+            conn.execute("DELETE FROM run_feedback WHERE run_id = ?", (run_id,))
             conn.execute(
                 """
                 UPDATE runs
