@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageChops
 
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
@@ -31,6 +31,7 @@ from vfieval.pipeline.visualize import save_difference, save_extra_tensor, save_
 
 
 VALID_PRECISIONS = {"fp32", "fp16", "bf16"}
+ARTIFACT_PROFILES = {"evaluation", "diagnostic", "benchmark"}
 DEFAULT_VISUALIZE_HEIGHT = 832
 DEFAULT_VISUALIZE_WIDTH = 1792
 # Above this max edge a downscaled preview thumbnail is worth its extra encode;
@@ -57,6 +58,121 @@ class InferenceJobResult:
     output_health: dict[str, Any] | None = None
     prefetch_wait_seconds: float = 0.0
     save_backlog_seconds: float = 0.0
+    performance: dict[str, Any] | None = None
+
+
+class _DeviceEventTimings:
+    """Collect asynchronous CUDA/NPU event durations with one final sync."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
+        self._module = None
+        self._pairs: dict[str, list[tuple[Any, Any]]] = defaultdict(list)
+        if device.type == "cuda" and hasattr(torch, "cuda"):
+            self._module = torch.cuda
+        elif device.type == "npu" and hasattr(torch, "npu"):
+            self._module = torch.npu
+
+    def start(self) -> Any | None:
+        if self._module is None or not hasattr(self._module, "Event"):
+            return None
+        try:
+            event = self._module.Event(enable_timing=True)
+            event.record()
+            return event
+        except Exception:
+            self._module = None
+            return None
+
+    def stop(self, stage: str, start: Any | None) -> None:
+        if self._module is None or start is None:
+            return
+        try:
+            end = self._module.Event(enable_timing=True)
+            end.record()
+            self._pairs[stage].append((start, end))
+        except Exception:
+            self._module = None
+            self._pairs.clear()
+
+    def result(self) -> dict[str, float]:
+        if self._module is None or not self._pairs:
+            return {}
+        try:
+            self._module.synchronize()
+            return {
+                stage: sum(float(start.elapsed_time(end)) for start, end in pairs) / 1000.0
+                for stage, pairs in self._pairs.items()
+            }
+        except Exception:
+            return {}
+
+
+class _NpuSmiSampler:
+    """Best-effort low-rate Ascend utilization sampling; failures stay optional."""
+
+    def __init__(self, device: torch.device, enabled: bool = True) -> None:
+        self._command = shutil.which("npu-smi") if enabled and device.type == "npu" else None
+        self._device_index = int(device.index or 0)
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._samples: list[dict[str, float]] = []
+
+    def start(self) -> None:
+        if self._command is None:
+            return
+        self._thread = threading.Thread(target=self._run, name="vfieval-npu-smi", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def result(self) -> dict[str, Any] | None:
+        if not self._samples:
+            return None
+        keys = sorted({key for sample in self._samples for key in sample})
+        return {
+            "sample_count": len(self._samples),
+            "averages": {
+                key: sum(sample[key] for sample in self._samples if key in sample)
+                / sum(1 for sample in self._samples if key in sample)
+                for key in keys
+            },
+        }
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                result = subprocess.run(
+                    [str(self._command), "info", "-t", "usages", "-i", str(self._device_index)],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=4,
+                )
+                if result.returncode == 0:
+                    sample = self._parse(result.stdout)
+                    if sample:
+                        self._samples.append(sample)
+            except Exception:
+                return
+            self._stop.wait(1.0)
+
+    @staticmethod
+    def _parse(text: str) -> dict[str, float]:
+        sample: dict[str, float] = {}
+        for line in str(text).splitlines():
+            lowered = line.lower()
+            values = [float(value) for value in re.findall(r"(?<![A-Za-z])\d+(?:\.\d+)?", line)]
+            if not values:
+                continue
+            if "aicore" in lowered or "ai core" in lowered or "utilization rate" in lowered:
+                sample["aicore_percent"] = values[-1]
+            elif "memory" in lowered and ("usage" in lowered or "utilization" in lowered):
+                sample["memory_percent"] = values[-1]
+        return sample
 
 
 def _extract_model_load_report(model: Any) -> dict[str, Any] | None:
@@ -232,6 +348,7 @@ def _artifact_mime(kind: str) -> str:
 
 
 def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> InferenceJobResult:
+    total_wall_start = time.perf_counter()
     job = db.get_job(job_id)
     payload = job["payload"]
     model_id = int(payload["model_id"])
@@ -241,6 +358,7 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
     batch_size = int(payload.get("batch_size", 1))
     device = resolve_device(str(payload.get("device", "auto")))
     precision = str(payload.get("precision", "fp32"))
+    artifact_profile = str(payload.get("artifact_profile") or "evaluation")
     metric_names = list(payload.get("metrics", []))
     run_id = int(payload["run_id"]) if payload.get("run_id") is not None else None
     shard_count = int(payload.get("shard_count") or 1)
@@ -254,6 +372,10 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
         precision = "fp32"
     if precision not in VALID_PRECISIONS:
         raise ValueError(f"precision must be one of {sorted(VALID_PRECISIONS)}, got {precision}")
+    if artifact_profile not in ARTIFACT_PROFILES:
+        raise ValueError(f"artifact_profile must be one of {sorted(ARTIFACT_PROFILES)}")
+    if artifact_profile == "benchmark" and metric_names:
+        raise ValueError("benchmark artifact_profile does not run metrics")
     if height <= 0 or width <= 0:
         raise ValueError("height and width must be positive")
     if batch_size <= 0:
@@ -265,6 +387,8 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
     if sample_ids is not None:
         allowed = {int(sample_id) for sample_id in sample_ids}
         samples = [sample for sample in samples if int(sample["id"]) in allowed]
+    if artifact_profile == "benchmark":
+        samples = samples[: max(1, int(payload.get("benchmark_samples") or 200))]
     if not samples:
         raise ValueError(f"dataset {dataset_id} has no samples")
 
@@ -302,6 +426,11 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
     )
     model_load_report = _extract_model_load_report(model)
     tune_for_inference(device)
+    startup_seconds = time.perf_counter() - total_wall_start
+    _reset_peak_memory(device)
+    device_events = _DeviceEventTimings(device)
+    npu_smi = _NpuSmiSampler(device, enabled=bool(payload.get("sample_npu_smi", True)))
+    npu_smi.start()
 
     if model_load_report is not None:
         _write_model_load_log(run_dir, model_load_report)
@@ -314,9 +443,10 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
     # release the GIL, but the glue between them does not).
     cores = os.cpu_count() or 8
     per_shard = max(1, cores // max(1, shard_count))
-    prefetch_workers = _resolve_pool_size(payload.get("prefetch_workers"), per_shard, lo=8, hi=48)
-    save_workers = _resolve_pool_size(payload.get("save_workers"), per_shard, lo=8, hi=48)
-    save_warp_blend = bool(payload.get("save_warp_blend", False))
+    prefetch_workers = _resolve_pool_size(payload.get("prefetch_workers"), min(2, per_shard), lo=1, hi=2)
+    save_workers = _resolve_pool_size(payload.get("save_workers"), min(8, per_shard), lo=1, hi=8)
+    save_warp_blend = artifact_profile == "diagnostic" or bool(payload.get("save_warp_blend", False))
+    max_save_inflight = int(payload.get("max_save_inflight") or max(2, save_workers * 2))
     pipeline = _AsyncSavePipeline(
         db=db,
         job_id=job_id,
@@ -324,10 +454,15 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
         is_shard=is_shard,
         run_dir=run_dir,
         save_workers=save_workers,
+        max_inflight=max_save_inflight,
+        artifact_batch_size=int(payload.get("artifact_db_batch_size") or 128),
     )
 
     timing = {"decode": 0.0, "model": 0.0, "post": 0.0, "save": 0.0}
     output_health = _OutputHealthAccumulator()
+    direct_processed = 0
+    steady_start = time.perf_counter()
+    benchmark_warmed = False
 
     try:
         for batch_rows, img0_cpu, img1_cpu, gt_cpu_list, prefetch_wait in _iter_prefetched_batches(
@@ -335,20 +470,43 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
             batch_size=batch_size,
             height=height,
             width=width,
-            has_gt=True,
+            has_gt=artifact_profile != "benchmark",
             workers=prefetch_workers,
         ):
             _raise_if_canceled(db, run_id, job_id)
             timing["decode"] += prefetch_wait
 
             t1 = time.perf_counter()
+            model_event = device_events.start()
             img0 = img0_cpu.to(device, non_blocking=True)
             img1 = img1_cpu.to(device, non_blocking=True)
+            if artifact_profile == "benchmark" and not benchmark_warmed:
+                warmup_batches = max(0, int(payload.get("benchmark_warmup_batches") or 10))
+                with torch.no_grad(), _autocast_context(device, precision):
+                    for _ in range(warmup_batches):
+                        warm_outputs = model.predict(img0, img1, 0.5)
+                        warm_img0 = _resize_to_device(img0, visualize_height, visualize_width)
+                        warm_img1 = _resize_to_device(img1, visualize_height, visualize_width)
+                        compose_interpolated(warm_img0, warm_img1, warm_outputs)
+                module = _device_module(device)
+                if module is not None:
+                    try:
+                        module.synchronize()
+                    except Exception:
+                        pass
+                benchmark_warmed = True
+                timing = {"decode": 0.0, "model": 0.0, "post": 0.0, "save": 0.0}
+                device_events = _DeviceEventTimings(device)
+                steady_start = time.perf_counter()
+                t1 = time.perf_counter()
+                model_event = device_events.start()
             with torch.no_grad(), _autocast_context(device, precision):
                 outputs = model.predict(img0, img1, 0.5)
+            device_events.stop("transfer_and_model", model_event)
             timing["model"] += time.perf_counter() - t1
 
             t2 = time.perf_counter()
+            post_event = device_events.start()
             # Compose pred at the visualization resolution: downscale the (near
             # full-res) source frames to viz size, upsample the model's low-res
             # flow/mask to match, then warp. Warping sharp sources keeps pred
@@ -358,32 +516,47 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
             img0_viz = _resize_to_device(img0, visualize_height, visualize_width)
             img1_viz = _resize_to_device(img1, visualize_height, visualize_width)
             composed_viz = compose_interpolated(img0_viz, img1_viz, outputs)
+            device_events.stop("postprocess", post_event)
+            if artifact_profile == "benchmark":
+                direct_processed += len(batch_rows)
+                timing["post"] += time.perf_counter() - t2
+                db.update_job_progress(job_id, direct_processed)
+                if run_id is not None:
+                    if is_shard:
+                        db.update_run_progress_from_jobs(run_id, "running")
+                    else:
+                        db.update_run_progress(run_id, direct_processed)
+                continue
             # pred is the evaluation artifact and is always saved at viz res.
             # flow/mask are stored at the model's *native* output resolution —
             # they are upsampled anyway before warping, so persisting the small
             # native tensors and letting the UI upscale for display saves disk
             # proportional to (viz / native) squared. warp/blend are diagnostic
             # only and are materialized to CPU (and saved) solely on request.
-            bundle_cpu = {
-                "pred": composed_viz["pred"].detach().to("cpu"),
-                "mask0": torch.sigmoid(outputs["mask0"]).detach().to("cpu"),
-                "mask1": torch.sigmoid(outputs["mask1"]).detach().to("cpu"),
-                "flowt_0": outputs["flowt_0"].detach().to("cpu"),
-                "flowt_1": outputs["flowt_1"].detach().to("cpu"),
+            device_bundle: dict[str, torch.Tensor] = {
+                "pred": composed_viz["pred"],
+                "mask0": torch.sigmoid(outputs["mask0"]),
+                "mask1": torch.sigmoid(outputs["mask1"]),
+                "flowt_0": outputs["flowt_0"],
+                "flowt_1": outputs["flowt_1"],
             }
             if save_warp_blend:
-                bundle_cpu["warp0"] = composed_viz["warp0"].detach().to("cpu")
-                bundle_cpu["warp1"] = composed_viz["warp1"].detach().to("cpu")
-                bundle_cpu["blend"] = composed_viz["blend"].detach().to("cpu")
-            output_health.update(bundle_cpu)
-            extra_cpu: dict[str, torch.Tensor] = {}
-            for name, tensor in outputs.items():
-                if name in CORE_OUTPUTS or not isinstance(tensor, torch.Tensor):
-                    continue
-                try:
-                    extra_cpu[name] = tensor.detach().to("cpu")
-                except Exception:
-                    continue
+                device_bundle.update({name: composed_viz[name] for name in ("warp0", "warp1", "blend")})
+            device_extra: dict[str, torch.Tensor] = {}
+            if artifact_profile == "diagnostic":
+                for name, tensor in outputs.items():
+                    if name in CORE_OUTPUTS or not isinstance(tensor, torch.Tensor):
+                        continue
+                    device_extra[name] = tensor
+            transferred = _detach_tensors_to_cpu({**device_bundle, **{f"extra::{name}": tensor for name, tensor in device_extra.items()}})
+            health_bundle = {name: transferred[name] for name in ("pred", "mask0", "mask1", "flowt_0", "flowt_1")}
+            output_health.update(health_bundle)
+            bundle_cpu = {"pred": transferred["pred"]}
+            if artifact_profile == "diagnostic":
+                bundle_cpu.update({name: transferred[name] for name in ("mask0", "mask1", "flowt_0", "flowt_1")})
+            if save_warp_blend:
+                bundle_cpu.update({name: transferred[name] for name in ("warp0", "warp1", "blend")})
+            extra_cpu = {name: transferred[f"extra::{name}"] for name in device_extra}
             timing["post"] += time.perf_counter() - t2
 
             t3 = time.perf_counter()
@@ -395,20 +568,52 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
             )
             timing["save"] += time.perf_counter() - t3
 
+        backlog_start = time.perf_counter()
         pipeline.wait_for_all()
+        save_backlog_seconds = time.perf_counter() - backlog_start
     except BaseException:
         pipeline.shutdown()
+        npu_smi.stop()
         raise
 
-    processed = pipeline.processed_count
+    processed = pipeline.processed_count + direct_processed
     video_groups = pipeline.video_groups
     pipeline.shutdown()
+    npu_smi.stop()
 
     if video_groups:
-        _write_video_artifacts(db, job_id, run_dir, video_groups)
+        if is_shard and bool(payload.get("defer_video_finalize")):
+            _write_shard_video_manifest(run_dir, job_id, video_groups)
+        else:
+            _write_video_artifacts(db, job_id, run_dir, video_groups)
 
-    output_health_report = output_health.to_dict()
-    _write_output_health_log(run_dir, output_health_report)
+    device_timing = device_events.result()
+    steady_seconds = time.perf_counter() - steady_start
+    total_wall_seconds = time.perf_counter() - total_wall_start
+    performance = {
+        "artifact_profile": artifact_profile,
+        "startup_seconds": startup_seconds,
+        "steady_state_seconds": steady_seconds,
+        "total_wall_seconds": total_wall_seconds,
+        "end_to_end_fps": _fps(processed, total_wall_seconds),
+        "steady_state_fps": _fps(processed, steady_seconds),
+        "prefetch_wait_seconds": timing["decode"],
+        "save_backpressure_seconds": pipeline.backpressure_seconds,
+        "save_backlog_seconds": save_backlog_seconds,
+        "save_max_inflight": pipeline.max_observed_inflight,
+        "artifact_db_batches": pipeline.artifact_db_batches,
+        "device_seconds": device_timing,
+        "device_memory": _peak_memory(device),
+        "device_name": _device_name(device),
+        "npu_smi": npu_smi.result(),
+        "batch_size": batch_size,
+        "prefetch_workers": prefetch_workers,
+        "save_workers": save_workers,
+    }
+
+    output_health_report = None if artifact_profile == "benchmark" else output_health.to_dict()
+    if output_health_report is not None:
+        _write_output_health_log(run_dir, output_health_report)
 
     result = InferenceJobResult(
         samples=processed,
@@ -417,7 +622,11 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
         model_fps=_fps(processed, timing["model"]),
         postprocess_fps=_fps(processed, timing["post"]),
         save_fps=_fps(processed, timing["save"]),
+        model_load=model_load_report,
         output_health=output_health_report,
+        prefetch_wait_seconds=timing["decode"],
+        save_backlog_seconds=save_backlog_seconds,
+        performance=performance,
     )
 
     result_dict = dict(result.__dict__)
@@ -485,11 +694,15 @@ def _run_video_compare_job(
             sample_dir.mkdir(parents=True, exist_ok=True)
             gt_output_path = _copy_compare_image(Path(row["gt_path"]), sample_dir / "gt.png")
             pred_output_path = _copy_compare_image(Path(row["img1_path"]), sample_dir / "pred.png")
+            diff_output_path = sample_dir / "difference.png"
+            with Image.open(gt_output_path).convert("RGB") as gt_image, Image.open(pred_output_path).convert("RGB") as pred_image:
+                ImageChops.difference(pred_image, gt_image).save(diff_output_path)
 
             artifact_metadata = {"sample": row["name"], **_compare_track_metadata(row)}
             _add_image_artifact_with_preview(db, job_id, int(row["id"]), "gt", gt_output_path, artifact_metadata)
             _add_image_artifact_with_preview(db, job_id, int(row["id"]), "pred", pred_output_path, artifact_metadata)
-            _collect_compare_frame(video_groups, row, gt_output_path, pred_output_path)
+            _add_image_artifact_with_preview(db, job_id, int(row["id"]), "difference", diff_output_path, artifact_metadata)
+            _collect_compare_frame(video_groups, row, gt_output_path, pred_output_path, diff_output_path)
         except RunCanceled:
             raise
         except Exception as exc:
@@ -588,10 +801,94 @@ def _resize_to_device(tensor: torch.Tensor, height: int, width: int) -> torch.Te
     )
 
 
+def _detach_tensors_to_cpu(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Transfer a heterogeneous tensor bundle with one device-to-host copy."""
+    if not tensors:
+        return {}
+    names: list[str] = []
+    shapes: list[torch.Size] = []
+    sizes: list[int] = []
+    flattened: list[torch.Tensor] = []
+    for name, tensor in tensors.items():
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        detached = tensor.detach()
+        names.append(name)
+        shapes.append(detached.shape)
+        sizes.append(detached.numel())
+        flattened.append(detached.reshape(-1))
+    if not flattened:
+        return {}
+    packed = torch.cat(flattened, dim=0) if len(flattened) > 1 else flattened[0]
+    packed_cpu = packed.to("cpu")
+    result: dict[str, torch.Tensor] = {}
+    offset = 0
+    for name, shape, size in zip(names, shapes, sizes):
+        result[name] = packed_cpu[offset : offset + size].reshape(shape)
+        offset += size
+    return result
+
+
 def _fps(count: int, seconds: float) -> float:
     if seconds <= 0:
         return 0.0
     return float(count) / seconds
+
+
+def _device_module(device: torch.device):
+    if device.type == "cuda" and hasattr(torch, "cuda"):
+        return torch.cuda
+    if device.type == "npu" and hasattr(torch, "npu"):
+        return torch.npu
+    return None
+
+
+def _reset_peak_memory(device: torch.device) -> None:
+    module = _device_module(device)
+    if module is None:
+        return
+    try:
+        module.reset_peak_memory_stats(device)
+    except Exception:
+        try:
+            module.reset_peak_memory_stats()
+        except Exception:
+            pass
+
+
+def _peak_memory(device: torch.device) -> dict[str, int]:
+    module = _device_module(device)
+    if module is None:
+        return {}
+    result: dict[str, int] = {}
+    for name in ("max_memory_allocated", "max_memory_reserved"):
+        function = getattr(module, name, None)
+        if function is None:
+            continue
+        try:
+            result[name] = int(function(device))
+        except Exception:
+            try:
+                result[name] = int(function())
+            except Exception:
+                continue
+    return result
+
+
+def _device_name(device: torch.device) -> str:
+    module = _device_module(device)
+    if module is None:
+        return "CPU"
+    function = getattr(module, "get_device_name", None)
+    if function is None:
+        return device.type.upper()
+    try:
+        return str(function(device.index or 0))
+    except Exception:
+        try:
+            return str(function(device))
+        except Exception:
+            return device.type.upper()
 
 
 def _load_resized_batch(paths: list[str], device: torch.device, height: int, width: int) -> torch.Tensor:
@@ -611,6 +908,18 @@ def _add_image_artifact_with_preview(
     metadata: dict[str, Any],
     make_preview: bool = True,
 ) -> int:
+    record = _image_artifact_record(sample_id, kind, path, metadata, make_preview=make_preview)
+    return db.add_artifacts_bulk(job_id, [record])[0]
+
+
+def _image_artifact_record(
+    sample_id: int,
+    kind: str,
+    path: Path,
+    metadata: dict[str, Any],
+    *,
+    make_preview: bool,
+) -> dict[str, Any]:
     # Previews exist so the UI can render a small thumbnail without fetching a
     # multi-megapixel original. When the artifact itself is already small (the
     # visualization resolution defaults to 832x384, at or below the 512px
@@ -624,7 +933,13 @@ def _add_image_artifact_with_preview(
             preview_metadata.update({"preview_path": str(preview), "preview_max_edge": 512})
         except Exception:
             pass
-    return db.add_artifact(job_id, sample_id, kind, str(path), "image/png", preview_metadata)
+    return {
+        "sample_id": int(sample_id),
+        "kind": str(kind),
+        "path": str(path),
+        "mime_type": "image/png",
+        "metadata": preview_metadata,
+    }
 
 
 def _compare_track_metadata(sample: dict[str, Any]) -> dict[str, Any]:
@@ -657,6 +972,21 @@ def _write_run_metadata(run_dir: Path, job: dict[str, Any], model: dict[str, Any
     (run_dir / "model_info.json").write_text(json.dumps(model, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     if dataset is not None:
         (run_dir / "video_group_info.json").write_text(json.dumps(dataset, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+
+
+def _write_shard_video_manifest(
+    run_dir: Path,
+    job_id: int,
+    video_groups: dict[str, dict[str, Any]],
+) -> Path:
+    manifest_dir = run_dir / "logs" / "shards"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    path = manifest_dir / f"{int(job_id)}.json"
+    path.write_text(
+        json.dumps({"job_id": int(job_id), "video_groups": video_groups}, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+    return path
 
 
 def _save_extra_outputs(outputs: dict[str, torch.Tensor], sample_dir: Path, index: int) -> dict[str, Path]:
@@ -754,6 +1084,7 @@ def _collect_compare_frame(
     sample: dict[str, Any],
     gt_path: Path,
     pred_path: Path,
+    diff_path: Path,
 ) -> None:
     metadata = sample.get("metadata") or {}
     video_key = str(metadata.get("compare_group") or metadata.get("video_name") or "compare")
@@ -772,6 +1103,7 @@ def _collect_compare_frame(
             "sample_name": sample["name"],
             "pred_path": Path(pred_path),
             "gt_path": Path(gt_path),
+            "diff_path": Path(diff_path),
             "track_label": metadata.get("compare_track_label"),
             "track_key": metadata.get("compare_track_key"),
             "track_run_id": metadata.get("compare_track_run_id"),
@@ -796,10 +1128,8 @@ def _write_video_artifacts(
             _write_multitrack_compare_video_artifacts(db, job_id, run_dir, group, frames, video_name, fps)
             continue
         video_dir = run_dir / "videos" / video_name
-        pred_frames_dir = video_dir / "pred_frames"
-        gt_frames_dir = video_dir / "gt_frames"
-        diff_frames_dir = video_dir / "diff_frames"
-        pred_frame_paths = _copy_ordered_frames([frame["pred_path"] for frame in frames], pred_frames_dir)
+        video_dir.mkdir(parents=True, exist_ok=True)
+        pred_frame_paths = [Path(frame["pred_path"]) for frame in frames]
         pred_video_path = video_dir / "pred.mp4"
         _write_mp4(pred_frame_paths, pred_video_path, fps)
         pred_metadata = _video_artifact_metadata(group["video_name"], frames, pred_frame_paths, fps)
@@ -815,7 +1145,7 @@ def _write_video_artifacts(
 
         gt_paths = [frame["gt_path"] for frame in frames if frame["gt_path"] is not None]
         if len(gt_paths) == len(frames):
-            gt_frame_paths = _copy_ordered_frames(gt_paths, gt_frames_dir)
+            gt_frame_paths = [Path(path) for path in gt_paths]
             gt_video_path = video_dir / "gt.mp4"
             _write_mp4(gt_frame_paths, gt_video_path, fps)
             gt_metadata = _video_artifact_metadata(group["video_name"], frames, gt_frame_paths, fps)
@@ -830,7 +1160,7 @@ def _write_video_artifacts(
 
         diff_paths = [frame["diff_path"] for frame in frames if frame["diff_path"] is not None]
         if len(diff_paths) == len(frames):
-            diff_frame_paths = _copy_ordered_frames(diff_paths, diff_frames_dir)
+            diff_frame_paths = [Path(path) for path in diff_paths]
             diff_video_path = video_dir / "diff.mp4"
             _write_mp4(diff_frame_paths, diff_video_path, fps)
             diff_metadata = _video_artifact_metadata(group["video_name"], frames, diff_frame_paths, fps)
@@ -876,7 +1206,7 @@ def _write_multitrack_compare_video_artifacts(
     gt_video_path = None
     ordered_gt = [gt_by_order[index] for index in sorted(gt_by_order)]
     if ordered_gt:
-        gt_frame_paths = _copy_ordered_frames(ordered_gt, video_dir / "gt_frames")
+        gt_frame_paths = ordered_gt
         gt_video_path = video_dir / "gt.mp4"
         _write_mp4(gt_frame_paths, gt_video_path, fps)
         db.add_artifact(
@@ -895,9 +1225,13 @@ def _write_multitrack_compare_video_artifacts(
             continue
         track_label = str(ordered[0].get("track_label") or track_key)
         track_dir = video_dir / sanitize_name(track_label)
-        pred_frame_paths = _copy_ordered_frames([Path(frame["pred_path"]) for frame in ordered], track_dir / "pred_frames")
+        track_dir.mkdir(parents=True, exist_ok=True)
+        pred_frame_paths = [Path(frame["pred_path"]) for frame in ordered]
         pred_video_path = track_dir / "pred.mp4"
         _write_mp4(pred_frame_paths, pred_video_path, fps)
+        diff_frame_paths = [Path(frame["diff_path"]) for frame in ordered]
+        diff_video_path = track_dir / "diff.mp4"
+        _write_mp4(diff_frame_paths, diff_video_path, fps)
         track_metadata = {
             "compare_track_label": track_label,
             "compare_track_key": track_key,
@@ -912,6 +1246,14 @@ def _write_multitrack_compare_video_artifacts(
             "video/mp4",
             {**_video_artifact_metadata(group["video_name"], ordered, pred_frame_paths, fps), **track_metadata},
         )
+        db.add_artifact(
+            job_id,
+            None,
+            "diff_video",
+            str(diff_video_path),
+            "video/mp4",
+            {**_video_artifact_metadata(group["video_name"], ordered, diff_frame_paths, fps), **track_metadata},
+        )
 
         manifest_tracks.append(
             {
@@ -919,6 +1261,7 @@ def _write_multitrack_compare_video_artifacts(
                 "track_key": track_key,
                 "frames": len(ordered),
                 "pred_video": str(pred_video_path.resolve()),
+                "diff_video": str(diff_video_path.resolve()),
                 "compare_track_run_id": ordered[0].get("track_run_id"),
                 "compare_track_artifact_id": ordered[0].get("track_artifact_id"),
             }
@@ -993,10 +1336,64 @@ def _copy_ordered_frames(frame_paths: list[Path], output_dir: Path) -> list[Path
 
 
 def _write_mp4(frame_paths: list[Path], output_path: Path, fps: float) -> None:
-    frame_dir = frame_paths[0].parent
-    if _write_mp4_ffmpeg(frame_dir, output_path, fps):
+    if _write_mp4_ffmpeg_pipe(frame_paths, output_path, fps):
         return
     _write_mp4_cv2(frame_paths, output_path, fps)
+
+
+def _write_mp4_ffmpeg_pipe(frame_paths: list[Path], output_path: Path, fps: float) -> bool:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg or not frame_paths or any(path.suffix.lower() != ".png" for path in frame_paths):
+        return False
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "image2pipe",
+        "-framerate",
+        str(float(fps)),
+        "-vcodec",
+        "png",
+        "-i",
+        "pipe:0",
+        "-an",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    process = None
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        assert process.stdin is not None
+        for path in frame_paths:
+            with path.open("rb") as handle:
+                shutil.copyfileobj(handle, process.stdin, length=1024 * 1024)
+        process.stdin.close()
+        stderr = process.stderr.read() if process.stderr is not None else b""
+        return_code = process.wait(timeout=120)
+        return return_code == 0 and output_path.is_file() and output_path.stat().st_size > 0
+    except Exception:
+        if process is not None:
+            try:
+                process.kill()
+                process.wait(timeout=5)
+            except Exception:
+                pass
+        output_path.unlink(missing_ok=True)
+        return False
+    finally:
+        if process is not None:
+            for stream in (process.stdin, process.stderr):
+                if stream is not None and not stream.closed:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
 
 
 def _write_mp4_ffmpeg(frame_dir: Path, output_path: Path, fps: float) -> bool:
@@ -1206,6 +1603,8 @@ class _AsyncSavePipeline:
         is_shard: bool,
         run_dir: Path,
         save_workers: int,
+        max_inflight: int,
+        artifact_batch_size: int,
     ) -> None:
         self._db = db
         self._job_id = job_id
@@ -1213,12 +1612,18 @@ class _AsyncSavePipeline:
         self._is_shard = is_shard
         self._run_dir = run_dir
         self._pool = ThreadPoolExecutor(max_workers=save_workers, thread_name_prefix="vfi-save")
+        self._slots = threading.Semaphore(max(1, int(max_inflight)))
         self._pending: list[Future] = []
         self._lock = threading.Lock()
         self._processed = 0
         self._total = 0
         self._video_groups: dict[str, dict[str, Any]] = {}
         self._last_progress_report = 0
+        self._backpressure_seconds = 0.0
+        self._max_observed_inflight = 0
+        self._artifact_batch_size = max(1, int(artifact_batch_size))
+        self._artifact_buffer: list[dict[str, Any]] = []
+        self._artifact_db_batches = 0
 
     @property
     def processed_count(self) -> int:
@@ -1227,6 +1632,18 @@ class _AsyncSavePipeline:
     @property
     def video_groups(self) -> dict[str, dict[str, Any]]:
         return self._video_groups
+
+    @property
+    def backpressure_seconds(self) -> float:
+        return self._backpressure_seconds
+
+    @property
+    def max_observed_inflight(self) -> int:
+        return self._max_observed_inflight
+
+    @property
+    def artifact_db_batches(self) -> int:
+        return self._artifact_db_batches
 
     def submit_batch(
         self,
@@ -1237,20 +1654,25 @@ class _AsyncSavePipeline:
         gt_cpu_list: list[torch.Tensor | None],
     ) -> None:
         self._total += len(batch_rows)
-        with self._lock:
-            for idx, row in enumerate(batch_rows):
-                per_sample_bundle = {name: bundle_cpu[name][idx] for name in bundle_cpu}
-                per_sample_extra = {name: extra_cpu[name][idx] for name in extra_cpu}
-                gt_tensor = gt_cpu_list[idx] if idx < len(gt_cpu_list) else None
-                future = self._pool.submit(
-                    self._save_sample,
-                    dict(row),
-                    per_sample_bundle,
-                    per_sample_extra,
-                    gt_tensor,
-                )
-                future.add_done_callback(self._on_sample_done)
+        for idx, row in enumerate(batch_rows):
+            wait_start = time.perf_counter()
+            self._slots.acquire()
+            waited = time.perf_counter() - wait_start
+            per_sample_bundle = {name: bundle_cpu[name][idx] for name in bundle_cpu}
+            per_sample_extra = {name: extra_cpu[name][idx] for name in extra_cpu}
+            gt_tensor = gt_cpu_list[idx] if idx < len(gt_cpu_list) else None
+            future = self._pool.submit(
+                self._save_sample,
+                dict(row),
+                per_sample_bundle,
+                per_sample_extra,
+                gt_tensor,
+            )
+            with self._lock:
+                self._backpressure_seconds += waited
                 self._pending.append(future)
+                self._max_observed_inflight = max(self._max_observed_inflight, len(self._pending))
+            future.add_done_callback(self._on_sample_done)
 
     def wait_for_all(self) -> None:
         while True:
@@ -1258,7 +1680,7 @@ class _AsyncSavePipeline:
                 pending = list(self._pending)
                 self._pending = []
             if not pending:
-                return
+                break
             for future in pending:
                 # _save_sample already catches its own exceptions and records
                 # them via _record_sample_error, so a future.exception() here
@@ -1268,9 +1690,11 @@ class _AsyncSavePipeline:
                 exc = future.exception()
                 if exc is not None:
                     raise exc
+        self._flush_artifact_records()
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=True)
+        self._flush_artifact_records()
 
     def _save_sample(
         self,
@@ -1285,6 +1709,7 @@ class _AsyncSavePipeline:
         try:
             sample_dir = self._run_dir / sanitize_name(sample_name)
             paths = _save_visual_bundle_from_cpu(bundle, sample_dir)
+            artifact_records: list[dict[str, Any]] = []
             # Previews are only worth their extra encode when the artifact is
             # genuinely large. At the default visualization resolution the saved
             # image is already small, so skip the redundant thumbnail — the
@@ -1293,8 +1718,10 @@ class _AsyncSavePipeline:
             pred_h, pred_w = int(bundle["pred"].shape[-2]), int(bundle["pred"].shape[-1])
             make_preview = max(pred_h, pred_w) > PREVIEW_SKIP_MAX_EDGE
             for kind, path in paths.items():
-                _add_image_artifact_with_preview(
-                    self._db, job_id, sample_id, kind, path, {"sample": sample_name}, make_preview=make_preview
+                artifact_records.append(
+                    _image_artifact_record(
+                        sample_id, kind, path, {"sample": sample_name}, make_preview=make_preview
+                    )
                 )
             extra_paths: dict[str, Path] = {}
             for name, tensor in extra.items():
@@ -1306,8 +1733,10 @@ class _AsyncSavePipeline:
                 except Exception:
                     continue
             for kind, path in extra_paths.items():
-                _add_image_artifact_with_preview(
-                    self._db, job_id, sample_id, kind, path, {"sample": sample_name}, make_preview=False
+                artifact_records.append(
+                    _image_artifact_record(
+                        sample_id, kind, path, {"sample": sample_name}, make_preview=False
+                    )
                 )
 
             diff_path = None
@@ -1321,32 +1750,69 @@ class _AsyncSavePipeline:
                     gt_tensor = _resize_chw(gt_tensor, pred_h, pred_w)
                 gt_path = sample_dir / "gt.png"
                 save_rgb_tensor(gt_tensor, gt_path)
-                _add_image_artifact_with_preview(
-                    self._db, job_id, sample_id, "gt", gt_path, {"sample": sample_name}, make_preview=False
+                artifact_records.append(
+                    _image_artifact_record(
+                        sample_id, "gt", gt_path, {"sample": sample_name}, make_preview=False
+                    )
                 )
                 diff_path = sample_dir / "difference.png"
                 save_difference(bundle["pred"], gt_tensor, diff_path)
-                _add_image_artifact_with_preview(
-                    self._db, job_id, sample_id, "difference", diff_path, {"sample": sample_name}, make_preview=False
+                artifact_records.append(
+                    _image_artifact_record(
+                        sample_id, "difference", diff_path, {"sample": sample_name}, make_preview=False
+                    )
                 )
+            self._queue_artifact_records(artifact_records)
             with self._lock:
                 _collect_video_frame(self._video_groups, row, paths["pred"], diff_path, gt_path)
         except Exception as exc:
             _record_sample_error(self._db, job_id, sample_id, sample_name, exc)
 
-    def _on_sample_done(self, future: Future) -> None:
+    def _queue_artifact_records(self, records: list[dict[str, Any]]) -> None:
+        if not records:
+            return
+        batch: list[dict[str, Any]] = []
         with self._lock:
-            self._processed += 1
-            processed = self._processed
-            total = self._total
+            self._artifact_buffer.extend(records)
+            if len(self._artifact_buffer) >= self._artifact_batch_size:
+                batch = self._artifact_buffer
+                self._artifact_buffer = []
+        if batch:
             try:
-                self._pending.remove(future)
-            except ValueError:
-                pass
-            step = max(1, total // 200)
-            report_now = processed == total or processed - self._last_progress_report >= step
-            if report_now:
-                self._last_progress_report = processed
+                self._db.add_artifacts_bulk(self._job_id, batch)
+            except Exception:
+                with self._lock:
+                    self._artifact_buffer = batch + self._artifact_buffer
+                raise
+            with self._lock:
+                self._artifact_db_batches += 1
+
+    def _flush_artifact_records(self) -> None:
+        with self._lock:
+            batch = self._artifact_buffer
+            self._artifact_buffer = []
+        if not batch:
+            return
+        self._db.add_artifacts_bulk(self._job_id, batch)
+        with self._lock:
+            self._artifact_db_batches += 1
+
+    def _on_sample_done(self, future: Future) -> None:
+        try:
+            with self._lock:
+                self._processed += 1
+                processed = self._processed
+                total = self._total
+                try:
+                    self._pending.remove(future)
+                except ValueError:
+                    pass
+                step = max(1, total // 200)
+                report_now = processed == total or processed - self._last_progress_report >= step
+                if report_now:
+                    self._last_progress_report = processed
+        finally:
+            self._slots.release()
         if not report_now:
             return
         try:

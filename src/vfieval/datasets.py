@@ -25,20 +25,19 @@ from vfieval.db import Database
 from vfieval.file_inputs import VIDEO_SUFFIXES, decode_cache_dir, decode_cache_key
 
 
-def _frame_downscale_copy(
+def _frame_resize_copy(
     workspace: WorkspaceConfig,
     src_path: Path,
     target_w: int,
     target_h: int,
 ) -> Path:
-    """LANCZOS-downscale a single frame to ``(target_w, target_h)`` and cache
+    """Resize a platform-owned aligned GT frame to ``(target_w, target_h)`` and cache
     the result under ``<workspace>/compare_cache``, keyed by source path +
     mtime/size + target size. Returns the path to the cached PNG.
 
-    Only ever downscales — sources already at or below the target are copied
-    through unchanged so we never upscale. Used in compare sample assembly so
-    GT and Pred tracks share one resolution before evaluation & visualization:
-    the higher-resolution side is downscaled to ``min(W) x min(H)``.
+    External sources must already match exactly. This helper exists for the
+    explicit ``source_frame_indices`` path, where VFIEval generates an aligned
+    GT asset at the inference output resolution.
     """
     src_path = src_path.resolve()
     stat = src_path.stat()
@@ -56,10 +55,6 @@ def _frame_downscale_copy(
     if out_path.exists():
         return out_path
     with Image.open(src_path).convert("RGB") as image:
-        src_w, src_h = image.size
-        if src_w <= target_w and src_h <= target_h:
-            image.save(out_path)
-            return out_path
         image.resize((target_w, target_h), Image.LANCZOS).save(out_path)
     return out_path
 
@@ -293,9 +288,8 @@ def scan_compare_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: i
     if align_mode != "strict":
         raise ValueError("compare datasets currently only support strict alignment")
 
-    # Common compare resolution: per-axis min of GT and Pred. The
-    # higher-resolution side is downscaled here per frame so the two tracks
-    # share one size for evaluation & visualization downstream.
+    # External inputs have already passed exact strict validation. A target may
+    # still be present for the platform-owned aligned-GT path.
     target_w = _optional_positive_int(metadata.get("compare_target_width"))
     target_h = _optional_positive_int(metadata.get("compare_target_height"))
     downscale_mode = "none"
@@ -379,11 +373,9 @@ def _align_compare_frames(
 ) -> tuple[Path, Path]:
     """Resolve frame-level dimension alignment for the two compare sides.
 
-    When ``downscale_mode == "enabled"`` and ``target_w``/``target_h`` are set,
-    the higher-resolution side is LANCZOS-downscaled to ``(target_w, target_h)``
-    (per-axis min of the two sides' native resolution as computed in
-    ``preflight_run``). If both sides already match the target (or targets are
-    unset), the frames pass through unchanged.
+    When a platform-owned indexed mapping supplies a target resolution, resize
+    the generated aligned GT to that exact resolution. External inputs already
+    match, so this function does not normalize external mismatches.
     """
     if downscale_mode != "enabled" or target_w is None or target_h is None:
         return reference_frame, distorted_frame
@@ -392,9 +384,9 @@ def _align_compare_frames(
     if ref_size == dist_size and ref_size == (target_w, target_h):
         return reference_frame, distorted_frame
     if ref_size != (target_w, target_h):
-        reference_frame = _frame_downscale_copy(workspace, reference_frame, target_w, target_h)
+        reference_frame = _frame_resize_copy(workspace, reference_frame, target_w, target_h)
     if dist_size != (target_w, target_h):
-        distorted_frame = _frame_downscale_copy(workspace, distorted_frame, target_w, target_h)
+        distorted_frame = _frame_resize_copy(workspace, distorted_frame, target_w, target_h)
     return reference_frame, distorted_frame
 
 
@@ -409,21 +401,19 @@ def _select_track_reference(
     A run's pred approximates ``source_frames[gt_index]`` for each sample, so the
     ordered ``source_frame_indices`` (the recorded ``gt_index`` list) map pred
     frame ``i`` onto the correct source frame. Selecting those frames yields a GT
-    that lines up head-to-head with the pred — unlike the legacy tail-trim, which
-    drops the clip's tail and leaves a ``frame_step`` offset.
+    that lines up head-to-head with the pred without an implicit offset.
 
-    Returns fresh lists (never the shared ``reference_frames``) so the caller can
-    trim them per track without corrupting the source for later tracks. Falls
-    back to ``strict_trim`` (copies of the full source) when a track has no
-    recorded mapping — i.e. a pred produced before this change.
+    Returns fresh lists (never the shared ``reference_frames``). Tracks without
+    a mapping use strict one-to-one alignment; a present but invalid mapping is
+    rejected instead of silently falling back.
     """
     indices = [int(value) for value in source_frame_indices] if source_frame_indices else []
     if not indices:
-        return list(reference_frames), list(reference_timestamps), "strict_trim"
-    # Guard against a mapping that points past the source clip (e.g. the clip was
-    # re-decoded at a different length); fall back rather than IndexError.
+        return list(reference_frames), list(reference_timestamps), "strict"
+    if len(indices) != int(distorted_count):
+        raise ValueError("source_frame_indices must contain exactly one index per pred frame")
     if any(index < 0 or index >= len(reference_frames) for index in indices):
-        return list(reference_frames), list(reference_timestamps), "strict_trim"
+        raise ValueError("source_frame_indices contains an index outside the reference clip")
     selected_frames = [reference_frames[index] for index in indices]
     selected_timestamps = [
         reference_timestamps[index] if index < len(reference_timestamps) else None
@@ -446,7 +436,7 @@ def _scan_multitrack_compare_dataset(
     if not tracks:
         raise ValueError("multi-track compare dataset requires at least one track")
 
-    # Per-axis min of GT and every pred track — the shared compare resolution.
+    # Exact external resolution, or the inference resolution for indexed GT.
     target_w = _optional_positive_int(metadata.get("compare_target_width"))
     target_h = _optional_positive_int(metadata.get("compare_target_height"))
     downscale_mode = "none"
@@ -471,15 +461,15 @@ def _scan_multitrack_compare_dataset(
         # A pred does not approximate source frame i; it approximates
         # source_frames[gt_index]. When the track carries source_frame_indices,
         # select exactly those source frames as this track's GT so pred[i] lines
-        # up with reference[i] (head-offset, not the legacy tail-trim). Legacy
-        # preds lack the mapping and fall back to strict trim-to-common.
+        # up with reference[i]. Legacy preds without a mapping remain valid only
+        # when they already satisfy the exact strict contract.
         track_reference_frames, track_reference_timestamps, alignment_mode = _select_track_reference(
             reference_frames=reference_frames,
             reference_timestamps=reference_timestamps,
             source_frame_indices=track.get("source_frame_indices"),
             distorted_count=len(distorted_frames),
         )
-        if alignment_mode == "strict_trim":
+        if alignment_mode == "strict":
             validate_strict_decoded_alignment(
                 reference_frames=track_reference_frames,
                 distorted_frames=distorted_frames,
@@ -489,13 +479,16 @@ def _scan_multitrack_compare_dataset(
                 distorted_timestamps=distorted_timestamps,
             )
         else:
-            # Indexed selection already made the lists equal-length; guard the
-            # tail so a zip below never silently drops frames.
-            common = min(len(track_reference_frames), len(distorted_frames))
-            del track_reference_frames[common:]
-            del track_reference_timestamps[common:]
-            del distorted_frames[common:]
-            del distorted_timestamps[common:]
+            if len(track_reference_frames) != len(distorted_frames):
+                raise ValueError(
+                    "source_frame_indices must contain exactly one reference frame per pred frame"
+                )
+            if reference_fps is not None and distorted_fps is not None:
+                if abs(float(reference_fps) - float(distorted_fps)) > 1e-6:
+                    raise ValueError(
+                        "strict compare requires matching fps metadata: "
+                        f"{reference_fps} vs {distorted_fps}"
+                    )
         scanned_tracks.append(
             {
                 "track_label": track_label,

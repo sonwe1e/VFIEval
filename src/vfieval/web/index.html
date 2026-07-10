@@ -16,6 +16,8 @@
         <nav class="nav" aria-label="主导航">
           <button class="nav-item active" data-view="create" type="button">新建任务</button>
           <button class="nav-item" data-view="compare" type="button">视频对比</button>
+          <button class="nav-item" data-view="media" type="button">Media Library</button>
+          <button class="nav-item" data-view="evaluations" type="button">多人盲评</button>
           <button class="nav-item" data-view="runs" type="button">运行记录</button>
           <button class="nav-item" data-view="stats" type="button">评分统计</button>
         </nav>
@@ -131,6 +133,26 @@
                 <input name="batch_size_per_device" type="number" min="1" value="64">
               </label>
               <label>
+                <span>Artifact Profile</span>
+                <select name="artifact_profile">
+                  <option value="evaluation" selected>evaluation</option>
+                  <option value="diagnostic">diagnostic</option>
+                  <option value="benchmark">benchmark</option>
+                </select>
+              </label>
+              <label>
+                <span>Prefetch Workers</span>
+                <input name="prefetch_workers" type="number" min="1" placeholder="自动">
+              </label>
+              <label>
+                <span>Save Workers</span>
+                <input name="save_workers" type="number" min="1" placeholder="自动">
+              </label>
+              <label>
+                <span>最大在途保存样本</span>
+                <input name="max_save_inflight" type="number" min="1" placeholder="自动">
+              </label>
+              <label>
                 <span>frame_step</span>
                 <input name="frame_step" type="number" min="1" value="1">
               </label>
@@ -180,6 +202,7 @@
           </details>
           <button id="refresh-compare-sources" class="secondary" type="button">刷新对比来源</button>
           <button id="start-compare" type="submit" disabled>开始对比</button>
+          <button id="create-adhoc-evaluation" class="secondary" type="button">生成自由盲评任务</button>
         </form>
 
         <section id="compare-selection" class="panel video-selection"></section>
@@ -197,6 +220,37 @@
         <section id="run-detail" class="panel"></section>
       </section>
 
+      <section id="view-media" class="view">
+        <div class="view-head">
+          <h2>Media Library</h2>
+          <p class="muted">统一管理 videos/、external GT/Pred 与 Run 视频产物。上传路径由服务端生成。</p>
+        </div>
+        <form id="collection-form" class="panel field-grid">
+          <label><span>新 Collection</span><input name="name" maxlength="200" placeholder="例如 external-benchmark"></label>
+          <button type="submit">创建 Collection</button>
+        </form>
+        <form id="upload-form" class="panel infer-grid">
+          <fieldset class="field-group">
+            <legend>External 上传</legend>
+            <div class="field-grid">
+              <label><span>Collection</span><select name="collection_id"></select></label>
+              <label><span>角色</span><select name="role"><option value="gt">external GT</option><option value="pred">external Pred</option></select></label>
+              <label><span>类型</span><select name="media_kind"><option value="video">视频</option><option value="frame_sequence">帧序列 ZIP</option></select></label>
+              <label><span>显示别名</span><input name="display_name" maxlength="240" required></label>
+              <label><span>文件</span><input name="file" type="file" required></label>
+              <label><span>帧序列 FPS</span><input name="fps" type="number" min="0.001" step="0.001" placeholder="视频无需填写"></label>
+            </div>
+          </fieldset>
+          <div id="upload-progress" class="muted"></div>
+          <button type="submit">分片上传</button>
+          <button id="pause-upload" class="secondary" type="button">暂停（可重新提交续传）</button>
+        </form>
+        <section class="panel">
+          <div class="panel-head"><h2>资产</h2><button id="refresh-media" class="secondary" type="button">刷新</button></div>
+          <div id="media-content"></div>
+        </section>
+      </section>
+
       <section id="view-stats" class="view">
         <section class="panel">
           <div class="panel-head">
@@ -208,6 +262,41 @@
           </div>
           <div id="stats-content"></div>
         </section>
+      </section>
+
+      <section id="view-evaluations" class="view">
+        <div class="view-head">
+          <h2>多人盲评与 Campaign</h2>
+          <p class="muted">浏览器使用稳定本地 UUID；投票前只显示匿名左右轨道，不泄露模型、权重、Run 或资产编号。</p>
+        </div>
+        <form id="evaluator-form" class="panel field-grid">
+          <label><span>评测员显示名</span><input name="display_name" maxlength="120" required></label>
+          <button type="submit">保存评测员</button>
+        </form>
+        <form id="campaign-form" class="panel field-grid">
+          <label><span>Campaign 名称</span><input name="name" maxlength="240" required></label>
+          <label><span>每个候选对目标票数</span><input name="target_votes" type="number" min="1" max="1000" value="3"></label>
+          <button type="submit">创建 Campaign</button>
+        </form>
+        <section class="panel">
+          <div class="panel-head"><h3>Campaign</h3><button id="refresh-evaluations" class="secondary" type="button">刷新</button></div>
+          <div id="campaign-list"></div>
+        </section>
+        <form id="candidate-form" class="panel infer-grid">
+          <fieldset class="field-group">
+            <legend>添加候选</legend>
+            <div class="field-grid">
+              <label><span>Campaign</span><select name="campaign_id"></select></label>
+              <label><span>GT 资产</span><select name="reference_asset_id"></select></label>
+              <label><span>Pred 资产</span><select name="asset_id"></select></label>
+              <label><span>视频标识</span><input name="video_name" maxlength="240" required></label>
+              <label><span>候选快照标签</span><input name="label" maxlength="240"></label>
+            </div>
+          </fieldset>
+          <button type="submit">添加候选</button>
+        </form>
+        <section id="evaluation-task" class="panel"></section>
+        <section id="campaign-analysis" class="panel"></section>
       </section>
     </main>
     </div>

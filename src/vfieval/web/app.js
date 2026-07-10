@@ -8,6 +8,8 @@ const STATUS_LABELS = {
   canceled: "已取消",
   metric_queued: "评测排队",
   metric_running: "评测中",
+  finalize_queued: "视频合成排队",
+  finalizing: "视频合成中",
 };
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "canceled"]);
@@ -81,6 +83,20 @@ const state = {
   feedbackStats: null,
   editingFeedback: null,
   statsFilters: { dataset: "", model: "", checkpoint: "", video: "" },
+  mediaCollections: [],
+  mediaAssets: [],
+  activeUpload: null,
+  uploadPaused: false,
+  evaluatorId: localStorage.getItem("vfieval-evaluator-id") || "",
+  evaluatorName: localStorage.getItem("vfieval-evaluator-name") || "",
+  evaluationCampaigns: [],
+  selectedCampaignId: null,
+  campaignCandidates: [],
+  currentEvaluationTask: null,
+  campaignAnalysis: null,
+  evaluationTaskStartedAt: 0,
+  evaluationFrameIndex: 0,
+  campaignAnalysisFilters: { video: "", model: "", checkpoint: "", collection_id: "", evaluator_id: "" },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -456,6 +472,18 @@ function selectedVideoNames() {
   return qualified;
 }
 
+function selectedSourceAssets() {
+  const result = [];
+  for (const groupName of selectedGroupNames()) {
+    const assetIds = state.videoPages[groupName]?.asset_ids || {};
+    for (const videoName of selectedVideoNamesForGroup(groupName)) {
+      const assetId = Number(assetIds[videoName] || 0);
+      if (assetId > 0) result.push({ asset_id: assetId });
+    }
+  }
+  return result;
+}
+
 async function loadVideoGroupPage(groupName, page = 1) {
   if (!groupName) return;
   const query = state.videoPageQuery[groupName] || "";
@@ -479,6 +507,7 @@ function videoSelectionPager(page, groupName) {
 }
 
 function compareGtKey(row) {
+  if (row.asset_id) return `asset:${row.asset_id}`;
   // GT is always a source clip now (one card per videos/ clip). The pred-aligned
   // GT is reconstructed backend-side from the pred's recorded source frame
   // indices, so there is no per-run GT card to disambiguate.
@@ -501,29 +530,29 @@ function compareTrackLabel(row) {
   return state.compareTrackLabels[artifactId] || row.compare_track_label || row.run_name || `run-${row.run_id}`;
 }
 
-// Compare warns on frame-count / size mismatches; they are no longer hard
-// blockers because the backend trims both tracks to their common min frame
-// count and downscales the higher-resolution side to min(W)×min(H). Reasons
-// are surfaced as an informational tooltip ("按短边对齐 / 降采样") so the
-// user knows what the backend will do, not that the selection is rejected.
+// External assets must match exactly. VFIEval-generated Pred assets may carry
+// source_frame_indices; only that platform-owned mapping can construct an
+// aligned GT at the inference resolution.
 function compareCompatibility(gt, predRow) {
   if (!gt) return null;
   const reasons = [];
   const gtFrames = Number(gt.frame_count || 0);
   const predFrames = Number(predRow.frame_count || 0);
+  const mapped = Array.isArray(predRow.source_frame_indices)
+    && predRow.source_frame_indices.length === predFrames;
   // GT is now the source clip (N frames); a pred is the interpolated subset
   // (N-step frames), so pred < gt is the expected relationship — the backend
   // reconstructs the aligned GT from the pred's recorded source frame indices.
   // Only a pred with MORE frames than the source clip is genuinely anomalous.
-  if (gtFrames && predFrames && predFrames > gtFrames) {
-    reasons.push(`帧数 ${predFrames} > 源片段 ${gtFrames} → 按短边对齐`);
+  if (gtFrames && predFrames && gtFrames !== predFrames && !mapped) {
+    reasons.push(`strict 帧数不一致：${predFrames} vs ${gtFrames}`);
   }
   const gtW = Number(gt.width || 0);
   const gtH = Number(gt.height || 0);
   const predW = Number(predRow.width || 0);
   const predH = Number(predRow.height || 0);
-  if (gtW && gtH && predW && predH && (gtW !== predW || gtH !== predH)) {
-    reasons.push(`分辨率 ${predW}x${predH} ≠ ${gtW}x${gtH} → 按短边降采样`);
+  if (gtW && gtH && predW && predH && (gtW !== predW || gtH !== predH) && !mapped) {
+    reasons.push(`strict 分辨率不一致：${predW}x${predH} vs ${gtW}x${gtH}`);
   }
   return { ok: reasons.length === 0, reasons };
 }
@@ -561,14 +590,30 @@ function compareSourcePager(meta, type) {
 async function loadCompareSources(options = {}) {
   if (options.gtPage !== undefined) state.compareGtPage = Math.max(1, Number(options.gtPage || 1));
   if (options.predPage !== undefined) state.comparePredPage = Math.max(1, Number(options.predPage || 1));
-  const gtPayload = await api(`/api/compare-sources/gt?page=${state.compareGtPage}&page_size=50&q=${encodeURIComponent(state.compareGtQuery)}`);
-  state.compareSources.gt = gtPayload.sources || [];
-  state.compareSourcesMeta.gt = gtPayload;
+  const gtPayload = await api(`/api/media/assets?role=gt&page=${state.compareGtPage}&page_size=50&q=${encodeURIComponent(state.compareGtQuery)}`);
+  state.compareSources.gt = (gtPayload.assets || []).map((row) => ({
+    ...row,
+    kind: "media_asset",
+    asset_id: row.id,
+    group: row.collection_name,
+    video: row.original_name || row.display_name,
+    video_name: row.provenance?.video_name || row.provenance?.video || row.display_name,
+  }));
+  state.compareSourcesMeta.gt = { ...gtPayload, total_pages: gtPayload.page_count, filtered_count: gtPayload.total };
   ensureCompareSelection();
-  const video = comparePredFilterVideo();
-  const predPayload = await api(`/api/compare-sources/pred?page=${state.comparePredPage}&page_size=50&q=${encodeURIComponent(state.comparePredQuery)}${video ? `&video=${encodeURIComponent(video)}` : ""}`);
-  state.compareSources.pred = predPayload.sources || [];
-  state.compareSourcesMeta.pred = predPayload;
+  const predPayload = await api(`/api/media/assets?role=pred&page=${state.comparePredPage}&page_size=50&q=${encodeURIComponent(state.comparePredQuery)}`);
+  state.compareSources.pred = (predPayload.assets || []).map((row) => ({
+    ...row,
+    kind: "media_asset",
+    artifact_id: row.id,
+    asset_id: row.id,
+    run_id: row.provenance?.run_id,
+    run_name: row.provenance?.run_name || row.display_name,
+    video: row.provenance?.video_name || row.display_name,
+    compare_track_label: row.provenance?.track_label || "",
+    source_frame_indices: row.metadata?.source_frame_indices || null,
+  }));
+  state.compareSourcesMeta.pred = { ...predPayload, total_pages: predPayload.page_count, filtered_count: predPayload.total };
   state.compareSourcesLoaded = true;
   ensureCompareSelection();
   renderCompareSelection();
@@ -674,6 +719,8 @@ function payloadFromForm() {
   const data = formData($("infer-form"));
   const groups = selectedGroupNames();
   const multi = groups.length > 1;
+  const sourceAssets = selectedSourceAssets();
+  const selectedVideos = selectedVideoNames();
   return {
     run_type: "model_inference",
     model_file: data.model_file,
@@ -682,7 +729,8 @@ function payloadFromForm() {
     // caches/reference keys); multi-group runs send `video_groups`.
     video_group: multi ? undefined : (groups[0] || ""),
     video_groups: multi ? groups : undefined,
-    selected_videos: selectedVideoNames(),
+    source_assets: sourceAssets.length === selectedVideos.length ? sourceAssets : undefined,
+    selected_videos: selectedVideos,
     resolution_mode: data.resolution_mode || "original",
     height: data.height ? Number(data.height) : null,
     width: data.width ? Number(data.width) : null,
@@ -696,6 +744,10 @@ function payloadFromForm() {
     visualize_width: data.visualize_width ? Number(data.visualize_width) : null,
     batch_size: Number(data.batch_size || 1),
     batch_size_per_device: Number(data.batch_size_per_device || data.batch_size || 1),
+    artifact_profile: data.artifact_profile || "evaluation",
+    prefetch_workers: data.prefetch_workers ? Number(data.prefetch_workers) : null,
+    save_workers: data.save_workers ? Number(data.save_workers) : null,
+    max_save_inflight: data.max_save_inflight ? Number(data.max_save_inflight) : null,
     frame_step: Number(data.frame_step || 1),
     max_frames: data.max_frames ? Number(data.max_frames) : null,
     metrics: selectedMetrics(),
@@ -706,9 +758,7 @@ function comparePayloadFromForm() {
   const data = formData($("compare-form"));
   const gt = selectedCompareGt();
   const predRows = selectedComparePredRows();
-  // GT is optional (preds-only comparison); need at least 2 tracks total.
-  const trackCount = predRows.length + (gt ? 1 : 0);
-  if (trackCount < 2) {
+  if (!gt || predRows.length < 1) {
     return null;
   }
   // With a GT selected, it is the reference and every pred is a distorted
@@ -719,15 +769,13 @@ function comparePayloadFromForm() {
   if (gt) {
     // GT is always a source clip now; the backend reconstructs each pred's
     // aligned GT from the clip using the pred's recorded source_frame_indices.
-    reference = { kind: "video_group", group: gt.group, video: gt.video };
+    reference = { kind: "media_asset", asset_id: Number(gt.asset_id || gt.id) };
     distortedRows = predRows;
   } else {
     const head = predRows[0];
     reference = {
-      kind: "run_artifact",
-      run_id: Number(head.run_id),
-      video: head.video,
-      artifact_id: Number(head.artifact_id),
+      kind: "media_asset",
+      asset_id: Number(head.asset_id || head.artifact_id),
       label: head.track_label || compareTrackLabel(head),
     };
     distortedRows = predRows.slice(1);
@@ -736,14 +784,12 @@ function comparePayloadFromForm() {
     run_type: "video_compare",
     reference,
     distorted: distortedRows.map((row) => ({
-      kind: "run_artifact",
-      run_id: Number(row.run_id),
-      video: row.video,
-      artifact_id: Number(row.artifact_id),
+      kind: "media_asset",
+      asset_id: Number(row.asset_id || row.artifact_id),
       label: row.track_label || compareTrackLabel(row),
     })),
     extra_layers: state.selectedCompareLayerKinds.size
-      ? distortedRows.map((row) => ({
+      ? distortedRows.filter((row) => row.run_id).map((row) => ({
           source: "run_artifact",
           run_id: Number(row.run_id),
           kinds: Array.from(state.selectedCompareLayerKinds),
@@ -994,6 +1040,7 @@ function renderPreflight() {
     </div>
     ${renderMessages("errors", result.errors || [])}
     ${renderMessages("warnings", result.warnings || [])}
+    ${renderExecutionProfileRecommendation(result)}
     ${renderPortableMetricHealthTable(result.metrics?.health || {})}
     ${renderDecodeBackendNotice()}
     <h3>本次推理视频</h3>
@@ -1022,7 +1069,7 @@ function renderCompareGtCards(gtRows) {
       <label class="source-card${active ? " selected" : ""}">
         <input type="radio" name="compare_gt_pick" data-compare-gt="${escapeHtml(key)}" ${active ? "checked" : ""}>
         <span class="source-card-body">
-          <span class="source-card-title">${title} <span class="compat-badge">videos/</span></span>
+          <span class="source-card-title">${title} <span class="compat-badge">${escapeHtml(row.source_kind || "asset")}</span></span>
           <span class="source-card-meta">
             <span>${escapeHtml(row.frame_count || 0)} 帧</span>
             <span>${escapeHtml(row.width || "-")}×${escapeHtml(row.height || "-")}</span>
@@ -1044,19 +1091,19 @@ function renderComparePredCards(predRows, selectedPreds) {
     const badge = compat
       ? (compat.ok
           ? "<span class=\"compat-badge compat-ok\">对齐</span>"
-          : `<span class="compat-badge compat-warn" title="${escapeHtml(compat.reasons.join("；"))}">将对齐</span>`)
+          : `<span class="compat-badge compat-warn" title="${escapeHtml(compat.reasons.join("；"))}">strict 不匹配</span>`)
       : "";
     const warning = compat && !compat.ok
       ? `<span class="source-card-warn">${escapeHtml(compat.reasons.join("；"))}</span>`
       : "";
-    // "incompatible" keeps the CSS hook; it no longer blocks checkbox/submit —
-    // it is just a visual hint that the backend will normalise the pair.
+    // Keep the row selectable so preflight can return a precise per-track
+    // strict-alignment error; the server never normalizes external inputs.
     return `
       <div class="source-card${active ? " selected" : ""}${compat && !compat.ok ? " incompatible" : ""}">
         <label class="source-card-pick">
           <input type="checkbox" data-compare-pred="${escapeHtml(row.artifact_id)}" ${active ? "checked" : ""}>
           <span class="source-card-body">
-            <span class="source-card-title">#${escapeHtml(row.run_id)} ${escapeHtml(row.run_name || "")} ${badge}</span>
+            <span class="source-card-title">${row.run_id ? `#${escapeHtml(row.run_id)} ` : ""}${escapeHtml(row.run_name || row.display_name || "External Pred")} ${badge}</span>
             <span class="source-card-meta">
               <span>${escapeHtml(row.video || "-")}</span>
               <span>${escapeHtml(row.frame_count || 0)} 帧</span>
@@ -1261,6 +1308,28 @@ async function startCompareRun(event) {
   switchView("runs");
   await refreshRunsOnly();
   await selectRun(created.run_id);
+}
+
+async function createAdhocEvaluation() {
+  const gt = selectedCompareGt();
+  const preds = selectedComparePredRows();
+  if (!gt || preds.length !== 2) {
+    throw new Error("自由盲评需要选择一份 GT 和恰好两份 Pred");
+  }
+  const created = await api("/api/evaluation-tasks/adhoc", {
+    method: "POST",
+    body: JSON.stringify({
+      reference_asset_id: Number(gt.asset_id || gt.id),
+      candidate_asset_ids: preds.map((row) => Number(row.asset_id || row.id)),
+      video_name: gt.video_name || gt.video || gt.display_name || "adhoc",
+      name: `Adhoc · ${gt.display_name || gt.video || "Compare"}`,
+      target_votes: 1,
+    }),
+  });
+  state.selectedCampaignId = Number(created.campaign.id);
+  switchView("evaluations");
+  await loadEvaluations();
+  toast("自由盲评任务已生成");
 }
 
 function table(rows, columns, options = {}) {
@@ -1576,6 +1645,141 @@ function renderOutputHealthReport(run) {
   return `<div class="${cls}"><p><strong>Output health</strong>: ${escapeHtml(summary)}</p>${detail}</div>`;
 }
 
+class Sha256Hasher {
+  constructor() {
+    this.h = new Uint32Array([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+    this.buffer = new Uint8Array(64);
+    this.bufferLength = 0;
+    this.bytesHashed = 0;
+    this.finished = false;
+  }
+
+  update(data) {
+    if (this.finished) throw new Error("SHA-256 hasher is already finalized");
+    const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+    this.bytesHashed += bytes.length;
+    let position = 0;
+    while (position < bytes.length) {
+      const take = Math.min(bytes.length - position, 64 - this.bufferLength);
+      this.buffer.set(bytes.subarray(position, position + take), this.bufferLength);
+      this.bufferLength += take;
+      position += take;
+      if (this.bufferLength === 64) {
+        this.process(this.buffer);
+        this.bufferLength = 0;
+      }
+    }
+    return this;
+  }
+
+  process(chunk) {
+    const k = Sha256Hasher.K;
+    const w = new Uint32Array(64);
+    for (let i = 0; i < 16; i += 1) {
+      const offset = i * 4;
+      w[i] = ((chunk[offset] << 24) | (chunk[offset + 1] << 16) | (chunk[offset + 2] << 8) | chunk[offset + 3]) >>> 0;
+    }
+    for (let i = 16; i < 64; i += 1) {
+      const x = w[i - 15];
+      const y = w[i - 2];
+      const s0 = (((x >>> 7) | (x << 25)) ^ ((x >>> 18) | (x << 14)) ^ (x >>> 3)) >>> 0;
+      const s1 = (((y >>> 17) | (y << 15)) ^ ((y >>> 19) | (y << 13)) ^ (y >>> 10)) >>> 0;
+      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+    }
+    let [a, b, c, d, e, f, g, h] = this.h;
+    for (let i = 0; i < 64; i += 1) {
+      const s1 = (((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7))) >>> 0;
+      const choice = ((e & f) ^ (~e & g)) >>> 0;
+      const t1 = (h + s1 + choice + k[i] + w[i]) >>> 0;
+      const s0 = (((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10))) >>> 0;
+      const majority = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
+      const t2 = (s0 + majority) >>> 0;
+      h = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+    }
+    [a, b, c, d, e, f, g, h].forEach((value, index) => { this.h[index] = (this.h[index] + value) >>> 0; });
+  }
+
+  hex() {
+    if (!this.finished) {
+      const bits = this.bytesHashed * 8;
+      this.buffer[this.bufferLength] = 0x80;
+      this.bufferLength += 1;
+      if (this.bufferLength > 56) {
+        this.buffer.fill(0, this.bufferLength, 64);
+        this.process(this.buffer);
+        this.bufferLength = 0;
+      }
+      this.buffer.fill(0, this.bufferLength, 56);
+      const high = Math.floor(bits / 0x100000000);
+      const low = bits >>> 0;
+      for (let i = 0; i < 4; i += 1) this.buffer[56 + i] = (high >>> (24 - i * 8)) & 0xff;
+      for (let i = 0; i < 4; i += 1) this.buffer[60 + i] = (low >>> (24 - i * 8)) & 0xff;
+      this.process(this.buffer);
+      this.finished = true;
+    }
+    return Array.from(this.h).map((value) => value.toString(16).padStart(8, "0")).join("");
+  }
+}
+
+Sha256Hasher.K = new Uint32Array([
+  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]);
+
+async function sha256File(file, onProgress = () => {}) {
+  const hasher = new Sha256Hasher();
+  const chunkSize = 8 * 1024 * 1024;
+  for (let offset = 0; offset < file.size; offset += chunkSize) {
+    const bytes = new Uint8Array(await file.slice(offset, Math.min(file.size, offset + chunkSize)).arrayBuffer());
+    hasher.update(bytes);
+    onProgress(Math.min(file.size, offset + bytes.length), file.size);
+  }
+  return hasher.hex();
+}
+
+async function sha256Blob(blob) {
+  const digest = await crypto.subtle.digest("SHA-256", await blob.arrayBuffer());
+  return Array.from(new Uint8Array(digest)).map((value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+function renderPerformanceReport(run) {
+  const report = run?.result?.performance;
+  if (!report || typeof report !== "object") return "";
+  const memory = report.device_memory || {};
+  const deviceSeconds = report.device_seconds || {};
+  return `
+    <section class="performance-report">
+      <h3>Performance</h3>
+      <div class="summary-grid">
+        <div><span>Profile</span><strong>${escapeHtml(report.artifact_profile || "-")}</strong></div>
+        <div><span>End-to-end FPS</span><strong>${formatNumber(report.end_to_end_fps)}</strong></div>
+        <div><span>Steady FPS</span><strong>${formatNumber(report.steady_state_fps)}</strong></div>
+        <div><span>Total wall</span><strong>${formatNumber(report.total_wall_seconds)}s</strong></div>
+        <div><span>Prefetch wait</span><strong>${formatNumber(report.prefetch_wait_seconds)}s</strong></div>
+        <div><span>Save backpressure</span><strong>${formatNumber(report.save_backpressure_seconds)}s</strong></div>
+        <div><span>Device model</span><strong>${formatNumber(deviceSeconds.transfer_and_model)}s</strong></div>
+        <div><span>Device post</span><strong>${formatNumber(deviceSeconds.postprocess)}s</strong></div>
+        <div><span>Peak allocated</span><strong>${formatBytes(memory.max_memory_allocated || 0)}</strong></div>
+        <div><span>Save queue peak</span><strong>${escapeHtml(report.save_max_inflight ?? "-")}</strong></div>
+      </div>
+    </section>
+  `;
+}
+
+function renderExecutionProfileRecommendation(preflight) {
+  const profile = preflight?.execution_profile;
+  if (!profile) return "";
+  const settings = profile.settings || {};
+  const performance = profile.performance || {};
+  return `<div class="message"><p><strong>Benchmark 建议</strong>：batch ${escapeHtml(settings.batch_size ?? "-")}，prefetch ${escapeHtml(settings.prefetch_workers ?? "-")}，save ${escapeHtml(settings.save_workers ?? "-")}；历史稳态 ${formatNumber(performance.steady_state_fps)} FPS。用户设置仍会优先。</p></div>`;
+}
+
 function renderDecodePanel(run) {
   const job = (run.jobs || []).find((item) => item.role === "decode" || item.kind === "decode");
   if (!job && run.status !== "decoding") return "";
@@ -1691,6 +1895,7 @@ function renderRunDetail() {
       ${renderCleanedArtifactsNotice(run)}
       ${renderModelLoadReport(run)}
       ${renderOutputHealthReport(run)}
+      ${renderPerformanceReport(run)}
       ${renderDecodePanel(run)}
       <div class="message"><p><strong>Execution</strong>: ${runExecutionTarget(run)}</p></div>
       ${renderPortableMetricHealthTable(run.metadata?.metric_health || {})}
@@ -2868,6 +3073,14 @@ function formatNumber(value) {
   return Number(value).toFixed(2);
 }
 
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return "-";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  const index = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+  return `${(bytes / (1024 ** index)).toFixed(index ? 2 : 0)} ${units[index]}`;
+}
+
 function formatDuration(value) {
   const seconds = Number(value || 0);
   if (!Number.isFinite(seconds) || seconds <= 0) return "-";
@@ -2875,6 +3088,446 @@ function formatDuration(value) {
   const minutes = Math.floor(seconds / 60);
   const rest = Math.round(seconds % 60).toString().padStart(2, "0");
   return `${minutes}:${rest}`;
+}
+
+function mediaAssetContent(asset) {
+  if (asset.state !== "ready") return `<span class="muted">${escapeHtml(asset.state || "unavailable")}</span>`;
+  if (asset.media_kind === "video") {
+    return `<video controls playsinline preload="metadata" src="/api/media/assets/${Number(asset.id)}/content"></video>`;
+  }
+  return `<a href="/api/media/assets/${Number(asset.id)}/content" target="_blank" rel="noreferrer">查看首帧</a>`;
+}
+
+function renderMediaLibrary() {
+  const collectionSelect = $("upload-form")?.elements.collection_id;
+  if (collectionSelect) {
+    const selected = collectionSelect.value;
+    collectionSelect.innerHTML = state.mediaCollections
+      .map((collection) => `<option value="${Number(collection.id)}">${escapeHtml(collection.name)} (${Number(collection.asset_count || 0)})</option>`)
+      .join("");
+    if (state.mediaCollections.some((row) => String(row.id) === String(selected))) collectionSelect.value = selected;
+  }
+  const host = $("media-content");
+  if (!host) return;
+  host.innerHTML = `<div class="table compact-table">${table(state.mediaAssets, [
+    { label: "预览", render: (asset) => mediaAssetContent(asset) },
+    { label: "别名", render: (asset) => `<strong>${escapeHtml(asset.display_name)}</strong><br><span class="muted">${escapeHtml(asset.original_name || "-")}</span>` },
+    { label: "Collection", render: (asset) => escapeHtml(asset.collection_name || "-") },
+    { label: "来源 / 角色", render: (asset) => `${escapeHtml(asset.source_kind)} / ${escapeHtml(asset.role)}` },
+    { label: "媒体", render: (asset) => `${escapeHtml(asset.media_kind)}<br><span class="muted">${Number(asset.width || 0)}×${Number(asset.height || 0)} · ${Number(asset.frame_count || 0)} 帧 · ${formatNumber(asset.fps)} fps</span>` },
+    { label: "大小", render: (asset) => formatBytes(asset.size_bytes) },
+    { label: "状态", render: (asset) => statusBadge(asset.state || "ready") },
+    { label: "操作", render: (asset) => asset.source_kind === "upload" ? `<button class="danger secondary" data-media-delete="${Number(asset.id)}" type="button">软删除</button>` : "-" },
+  ])}</div>`;
+}
+
+async function loadMediaLibrary() {
+  const [collectionsPayload, assetsPayload] = await Promise.all([
+    api("/api/media/collections"),
+    api("/api/media/assets?page_size=200&state="),
+  ]);
+  state.mediaCollections = collectionsPayload.collections || [];
+  state.mediaAssets = assetsPayload.assets || [];
+  renderMediaLibrary();
+}
+
+async function createMediaCollection(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const values = formData(form);
+  await api("/api/media/collections", {
+    method: "POST",
+    body: JSON.stringify({ name: values.name }),
+  });
+  form.reset();
+  await loadMediaLibrary();
+  toast("Collection 已创建");
+}
+
+function uploadResumeKey(file, values) {
+  return `vfieval-upload:${values.collection_id}:${values.role}:${values.media_kind}:${values.display_name}:${file.name}:${file.size}:${file.lastModified}`;
+}
+
+async function rawJsonRequest(path, options) {
+  const response = await fetch(path, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error?.message || data.message || response.statusText);
+  return data;
+}
+
+async function uploadExternalMedia(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const values = formData(form);
+  const file = form.elements.file.files?.[0];
+  if (!file) throw new Error("请选择上传文件");
+  if (!values.collection_id) throw new Error("请先创建 Collection");
+  const progress = $("upload-progress");
+  const setProgress = (text) => { if (progress) progress.textContent = text; };
+  const resumeKey = uploadResumeKey(file, values);
+  state.uploadPaused = false;
+  setProgress("正在计算完整文件 SHA-256…");
+  const fileSha256 = await sha256File(file, (done, total) => {
+    setProgress(`正在校验文件：${Math.round((done / Math.max(1, total)) * 100)}%`);
+  });
+
+  let session = null;
+  const savedUploadId = localStorage.getItem(resumeKey);
+  if (savedUploadId) {
+    try {
+      session = await api(`/api/uploads/${savedUploadId}`);
+      if (session.status !== "uploading" || Number(session.total_size) !== file.size || session.sha256 !== fileSha256) session = null;
+    } catch (_error) {
+      session = null;
+    }
+  }
+  if (!session) {
+    const created = await api("/api/uploads", {
+      method: "POST",
+      body: JSON.stringify({
+        collection_id: Number(values.collection_id),
+        role: values.role,
+        media_kind: values.media_kind,
+        display_name: values.display_name,
+        original_name: file.name,
+        total_size: file.size,
+        sha256: fileSha256,
+        fps: values.fps ? Number(values.fps) : null,
+      }),
+    });
+    session = created.upload;
+    localStorage.setItem(resumeKey, session.id);
+  }
+  state.activeUpload = session.id;
+  const chunkSize = Number(session.chunk_size || 8 * 1024 * 1024);
+  const uploaded = new Set((session.parts || []).map((part) => Number(part.part_index)));
+  const partCount = Math.ceil(file.size / chunkSize);
+  for (let index = 0; index < partCount; index += 1) {
+    if (state.uploadPaused) {
+      state.activeUpload = null;
+      setProgress("上传已暂停；重新选择同一文件并提交即可从现有分片续传。");
+      return;
+    }
+    if (uploaded.has(index)) continue;
+    const start = index * chunkSize;
+    const end = Math.min(file.size, start + chunkSize);
+    const part = file.slice(start, end);
+    setProgress(`上传分片 ${index + 1}/${partCount}…`);
+    const partSha256 = await sha256Blob(part);
+    await rawJsonRequest(`/api/uploads/${session.id}/parts/${index}`, {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "Content-Range": `bytes ${start}-${end - 1}/${file.size}`,
+        "X-Chunk-SHA256": partSha256,
+      },
+      body: part,
+    });
+  }
+  setProgress("正在服务端校验并建立媒体资产…");
+  await api(`/api/uploads/${session.id}/complete`, { method: "POST", body: "{}" });
+  localStorage.removeItem(resumeKey);
+  state.activeUpload = null;
+  form.reset();
+  setProgress("上传完成");
+  await loadMediaLibrary();
+  toast("媒体资产已上传");
+}
+
+async function deleteMediaAsset(assetId) {
+  if (!window.confirm("软删除该媒体资产？历史 Campaign、投票和统计不会被删除。")) return;
+  await api(`/api/media/assets/${Number(assetId)}`, { method: "DELETE" });
+  await loadMediaLibrary();
+  await loadCompareSources({ gtPage: 1, predPage: 1 });
+  toast("媒体资产已软删除");
+}
+
+function ensureEvaluatorId() {
+  if (state.evaluatorId) return state.evaluatorId;
+  state.evaluatorId = crypto.randomUUID
+    ? crypto.randomUUID()
+    : `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  localStorage.setItem("vfieval-evaluator-id", state.evaluatorId);
+  return state.evaluatorId;
+}
+
+function renderCampaignAnalysis() {
+  const host = $("campaign-analysis");
+  if (!host) return;
+  const analysis = state.campaignAnalysis;
+  if (!analysis) {
+    host.innerHTML = "<p class=\"muted\">发布 Campaign 后显示覆盖率、胜率矩阵、Bradley–Terry 排名和客观指标统计。</p>";
+    return;
+  }
+  const coverage = analysis.coverage || {};
+  const ranking = analysis.human?.ranking || [];
+  const headToHead = analysis.human?.head_to_head || [];
+  const metrics = analysis.objective?.metrics || [];
+  const correlations = analysis.cross_analysis?.metrics || [];
+  const evaluatorVotes = analysis.evaluator_votes || [];
+  const reasonRows = Object.entries(analysis.quality_reasons || {}).map(([reason, count]) => ({ reason, count }));
+  const campaignId = Number(analysis.campaign?.id || state.selectedCampaignId);
+  const analysisParams = new URLSearchParams();
+  for (const [key, value] of Object.entries(state.campaignAnalysisFilters || {})) {
+    if (value) analysisParams.set(key, value);
+  }
+  analysisParams.set("format", "csv");
+  host.innerHTML = `
+    <div class="panel-head"><div><h3>Campaign 分析</h3><p class="muted">人工与客观指标分别展示，不生成混合总分。</p></div><div class="actions"><a class="secondary button-link" href="/api/evaluation-campaigns/${campaignId}/analysis?${escapeHtml(analysisParams.toString())}">排名 CSV</a><a class="secondary button-link" href="/api/evaluation-campaigns/${campaignId}/export?format=csv">完整 CSV</a><a class="secondary button-link" href="/api/evaluation-campaigns/${campaignId}/export">完整 JSON</a></div></div>
+    <section class="stats-filters">
+      ${[["video", "视频"], ["model", "模型"], ["checkpoint", "权重"], ["evaluator_id", "评测员 UUID"]].map(([name, label]) => `<label><span>${label}</span><input data-campaign-filter="${name}" value="${escapeHtml(state.campaignAnalysisFilters[name] || "")}"></label>`).join("")}
+      <label><span>Collection</span><select data-campaign-filter="collection_id"><option value="">全部</option>${state.mediaCollections.map((collection) => `<option value="${Number(collection.id)}" ${String(state.campaignAnalysisFilters.collection_id) === String(collection.id) ? "selected" : ""}>${escapeHtml(collection.name)}</option>`).join("")}</select></label>
+      <button data-campaign-analysis-apply type="button">应用筛选</button>
+      <button data-campaign-analysis-reset class="secondary" type="button">清除</button>
+    </section>
+    <div class="summary-grid">
+      <div><span>覆盖任务</span><strong>${Number(coverage.completed_tasks || 0)}/${Number(coverage.tasks || 0)}</strong></div>
+      <div><span>每对目标票数</span><strong>${Number(coverage.target_votes_per_task || 0)}</strong></div>
+      <div><span>结论状态</span><strong>${coverage.provisional ? "provisional" : "complete"}</strong></div>
+      <div><span>评测一致率</span><strong>${analysis.agreement_rate == null ? "-" : formatNumber(Number(analysis.agreement_rate) * 100) + "%"}</strong></div>
+    </div>
+    <section class="stats-block"><h3>Bradley–Terry 排名（平局半胜）</h3><div class="table compact-table">${table(ranking, [
+      { label: "排名", render: (row) => String(ranking.indexOf(row) + 1) },
+      { label: "候选", render: (row) => escapeHtml(row.label || `asset-${row.asset_id}`) },
+      { label: "模型 / 权重", render: (row) => `${escapeHtml(row.model_name || "-")}<br><span class="muted">${escapeHtml(row.checkpoint || "-")}</span>` },
+      { label: "得分", render: (row) => formatNumber(row.score) },
+      { label: "95% CI", render: (row) => `${formatNumber(row.ci95?.[0])} – ${formatNumber(row.ci95?.[1])}` },
+    ])}</div></section>
+    <section class="stats-block"><h3>Head-to-head</h3><div class="table compact-table">${table(headToHead, [
+      { label: "候选对", render: (row) => `${Number(row.asset_a_id)} vs ${Number(row.asset_b_id)}` },
+      { label: "票数", render: (row) => Number(row.votes || 0) },
+      { label: "A 半胜", render: (row) => formatNumber(row.wins_first) },
+      { label: "B 半胜", render: (row) => formatNumber(row.wins_second) },
+      { label: "A / B 胜率", render: (row) => `${formatNumber(Number(row.win_rate_a || 0) * 100)}% / ${formatNumber(Number(row.win_rate_b || 0) * 100)}%` },
+      { label: "平局", render: (row) => Number(row.ties || 0) },
+    ])}</div></section>
+    <section class="stats-block"><h3>覆盖与质量原因</h3><div class="table compact-table">${table(reasonRows, [
+      { label: "原因", render: (row) => escapeHtml(row.reason) },
+      { label: "次数", render: (row) => Number(row.count || 0) },
+    ])}</div><div class="table compact-table">${table(evaluatorVotes, [
+      { label: "评测员", render: (row) => escapeHtml(row.evaluator_name || row.evaluator_id) },
+      { label: "票数", render: (row) => Number(row.votes || 0) },
+    ])}</div></section>
+    <section class="stats-block"><h3>客观指标</h3><div class="table compact-table">${table(metrics, [
+      { label: "指标", render: (row) => escapeHtml(row.metric_name) },
+      { label: "方向", render: (row) => escapeHtml(row.direction || "-") },
+      { label: "候选资产", render: (row) => Number(row.asset_id) },
+      { label: "有效样本", render: (row) => Number(row.count || 0) },
+      { label: "均值 / 中位数", render: (row) => `${formatNumber(row.mean)} / ${formatNumber(row.median)}` },
+      { label: "P10 / P90", render: (row) => `${formatNumber(row.p10)} / ${formatNumber(row.p90)}` },
+      { label: "状态", render: (row) => escapeHtml(JSON.stringify(row.status_counts || {})) },
+    ])}</div></section>
+    ${correlations.length ? `<section class="stats-block"><h3>人工排名与指标排名 Spearman</h3><div class="table compact-table">${table(correlations, [
+      { label: "指标", render: (row) => escapeHtml(row.metric_name) },
+      { label: "候选数", render: (row) => Number(row.candidate_count || 0) },
+      { label: "Spearman", render: (row) => formatNumber(row.spearman) },
+      { label: "冲突候选", render: (row) => escapeHtml((row.conflict_asset_ids || []).join(", ") || "-") },
+    ])}</div></section>` : ""}
+  `;
+}
+
+function renderEvaluationTask() {
+  const host = $("evaluation-task");
+  if (!host) return;
+  const task = state.currentEvaluationTask;
+  if (!state.evaluatorId || !state.evaluatorName) {
+    host.innerHTML = "<p class=\"muted\">先填写评测员显示名，再参加已发布的 Campaign。</p>";
+    return;
+  }
+  if (!task) {
+    host.innerHTML = "<p class=\"muted\">当前 Campaign 暂无待评任务，或尚未发布。</p>";
+    return;
+  }
+  const taskMedia = (side) => task[`${side}_media_kind`] === "frame_sequence"
+    ? `<img data-evaluation-frame-side="${escapeHtml(side)}" src="${escapeHtml(`${task[`${side}_url`]}&frame=${state.evaluationFrameIndex}`)}" alt="${escapeHtml(side)}">`
+    : `<video controls playsinline preload="metadata" src="${escapeHtml(task[`${side}_url`])}"></video>`;
+  const hasFrameSequence = ["reference", "left", "right"].some((side) => task[`${side}_media_kind`] === "frame_sequence");
+  host.innerHTML = `
+    <div class="panel-head"><div><h3>匿名任务 · ${escapeHtml(task.video_name)}</h3><p class="muted">参考 GT 仅用于观察；选择更好的匿名候选，或选择平局。</p></div></div>
+    <div class="evaluation-grid">
+      <article><h4>参考 GT</h4>${taskMedia("reference")}</article>
+      <article><h4>候选 A</h4>${taskMedia("left")}</article>
+      <article><h4>候选 B</h4>${taskMedia("right")}</article>
+    </div>
+    ${hasFrameSequence ? `<label class="wide-field"><span>单帧位置 ${state.evaluationFrameIndex + 1}/${Number(task.frame_count || 1)}</span><input data-evaluation-frame type="range" min="0" max="${Math.max(0, Number(task.frame_count || 1) - 1)}" value="${state.evaluationFrameIndex}"></label>` : ""}
+    <div class="checkbox-row evaluation-reasons">
+      ${(task.quality_reasons || []).map((reason) => `<label><input type="checkbox" data-evaluation-reason value="${escapeHtml(reason)}">${escapeHtml(reason)}</label>`).join("")}
+    </div>
+    <div class="field-grid">
+      <label><span>置信度</span><select id="evaluation-confidence"><option value="">未填写</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select></label>
+      <label><span>备注</span><textarea id="evaluation-note" maxlength="4000"></textarea></label>
+    </div>
+    <div class="evaluation-actions">
+      <button data-evaluation-vote="left" type="button">候选 A 更好</button>
+      <button data-evaluation-vote="tie" class="secondary" type="button">平局</button>
+      <button data-evaluation-vote="right" type="button">候选 B 更好</button>
+    </div>
+  `;
+  state.evaluationTaskStartedAt = Date.now();
+}
+
+function fillCampaignControls() {
+  const candidateForm = $("candidate-form");
+  if (!candidateForm) return;
+  const campaignSelect = candidateForm.elements.campaign_id;
+  campaignSelect.innerHTML = state.evaluationCampaigns
+    .filter((campaign) => campaign.status === "draft")
+    .map((campaign) => `<option value="${Number(campaign.id)}">${escapeHtml(campaign.name)}</option>`)
+    .join("");
+  if (state.selectedCampaignId && state.evaluationCampaigns.some((row) => Number(row.id) === Number(state.selectedCampaignId) && row.status === "draft")) {
+    campaignSelect.value = String(state.selectedCampaignId);
+  }
+  const gt = state.mediaAssets.filter((asset) => asset.state === "ready" && ["source", "gt"].includes(asset.role));
+  const pred = state.mediaAssets.filter((asset) => asset.state === "ready" && asset.role === "pred");
+  candidateForm.elements.reference_asset_id.innerHTML = gt.map((asset) => `<option value="${Number(asset.id)}">${escapeHtml(asset.collection_name || "-")} · ${escapeHtml(asset.display_name)}</option>`).join("");
+  candidateForm.elements.asset_id.innerHTML = pred.map((asset) => `<option value="${Number(asset.id)}">${escapeHtml(asset.collection_name || "-")} · ${escapeHtml(asset.display_name)}</option>`).join("");
+}
+
+function renderCampaigns() {
+  const host = $("campaign-list");
+  if (!host) return;
+  host.innerHTML = `<div class="table compact-table">${table(state.evaluationCampaigns, [
+    { label: "Campaign", render: (row) => `<strong>${escapeHtml(row.name)}</strong><br><span class="muted">#${Number(row.id)}</span>` },
+    { label: "状态", render: (row) => statusBadge(row.status) },
+    { label: "候选 / 任务 / 投票", render: (row) => `${Number(row.candidates || 0)} / ${Number(row.tasks || 0)} / ${Number(row.votes || 0)}` },
+    { label: "目标票数", render: (row) => Number(row.target_votes || 0) },
+    { label: "操作", render: (row) => `<button class="secondary" data-campaign-select="${Number(row.id)}" type="button">打开</button>${row.status === "draft" ? ` <button data-campaign-publish="${Number(row.id)}" type="button">发布</button>` : ""}${row.status === "published" ? ` <button class="secondary" data-campaign-close="${Number(row.id)}" type="button">关闭</button>` : ""}` },
+  ])}</div>`;
+  if (state.selectedCampaignId) {
+    host.insertAdjacentHTML("beforeend", `<section class="stats-block"><h3>已选 Campaign 候选</h3><div class="table compact-table">${table(state.campaignCandidates, [
+      { label: "视频", render: (row) => escapeHtml(row.video_name) },
+      { label: "GT", render: (row) => Number(row.reference_asset_id) },
+      { label: "候选", render: (row) => escapeHtml(row.label_snapshot) },
+      { label: "模型 / 权重", render: (row) => `${escapeHtml(row.model_snapshot || "-")} / ${escapeHtml(row.checkpoint_snapshot || "-")}` },
+    ])}</div></section>`);
+  }
+  fillCampaignControls();
+}
+
+async function loadEvaluationCampaign(campaignId) {
+  state.selectedCampaignId = Number(campaignId);
+  const selected = state.evaluationCampaigns.find((row) => Number(row.id) === Number(campaignId));
+  const candidatesPayload = await api(`/api/evaluation-campaigns/${Number(campaignId)}/candidates`);
+  state.campaignCandidates = candidatesPayload.candidates || [];
+  state.currentEvaluationTask = null;
+  state.evaluationFrameIndex = 0;
+  state.campaignAnalysis = null;
+  if (["published", "closed"].includes(selected?.status)) {
+    await loadCampaignAnalysis(campaignId);
+    if (selected?.status === "published" && state.evaluatorId && state.evaluatorName) {
+      const next = await api(`/api/evaluation-campaigns/${Number(campaignId)}/next?evaluator_id=${encodeURIComponent(state.evaluatorId)}`);
+      state.currentEvaluationTask = next.task || null;
+    }
+  }
+  renderCampaigns();
+  renderEvaluationTask();
+  renderCampaignAnalysis();
+}
+
+async function loadCampaignAnalysis(campaignId = state.selectedCampaignId) {
+  if (!campaignId) return;
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(state.campaignAnalysisFilters || {})) {
+    if (value) params.set(key, value);
+  }
+  state.campaignAnalysis = await api(`/api/evaluation-campaigns/${Number(campaignId)}/analysis${params.toString() ? `?${params}` : ""}`);
+}
+
+async function loadEvaluations() {
+  if (!state.mediaAssets.length) await loadMediaLibrary();
+  const campaignsPayload = await api("/api/evaluation-campaigns");
+  state.evaluationCampaigns = campaignsPayload.campaigns || [];
+  const evaluatorForm = $("evaluator-form");
+  if (evaluatorForm) evaluatorForm.elements.display_name.value = state.evaluatorName;
+  const validSelection = state.evaluationCampaigns.some((row) => Number(row.id) === Number(state.selectedCampaignId));
+  if (!validSelection) state.selectedCampaignId = state.evaluationCampaigns[0]?.id || null;
+  if (state.selectedCampaignId) {
+    await loadEvaluationCampaign(state.selectedCampaignId);
+  } else {
+    state.campaignCandidates = [];
+    state.currentEvaluationTask = null;
+    state.campaignAnalysis = null;
+    renderCampaigns();
+    renderEvaluationTask();
+    renderCampaignAnalysis();
+  }
+}
+
+async function saveEvaluator(event) {
+  event.preventDefault();
+  const displayName = String(formData(event.currentTarget).display_name || "").trim();
+  const evaluatorId = ensureEvaluatorId();
+  const result = await api("/api/evaluators/session", {
+    method: "POST",
+    body: JSON.stringify({ evaluator_id: evaluatorId, display_name: displayName }),
+  });
+  state.evaluatorName = result.evaluator.display_name;
+  localStorage.setItem("vfieval-evaluator-name", state.evaluatorName);
+  await loadEvaluations();
+  toast("评测员信息已保存");
+}
+
+async function createEvaluationCampaign(event) {
+  event.preventDefault();
+  const values = formData(event.currentTarget);
+  const result = await api("/api/evaluation-campaigns", {
+    method: "POST",
+    body: JSON.stringify({ name: values.name, target_votes: Number(values.target_votes || 3) }),
+  });
+  event.currentTarget.reset();
+  state.selectedCampaignId = Number(result.campaign.id);
+  await loadEvaluations();
+  toast("Campaign 已创建");
+}
+
+async function addEvaluationCandidate(event) {
+  event.preventDefault();
+  const values = formData(event.currentTarget);
+  await api(`/api/evaluation-campaigns/${Number(values.campaign_id)}/candidates`, {
+    method: "POST",
+    body: JSON.stringify({
+      reference_asset_id: Number(values.reference_asset_id),
+      asset_id: Number(values.asset_id),
+      video_name: values.video_name,
+      label: values.label || undefined,
+    }),
+  });
+  state.selectedCampaignId = Number(values.campaign_id);
+  await loadEvaluations();
+  toast("候选已添加");
+}
+
+async function publishEvaluationCampaign(campaignId) {
+  await api(`/api/evaluation-campaigns/${Number(campaignId)}/publish`, { method: "POST", body: "{}" });
+  state.selectedCampaignId = Number(campaignId);
+  await loadEvaluations();
+  toast("Campaign 已发布");
+}
+
+async function closeEvaluationCampaign(campaignId) {
+  await api(`/api/evaluation-campaigns/${Number(campaignId)}/close`, { method: "POST", body: "{}" });
+  state.selectedCampaignId = Number(campaignId);
+  await loadEvaluations();
+  toast("Campaign 已关闭");
+}
+
+async function submitEvaluationVote(choice) {
+  const task = state.currentEvaluationTask;
+  if (!task) return;
+  const reasons = Array.from(document.querySelectorAll("[data-evaluation-reason]:checked")).map((item) => item.value);
+  await api(`/api/evaluation-tasks/${Number(task.id)}/votes`, {
+    method: "POST",
+    body: JSON.stringify({
+      evaluator_id: state.evaluatorId,
+      choice,
+      reasons,
+      confidence: $("evaluation-confidence")?.value || "",
+      note: $("evaluation-note")?.value || "",
+      duration_ms: Math.max(0, Date.now() - state.evaluationTaskStartedAt),
+    }),
+  });
+  await loadEvaluations();
+  toast("投票已保存");
 }
 
 async function refreshCatalog() {
@@ -2924,6 +3577,14 @@ document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("
       await loadStats();
       return;
     }
+    if (view === "media") {
+      await loadMediaLibrary();
+      return;
+    }
+    if (view === "evaluations") {
+      await loadEvaluations();
+      return;
+    }
     if (view !== "runs") {
       return;
     }
@@ -2941,12 +3602,24 @@ document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("
 }));
 $("infer-form").addEventListener("submit", (event) => startRun(event).catch((error) => toast(error.message)));
 $("compare-form").addEventListener("submit", (event) => startCompareRun(event).catch((error) => toast(error.message)));
+$("create-adhoc-evaluation").addEventListener("click", () => createAdhocEvaluation().catch((error) => toast(error.message)));
+$("collection-form").addEventListener("submit", (event) => createMediaCollection(event).catch((error) => toast(error.message)));
+$("upload-form").addEventListener("submit", (event) => uploadExternalMedia(event).catch((error) => toast(error.message)));
+$("evaluator-form").addEventListener("submit", (event) => saveEvaluator(event).catch((error) => toast(error.message)));
+$("campaign-form").addEventListener("submit", (event) => createEvaluationCampaign(event).catch((error) => toast(error.message)));
+$("candidate-form").addEventListener("submit", (event) => addEvaluationCandidate(event).catch((error) => toast(error.message)));
 $("refresh").addEventListener("click", () => refreshRunsOnly().catch((error) => toast(error.message)));
 $("refresh-files").addEventListener("click", () => refreshCatalog().then(() => toast("文件列表已刷新")).catch((error) => toast(error.message)));
 $("refresh-compare-sources").addEventListener("click", () => loadCompareSources({ gtPage: 1, predPage: 1 }).then(() => scheduleComparePreflight(0)).then(() => toast("对比来源已刷新")).catch((error) => toast(error.message)));
 $("refresh-stats").addEventListener("click", () => loadStats().then(() => toast("统计数据已刷新")).catch((error) => toast(error.message)));
 $("infer-form").addEventListener("input", () => schedulePreflight());
 $("compare-form").addEventListener("input", () => scheduleComparePreflight());
+$("refresh-media").addEventListener("click", () => loadMediaLibrary().then(() => toast("媒体资产已刷新")).catch((error) => toast(error.message)));
+$("pause-upload").addEventListener("click", () => {
+  state.uploadPaused = true;
+  toast(state.activeUpload ? "将在当前分片完成后暂停" : "当前没有进行中的上传");
+});
+$("refresh-evaluations").addEventListener("click", () => loadEvaluations().then(() => toast("盲评数据已刷新")).catch((error) => toast(error.message)));
 
 $("infer-form").addEventListener("change", async (event) => {
   renderCustomSizeVisibility();
@@ -2961,6 +3634,18 @@ $("infer-form").addEventListener("change", async (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  const evaluationFrame = event.target.closest("[data-evaluation-frame]");
+  if (evaluationFrame && state.currentEvaluationTask) {
+    state.evaluationFrameIndex = Number(evaluationFrame.value || 0);
+    document.querySelectorAll("[data-evaluation-frame-side]").forEach((image) => {
+      const url = new URL(image.src, window.location.origin);
+      url.searchParams.set("frame", String(state.evaluationFrameIndex));
+      image.src = `${url.pathname}${url.search}`;
+    });
+    const label = evaluationFrame.closest("label")?.querySelector("span");
+    if (label) label.textContent = `单帧位置 ${state.evaluationFrameIndex + 1}/${Number(state.currentEvaluationTask.frame_count || 1)}`;
+    return;
+  }
   const statsFilter = event.target.closest("[data-stats-filter]");
   if (statsFilter) {
     state.statsFilters[statsFilter.dataset.statsFilter] = statsFilter.value || "";
@@ -3117,6 +3802,45 @@ document.addEventListener("submit", (event) => {
 });
 
 document.addEventListener("click", async (event) => {
+  if (event.target.closest("[data-campaign-analysis-apply]")) {
+    document.querySelectorAll("[data-campaign-filter]").forEach((input) => {
+      state.campaignAnalysisFilters[input.dataset.campaignFilter] = input.value || "";
+    });
+    await loadCampaignAnalysis();
+    renderCampaignAnalysis();
+    return;
+  }
+  if (event.target.closest("[data-campaign-analysis-reset]")) {
+    state.campaignAnalysisFilters = { video: "", model: "", checkpoint: "", collection_id: "", evaluator_id: "" };
+    await loadCampaignAnalysis();
+    renderCampaignAnalysis();
+    return;
+  }
+  const campaignSelect = event.target.closest("[data-campaign-select]");
+  if (campaignSelect) {
+    await loadEvaluationCampaign(Number(campaignSelect.dataset.campaignSelect));
+    return;
+  }
+  const campaignPublish = event.target.closest("[data-campaign-publish]");
+  if (campaignPublish) {
+    await publishEvaluationCampaign(Number(campaignPublish.dataset.campaignPublish));
+    return;
+  }
+  const campaignClose = event.target.closest("[data-campaign-close]");
+  if (campaignClose) {
+    await closeEvaluationCampaign(Number(campaignClose.dataset.campaignClose));
+    return;
+  }
+  const evaluationVote = event.target.closest("[data-evaluation-vote]");
+  if (evaluationVote) {
+    await submitEvaluationVote(evaluationVote.dataset.evaluationVote);
+    return;
+  }
+  const mediaDelete = event.target.closest("[data-media-delete]");
+  if (mediaDelete) {
+    await deleteMediaAsset(Number(mediaDelete.dataset.mediaDelete));
+    return;
+  }
   const feedbackDelete = event.target.closest("[data-feedback-delete]");
   if (feedbackDelete) {
     await deleteRunFeedback(Number(feedbackDelete.dataset.feedbackRun), Number(feedbackDelete.dataset.feedbackDelete));

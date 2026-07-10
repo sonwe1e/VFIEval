@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import json
+import shutil
 import sqlite3
 import time
 from pathlib import Path
@@ -22,6 +23,9 @@ def _loads(text: str | None) -> Any:
     if not text:
         return {}
     return json.loads(text)
+
+
+LATEST_SCHEMA_VERSION = "2026-07-media-evaluation-v1"
 
 
 def _rating_key(score: float) -> str:
@@ -265,6 +269,215 @@ CREATE TABLE IF NOT EXISTS run_feedback (
 );
 
 CREATE INDEX IF NOT EXISTS idx_run_feedback_run ON run_feedback(run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_run_feedback_video ON run_feedback(video, model_name, checkpoint);
+CREATE INDEX IF NOT EXISTS idx_run_feedback_filters ON run_feedback(model_name, checkpoint, video, run_id);
+CREATE INDEX IF NOT EXISTS idx_run_feedback_user ON run_feedback(username, created_at);
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version TEXT PRIMARY KEY,
+    applied_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS media_collections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    slug TEXT NOT NULL UNIQUE,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS media_assets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    collection_id INTEGER REFERENCES media_collections(id) ON DELETE SET NULL,
+    source_key TEXT NOT NULL UNIQUE,
+    source_kind TEXT NOT NULL CHECK(source_kind IN ('folder', 'upload', 'run_artifact')),
+    media_kind TEXT NOT NULL CHECK(media_kind IN ('video', 'frame_sequence')),
+    role TEXT NOT NULL CHECK(role IN ('source', 'gt', 'pred')),
+    display_name TEXT NOT NULL,
+    original_name TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'ready',
+    content_sha256 TEXT,
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    storage_path TEXT NOT NULL,
+    mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+    frame_count INTEGER NOT NULL DEFAULT 0,
+    width INTEGER NOT NULL DEFAULT 0,
+    height INTEGER NOT NULL DEFAULT 0,
+    fps REAL,
+    provenance_json TEXT NOT NULL DEFAULT '{}',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    deleted_at REAL,
+    UNIQUE(collection_id, display_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_media_assets_catalog
+ON media_assets(state, role, source_kind, collection_id, display_name);
+CREATE INDEX IF NOT EXISTS idx_media_assets_hash ON media_assets(content_sha256);
+
+CREATE TABLE IF NOT EXISTS media_asset_relations (
+    parent_asset_id INTEGER NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
+    child_asset_id INTEGER NOT NULL REFERENCES media_assets(id) ON DELETE CASCADE,
+    relation_type TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    PRIMARY KEY(parent_asset_id, child_asset_id, relation_type)
+);
+
+CREATE TABLE IF NOT EXISTS run_media_assets (
+    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    asset_id INTEGER NOT NULL REFERENCES media_assets(id) ON DELETE RESTRICT,
+    role TEXT NOT NULL,
+    video_name TEXT NOT NULL DEFAULT '',
+    track_label TEXT NOT NULL DEFAULT '',
+    model_name TEXT NOT NULL DEFAULT '',
+    checkpoint TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    PRIMARY KEY(run_id, asset_id, role, video_name, track_label)
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_media_assets_run
+ON run_media_assets(run_id, role, video_name, track_label);
+CREATE INDEX IF NOT EXISTS idx_run_media_assets_asset ON run_media_assets(asset_id);
+
+CREATE TABLE IF NOT EXISTS metric_asset_bindings (
+    metric_result_id INTEGER PRIMARY KEY REFERENCES metric_results(id) ON DELETE CASCADE,
+    reference_asset_id INTEGER REFERENCES media_assets(id) ON DELETE SET NULL,
+    distorted_asset_id INTEGER REFERENCES media_assets(id) ON DELETE SET NULL,
+    video_name TEXT NOT NULL DEFAULT '',
+    track_label TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_metric_asset_bindings_pair
+ON metric_asset_bindings(reference_asset_id, distorted_asset_id, video_name);
+
+CREATE TABLE IF NOT EXISTS upload_sessions (
+    id TEXT PRIMARY KEY,
+    collection_id INTEGER NOT NULL REFERENCES media_collections(id) ON DELETE RESTRICT,
+    role TEXT NOT NULL CHECK(role IN ('gt', 'pred')),
+    media_kind TEXT NOT NULL CHECK(media_kind IN ('video', 'frame_sequence')),
+    display_name TEXT NOT NULL,
+    original_name TEXT NOT NULL,
+    expected_size INTEGER NOT NULL,
+    expected_sha256 TEXT NOT NULL,
+    fps REAL,
+    chunk_size INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    received_bytes INTEGER NOT NULL DEFAULT 0,
+    error_json TEXT NOT NULL DEFAULT '{}',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_upload_sessions_state ON upload_sessions(state, updated_at);
+
+CREATE TABLE IF NOT EXISTS upload_parts (
+    upload_id TEXT NOT NULL REFERENCES upload_sessions(id) ON DELETE CASCADE,
+    part_index INTEGER NOT NULL,
+    offset_bytes INTEGER NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    sha256 TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY(upload_id, part_index)
+);
+
+CREATE TABLE IF NOT EXISTS execution_profiles (
+    fingerprint TEXT PRIMARY KEY,
+    model_name TEXT NOT NULL,
+    checkpoint TEXT NOT NULL DEFAULT '',
+    device_kind TEXT NOT NULL,
+    device_model TEXT NOT NULL DEFAULT '',
+    device_count INTEGER NOT NULL,
+    height INTEGER NOT NULL,
+    width INTEGER NOT NULL,
+    precision TEXT NOT NULL,
+    artifact_profile TEXT NOT NULL,
+    settings_json TEXT NOT NULL DEFAULT '{}',
+    performance_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS evaluators (
+    id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS evaluation_campaigns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    campaign_type TEXT NOT NULL CHECK(campaign_type IN ('campaign', 'adhoc')),
+    status TEXT NOT NULL CHECK(status IN ('draft', 'published', 'closed')),
+    target_votes INTEGER NOT NULL DEFAULT 3,
+    seed INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS evaluation_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER NOT NULL REFERENCES evaluation_campaigns(id) ON DELETE CASCADE,
+    reference_asset_id INTEGER NOT NULL REFERENCES media_assets(id) ON DELETE RESTRICT,
+    asset_id INTEGER NOT NULL REFERENCES media_assets(id) ON DELETE RESTRICT,
+    video_name TEXT NOT NULL,
+    label_snapshot TEXT NOT NULL,
+    model_snapshot TEXT NOT NULL DEFAULT '',
+    checkpoint_snapshot TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    UNIQUE(campaign_id, reference_asset_id, asset_id, video_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_evaluation_candidates_campaign
+ON evaluation_candidates(campaign_id, video_name);
+
+CREATE TABLE IF NOT EXISTS evaluation_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER REFERENCES evaluation_campaigns(id) ON DELETE CASCADE,
+    reference_asset_id INTEGER NOT NULL REFERENCES media_assets(id) ON DELETE RESTRICT,
+    candidate_a_id INTEGER NOT NULL REFERENCES evaluation_candidates(id) ON DELETE CASCADE,
+    candidate_b_id INTEGER NOT NULL REFERENCES evaluation_candidates(id) ON DELETE CASCADE,
+    video_name TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'ready',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    CHECK(candidate_a_id < candidate_b_id),
+    UNIQUE(campaign_id, reference_asset_id, candidate_a_id, candidate_b_id, video_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_evaluation_tasks_campaign
+ON evaluation_tasks(campaign_id, video_name, state);
+
+CREATE TABLE IF NOT EXISTS evaluation_votes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES evaluation_tasks(id) ON DELETE CASCADE,
+    evaluator_id TEXT NOT NULL REFERENCES evaluators(id) ON DELETE CASCADE,
+    choice TEXT NOT NULL CHECK(choice IN ('left', 'right', 'tie')),
+    preferred_asset_id INTEGER REFERENCES media_assets(id) ON DELETE SET NULL,
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    confidence TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    duration_ms INTEGER,
+    presentation_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(task_id, evaluator_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_evaluation_votes_task ON evaluation_votes(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_evaluation_votes_evaluator ON evaluation_votes(evaluator_id, created_at);
 """
 
 
@@ -290,8 +503,13 @@ class Database:
 
     def init(self) -> None:
         with self.connection() as conn:
+            self._backup_before_upgrade(conn)
             conn.executescript(SCHEMA)
             self._migrate(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (LATEST_SCHEMA_VERSION, utc_ts()),
+            )
             now = utc_ts()
             conn.execute(
                 """
@@ -300,6 +518,30 @@ class Database:
                 """,
                 (now,),
             )
+
+    def _backup_before_upgrade(self, conn: sqlite3.Connection) -> None:
+        has_runs = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'runs'"
+        ).fetchone()
+        if has_runs is None:
+            return
+        has_migrations = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+        ).fetchone()
+        if has_migrations is not None:
+            applied = conn.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = ?",
+                (LATEST_SCHEMA_VERSION,),
+            ).fetchone()
+            if applied is not None:
+                return
+        conn.execute("PRAGMA wal_checkpoint(FULL)")
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        backup_dir = self.db_path.parent / "backups" / stamp
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        target = backup_dir / self.db_path.name
+        if self.db_path.exists() and not target.exists():
+            shutil.copy2(self.db_path, target)
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
@@ -351,6 +593,12 @@ class Database:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_run_feedback_video ON run_feedback(video, model_name, checkpoint)"
         )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_run_feedback_filters ON run_feedback(model_name, checkpoint, video, run_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_run_feedback_user ON run_feedback(username, created_at)"
+        )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(datasets)").fetchall()}
         dataset_columns = {
             "source_type": "TEXT NOT NULL DEFAULT 'frames'",
@@ -369,6 +617,9 @@ class Database:
         }.items():
             if name not in run_columns:
                 conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
+        profile_columns = {row["name"] for row in conn.execute("PRAGMA table_info(execution_profiles)").fetchall()}
+        if "device_model" not in profile_columns:
+            conn.execute("ALTER TABLE execution_profiles ADD COLUMN device_model TEXT NOT NULL DEFAULT ''")
 
     def query(self, sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
         with self.connection() as conn:
@@ -1392,114 +1643,153 @@ class Database:
         0.25 step, so the distribution histogram spans the 17 quarter-values from
         1.00 to 5.00.
         """
-        entries = self.list_all_feedback(limit=100000)
+        return self._feedback_stats_sql(
+            dataset=dataset,
+            model_name=model_name,
+            checkpoint=checkpoint,
+            video=video,
+        )
 
-        def _keep(row: dict[str, Any]) -> bool:
-            if dataset and str(row.get("dataset_name") or "") != dataset:
-                return False
-            if model_name and str(row.get("model_name") or "") != model_name:
-                return False
-            if checkpoint and str(row.get("checkpoint") or "") != checkpoint:
-                return False
-            if video and str(row.get("video") or "") != video:
-                return False
-            return True
+    def _feedback_sql_scope(
+        self,
+        *,
+        dataset: str | None = None,
+        model_name: str | None = None,
+        checkpoint: str | None = None,
+        video: str | None = None,
+    ) -> tuple[str, list[Any]]:
+        clauses = ["r.deleted_at IS NULL"]
+        params: list[Any] = []
+        for value, expression in (
+            (dataset, "d.name"),
+            (model_name, "f.model_name"),
+            (checkpoint, "f.checkpoint"),
+            (video, "f.video"),
+        ):
+            if value:
+                clauses.append(f"{expression} = ?")
+                params.append(str(value))
+        return " AND ".join(clauses), params
 
-        entries = [row for row in entries if _keep(row)]
-        total = len(entries)
-        ratings = [float(row["rating"]) for row in entries if row.get("rating") is not None]
-        issue_count = sum(1 for row in entries if str(row.get("issue") or "").strip())
+    def _feedback_stats_sql(
+        self,
+        *,
+        dataset: str | None = None,
+        model_name: str | None = None,
+        checkpoint: str | None = None,
+        video: str | None = None,
+    ) -> dict[str, Any]:
+        where, params = self._feedback_sql_scope(
+            dataset=dataset,
+            model_name=model_name,
+            checkpoint=checkpoint,
+            video=video,
+        )
+        source = "run_feedback f JOIN runs r ON r.id = f.run_id JOIN datasets d ON d.id = r.dataset_id"
+        summary = self.get(
+            f"""
+            SELECT COUNT(*) AS total,
+                   COUNT(f.rating) AS rating_count,
+                   ROUND(AVG(f.rating), 2) AS average_rating,
+                   SUM(CASE WHEN TRIM(f.issue) != '' THEN 1 ELSE 0 END) AS issue_count
+            FROM {source}
+            WHERE {where}
+            """,
+            params,
+        ) or {}
         distribution = {_rating_key(step / 4): 0 for step in range(4, 21)}
-        for score in ratings:
-            key = _rating_key(score)
-            if key in distribution:
-                distribution[key] += 1
+        for row in self.query(
+            f"""
+            SELECT printf('%.2f', f.rating) AS rating_key, COUNT(*) AS count
+            FROM {source}
+            WHERE {where} AND f.rating IS NOT NULL
+            GROUP BY printf('%.2f', f.rating)
+            """,
+            params,
+        ):
+            if row["rating_key"] in distribution:
+                distribution[row["rating_key"]] = int(row["count"])
 
-        groups: dict[str, dict[Any, dict[str, Any]]] = {
-            "by_user": {},
-            "by_run": {},
-            "by_video": {},
-            "by_model": {},
-            "by_checkpoint": {},
-            "by_model_checkpoint": {},
-        }
-
-        def _bucket(dimension: str, key: Any, label: dict[str, Any]) -> dict[str, Any]:
-            store = groups[dimension]
-            if key not in store:
-                store[key] = {**label, "count": 0, "ratings": [], "issues": 0}
-            return store[key]
-
-        for row in entries:
-            rating = float(row["rating"]) if row.get("rating") is not None else None
-            has_issue = bool(str(row.get("issue") or "").strip())
-            username = str(row.get("username") or "匿名")
-            video_name = str(row.get("video") or "").strip()
-            model = str(row.get("model_name") or "").strip()
-            ckpt = str(row.get("checkpoint") or "").strip() or "-"
-            targets = [
-                _bucket("by_user", username, {"username": username}),
-            ]
-            run_id = row.get("run_id")
-            if run_id is not None:
-                targets.append(
-                    _bucket("by_run", int(run_id), {"run_id": int(run_id), "run_name": row.get("run_name")})
+        def grouped(
+            fields: list[tuple[str, str]],
+            *,
+            extra: str = "",
+            order: str,
+        ) -> list[dict[str, Any]]:
+            select_fields = ", ".join(f"{expression} AS {alias}" for alias, expression in fields)
+            group_fields = ", ".join(expression for _alias, expression in fields)
+            scoped = f"{where}{extra}"
+            rows = self.query(
+                f"""
+                SELECT {select_fields}, COUNT(*) AS count,
+                       COUNT(f.rating) AS rating_count,
+                       ROUND(AVG(f.rating), 2) AS average_rating,
+                       SUM(CASE WHEN TRIM(f.issue) != '' THEN 1 ELSE 0 END) AS issues
+                FROM {source}
+                WHERE {scoped}
+                GROUP BY {group_fields}
+                ORDER BY {order}
+                """,
+                params,
+            )
+            rating_rows = self.query(
+                f"""
+                SELECT {select_fields}, printf('%.2f', f.rating) AS rating_key, COUNT(*) AS count
+                FROM {source}
+                WHERE {scoped} AND f.rating IS NOT NULL
+                GROUP BY {group_fields}, printf('%.2f', f.rating)
+                """,
+                params,
+            )
+            histograms: dict[tuple[Any, ...], dict[str, int]] = {}
+            for rating_row in rating_rows:
+                key = tuple(rating_row[alias] for alias, _expression in fields)
+                histogram = histograms.setdefault(key, {_rating_key(step / 4): 0 for step in range(4, 21)})
+                if rating_row["rating_key"] in histogram:
+                    histogram[rating_row["rating_key"]] = int(rating_row["count"])
+            for row in rows:
+                key = tuple(row[alias] for alias, _expression in fields)
+                row["rating_distribution"] = histograms.get(
+                    key, {_rating_key(step / 4): 0 for step in range(4, 21)}
                 )
-            if video_name:
-                targets.append(_bucket("by_video", video_name, {"video": video_name}))
-            if model:
-                targets.append(_bucket("by_model", model, {"model_name": model}))
-                targets.append(_bucket("by_checkpoint", (model, ckpt), {"model_name": model, "checkpoint": ckpt}))
-                combo_key = (model, ckpt, video_name)
-                targets.append(
-                    _bucket(
-                        "by_model_checkpoint",
-                        combo_key,
-                        {"model_name": model, "checkpoint": ckpt, "video": video_name},
-                    )
-                )
-            for bucket in targets:
-                bucket["count"] += 1
-                if rating is not None:
-                    bucket["ratings"].append(rating)
-                if has_issue:
-                    bucket["issues"] += 1
+                row["count"] = int(row["count"] or 0)
+                row["rating_count"] = int(row["rating_count"] or 0)
+                row["issues"] = int(row["issues"] or 0)
+            return rows
 
-        def _finalize(bucket: dict[str, Any]) -> dict[str, Any]:
-            values = bucket.pop("ratings", [])
-            bucket["rating_count"] = len(values)
-            bucket["average_rating"] = round(sum(values) / len(values), 2) if values else None
-            return bucket
-
+        username = "CASE WHEN TRIM(f.username) = '' THEN '匿名' ELSE f.username END"
+        checkpoint_expr = "CASE WHEN TRIM(f.checkpoint) = '' THEN '-' ELSE f.checkpoint END"
         return {
-            "total": total,
-            "rating_count": len(ratings),
-            "average_rating": round(sum(ratings) / len(ratings), 2) if ratings else None,
-            "issue_count": issue_count,
+            "total": int(summary.get("total") or 0),
+            "rating_count": int(summary.get("rating_count") or 0),
+            "average_rating": summary.get("average_rating"),
+            "issue_count": int(summary.get("issue_count") or 0),
             "rating_distribution": distribution,
-            "by_user": sorted(
-                (_finalize(b) for b in groups["by_user"].values()),
-                key=lambda item: (-int(item["count"]), str(item["username"])),
+            "by_user": grouped([("username", username)], order="count DESC, username"),
+            "by_run": grouped(
+                [("run_id", "f.run_id"), ("run_name", "r.name")], order="f.run_id DESC"
             ),
-            "by_run": sorted(
-                (_finalize(b) for b in groups["by_run"].values()),
-                key=lambda item: -int(item["run_id"]),
+            "by_video": grouped(
+                [("video", "f.video")], extra=" AND TRIM(f.video) != ''", order="count DESC, f.video"
             ),
-            "by_video": sorted(
-                (_finalize(b) for b in groups["by_video"].values()),
-                key=lambda item: (-int(item["count"]), str(item["video"])),
+            "by_model": grouped(
+                [("model_name", "f.model_name")],
+                extra=" AND TRIM(f.model_name) != ''",
+                order="count DESC, f.model_name",
             ),
-            "by_model": sorted(
-                (_finalize(b) for b in groups["by_model"].values()),
-                key=lambda item: (-int(item["count"]), str(item["model_name"])),
+            "by_checkpoint": grouped(
+                [("model_name", "f.model_name"), ("checkpoint", checkpoint_expr)],
+                extra=" AND TRIM(f.model_name) != ''",
+                order=f"f.model_name, {checkpoint_expr}",
             ),
-            "by_checkpoint": sorted(
-                (_finalize(b) for b in groups["by_checkpoint"].values()),
-                key=lambda item: (str(item["model_name"]), str(item["checkpoint"])),
-            ),
-            "by_model_checkpoint": sorted(
-                (_finalize(b) for b in groups["by_model_checkpoint"].values()),
-                key=lambda item: (str(item["video"]), str(item["model_name"]), str(item["checkpoint"])),
+            "by_model_checkpoint": grouped(
+                [
+                    ("model_name", "f.model_name"),
+                    ("checkpoint", checkpoint_expr),
+                    ("video", "f.video"),
+                ],
+                extra=" AND TRIM(f.model_name) != ''",
+                order=f"f.video, f.model_name, {checkpoint_expr}",
             ),
         }
 
@@ -1509,26 +1799,57 @@ class Database:
         Powers the stats-tab filter dropdowns without the frontend having to
         derive them from the full entry list.
         """
-        entries = self.list_all_feedback(limit=100000)
-        datasets: set[str] = set()
-        models: set[str] = set()
-        checkpoints: set[str] = set()
-        videos: set[str] = set()
-        for row in entries:
-            if str(row.get("dataset_name") or "").strip():
-                datasets.add(str(row["dataset_name"]).strip())
-            if str(row.get("model_name") or "").strip():
-                models.add(str(row["model_name"]).strip())
-            if str(row.get("checkpoint") or "").strip():
-                checkpoints.add(str(row["checkpoint"]).strip())
-            if str(row.get("video") or "").strip():
-                videos.add(str(row["video"]).strip())
+        source = "run_feedback f JOIN runs r ON r.id = f.run_id JOIN datasets d ON d.id = r.dataset_id"
+
+        def values(expression: str) -> list[str]:
+            rows = self.query(
+                f"""
+                SELECT DISTINCT {expression} AS value
+                FROM {source}
+                WHERE r.deleted_at IS NULL AND TRIM({expression}) != ''
+                ORDER BY value
+                """
+            )
+            return [str(row["value"]) for row in rows]
+
         return {
-            "datasets": sorted(datasets),
-            "models": sorted(models),
-            "checkpoints": sorted(checkpoints),
-            "videos": sorted(videos),
+            "datasets": values("d.name"),
+            "models": values("f.model_name"),
+            "checkpoints": values("f.checkpoint"),
+            "videos": values("f.video"),
         }
+
+    def list_recent_feedback(
+        self,
+        *,
+        limit: int = 100,
+        dataset: str | None = None,
+        model_name: str | None = None,
+        checkpoint: str | None = None,
+        video: str | None = None,
+    ) -> list[dict[str, Any]]:
+        where, params = self._feedback_sql_scope(
+            dataset=dataset,
+            model_name=model_name,
+            checkpoint=checkpoint,
+            video=video,
+        )
+        rows = self.query(
+            f"""
+            SELECT f.*, r.name AS run_name, r.status AS run_status,
+                   r.deleted_at AS run_deleted_at, d.name AS dataset_name
+            FROM run_feedback f
+            JOIN runs r ON r.id = f.run_id
+            JOIN datasets d ON d.id = r.dataset_id
+            WHERE {where}
+            ORDER BY f.created_at DESC, f.id DESC
+            LIMIT ?
+            """,
+            (*params, min(1000, max(1, int(limit)))),
+        )
+        for row in rows:
+            row["metadata"] = _loads(row.pop("metadata_json", None))
+        return rows
 
     def mark_run_artifacts_cleaned(self, run_id: int) -> None:
         now = utc_ts()
@@ -1541,6 +1862,15 @@ class Database:
             # scores are orphaned (the #26 case: results deleted but ratings
             # lingered), so drop them alongside the artifacts.
             conn.execute("DELETE FROM run_feedback WHERE run_id = ?", (run_id,))
+            conn.execute(
+                """
+                UPDATE media_assets
+                SET state = 'unavailable', updated_at = ?
+                WHERE source_kind = 'run_artifact'
+                  AND id IN (SELECT asset_id FROM run_media_assets WHERE run_id = ?)
+                """,
+                (now, run_id),
+            )
             conn.execute(
                 """
                 UPDATE runs
@@ -1620,6 +1950,23 @@ class Database:
         if output_health is not None:
             result["output_health"] = output_health
         artifact_summary = self.summarize_run_artifacts(run_id)
+        if any(bool((job.get("payload") or {}).get("defer_video_finalize")) for job in jobs):
+            existing = self.list_run_jobs(run_id, "finalize")
+            if not existing:
+                self.add_run_job(
+                    run_id,
+                    "finalize",
+                    {
+                        "run_id": run_id,
+                        "inference_job_ids": [int(job["job_id"]) for job in jobs],
+                    },
+                    progress_total=1,
+                    shard_index=0,
+                    device=None,
+                    metadata={"source": "multi_device"},
+                )
+            self.complete_run_inference(run_id, result, artifact_summary, "finalize_queued")
+            return True
         metrics = list(run.get("metrics") or [])
         if metrics:
             metric_payload = {
@@ -1918,6 +2265,32 @@ class Database:
                 (job_id, sample_id, kind, str(Path(path).resolve()), mime_type, _json(metadata), now),
             )
             return int(cur.lastrowid)
+
+    def add_artifacts_bulk(self, job_id: int, records: Iterable[dict[str, Any]]) -> list[int]:
+        rows = list(records)
+        if not rows:
+            return []
+        now = utc_ts()
+        ids: list[int] = []
+        with self.connection() as conn:
+            for record in rows:
+                cur = conn.execute(
+                    """
+                    INSERT INTO artifacts(job_id, sample_id, kind, path, mime_type, metadata_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(job_id),
+                        record.get("sample_id"),
+                        str(record["kind"]),
+                        str(record.get("path") or ""),
+                        str(record.get("mime_type") or "application/octet-stream"),
+                        _json(record.get("metadata") or {}),
+                        now,
+                    ),
+                )
+                ids.append(int(cur.lastrowid))
+        return ids
 
     def list_artifacts(self, job_id: int | None = None, kind: str | None = None) -> list[dict[str, Any]]:
         clauses: list[str] = []

@@ -82,7 +82,7 @@ def add_completed_pred_run(
     pred_metadata = {"video_name": video_name, "frames": sample_count, "width": size[0], "height": size[1], "fps": fps}
     # Preds produced after the source-clip-GT change carry the mapping Compare
     # uses to reconstruct a pred-aligned GT from the source clip. Legacy preds
-    # (these fields omitted) fall back to strict trim-to-common.
+    # without these fields remain valid only when exact strict alignment holds.
     if source_video_path is not None:
         pred_metadata["source_video_path"] = str(source_video_path.resolve())
     if source_frame_indices is not None:

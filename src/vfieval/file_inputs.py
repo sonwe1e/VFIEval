@@ -350,7 +350,7 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
             validate_strict_alignment,
             validate_strict_decoded_alignment,
         )
-        from vfieval.datasets import _load_compare_source_frames
+        from vfieval.datasets import _load_compare_source_frames, _select_track_reference
 
         health = metrics_health(workspace)
         selected_metrics = [str(name) for name in (payload.get("metrics") or [])]
@@ -389,24 +389,60 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
                 "compare_reference",
             )
             distorted_tracks = []
+            indexed_mapping: list[int] | None = None
             for track_index, descriptor in enumerate(distorted_descriptors):
                 distorted = resolve_compare_descriptor(workspace, db, descriptor, role="distorted")
                 track_label = str(distorted.get("track_label") or distorted.get("label") or f"pred{track_index + 1}")
                 try:
-                    track_alignment = validate_strict_alignment(reference, distorted)
                     distorted_frames, distorted_fps, distorted_timestamps = _load_compare_source_frames(
                         workspace,
                         Path(str(distorted["path"])),
                         f"compare_distorted_{track_index}",
                     )
-                    validate_strict_decoded_alignment(
+                    track_reference_frames, track_reference_timestamps, mapping_mode = _select_track_reference(
                         reference_frames=reference_frames,
-                        distorted_frames=distorted_frames,
-                        reference_fps=reference_fps,
-                        distorted_fps=distorted_fps,
                         reference_timestamps=reference_timestamps,
-                        distorted_timestamps=distorted_timestamps,
+                        source_frame_indices=distorted.get("source_frame_indices"),
+                        distorted_count=len(distorted_frames),
                     )
+                    if mapping_mode == "indexed":
+                        indices = [int(value) for value in distorted.get("source_frame_indices") or []]
+                        if len(track_reference_frames) != len(distorted_frames):
+                            raise ValueError(
+                                "source_frame_indices must contain exactly one reference frame per pred frame"
+                            )
+                        if indexed_mapping is None:
+                            indexed_mapping = indices
+                        elif indexed_mapping != indices:
+                            raise ValueError("all tracks must use the same source_frame_indices for a shared GT")
+                        if reference_fps is not None and distorted_fps is not None:
+                            if abs(float(reference_fps) - float(distorted_fps)) > 1e-6:
+                                raise ValueError(
+                                    "strict compare requires matching fps metadata: "
+                                    f"{reference_fps} vs {distorted_fps}"
+                                )
+                        aligned_reference = {
+                            **reference,
+                            "frame_count": len(track_reference_frames),
+                            "width": int(distorted.get("width") or 0),
+                            "height": int(distorted.get("height") or 0),
+                        }
+                        track_alignment = {
+                            **validate_strict_alignment(aligned_reference, distorted),
+                            "alignment_source": "source_frame_indices",
+                            "source_reference_width": int(reference.get("width") or 0),
+                            "source_reference_height": int(reference.get("height") or 0),
+                        }
+                    else:
+                        track_alignment = validate_strict_alignment(reference, distorted)
+                        validate_strict_decoded_alignment(
+                            reference_frames=track_reference_frames,
+                            distorted_frames=distorted_frames,
+                            reference_fps=reference_fps,
+                            distorted_fps=distorted_fps,
+                            reference_timestamps=track_reference_timestamps,
+                            distorted_timestamps=distorted_timestamps,
+                        )
                 except Exception as exc:
                     raise RuntimeError(f"track {track_label}: {exc}") from exc
                 track = dict(distorted)
@@ -416,18 +452,23 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
                         "track_label": track_label,
                         "frame_count": len(distorted_frames),
                         "fps": distorted_fps,
+                        "alignment_mode": mapping_mode,
                         "alignment": track_alignment,
                     }
                 )
                 distorted_tracks.append(track)
-            # The common downscale target across all tracks is the per-axis min of
-            # every source's dimensions. The frame-level rescale in sample
-            # assembly uses this so GT and every track's pred share one size.
-            target_w = int(reference["width"])
-            target_h = int(reference["height"])
-            for track in distorted_tracks:
-                target_w = min(target_w, int(track.get("width") or 0))
-                target_h = min(target_h, int(track.get("height") or 0))
+            # External tracks already match exactly. Indexed VFIEval tracks use
+            # the Pred resolution as the target for the generated aligned GT.
+            target_w = int((distorted_tracks[0].get("alignment") or {}).get("target_width") or reference["width"])
+            target_h = int((distorted_tracks[0].get("alignment") or {}).get("target_height") or reference["height"])
+            if any(
+                (
+                    int((track.get("alignment") or {}).get("target_width") or 0),
+                    int((track.get("alignment") or {}).get("target_height") or 0),
+                ) != (target_w, target_h)
+                for track in distorted_tracks
+            ):
+                raise ValueError("all compare tracks must resolve to the same dimensions")
             reference_needs_downscale = (int(reference["width"]), int(reference["height"])) != (target_w, target_h)
             for track in distorted_tracks:
                 reference_reported = reference_needs_downscale
@@ -444,34 +485,36 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
             result["distorted_tracks"] = distorted_tracks
             ref_w0 = int(reference["width"])
             ref_h0 = int(reference["height"])
-            if reference_needs_downscale or any(
+            if indexed_mapping is not None and (reference_needs_downscale or any(
                 (int(track.get("width") or 0), int(track.get("height") or 0)) != (target_w, target_h)
                 for track in distorted_tracks
-            ):
+            )):
                 result["warnings"].append(
                     {
-                        "title": "分辨率不一致，将按短边降采样",
+                        "title": "将生成推理分辨率的 aligned GT",
                         "message": (
-                            f"GT {ref_w0}x{ref_h0} 与 pred 分辨率不一致，"
-                            f"较高分辨率一侧将降采样到 {target_w}x{target_h} 用于评测和可视化"
+                            f"原始 GT 为 {ref_w0}x{ref_h0}；平台将依据 source_frame_indices "
+                            f"生成 {target_w}x{target_h} aligned GT，不修改原始资产"
                         ),
-                        "type": "CompareResolutionMismatch",
+                        "type": "AlignedGTGenerated",
                         "details": {"target_width": target_w, "target_height": target_h},
                     }
                 )
-            # effective post-trim frame count = len(reference_frames) after
-            # validate_strict_decoded_alignment trimmed both to common length.
-            aligned_frame_count = len(reference_frames)
+            # Effective frame count is exact after either strict validation or
+            # the explicit platform-owned source-frame selection.
+            aligned_frame_count = int((distorted_tracks[0].get("alignment") or {}).get("frame_count") or len(reference_frames))
+            if any(int((track.get("alignment") or {}).get("frame_count") or 0) != aligned_frame_count for track in distorted_tracks):
+                raise ValueError("all compare tracks must resolve to the same frame count")
             original_ref_frame_count = int(reference.get("frame_count") or 0)
-            if original_ref_frame_count and aligned_frame_count != original_ref_frame_count:
+            if indexed_mapping is not None and original_ref_frame_count and aligned_frame_count != original_ref_frame_count:
                 result["warnings"].append(
                     {
-                        "title": "帧数不一致，将按短边对齐",
+                        "title": "已通过 source_frame_indices 选择 aligned GT",
                         "message": (
-                            f"GT {original_ref_frame_count} 帧与 pred {aligned_frame_count} 帧不一致，"
-                            f"已对齐到 {aligned_frame_count} 帧用于评测和可视化"
+                            f"从 {original_ref_frame_count} 帧原始 GT 中显式选择 "
+                            f"{aligned_frame_count} 帧，与 Pred 一一对齐"
                         ),
-                        "type": "CompareFrameCountMismatch",
+                        "type": "AlignedGTGenerated",
                         "details": {
                             "reference_frame_count": original_ref_frame_count,
                             "aligned_frame_count": aligned_frame_count,

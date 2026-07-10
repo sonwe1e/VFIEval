@@ -1066,6 +1066,7 @@ class Model:
                         "precision": "fp32",
                         "batch_size": 1,
                         "max_frames": 4,
+                        "artifact_profile": "diagnostic",
                     },
                 )
                 run_id = created["run_id"]
@@ -1607,7 +1608,7 @@ class Model:
                 sample_detail = _get(base_url, f"/api/runs/{run_id}/samples/{sample['sample_id']}")
                 self.assertIn("gt", sample_detail["artifacts"])
                 self.assertIn("pred", sample_detail["artifacts"])
-                self.assertNotIn("difference", sample_detail["artifacts"])
+                self.assertIn("difference", sample_detail["artifacts"])
                 self.assertNotIn("flowt_0", sample_detail["artifacts"])
                 self.assertNotIn("mask0", sample_detail["artifacts"])
             finally:
@@ -1655,7 +1656,7 @@ class Model:
                 sample_detail = _get(base_url, f"/api/runs/{run_id}/samples/{sample['sample_id']}")
                 self.assertIn("gt", sample_detail["artifacts"])
                 self.assertIn("pred", sample_detail["artifacts"])
-                self.assertNotIn("difference", sample_detail["artifacts"])
+                self.assertIn("difference", sample_detail["artifacts"])
                 self.assertNotIn("flowt_0", sample_detail["artifacts"])
                 self.assertNotIn("mask0", sample_detail["artifacts"])
                 self.assertNotIn("warp0", sample_detail["artifacts"])
@@ -1663,7 +1664,7 @@ class Model:
             finally:
                 stop_server(server, thread)
 
-    def test_video_compare_preflight_aligns_mismatched_frame_counts(self) -> None:
+    def test_video_compare_preflight_rejects_mismatched_frame_counts(self) -> None:
         # Misaligned frame counts are no longer hard-rejected: preflight should
         # succeed and surface the effective (min) aligned frame count through
         # alignment.frame_count plus an informational warning.
@@ -1686,10 +1687,8 @@ class Model:
                     "align_mode": "strict",
                 },
             )
-            self.assertTrue(result["ok"], result)
-            self.assertEqual(result["alignment"]["frame_count"], 2)  # min(3, 2)
-            frame_warnings = [w for w in result.get("warnings", []) if w.get("type") == "CompareFrameCountMismatch"]
-            self.assertEqual(len(frame_warnings), 1, result.get("warnings"))
+            self.assertFalse(result["ok"], result)
+            self.assertIn("matching frame counts", result["errors"][0]["message"])
 
     def test_video_compare_rejects_raw_string_descriptors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

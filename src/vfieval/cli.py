@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 
 from vfieval.config import WorkspaceConfig
@@ -10,7 +11,7 @@ from vfieval.db import Database
 from vfieval.metrics import METRIC_NAMES, create_metric
 from vfieval.metrics.base import MetricUnavailable
 from vfieval.metrics.health import metrics_health, prepare_metric_asset_manifest
-from vfieval.server import run_server
+from vfieval.server import _create_run_from_files, run_server
 from vfieval.worker import WorkerOptions, run_worker
 
 
@@ -73,8 +74,21 @@ def main(argv: list[str] | None = None) -> int:
     smoke_metric.add_argument("--distorted", required=True)
     smoke_metric.add_argument("--work-dir")
 
+    benchmark = sub.add_parser("benchmark")
+    benchmark.add_argument("--model-file", required=True)
+    benchmark.add_argument("--video-group", required=True)
+    benchmark.add_argument("--checkpoint", default="none")
+    benchmark.add_argument("--device", default="npu:0")
+    benchmark.add_argument("--device-id", action="append", dest="devices", default=[])
+    benchmark.add_argument("--execution-mode", choices=["single", "multi_npu", "multi_cuda"], default="single")
+    benchmark.add_argument("--precision", choices=["fp32", "fp16", "bf16"], default="fp16")
+    benchmark.add_argument("--batch-size", type=int, default=1)
+    benchmark.add_argument("--warmup-batches", type=int, default=10)
+    benchmark.add_argument("--samples", type=int, default=200)
+    benchmark.add_argument("--repeats", type=int, default=3)
+
     worker = sub.add_parser("worker")
-    worker.add_argument("--role", choices=["decode", "inference", "metric", "all"], default="all")
+    worker.add_argument("--role", choices=["decode", "inference", "finalize", "metric", "all"], default="all")
     worker.add_argument("--once", action="store_true")
     worker.add_argument("--poll-interval", type=float, default=5.0)
     worker.add_argument("--worker-id")
@@ -188,6 +202,46 @@ def main(argv: list[str] | None = None) -> int:
             code = 1
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return code
+
+    if args.command == "benchmark":
+        reports = []
+        for repeat in range(max(1, int(args.repeats))):
+            created = _create_run_from_files(
+                db,
+                workspace,
+                {
+                    "run_type": "model_inference",
+                    "name": f"benchmark-{Path(args.model_file).stem}-{repeat + 1}",
+                    "model_file": args.model_file,
+                    "video_group": args.video_group,
+                    "checkpoint": args.checkpoint,
+                    "device": args.device,
+                    "devices": args.devices,
+                    "execution_mode": args.execution_mode,
+                    "precision": args.precision,
+                    "batch_size": args.batch_size,
+                    "batch_size_per_device": args.batch_size,
+                    "artifact_profile": "benchmark",
+                    "benchmark_warmup_batches": args.warmup_batches,
+                    "benchmark_samples": args.samples,
+                    "metrics": [],
+                },
+            )
+            run_id = int(created["run_id"])
+            while True:
+                run = db.get_run(run_id)
+                if run["status"] in {"completed", "failed", "canceled"}:
+                    break
+                time.sleep(0.25)
+            if run["status"] != "completed":
+                raise RuntimeError(f"benchmark run {run_id} failed: {run.get('error')}")
+            reports.append({"run_id": run_id, "performance": (run.get("result") or {}).get("performance") or {}})
+        best = max(
+            reports,
+            key=lambda row: float((row.get("performance") or {}).get("steady_state_fps") or 0.0),
+        )
+        print(json.dumps({"repeats": reports, "best": best}, indent=2, ensure_ascii=False))
+        return 0
 
     if args.command == "worker":
         run_worker(

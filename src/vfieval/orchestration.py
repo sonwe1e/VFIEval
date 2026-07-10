@@ -29,6 +29,8 @@ def create_inference_jobs_for_run(db: Database, run_id: int) -> list[int]:
     batch_size = int(run.get("batch_size") or 1)
     visualize_height = metadata.get("visualize_height")
     visualize_width = metadata.get("visualize_width")
+    request = metadata.get("request") or {}
+    artifact_profile = str(metadata.get("artifact_profile") or request.get("artifact_profile") or "evaluation")
     samples = db.list_samples(dataset_id)
     if not samples:
         raise ValueError("decoded dataset has no samples")
@@ -48,6 +50,14 @@ def create_inference_jobs_for_run(db: Database, run_id: int) -> list[int]:
             samples=samples,
             visualize_height=visualize_height,
             visualize_width=visualize_width,
+            artifact_profile=artifact_profile,
+            prefetch_workers=request.get("prefetch_workers"),
+            save_workers=request.get("save_workers"),
+            max_save_inflight=request.get("max_save_inflight"),
+            artifact_db_batch_size=request.get("artifact_db_batch_size"),
+            sample_npu_smi=request.get("sample_npu_smi", True),
+            benchmark_warmup_batches=request.get("benchmark_warmup_batches"),
+            benchmark_samples=request.get("benchmark_samples"),
         )
     else:
         payload = {
@@ -62,6 +72,14 @@ def create_inference_jobs_for_run(db: Database, run_id: int) -> list[int]:
             "metrics": metrics,
             "visualize_height": visualize_height,
             "visualize_width": visualize_width,
+            "artifact_profile": artifact_profile,
+            "prefetch_workers": request.get("prefetch_workers"),
+            "save_workers": request.get("save_workers"),
+            "max_save_inflight": request.get("max_save_inflight"),
+            "artifact_db_batch_size": request.get("artifact_db_batch_size"),
+            "sample_npu_smi": request.get("sample_npu_smi", True),
+            "benchmark_warmup_batches": request.get("benchmark_warmup_batches"),
+            "benchmark_samples": request.get("benchmark_samples"),
         }
         job_ids = [
             db.add_run_job(
@@ -106,9 +124,29 @@ def partition_samples_by_video(samples: list[dict[str, Any]], devices: list[str]
         metadata = sample.get("metadata") or {}
         key = str(metadata.get("video_file") or metadata.get("video_name") or sample.get("name"))
         grouped.setdefault(key, []).append(int(sample["id"]))
+    if not devices:
+        return []
+    total = sum(len(values) for values in grouped.values())
+    average = total / max(1, len(devices))
+    split_needed = len(grouped) < len(devices) or any(len(values) > average * 1.25 for values in grouped.values())
+    units: list[list[int]] = []
+    for _key, sample_ids in sorted(grouped.items(), key=lambda item: len(item[1]), reverse=True):
+        if not split_needed:
+            units.append(sample_ids)
+            continue
+        desired = max(1, min(len(sample_ids), round(len(sample_ids) / max(1.0, average))))
+        desired = max(desired, min(len(devices), len(sample_ids)) if len(grouped) == 1 else desired)
+        base, remainder = divmod(len(sample_ids), desired)
+        offset = 0
+        for segment_index in range(desired):
+            segment_size = base + (1 if segment_index < remainder else 0)
+            if segment_size <= 0:
+                continue
+            units.append(sample_ids[offset : offset + segment_size])
+            offset += segment_size
     partitions: list[list[int]] = [[] for _ in devices]
     loads = [0 for _ in devices]
-    for _key, sample_ids in sorted(grouped.items(), key=lambda item: len(item[1]), reverse=True):
+    for sample_ids in sorted(units, key=len, reverse=True):
         shard_index = min(range(len(devices)), key=lambda index: loads[index])
         partitions[shard_index].extend(sample_ids)
         loads[shard_index] += len(sample_ids)
@@ -160,6 +198,14 @@ def _create_inference_shards(
     samples: list[dict[str, Any]],
     visualize_height: int | None = None,
     visualize_width: int | None = None,
+    artifact_profile: str = "evaluation",
+    prefetch_workers: int | None = None,
+    save_workers: int | None = None,
+    max_save_inflight: int | None = None,
+    artifact_db_batch_size: int | None = None,
+    sample_npu_smi: bool = True,
+    benchmark_warmup_batches: int | None = None,
+    benchmark_samples: int | None = None,
 ) -> list[int]:
     partitions = partition_samples_by_video(samples, devices)
     job_ids: list[int] = []
@@ -182,6 +228,15 @@ def _create_inference_shards(
             "shard_count": len(devices),
             "visualize_height": visualize_height,
             "visualize_width": visualize_width,
+            "artifact_profile": artifact_profile,
+            "prefetch_workers": prefetch_workers,
+            "save_workers": save_workers,
+            "max_save_inflight": max_save_inflight,
+            "artifact_db_batch_size": artifact_db_batch_size,
+            "sample_npu_smi": bool(sample_npu_smi),
+            "benchmark_warmup_batches": benchmark_warmup_batches,
+            "benchmark_samples": benchmark_samples,
+            "defer_video_finalize": True,
         }
         job_ids.append(
             db.add_run_job(
@@ -232,6 +287,15 @@ def _start_local_npu_worker_processes(
             idle_timeout=None,
         )
         processes.append(_spawn_worker_process(command, logs_dir / f"worker-{device.replace(':', '-')}.log"))
+    finalize_command = worker_process_command(
+        workspace,
+        role="finalize",
+        device_filter=None,
+        worker_id=f"local-finalize-{run_id}",
+        once=False,
+        idle_timeout=3600.0,
+    )
+    processes.append(_spawn_worker_process(finalize_command, logs_dir / "worker-finalize.log"))
     if start_metric_worker:
         command = worker_process_command(
             workspace,

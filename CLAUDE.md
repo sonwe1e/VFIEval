@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Finding What To Change
+
+Before reading source files to locate a change, consult `NAVIGATION.md`. It is a subsystem-indexed map: for each feature (Compare, Feedback, Inference, Metrics, Runs, ...) it lists the exact files, functions, line anchors, DB tables/methods, HTTP routes, and tests involved. Start there to jump straight to the relevant code instead of scanning the large files (`server.py`, `db.py`, `app.js` are each 2k–3.4k lines). Update `NAVIGATION.md` when you add or move a subsystem.
+
 ## Project Overview
 
 VFIEval is a local video frame interpolation (VFI) evaluation platform. It runs inference on user-provided model files against video datasets, performs post-processing (warp/blend/pred from flow+mask outputs), computes quality metrics, and serves results through a web UI. It does not train models and does not implement PSNR.
@@ -60,15 +64,15 @@ Set `$env:PYTHONPATH='src'` before running any vfieval commands outside of `pip 
 
 - **Model Adapter** (`src/vfieval/models/loader.py`) — Loads models from `file:path.py` (user model files in `models/`), `module:factory`, or `"dummy"`. User models define `class Model` with `infer(img0, img1)` returning a dict or 4-tuple of `(flowt_0, flowt_1, mask0, mask1)`.
 
-- **Database** (`src/vfieval/db.py`) — Single SQLite file at `.vfieval/vfieval.sqlite` with WAL mode. Tables: models, datasets, samples, jobs, artifacts, metric_results, metric_cache, experiments, runs, run_jobs, workers, run_feedback.
+- **Database** (`src/vfieval/db.py`) — Single SQLite file at `.vfieval/vfieval.sqlite` with WAL mode. In addition to Run/job/artifact/metric tables it owns the media catalog, upload sessions, execution profiles, evaluator/Campaign/task/vote data, and repeatable schema migrations.
 
-- **WorkspaceConfig** (`src/vfieval/config.py`) — Resolves all paths under `.vfieval/` (db, artifacts, runs, tmp).
+- **WorkspaceConfig** (`src/vfieval/config.py`) — Resolves all paths under `.vfieval/` (db, artifacts, runs, tmp, media, uploads, backups).
 
 - **Devices** (`src/vfieval/devices.py`) — Handles CUDA, NPU (torch_npu), and CPU device resolution, autocast, and precision support detection.
 
 ### Multi-GPU/NPU Execution
 
-`execution_mode=multi_cuda|multi_npu` partitions samples by video across devices. Each shard becomes a separate inference job with `device_filter`. NPU shards spawn independent worker processes; CUDA shards use local threads.
+`execution_mode=multi_cuda|multi_npu` partitions by video, then splits long videos into continuous sample segments when videos are insufficient or skewed. Each shard becomes an inference job with `device_filter`; shards write frames/manifests and one `finalize` job encodes videos before metrics. NPU shards spawn independent worker processes; CUDA shards use local threads.
 
 ### File Layout Conventions
 
@@ -94,7 +98,7 @@ Outputs: dict with `flowt_0 [B,2,h,w]`, `flowt_1 [B,2,h,w]`, `mask0 [B,1,h,w]`, 
 
 - **Prefetch pool** (`_iter_prefetched_batches`): a small `ThreadPoolExecutor` (default 2 workers, configurable via `payload["prefetch_workers"]`) decodes `img0`/`img1` (and optional GT) via PIL on CPU, resizes to inference resolution, and holds up to 2 batches ahead. `pin_memory()` is applied when CUDA is available.
 - **Main loop**: `.to(device, non_blocking=True)` → `model.predict` → `compose_interpolated` → single `.to("cpu")` for the whole bundle → submit to save pool. No per-sample `.cpu()` calls remain in the hot path.
-- **Save pool** (`_AsyncSavePipeline`): a `ThreadPoolExecutor` sized `min(8, cpu_count())` (configurable via `payload["save_workers"]`) does PNG encoding, `preview/` thumbnails, and `db.add_artifact` inserts in the background. Each save-worker thread opens its own short-lived sqlite3 connection so WAL-mode file locking is sufficient — no cross-thread `threading.Lock` is needed.
+- **Save pool** (`_AsyncSavePipeline`): a bounded `ThreadPoolExecutor` sized `min(8, cpu_count())` (configurable via `payload["save_workers"]`) does PNG encoding and previews. Artifact rows are buffered into batched SQLite transactions; queue backpressure bounds in-flight CPU tensors.
 - Progress updates are throttled to every `max(1, total // 200)` samples to keep SQLite writes off the hot path.
 
 ### Model Load + Output Health Diagnostics

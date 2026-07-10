@@ -18,6 +18,7 @@ from vfieval.job_errors import describe_job_failure, enrich_job_error
 from vfieval.orchestration import create_inference_jobs_for_run, start_workers_for_run
 from vfieval.pipeline.decode_runner import run_decode_job
 from vfieval.pipeline.inference import RunCanceled, run_inference_job
+from vfieval.pipeline.finalize_runner import run_finalize_job
 from vfieval.pipeline.metrics_runner import run_metric_job
 from vfieval.metrics import METRIC_NAMES
 
@@ -26,7 +27,8 @@ ROLE_KINDS = {
     "decode": ["decode"],
     "inference": ["inference"],
     "metric": ["metric"],
-    "all": ["decode", "inference", "metric"],
+    "finalize": ["finalize"],
+    "all": ["decode", "inference", "finalize", "metric"],
 }
 
 
@@ -164,10 +166,45 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
                 if db.get_job(int(job["id"]))["status"] != "canceled":
                     db.complete_job(int(job["id"]), result.__dict__)
                     run_id = job.get("payload", {}).get("run_id")
+                    if run_id is not None:
+                        from vfieval.media_assets import sync_run_assets
+
+                        sync_run_assets(db, workspace, int(run_id))
+                        if result.performance:
+                            from vfieval.performance import execution_profile_identity, record_execution_profile
+
+                            run = db.get_run(int(run_id))
+                            request = dict((run.get("metadata") or {}).get("request") or {})
+                            request.update(
+                                {
+                                    "height": int(run.get("height") or 0),
+                                    "width": int(run.get("width") or 0),
+                                    "artifact_profile": result.performance.get("artifact_profile") or request.get("artifact_profile"),
+                                    "device_model": result.performance.get("device_name") or "",
+                                }
+                            )
+                            try:
+                                identity = execution_profile_identity(workspace, request)
+                                record_execution_profile(
+                                    db,
+                                    identity,
+                                    {
+                                        "batch_size": int(job.get("payload", {}).get("batch_size") or 1),
+                                        "prefetch_workers": result.performance.get("prefetch_workers"),
+                                        "save_workers": result.performance.get("save_workers"),
+                                        "max_save_inflight": job.get("payload", {}).get("max_save_inflight"),
+                                    },
+                                    result.performance,
+                                )
+                            except Exception:
+                                pass
                     if run_id is not None and int(job.get("payload", {}).get("shard_count") or 1) > 1:
                         db.maybe_complete_multi_run_inference(int(run_id))
             elif job["kind"] == "metric":
                 result = run_metric_job(db, workspace, int(job["id"]))
+                db.complete_job(int(job["id"]), result)
+            elif job["kind"] == "finalize":
+                result = run_finalize_job(db, workspace, int(job["id"]))
                 db.complete_job(int(job["id"]), result)
             else:
                 raise ValueError(f"unsupported job kind {job['kind']}")

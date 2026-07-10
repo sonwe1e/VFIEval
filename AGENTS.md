@@ -304,6 +304,19 @@ Every Codex session working on VFIEval should read this `AGENTS.md` before plann
 2. **Silent-failure diagnostics** — `load_state_dict_portable` no longer discards `missing_keys` / `unexpected_keys`. `_dry_run_model_file` inspects flow magnitude and mask variance and returns diagnostics up through `preflight_run` / Run Detail. Any run whose checkpoint didn't attach is flagged before compute starts.
 3. **Compare raw-path removal** — `web/index.html` no longer contains reference/distorted text inputs; `app.js::payloadFromForm` returns `null` unless a structured GT + Pred picker selection exists; `compare_inputs.resolve_compare_descriptor` rejects strings; `server.py` dispatches `video_compare` strictly on `run_type`. Six `tests/test_v3_file_flow.py` cases were rewritten to use `{kind: "video_group"}` / `{kind: "run_artifact"}` descriptors via `v13_test_utils`; `test_video_compare_rejects_raw_string_descriptors` asserts the new rejection path.
 
+## Unified Media, Throughput, And Blind Evaluation Rules
+
+- `media_collections`, `media_assets`, and their relation/binding tables are the canonical identity layer for folder files, uploads, and Run video artifacts. Existing files are not moved. Backfill is idempotent by `source_key`; every ready asset records SHA-256, media metadata, a server-managed path, and provenance.
+- Primary inference sends `source_assets`; primary Compare sends `{kind: "media_asset", asset_id}`. Legacy `video_group`, `run_artifact`, and `/api/compare-sources/*` remain compatibility wrappers only.
+- External Compare is exact strict alignment: frame count, dimensions, FPS, and available timestamps must match per track. Never silently truncate, offset, or resize external inputs. Only VFIEval-owned `source_frame_indices` may select source frames and generate an inference-resolution aligned GT asset.
+- Uploads are 8 MiB resumable parts with per-part and whole-file SHA-256. The client chooses Collection, role, alias, and media kind but never a path. Frame sequences are ZIP + explicit FPS; reject traversal, symlinks, unsafe expansion, invalid images, and mixed dimensions.
+- Artifact profiles are stable: `evaluation` saves Pred/GT/Diff evaluation media without full internals; `diagnostic` adds Flow/Mask/Warp/Blend/extra; `benchmark` saves no media and runs no metrics.
+- The save pipeline must keep device-to-host bundles and pending saves bounded, transfer one packed tensor bundle per batch, batch artifact inserts, and encode videos directly from the already-written sample frames.
+- When device count exceeds video count or load is skewed, split long videos into continuous sample segments. Shards write frames plus manifests; a `finalize` job alone merges segments, encodes videos, publishes Run assets, and queues metrics.
+- Blind evaluation uses a stable browser UUID plus display name, not authentication. Participant task payloads and playback URLs must not reveal model, checkpoint, Run, candidate label, or true asset id before voting.
+- Formal blind votes are independent of `run_feedback`. Run cleanup may make Run media unavailable but must not delete Campaigns, candidates, tasks, votes, ranking history, or protected upload bytes.
+- Human and objective analysis remain separate. Human ranking uses pairwise half-wins for ties, Bradley–Terry, and deterministic bootstrap intervals. Objective summaries preserve metric direction and status semantics; never emit a combined subjective/objective score.
+
 ## Future Roadmap
 
 - V14 should add remote worker orchestration through HTTP worker lifecycle APIs.
@@ -322,3 +335,6 @@ V13 additions to keep covered:
 - `tests/test_compare_sources_api.py` — `/api/compare-sources/{gt,pred,flow,mask}` returns server-resident rows only and rejects any client-supplied `path`.
 - `tests/test_db_indices.py` — `idx_artifacts_sample`, `idx_metric_results_sample`, and `idx_run_jobs_device` exist after `db.connect()`.
 - `tests/test_sample_api_scope.py` — `/api/runs/{id}/samples/{sample_id}` and `/videos/{name}/timeline` issue O(sample) / O(video) SQL queries, not full-run scans (asserted via `sqlite3.set_trace_callback`).
+- `tests/test_media_catalog_uploads.py` — migration backup, idempotent folder backfill, `source_assets`, resumable/hash-checked ZIP upload, malicious ZIP rejection, HTTP Range, soft deletion, and aligned-GT provenance.
+- `tests/test_artifact_profiles.py` — evaluation/diagnostic/benchmark outputs, bounded save queue, batched artifact writes, segment balancing, finalize scheduling, and optional NPU utilization parsing.
+- `tests/test_evaluation_campaigns.py` — identity hiding, deterministic side randomization, vote upsert, 20 concurrent evaluators, coverage/provisional state, Bradley–Terry/bootstrap analysis, filters, closing, and protected media history.

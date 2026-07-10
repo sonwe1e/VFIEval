@@ -11,6 +11,7 @@ from vfieval.metrics import METRIC_NAMES, create_metric
 from vfieval.metrics.base import MetricUnavailable
 from vfieval.metrics.health import metric_cache_config, metric_requires_video_input
 from vfieval.pipeline.inference import RunCanceled
+from vfieval.media_assets import bind_metric_result, run_asset_pair, sync_run_assets
 
 METRIC_CACHE_VERSION = "metric-cache-v3"
 
@@ -31,6 +32,8 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
     if unsupported:
         raise ValueError(f"unsupported metrics: {', '.join(unsupported)}")
     _raise_if_canceled(db, run_id, job_id)
+    if run_id is not None:
+        sync_run_assets(db, workspace, run_id)
 
     artifacts = []
     pred_videos = []
@@ -89,7 +92,7 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                 )
             details = {**_compare_track_details(sample, artifact), **details}
 
-            db.add_metric_result(
+            metric_result_id = db.add_metric_result(
                 job_id=job_id,
                 inference_job_id=int(artifact["job_id"]),
                 sample_id=int(sample_id) if sample_id is not None else None,
@@ -98,6 +101,19 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                 value=value,
                 details=details,
             )
+            if run_id is not None:
+                sample_metadata = (sample or {}).get("metadata") or {}
+                video_name = str(sample_metadata.get("video_name") or sample_metadata.get("video_file") or "")
+                track_label = str(details.get("compare_track_label") or "")
+                reference_asset_id, distorted_asset_id = run_asset_pair(db, run_id, video_name, track_label)
+                bind_metric_result(
+                    db,
+                    metric_result_id,
+                    reference_asset_id,
+                    distorted_asset_id,
+                    video_name=video_name,
+                    track_label=track_label,
+                )
             summary[metric_name][status] = int(summary[metric_name].get(status, 0)) + 1
             if status == "completed" and value is not None:
                 values[metric_name].append(float(value))
@@ -120,7 +136,7 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                 status = "unavailable"
                 value = None
                 details = {"reason": "metric requires video artifacts but run has no pred_video outputs"}
-                db.add_metric_result(
+                metric_result_id = db.add_metric_result(
                     job_id=job_id,
                     inference_job_id=inference_job_id,
                     sample_id=None,
@@ -129,6 +145,8 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                     value=value,
                     details=details,
                 )
+                if run_id is not None:
+                    bind_metric_result(db, metric_result_id, None, None)
                 summary[metric_name][status] = int(summary[metric_name].get(status, 0)) + 1
                 current += 1
                 db.update_job_progress(job_id, current)
@@ -160,7 +178,7 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                             metric_device=metric_device,
                         )
                         details = {"video_name": video_name, **_compare_track_details(None, artifact), **details}
-                    db.add_metric_result(
+                    metric_result_id = db.add_metric_result(
                         job_id=job_id,
                         inference_job_id=int(artifact["job_id"]),
                         sample_id=None,
@@ -169,6 +187,19 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                         value=value,
                         details=details,
                     )
+                    if run_id is not None:
+                        track_label = str(details.get("compare_track_label") or "")
+                        reference_asset_id, distorted_asset_id = run_asset_pair(
+                            db, run_id, str(video_name or ""), track_label
+                        )
+                        bind_metric_result(
+                            db,
+                            metric_result_id,
+                            reference_asset_id,
+                            distorted_asset_id,
+                            video_name=str(video_name or ""),
+                            track_label=track_label,
+                        )
                     summary[metric_name][status] = int(summary[metric_name].get(status, 0)) + 1
                     if status == "completed" and value is not None:
                         values[metric_name].append(float(value))

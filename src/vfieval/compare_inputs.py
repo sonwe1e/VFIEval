@@ -105,9 +105,60 @@ def resolve_compare_descriptor(
         info = _resolve_run_artifact_descriptor(workspace, db, descriptor)
         info.update({"descriptor_kind": "run_artifact", "role": role or "distorted"})
         return info
+    if kind == "media_asset":
+        if "path" in descriptor:
+            raise ValueError("media_asset descriptors must not include client-supplied paths")
+        info = _resolve_media_asset_descriptor(workspace, db, descriptor, role=role)
+        info.update({"descriptor_kind": "media_asset", "role": role or "distorted"})
+        return info
     if not kind and "path" in descriptor:
         raise ValueError("structured compare descriptors must use server-resolved sources, not path fields")
     raise ValueError(f"unsupported compare source descriptor kind: {kind or '<missing>'}")
+
+
+def _resolve_media_asset_descriptor(
+    workspace: WorkspaceConfig,
+    db: Database,
+    descriptor: dict[str, Any],
+    role: str | None,
+) -> dict[str, Any]:
+    from vfieval.media_assets import resolve_asset_path
+
+    asset_id = _positive_int(descriptor.get("asset_id"), "media_asset descriptor requires asset_id")
+    asset, path = resolve_asset_path(db, workspace, asset_id, role=role)
+    info = inspect_compare_path(workspace, path)
+    provenance = asset.get("provenance") or {}
+    metadata = asset.get("metadata") or {}
+    label = str(
+        descriptor.get("label")
+        or descriptor.get("track_label")
+        or asset.get("display_name")
+        or f"asset-{asset_id}"
+    )
+    info.update(
+        {
+            "asset_id": asset_id,
+            "source_kind": asset.get("source_kind"),
+            "media_kind": asset.get("media_kind"),
+            "asset_role": asset.get("role"),
+            "label": label,
+            "track_label": label,
+            "run_id": provenance.get("run_id"),
+            "track_run_id": provenance.get("run_id"),
+            "artifact_id": provenance.get("artifact_id"),
+            "artifact_kind": provenance.get("artifact_kind"),
+            "video": provenance.get("video_name") or provenance.get("video") or path.stem,
+            "video_name": provenance.get("video_name") or provenance.get("video") or path.stem,
+            "group": provenance.get("video_group"),
+            "asset_metadata": metadata,
+            "source_video_path": metadata.get("source_video_path"),
+            "source_video_group": metadata.get("source_video_group"),
+            "source_video_file": metadata.get("source_video_file"),
+            "source_frame_indices": metadata.get("source_frame_indices"),
+            "frame_step": metadata.get("frame_step"),
+        }
+    )
+    return info
 
 
 def _resolve_video_group_descriptor(workspace: WorkspaceConfig, descriptor: dict[str, Any]) -> dict[str, Any]:
@@ -219,25 +270,14 @@ def _positive_int(value: Any, message: str) -> int:
 def validate_strict_alignment(reference: dict[str, Any], distorted: dict[str, Any]) -> dict[str, Any]:
     """Validate reference/distorted alignment for ``strict`` compare.
 
-    Frame counts are allowed to differ (common for VFI comparisons, where GT is
-    the source clip with ``N`` frames and Pred with ``N-step`` frames). The
-    effective, aligned frame count is ``min(ref_fc, dist_fc)`` — decoded-frame
-    lists are trimmed to that length before sample assembly.
-
-    Resolution is allowed to differ too: the higher-resolution side is
-    downscaled per-frame to the common ``target_width`` x ``target_height``
-    (per-axis min) before evaluation and visualization.
-
-    fps must still match — it is not affected by frame sampling or scaling.
-
-    Returns the resolved alignment metadata including ``effective_frame_count``
-    and ``target_width``/``target_height``.
+    Frame count, dimensions, FPS, and available decoded timestamps must match.
+    Platform-owned ``source_frame_indices`` are resolved before this function;
+    external inputs are never trimmed, offset, resized, or normalized.
     """
     ref_fc = int(reference.get("frame_count") or 0)
     dist_fc = int(distorted.get("frame_count") or 0)
-    # Common frame count is the shorter side. Decoded-frame lists are trimmed to
-    # this downstream in validate_strict_decoded_alignment / scan_compare_*.
-    effective_frame_count = min(ref_fc, dist_fc) if ref_fc and dist_fc else max(ref_fc, dist_fc)
+    if ref_fc <= 0 or dist_fc <= 0 or ref_fc != dist_fc:
+        raise ValueError(f"strict compare requires matching frame counts: {ref_fc} vs {dist_fc}")
     reference_fps = reference.get("fps")
     distorted_fps = distorted.get("fps")
     if reference_fps is not None and distorted_fps is not None:
@@ -250,28 +290,27 @@ def validate_strict_alignment(reference: dict[str, Any], distorted: dict[str, An
     ref_h = int(reference.get("height") or 0)
     dist_w = int(distorted.get("width") or 0)
     dist_h = int(distorted.get("height") or 0)
-    # Common target is the smaller of each axis. The higher-resolution side is
-    # downscaled to this size before evaluation/visualization; the lower side is
-    # never upscaled (downscaling only — preserves detail, matches VMAF's
-    # equal-size requirement).
-    target_w = min(ref_w, dist_w) if ref_w and dist_w else max(ref_w, dist_w)
-    target_h = min(ref_h, dist_h) if ref_h and dist_h else max(ref_h, dist_h)
+    if ref_w <= 0 or ref_h <= 0 or (ref_w, ref_h) != (dist_w, dist_h):
+        raise ValueError(
+            "strict compare requires matching dimensions: "
+            f"{ref_w}x{ref_h} vs {dist_w}x{dist_h}"
+        )
     return {
         # Original clip counts, useful for the UI badge ("帧数 X ≠ Y → 已对齐Z帧").
         "frame_count": ref_fc,
         "track_frame_count": dist_fc,
         # Length that downstream sample assembly actually uses.
-        "effective_frame_count": effective_frame_count,
-        "reference_needs_trim": ref_fc > effective_frame_count,
-        "distorted_needs_trim": dist_fc > effective_frame_count,
+        "effective_frame_count": ref_fc,
+        "reference_needs_trim": False,
+        "distorted_needs_trim": False,
         "width": ref_w,
         "height": ref_h,
         "track_width": dist_w,
         "track_height": dist_h,
-        "target_width": target_w,
-        "target_height": target_h,
-        "reference_needs_downscale": (ref_w, ref_h) != (target_w, target_h),
-        "distorted_needs_downscale": (dist_w, dist_h) != (target_w, target_h),
+        "target_width": ref_w,
+        "target_height": ref_h,
+        "reference_needs_downscale": False,
+        "distorted_needs_downscale": False,
         "fps": reference_fps if reference_fps is not None else distorted_fps,
     }
 
@@ -284,21 +323,15 @@ def validate_strict_decoded_alignment(
     reference_timestamps: list[float | None],
     distorted_timestamps: list[float | None],
 ) -> None:
-    # GT (N source frames) and Pred (typically N-step inferred frames) rarely
-    # share a length. Trim both decoded-frame lists to their common min length
-    # so downstream iteration always stays in lockstep. The leading frames are
-    # kept — for step=1 this matches the natural "pred[i] ≈ source[i+1]" layout.
-    common = min(len(reference_frames), len(distorted_frames))
-    if common == 0:
+    # The caller may already have selected a platform-owned indexed GT subset;
+    # after that selection both decoded sides must match exactly.
+    if not reference_frames or not distorted_frames:
         raise ValueError("strict compare requires at least one aligned frame on each side")
     if len(reference_frames) != len(distorted_frames):
-        del reference_frames[common:]
-        del distorted_frames[common:]
-        # Timestamps frame-indexed with the frames; stay in lockstep.
-        if reference_timestamps is not None and len(reference_timestamps) > common:
-            del reference_timestamps[common:]
-        if distorted_timestamps is not None and len(distorted_timestamps) > common:
-            del distorted_timestamps[common:]
+        raise ValueError(
+            "strict compare requires matching decoded frame counts: "
+            f"{len(reference_frames)} vs {len(distorted_frames)}"
+        )
     if reference_fps is not None and distorted_fps is not None:
         if abs(float(reference_fps) - float(distorted_fps)) > 1e-6:
             raise ValueError(

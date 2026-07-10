@@ -41,9 +41,52 @@ from vfieval.file_inputs import (
 )
 from vfieval.metrics import METRIC_NAMES
 from vfieval.metrics.health import metrics_health
+from vfieval.media_assets import (
+    bind_run_asset,
+    create_collection,
+    folder_asset_id_map,
+    get_asset,
+    list_assets,
+    list_collections,
+    media_audit,
+    resolve_asset_path,
+    soft_delete_asset,
+    source_assets_to_video_payload,
+    sync_catalog,
+    sync_folder_assets,
+    sync_run_assets,
+)
 from vfieval.orchestration import start_decode_worker
 from vfieval.pipeline.inference import DEFAULT_VISUALIZE_HEIGHT, DEFAULT_VISUALIZE_WIDTH
+from vfieval.performance import recommend_execution_profile
 from vfieval.worker import WorkerOptions, detect_capabilities, run_worker
+from vfieval.uploads import (
+    UPLOAD_CHUNK_SIZE,
+    complete_upload_session,
+    cleanup_stale_uploads,
+    create_upload_session,
+    delete_upload_session,
+    get_upload_session,
+    receive_upload_part,
+)
+from vfieval.evaluations import (
+    add_candidate,
+    analysis_csv,
+    campaign_analysis,
+    campaign_export,
+    campaign_export_csv,
+    close_campaign,
+    create_adhoc_task,
+    create_campaign,
+    get_campaign,
+    list_campaigns,
+    list_candidates,
+    next_task,
+    publish_campaign,
+    submit_vote,
+    task_media_asset_id,
+    upsert_evaluator,
+)
 
 
 TERMINAL_RUN_STATUSES = {"completed", "failed", "canceled"}
@@ -56,6 +99,7 @@ class _RequestBodyTooLarge(ValueError):
 
 
 def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -> None:
+    cleanup_stale_uploads(db, workspace)
     handler = _make_handler(db, workspace)
     server = ThreadingHTTPServer((host, port), handler)
     print(f"VFIEval listening on http://{host}:{port}")
@@ -66,6 +110,11 @@ def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -
 
 
 def _make_handler(db: Database, workspace: WorkspaceConfig):
+    # Idempotent startup backfill keeps legacy folder/run resources addressable
+    # by stable asset IDs. Subsequent asset-list requests only rescan folders;
+    # workers synchronize new Run artifacts when they are finalized.
+    sync_catalog(db, workspace, include_runs=True)
+
     class VFIEvalHandler(BaseHTTPRequestHandler):
         server_version = "VFIEval/0.1"
 
@@ -88,25 +137,124 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     return self._json(list_checkpoints(workspace, query.get("model_file", [None])[0]))
                 if path == "/api/devices":
                     return self._json(detect_capabilities())
+                if path == "/api/media/collections":
+                    sync_folder_assets(db, workspace)
+                    return self._json({"collections": list_collections(db)})
+                if path == "/api/media/assets":
+                    if query.get("sync", ["1"])[0] not in {"0", "false", "no"}:
+                        sync_folder_assets(db, workspace)
+                    collection_id = _optional_int(query.get("collection_id", [None])[0])
+                    return self._json(
+                        list_assets(
+                            db,
+                            collection_id=collection_id,
+                            role=query.get("role", [None])[0] or None,
+                            source_kind=query.get("source_kind", [None])[0] or None,
+                            state=query.get("state", ["ready"])[0] or None,
+                            query=query.get("q", [""])[0],
+                            page=int(query.get("page", ["1"])[0] or 1),
+                            page_size=int(query.get("page_size", ["50"])[0] or 50),
+                        )
+                    )
+                if path == "/api/media/audit":
+                    return self._json(media_audit(db))
+                match = re.fullmatch(r"/api/media/assets/(\d+)(?:/(content))?", path)
+                if match:
+                    asset_id = int(match.group(1))
+                    if match.group(2) == "content":
+                        _asset, media_path = resolve_asset_path(db, workspace, asset_id)
+                        if media_path.is_dir():
+                            files = sorted(child for child in media_path.iterdir() if child.is_file())
+                            if not files:
+                                return self._error(HTTPStatus.NOT_FOUND, "frame sequence is empty")
+                            media_path = files[0]
+                        return self._send_file(media_path)
+                    return self._json(get_asset(db, asset_id))
+                match = re.fullmatch(r"/api/uploads/([a-f0-9]{32})", path)
+                if match:
+                    return self._json(get_upload_session(db, match.group(1)))
+                if path == "/api/evaluation-campaigns":
+                    return self._json({"campaigns": list_campaigns(db)})
+                match = re.fullmatch(r"/api/evaluation-campaigns/(\d+)(?:/(candidates|next|analysis|export))?", path)
+                if match:
+                    campaign_id = int(match.group(1))
+                    section = match.group(2)
+                    if section == "candidates":
+                        return self._json({"campaign_id": campaign_id, "candidates": list_candidates(db, campaign_id)})
+                    if section == "next":
+                        evaluator_id = str(query.get("evaluator_id", [""])[0]).strip()
+                        if not evaluator_id:
+                            return self._error(HTTPStatus.BAD_REQUEST, "evaluator_id is required")
+                        return self._json(next_task(db, campaign_id, evaluator_id))
+                    if section == "analysis":
+                        analysis = campaign_analysis(
+                            db,
+                            campaign_id,
+                            bootstrap_samples=int(query.get("bootstrap_samples", ["1000"])[0] or 1000),
+                            filters={
+                                "video": query.get("video", [""])[0],
+                                "model": query.get("model", [""])[0],
+                                "checkpoint": query.get("checkpoint", [""])[0],
+                                "collection_id": query.get("collection_id", [""])[0],
+                                "evaluator_id": query.get("evaluator_id", [""])[0],
+                            },
+                        )
+                        if query.get("format", ["json"])[0] == "csv":
+                            return self._send_bytes(
+                                analysis_csv(analysis),
+                                "text/csv; charset=utf-8",
+                                f"campaign-{campaign_id}-analysis.csv",
+                            )
+                        return self._json(analysis)
+                    if section == "export":
+                        exported = campaign_export(db, campaign_id)
+                        if query.get("format", ["json"])[0] == "csv":
+                            return self._send_bytes(
+                                campaign_export_csv(exported),
+                                "text/csv; charset=utf-8",
+                                f"campaign-{campaign_id}-export.csv",
+                            )
+                        return self._json(exported)
+                    return self._json(get_campaign(db, campaign_id))
+                match = re.fullmatch(r"/api/evaluation-tasks/(\d+)/media/(reference|left|right)", path)
+                if match:
+                    evaluator_id = str(query.get("evaluator_id", [""])[0]).strip()
+                    if not evaluator_id:
+                        return self._error(HTTPStatus.BAD_REQUEST, "evaluator_id is required")
+                    asset_id = task_media_asset_id(db, int(match.group(1)), match.group(2), evaluator_id)
+                    _asset, media_path = resolve_asset_path(db, workspace, asset_id)
+                    if media_path.is_dir():
+                        files = sorted(child for child in media_path.iterdir() if child.is_file())
+                        if not files:
+                            return self._error(HTTPStatus.NOT_FOUND, "frame sequence is empty")
+                        frame_index = int(query.get("frame", ["0"])[0] or 0)
+                        if frame_index < 0 or frame_index >= len(files):
+                            return self._error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE, "frame index is out of range")
+                        media_path = files[frame_index]
+                    return self._send_file(media_path, cache_control="no-store")
                 if path == "/api/video-groups":
                     summary = query.get("summary", ["0"])[0] in {"1", "true", "yes"}
                     return self._json(list_video_groups(workspace, include_videos=not summary))
                 match = re.fullmatch(r"/api/video-groups/([^/]+)/videos", path)
                 if match:
+                    group_name = unquote(match.group(1))
                     frame_step = max(1, int(query.get("frame_step", ["1"])[0] or 1))
                     max_frames = _optional_int(query.get("max_frames", [None])[0])
-                    return self._json(
-                        list_video_group_videos(
-                            workspace,
-                            unquote(match.group(1)),
-                            frame_step,
-                            max_frames,
-                            page=int(query.get("page", ["1"])[0] or 1),
-                            page_size=int(query.get("page_size", ["50"])[0] or 50),
-                            query=query.get("q", [""])[0],
-                            sort=query.get("sort", ["name"])[0],
-                        )
+                    payload = list_video_group_videos(
+                        workspace,
+                        group_name,
+                        frame_step,
+                        max_frames,
+                        page=int(query.get("page", ["1"])[0] or 1),
+                        page_size=int(query.get("page_size", ["50"])[0] or 50),
+                        query=query.get("q", [""])[0],
+                        sort=query.get("sort", ["name"])[0],
                     )
+                    sync_folder_assets(db, workspace)
+                    payload["asset_ids"] = folder_asset_id_map(db, group_name)
+                    for video in payload.get("videos") or []:
+                        video["asset_id"] = payload["asset_ids"].get(str(video.get("name") or ""))
+                    return self._json(payload)
                 match = re.fullmatch(r"/api/video-thumbnails/([a-f0-9]{64})", path)
                 if match:
                     return self._send_file(thumbnail_path(workspace, match.group(1)))
@@ -212,6 +360,12 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                 if match:
                     return self._send_sample_file(int(match.group(1)), match.group(2))
                 self._error(HTTPStatus.NOT_FOUND, "not found")
+            except KeyError as exc:
+                self._error(HTTPStatus.NOT_FOUND, str(exc), type(exc).__name__)
+            except FileNotFoundError as exc:
+                self._error(HTTPStatus.NOT_FOUND, str(exc), type(exc).__name__)
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
             except Exception as exc:
                 self._error_internal(exc)
 
@@ -223,6 +377,77 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     body = self._read_json()
                 except _RequestBodyTooLarge as exc:
                     return self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, str(exc), "RequestBodyTooLarge")
+                if path == "/api/media/collections":
+                    try:
+                        collection = create_collection(
+                            db,
+                            str(body.get("name") or ""),
+                            str(body.get("slug") or "") or None,
+                            body.get("metadata") or {},
+                        )
+                    except ValueError as exc:
+                        return self._error(HTTPStatus.CONFLICT, str(exc), type(exc).__name__)
+                    return self._json({"collection": collection}, status=HTTPStatus.CREATED)
+                if path == "/api/uploads":
+                    try:
+                        upload = create_upload_session(db, workspace, body)
+                    except FileExistsError as exc:
+                        return self._error(HTTPStatus.CONFLICT, str(exc), type(exc).__name__)
+                    except ValueError as exc:
+                        return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
+                    return self._json(
+                        {"upload": upload, "chunk_size": UPLOAD_CHUNK_SIZE},
+                        status=HTTPStatus.CREATED,
+                    )
+                match = re.fullmatch(r"/api/uploads/([a-f0-9]{32})/complete", path)
+                if match:
+                    try:
+                        completed = complete_upload_session(db, workspace, match.group(1))
+                    except ValueError as exc:
+                        return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
+                    return self._json(completed)
+                if path == "/api/evaluators/session":
+                    try:
+                        evaluator = upsert_evaluator(db, body)
+                    except ValueError as exc:
+                        return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
+                    return self._json({"evaluator": evaluator}, status=HTTPStatus.CREATED)
+                if path == "/api/evaluation-campaigns":
+                    try:
+                        campaign = create_campaign(db, body)
+                    except ValueError as exc:
+                        return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
+                    return self._json({"campaign": campaign}, status=HTTPStatus.CREATED)
+                match = re.fullmatch(r"/api/evaluation-campaigns/(\d+)/(candidates|publish|close)", path)
+                if match:
+                    campaign_id = int(match.group(1))
+                    try:
+                        if match.group(2) == "candidates":
+                            candidate = add_candidate(db, workspace, campaign_id, body)
+                            return self._json({"candidate": candidate}, status=HTTPStatus.CREATED)
+                        if match.group(2) == "close":
+                            campaign = close_campaign(db, campaign_id)
+                            return self._json({"campaign": campaign})
+                        campaign = publish_campaign(db, workspace, campaign_id)
+                        return self._json({"campaign": campaign})
+                    except ValueError as exc:
+                        return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
+                if path == "/api/evaluation-tasks/adhoc":
+                    try:
+                        created = create_adhoc_task(db, workspace, body)
+                    except ValueError as exc:
+                        return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
+                    return self._json(created, status=HTTPStatus.CREATED)
+                match = re.fullmatch(r"/api/evaluation-tasks/(\d+)/votes", path)
+                if match:
+                    evaluator_id = str(body.get("evaluator_id") or "").strip()
+                    if not evaluator_id:
+                        return self._error(HTTPStatus.BAD_REQUEST, "evaluator_id is required")
+                    try:
+                        vote = submit_vote(db, int(match.group(1)), evaluator_id, body)
+                    except ValueError as exc:
+                        return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
+                    return self._json({"vote": vote})
                 if path == "/api/models":
                     adapter = body["adapter"]
                     if not adapter.startswith("file:") and adapter != "dummy":
@@ -270,13 +495,25 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     db.register_worker(worker_id, role, body.get("capabilities") or {})
                     return self._json({"worker_id": worker_id, "worker": db.get_worker(worker_id)})
                 if path == "/api/preflight":
-                    return self._json(preflight_run(db, workspace, body))
+                    prepared = source_assets_to_video_payload(db, workspace, body)
+                    result = preflight_run(db, workspace, prepared)
+                    profile_request = dict(prepared)
+                    profile_request.update(
+                        {
+                            "height": int((result.get("resolution") or {}).get("height") or prepared.get("height") or 0),
+                            "width": int((result.get("resolution") or {}).get("width") or prepared.get("width") or 0),
+                            "precision": str((result.get("device") or {}).get("effective_precision") or prepared.get("precision") or "fp32"),
+                        }
+                    )
+                    result["execution_profile"] = recommend_execution_profile(db, workspace, profile_request)
+                    return self._json(result)
                 if path == "/api/runs":
+                    body = source_assets_to_video_payload(db, workspace, body)
                     run_type = str(body.get("run_type") or "")
                     if run_type == "video_compare":
                         created = _create_video_compare_run(db, workspace, body)
                         return self._json(created, status=HTTPStatus.CREATED)
-                    if body.get("model_file") or body.get("video_group"):
+                    if body.get("model_file") or body.get("video_group") or body.get("source_assets"):
                         created = _create_run_from_files(db, workspace, body)
                         return self._json(created, status=HTTPStatus.CREATED)
                     metrics = list(body.get("metrics") or [])
@@ -410,9 +647,58 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
             except Exception as exc:
                 self._error_internal(exc)
 
+        def do_PUT(self) -> None:
+            try:
+                parsed = urlparse(self.path)
+                match = re.fullmatch(r"/api/uploads/([a-f0-9]{32})/parts/(\d+)", parsed.path)
+                if not match:
+                    return self._error(HTTPStatus.NOT_FOUND, "not found")
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                if length <= 0 or length > UPLOAD_CHUNK_SIZE:
+                    return self._error(
+                        HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                        f"upload part must contain between 1 and {UPLOAD_CHUNK_SIZE} bytes",
+                    )
+                content_range = str(self.headers.get("Content-Range") or "")
+                range_match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range)
+                if not range_match:
+                    return self._error(HTTPStatus.BAD_REQUEST, "valid Content-Range header is required")
+                start, end, total = (int(value) for value in range_match.groups())
+                if end - start + 1 != length:
+                    return self._error(HTTPStatus.BAD_REQUEST, "Content-Range does not match Content-Length")
+                session = get_upload_session(db, match.group(1))
+                if total != int(session["expected_size"]):
+                    return self._error(HTTPStatus.BAD_REQUEST, "Content-Range total does not match upload size")
+                digest = str(self.headers.get("X-Chunk-SHA256") or "").strip()
+                data = self.rfile.read(length)
+                uploaded = receive_upload_part(
+                    db,
+                    workspace,
+                    match.group(1),
+                    int(match.group(2)),
+                    data,
+                    offset_bytes=start,
+                    sha256=digest,
+                )
+                return self._json({"upload": uploaded})
+            except KeyError as exc:
+                self._error(HTTPStatus.NOT_FOUND, str(exc), type(exc).__name__)
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
+            except Exception as exc:
+                self._error_internal(exc)
+
         def do_DELETE(self) -> None:
             try:
                 parsed = urlparse(self.path)
+                asset_match = re.fullmatch(r"/api/media/assets/(\d+)", parsed.path)
+                if asset_match:
+                    asset = soft_delete_asset(db, workspace, int(asset_match.group(1)))
+                    return self._json({"asset": asset, "deleted": True})
+                upload_match = re.fullmatch(r"/api/uploads/([a-f0-9]{32})", parsed.path)
+                if upload_match:
+                    delete_upload_session(db, workspace, upload_match.group(1))
+                    return self._json({"upload_id": upload_match.group(1), "deleted": True})
                 match = re.fullmatch(r"/api/runs/(\d+)/feedback/(\d+)", parsed.path)
                 if match:
                     run_id = int(match.group(1))
@@ -429,6 +715,10 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     db.request_run_cancel(run_id)
                 db.soft_delete_run(run_id)
                 return self._json({"run_id": run_id, "deleted": True})
+            except KeyError as exc:
+                self._error(HTTPStatus.NOT_FOUND, str(exc), type(exc).__name__)
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
             except Exception as exc:
                 self._error_internal(exc)
 
@@ -453,6 +743,16 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
             self.send_header("Cache-Control", "no-store")
             for key, value in (headers or {}).items():
                 self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def _send_bytes(self, payload: bytes, content_type: str, filename: str | None = None) -> None:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Cache-Control", "no-store")
+            if filename:
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
             self.end_headers()
             self.wfile.write(payload)
 
@@ -841,10 +1141,15 @@ def _find_run_sample_by_frame(db: Database, run_id: int, video_name: str, frame_
 
 
 def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict) -> dict:
+    artifact_profile = str(body.get("artifact_profile") or "evaluation")
+    if artifact_profile not in {"evaluation", "diagnostic", "benchmark"}:
+        raise ValueError("artifact_profile must be evaluation, diagnostic, or benchmark")
     preflight = preflight_run(db, workspace, body)
     if not preflight["ok"]:
         raise ValueError(_preflight_error_message(preflight))
     metrics = list(body.get("metrics") or [])
+    if artifact_profile == "benchmark" and metrics:
+        raise ValueError("benchmark artifact_profile does not run metrics")
     unsupported = [name for name in metrics if name not in METRIC_NAMES]
     if unsupported:
         raise ValueError(f"unsupported metrics: {', '.join(unsupported)}")
@@ -918,6 +1223,7 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
             "max_frames": max_frames,
             "video_glob": "*",
             "selected_videos": selected_videos,
+            "source_assets": body.get("source_assets") or [],
         },
     )
     metadata = {
@@ -943,7 +1249,16 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
             "frame_step": frame_step,
             "max_frames": max_frames,
             "selected_videos": selected_videos,
+            "source_assets": body.get("source_assets") or [],
             "metrics": metrics,
+            "artifact_profile": artifact_profile,
+            "prefetch_workers": body.get("prefetch_workers"),
+            "save_workers": body.get("save_workers"),
+            "max_save_inflight": body.get("max_save_inflight"),
+            "artifact_db_batch_size": body.get("artifact_db_batch_size"),
+            "sample_npu_smi": body.get("sample_npu_smi", True),
+            "benchmark_warmup_batches": int(body.get("benchmark_warmup_batches") or 10),
+            "benchmark_samples": int(body.get("benchmark_samples") or 200),
         },
         "model_file": model_path.name,
         "checkpoint": checkpoint_relative,
@@ -961,6 +1276,7 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         "selected_videos": selected_videos,
         "metric_health": preflight.get("metrics", {}).get("health", {}),
         "preflight": preflight,
+        "artifact_profile": artifact_profile,
     }
     if body.get("retry_of_run_id") is not None:
         metadata["retry_of_run_id"] = int(body["retry_of_run_id"])
@@ -979,6 +1295,21 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         metadata={**metadata, "output_dir": output_dir},
         create_inference_job=False,
     )
+    for descriptor in body.get("source_assets") or []:
+        if not isinstance(descriptor, dict) or descriptor.get("asset_id") in {None, ""}:
+            continue
+        asset = get_asset(db, int(descriptor["asset_id"]))
+        provenance = asset.get("provenance") or {}
+        bind_run_asset(
+            db,
+            run_id,
+            int(asset["id"]),
+            "source",
+            video_name=str(provenance.get("video") or asset.get("original_name") or asset.get("display_name") or ""),
+            model_name=model_path.name,
+            checkpoint=str(checkpoint_relative or ""),
+            metadata={"input": True},
+        )
     total_decode_frames = _decode_progress_total(video_infos, max_frames)
     db.add_run_job(
         run_id,
@@ -1043,10 +1374,8 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
         distorted_tracks = [dict(preflight["distorted"])]
     reference_path = str(reference.get("path") or "")
     distorted_path = str(distorted_tracks[0].get("path") if distorted_tracks else "")
-    # The compare target dimensions — downscale the higher-resolution side so GT
-    # and every pred track share one resolution before evaluation & viz. Width/
-    # height feed the (dummy) model record; target_width/target_height drive the
-    # per-frame rescale in sample assembly.
+    # External tracks use their exact strict dimensions. Platform-owned indexed
+    # tracks use the inference resolution for generated aligned GT frames.
     alignment = preflight.get("alignment") or {}
     width = int(alignment.get("width") or 0)
     height = int(alignment.get("height") or 0)
@@ -1064,6 +1393,7 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
     compare_tracks = [
         {
             "distorted_path": str(track.get("path") or ""),
+            "asset_id": track.get("asset_id"),
             "track_label": unique_labels[index],
             "track_run_id": track.get("run_id") or track.get("track_run_id"),
             "artifact_id": track.get("artifact_id"),
@@ -1071,10 +1401,8 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
             "width": int(track.get("width") or 0),
             "height": int(track.get("height") or 0),
             "needs_downscale": bool((int(track.get("width") or 0), int(track.get("height") or 0)) != (target_width, target_height)),
-            # Source-clip mapping (present on preds produced after the
-            # source-clip-GT change) lets the compare scan reconstruct a
-            # pred-aligned GT from the source clip. Legacy preds lack these and
-            # fall back to trim-to-common alignment against the reference.
+            # Source-clip mapping lets Compare reconstruct a Pred-aligned GT.
+            # Legacy tracks without it must already satisfy exact strict alignment.
             "source_video_path": track.get("source_video_path"),
             "source_frame_indices": track.get("source_frame_indices"),
             "frame_step": track.get("frame_step"),
@@ -1101,8 +1429,7 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
         name="video_compare",
         adapter="dummy",
         checkpoint_path=None,
-        # Compare emits artifacts at the common target resolution (higher-res
-        # side downscaled), so record that as the run's working resolution.
+        # Record the exact validated or platform-generated aligned resolution.
         input_height=target_height or height,
         input_width=target_width or width,
         metadata={"source": "compare", "run_type": "video_compare"},
@@ -1120,13 +1447,11 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
             "align_mode": "strict",
             "compare_tag": compare_tag,
             "video_name": video_name,
-            # Common compare resolution: the higher-resolution side is downscaled
-            # to this per frame assembly so GT and every pred track share size.
+            # Exact validated or platform-generated aligned resolution.
             "compare_target_width": target_width,
             "compare_target_height": target_height,
             "reference_needs_downscale": reference_needs_downscale,
-            # Post-alignment frame count after trim-to-common. Sample assembly
-            # crops decoded frames to this length.
+            # Exact post-selection frame count; no implicit truncation occurs.
             "compare_effective_frame_count": effective_frame_count,
         },
     )
@@ -1138,6 +1463,7 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
         "run_type": "video_compare",
         "source": "direct_compare",
         "reference_path": reference_path,
+        "reference_asset_id": reference.get("asset_id"),
         "distorted_path": distorted_path,
         "distorted_tracks": compare_tracks,
         "align_mode": "strict",
@@ -1172,6 +1498,29 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
         metrics=metrics,
         metadata={**metadata, "output_dir": str(workspace.runs_dir / str(db.next_run_id()))},
     )
+    if reference.get("asset_id") is not None:
+        from vfieval.media_assets import bind_run_asset
+
+        bind_run_asset(
+            db,
+            run_id,
+            int(reference["asset_id"]),
+            "gt",
+            video_name=video_name,
+            metadata={"input": True, "descriptor_kind": reference.get("descriptor_kind")},
+        )
+        for track in compare_tracks:
+            if track.get("asset_id") is None:
+                continue
+            bind_run_asset(
+                db,
+                run_id,
+                int(track["asset_id"]),
+                "pred",
+                video_name=video_name,
+                track_label=str(track.get("track_label") or ""),
+                metadata={"input": True},
+            )
     _start_local_inference_worker(db, workspace)
     return {"run_id": run_id, "run": db.get_run(run_id), "preflight": preflight}
 
@@ -1677,19 +2026,13 @@ def _feedback_overview(
     stats["filters"] = {k: v for k, v in active.items() if v}
     stats["filter_options"] = db.feedback_filter_options()
 
-    def _keep(row: dict[str, Any]) -> bool:
-        if dataset and str(row.get("dataset_name") or "") != dataset:
-            return False
-        if model_name and str(row.get("model_name") or "") != model_name:
-            return False
-        if checkpoint and str(row.get("checkpoint") or "") != checkpoint:
-            return False
-        if video and str(row.get("video") or "") != video:
-            return False
-        return True
-
-    recent = [row for row in db.list_all_feedback(limit=100000) if _keep(row)]
-    stats["recent"] = recent[:100]
+    stats["recent"] = db.list_recent_feedback(
+        limit=100,
+        dataset=dataset or None,
+        model_name=model_name or None,
+        checkpoint=checkpoint or None,
+        video=video or None,
+    )
     return stats
 
 
@@ -2650,7 +2993,7 @@ def _retry_run_metrics(db: Database, run_id: int) -> dict:
 def _dashboard(db: Database) -> dict:
     runs = db.list_runs(limit=500)
     workers = db.list_workers()
-    active_statuses = {"queued", "running", "metric_queued", "metric_running"}
+    active_statuses = {"queued", "running", "finalize_queued", "finalizing", "metric_queued", "metric_running"}
     now = time.time()
     healthy_workers = [worker for worker in workers if now - float(worker["last_seen_at"]) < 120.0]
     metric_unavailable = 0

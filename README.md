@@ -212,6 +212,44 @@ Status interpretation:
 
 Metric assets live under `set/metrics/` by default, or under `VFIEVAL_METRIC_ASSETS_DIR` when that environment variable is set. Missing dependencies, failed downloads, or unsupported evaluator devices are recorded as `unavailable`; VFIEval never substitutes a different metric score.
 
+## 统一媒体资产与 External 上传
+
+Media Library 以稳定 `asset_id` 统一索引 `videos/` 文件、External 上传和 Run 视频产物。目录扫描与历史 Run 会幂等回填到 Catalog；原文件不移动，Catalog 只保存服务端路径、SHA-256、媒体信息和 provenance。Run 清理只把对应 `run_artifact` 资产标记为 `unavailable`，不会破坏源素材、Campaign、正式盲评投票或统计历史。
+
+External 视频和帧序列通过浏览器分片上传：
+
+- 固定 8 MiB 分片，支持重复分片幂等和重新提交续传，单资产默认上限 50 GiB。
+- 视频保留原扩展名；帧序列首版使用 ZIP 并必须填写 FPS。
+- 每片及完整文件均校验 SHA-256；拒绝路径穿越、符号链接、危险解压比、无效图片和混合尺寸。
+- 服务端写入 `.vfieval/media/{collection}/{asset_uuid}/`；客户端不能提交磁盘路径。
+- 同一 Collection 内显示别名唯一。软删除被 Campaign/投票引用的资产时只禁用播放并保留分析记录。
+
+Compare 主界面只提交 `media_asset` descriptor。External GT/Pred 必须在帧数、尺寸、FPS及可用时间戳上严格一致，不做自动截断、偏移或缩放。VFIEval 自产 Pred 可使用平台记录的 `source_frame_indices` 生成推理分辨率的 `aligned GT`，并记录 `generated_from / aligned_gt_of / pred_of` 关系。
+
+## 产物档位与 Benchmark
+
+- `evaluation`：默认保存 Pred/GT/Diff 无损帧、视频及指标所需输入，不全量保存内部层。
+- `diagnostic`：额外保存 Flow/Mask/Warp/Blend/`extra_*`。
+- `benchmark`：不保存媒体产物、不运行指标，只输出启动、稳态、端到端、队列、显存和设备阶段性能。
+
+保存队列有界并施加背压，artifact 记录批量写入 SQLite。多卡任务在视频不足或负载不均时按连续 sample segment 分片；各 shard 只写帧和 manifest，`finalize` job 统一合并视频并在之后启动指标。
+
+运行标准 benchmark（默认 warmup 10 batch、测量 200 个样本、重复 3 次）：
+
+```powershell
+python -m vfieval.cli --workspace .vfieval benchmark --model-file my_model.py --video-group anime_style --execution-mode multi_npu --device-id npu:0 --device-id npu:1 --precision fp16 --batch-size 4
+```
+
+最优 batch/prefetch/save 配置按模型哈希、权重哈希、分辨率、精度、设备型号/数量和产物档位写入 `execution_profiles`，后续 preflight 会展示建议，表单中的显式设置仍优先。
+
+## 多人盲评与 Campaign
+
+浏览器生成稳定 evaluator UUID，评测员只需填写显示名；这是可信局域网体验标识，不是身份认证。Campaign 发布前会校验所有 GT/候选资产及严格对齐关系，并为每个视频生成平衡 round-robin 候选对。左右顺序按 `(task, evaluator, seed)` 稳定随机化。
+
+参与者接口只返回 task-side 播放 URL，投票前不返回模型、权重、Run 或真实 asset id。每名评测员对同一任务只有一行投票，可修改；选项为 A、B 或平局，并可记录清晰度、时序稳定、重影、伪影、运动自然度、置信度和备注。
+
+分析页分别展示 Head-to-head 胜率、Bradley–Terry 排名、固定种子 1000 次 bootstrap 的 95% 区间、覆盖率/`provisional` 状态、评测员票数、一致率和质量原因。客观指标保持各自方向与 `completed/unavailable/failed/skipped` 语义，不生成主客观混合总分。Campaign 支持完整 CSV/JSON 导出。
+
 ## API
 
 主流程端点：
@@ -221,6 +259,18 @@ Metric assets live under `set/metrics/` by default, or under `VFIEVAL_METRIC_ASS
 - `GET /api/devices`
 - `GET /api/video-groups`，支持 `summary=1` 只返回分组和数量
 - `GET /api/video-groups/{name}/videos?page=&page_size=&q=&sort=`
+- `GET/POST /api/media/collections`
+- `GET /api/media/assets?collection_id=&role=&source_kind=&q=&page=`
+- `GET /api/media/assets/{id}`
+- `GET /api/media/assets/{id}/content`，支持 HTTP Range
+- `GET /api/media/audit`
+- `POST /api/uploads`、`PUT /api/uploads/{id}/parts/{index}`、`POST /api/uploads/{id}/complete`
+- `GET/DELETE /api/uploads/{id}`
+- `GET/POST /api/evaluation-campaigns`
+- `POST /api/evaluation-campaigns/{id}/candidates|publish|close`
+- `GET /api/evaluation-campaigns/{id}/next|analysis|export`
+- `POST /api/evaluation-tasks/adhoc`
+- `POST /api/evaluation-tasks/{id}/votes`
 - `GET /api/compare-sources/gt?page=&page_size=&q=&group=`
 - `GET /api/compare-sources/pred?page=&page_size=&q=&video=&run_id=`
 - `GET /api/video-thumbnails/{key}`
@@ -251,7 +301,7 @@ Metric assets live under `set/metrics/` by default, or under `VFIEVAL_METRIC_ASS
 ## NPU、多卡与大图预览
 
 - 多卡 NPU 使用 `torch_npu`，设备名为 `npu:0`、`npu:1` 等；`/api/devices` 会返回检测到的 NPU 列表。
-- `execution_mode=multi_npu` 会按视频粒度拆分为多个 inference shard job，每个 shard 绑定一个 NPU，并由本地 UI 自动启动独立 worker 进程领取对应设备的任务。
+- `execution_mode=multi_npu` 优先按视频拆分；视频数量不足或负载明显不均时把长视频切为连续 sample segment。每个 shard 绑定一个 NPU，只写帧与 manifest，随后由 `finalize` job 合并视频并启动指标。
 - 手动启动 worker 时可以使用 `python -m vfieval.cli --workspace .vfieval worker --role inference --device-filter npu:0 --idle-timeout 120`，绑定后的 worker 只领取对应 NPU 的 shard。
 - 预检查会在最终 device/dtype 上执行模型 dry-run，能提前暴露 CPU/NPU tensor 不匹配。
 - 新建任务页首屏只读取模型/视频分组摘要、Run 摘要、设备和指标健康；视频列表、Compare 来源和预检查会在用户加载或选择后再请求。
