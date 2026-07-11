@@ -132,6 +132,20 @@ Contract：
 
 Run Detail 默认不会一次性加载所有视频和所有图片。页面先读取 Run 的视频摘要，再按当前视频加载窗口化 `timeline`；只有选中某个样本时，才调用 `GET /api/runs/{id}/samples/{sample_id}` 加载对应的 `GT / Pred / Diff / Flow / Mask / Warp / Blend`。
 
+Run 的产物、指标或清理状态发生变化时，服务端会递增 `content_revision`。前端检测到 revision 变化后会中止旧请求、失效当前 Run 的结果缓存，并原位恢复当前视频、帧位置、时间线窗口和指标选择；推理完成后不再需要整页刷新。详情页的 `刷新结果` 可强制执行同样的局部刷新。运行中尚未发布产物时显示“产物生成中”，只有终态重新查询后仍为空才显示无产物。
+
+## Run 删除、缓存与存储清理
+
+删除 Run 是持久化的异步清理流程，而不是只隐藏一行记录：
+
+- `DELETE /api/runs/{id}` 返回 `202 Accepted` 并创建 `run_purge_requests`。运行中的 Run 会先请求取消，worker 停止后才删除受信任的 `.vfieval/runs/{id}`、清理产物索引与 Run feedback，并把对应 Run 媒体标记为不可用。
+- 只有全部步骤成功后才写入 `deleted_at`。失败请求保留错误与清理报告，可重试；服务重启后会继续处理 `requested/canceling/purging` 请求。
+- `cleanup-artifacts` 走同一套幂等服务，但保留 Run 记录。批量删除逐 Run 建立请求，单项失败不会中断其它项。
+- `decode_cache` 与 `compare_cache` 通过 `cache_entries`、`run_cache_refs` 和活动 lease 管理。共享缓存只有在最后一个有效 Run 引用释放、没有活动 lease 且超过默认 10 分钟宽限期后才可回收。
+- 指标缓存、视频元数据与缩略图缓存不会随单个 Run 删除。历史残留和孤儿缓存必须先在 Media 页生成存储清理预览，再显式确认 GC。
+
+已发布的 Campaign 媒体会在破坏性清理前冻结到独立评测包，因此删除来源 Run 不会破坏正式盲评播放、投票或分析历史。
+
 ## Direct GT/Pred Compare
 
 `Run 类型` 选择 `双视频对比` 后，页面会按需加载 Compare 来源：
@@ -214,7 +228,13 @@ Metric assets live under `set/metrics/` by default, or under `VFIEVAL_METRIC_ASS
 
 ## 统一媒体资产与 External 上传
 
-Media Library 以稳定 `asset_id` 统一索引 `videos/` 文件、External 上传和 Run 视频产物。目录扫描与历史 Run 会幂等回填到 Catalog；原文件不移动，Catalog 只保存服务端路径、SHA-256、媒体信息和 provenance。Run 清理只把对应 `run_artifact` 资产标记为 `unavailable`，不会破坏源素材、Campaign、正式盲评投票或统计历史。
+Media 页按用途分成三块：
+
+- `Sources / Uploads`：`videos/` 中的规范来源与 External 上传。
+- `Derived Runs`：按 `Run → 视频 → Track` 分组折叠显示有效 Pred 输出；已删除或已清产物的 Run 不会重新出现在目录、Compare 或 Campaign 来源中。
+- `Evaluation Packages`：已发布 Campaign 的冻结评测包。自动生成的内部 Run Collection 不作为用户目录展示。
+
+Media Catalog 以稳定 `asset_id` 统一索引源文件、上传、Run 视频产物和评测包。目录扫描与历史 Run 会幂等回填；原文件不移动，Catalog 只保存服务端路径、SHA-256、媒体信息和 provenance。Run 清理把对应 `run_artifact` 标记为 `unavailable`，冻结的 `evaluation_package` 仍可播放。
 
 External 视频和帧序列通过浏览器分片上传：
 
@@ -242,13 +262,30 @@ python -m vfieval.cli --workspace .vfieval benchmark --model-file my_model.py --
 
 最优 batch/prefetch/save 配置按模型哈希、权重哈希、分辨率、精度、设备型号/数量和产物档位写入 `execution_profiles`，后续 preflight 会展示建议，表单中的显式设置仍优先。
 
-## 多人盲评与 Campaign
+## 多人盲评与 Campaign V2
 
-浏览器生成稳定 evaluator UUID，评测员只需填写显示名；这是可信局域网体验标识，不是身份认证。Campaign 发布前会校验所有 GT/候选资产及严格对齐关系，并为每个视频生成平衡 round-robin 候选对。左右顺序按 `(task, evaluator, seed)` 稳定随机化。
+Evaluation Studio 集中管理创建、发布和组织者分析，并把参与页面独立出去。一个 V2 Campaign 固定比较两份 Pred 方法，主流程中的方法是一份完成 Run 的 Track；External Pred 只在高级入口使用。创建向导依次填写基本信息、选择 Run/Track A 与 B、查看共同视频矩阵并勾选视频、确认严格对齐和任务量，然后发布。
 
-参与者接口只返回 task-side 播放 URL，投票前不返回模型、权重、Run 或真实 asset id。每名评测员对同一任务只有一行投票，可修改；选项为 A、B 或平局，并可记录清晰度、时序稳定、重影、伪影、运动自然度、置信度和备注。
+矩阵不要求手填 `video_name`，会明确显示缺失、GT 冲突以及帧数、尺寸、FPS、时间戳不一致。只有两种方法都有输出、共享同一规范 GT 且严格对齐的视频才能进入发布；不截断、不偏移、不静默缩放。
 
-分析页分别展示 Head-to-head 胜率、Bradley–Terry 排名、固定种子 1000 次 bootstrap 的 95% 区间、覆盖率/`provisional` 状态、评测员票数、一致率和质量原因。客观指标保持各自方向与 `completed/unavailable/failed/skipped` 语义，不生成主客观混合总分。Campaign 支持完整 CSV/JSON 导出。
+发布是可恢复的 preparation job：先在 staging 中逐视频深度校验，再优先硬链接并以复制兜底，生成 `.vfieval/evaluations/{campaign_id}` 与 SHA-256 manifest，最后把冻结文件登记为 `source_kind="evaluation_package"` 并原子发布任务。发布后的配置和评测包不可变，可以关闭或归档；删除来源 Run 不影响播放。失败发布不会留下半成品任务或垃圾 draft，可从 Studio 重试。
+
+参与者只打开独立的 `/evaluate/{opaque_token}` 页面，不加载主导航、Media 或管理分析。浏览器生成稳定 evaluator UUID，评测员填写显示名后领取带可续期 lease 的任务；任务、assignment 和媒体 URL 都使用 opaque token，投票前不暴露模型、checkpoint、Run、方法标签或真实 asset/task id。GT/A/B 支持同步播放、seek、播放速率和循环，左右顺序按任务与评测员稳定随机。投票可选 A、B 或平局，并记录质量原因、置信度和备注。
+
+### 参与链接与局域网访问
+
+在 Studio 中选择已发布的 Campaign 后复制“参与链接”。参与者不需要注册或密码：打开链接、填写显示名，即可领取任务；同一浏览器会复用其本机 evaluator 身份。
+
+服务默认绑定 `127.0.0.1`，因此在本机 Studio 中显示的 `http://127.0.0.1:8765/evaluate/...` 只能由该服务器本机打开。若要让受控内网中的参与者访问，请以明确的内网监听地址启动：
+
+```powershell
+$env:PYTHONPATH='src'
+python -m vfieval.cli --workspace .vfieval serve --host 0.0.0.0 --port 8765
+```
+
+然后从 `http://<服务器内网 IP>:8765` 打开 Studio，并重新复制参与链接；该链接会使用当前页面的来源地址。不要把此服务直接暴露到公网。API 中的 `share_url` 保持相对 `/evaluate/{opaque_token}`，由 Studio 在显示和复制时补全当前来源，避免服务端猜测可访问的主机名。
+
+参与者完成个人全部可评任务后才看到当前实名实时结果；组织者可始终查看覆盖率和方法级分析。人类结果使用平局半胜、Bradley–Terry 和固定种子 bootstrap 区间；客观指标保持各自方向与 `completed/unavailable/failed/skipped` 语义，两者不合成总分。旧 schema v1 Campaign 保持只读，可导出和归档，不按标签猜测迁移。
 
 ## API
 
@@ -263,14 +300,18 @@ python -m vfieval.cli --workspace .vfieval benchmark --model-file my_model.py --
 - `GET /api/media/assets?collection_id=&role=&source_kind=&q=&page=`
 - `GET /api/media/assets/{id}`
 - `GET /api/media/assets/{id}/content`，支持 HTTP Range
+- `GET /api/media/sources?role=gt|pred`，只返回 source/upload 资产
+- `GET /api/media/run-outputs`，按 Run、视频和 Track 返回有效 Pred
 - `GET /api/media/audit`
 - `POST /api/uploads`、`PUT /api/uploads/{id}/parts/{index}`、`POST /api/uploads/{id}/complete`
 - `GET/DELETE /api/uploads/{id}`
-- `GET/POST /api/evaluation-campaigns`
-- `POST /api/evaluation-campaigns/{id}/candidates|publish|close`
-- `GET /api/evaluation-campaigns/{id}/next|analysis|export`
-- `POST /api/evaluation-tasks/adhoc`
-- `POST /api/evaluation-tasks/{id}/votes`
+- `GET /api/evaluation-campaigns`，合并 V2 与只读 v1 列表
+- `POST /api/evaluation-campaigns/v2/preview`
+- `POST /api/evaluation-campaigns/v2`
+- `GET /api/evaluation-campaigns/v2/{id}`、`/analysis`、`/export`
+- `POST /api/evaluation-campaigns/v2/{id}/publish|close|archive`
+- `GET /api/blind/{token}`、`POST /api/blind/{token}/session`
+- `POST /api/blind/{token}/tasks/{task_token}/vote|heartbeat`
 - `GET /api/compare-sources/gt?page=&page_size=&q=&group=`
 - `GET /api/compare-sources/pred?page=&page_size=&q=&video=&run_id=`
 - `GET /api/video-thumbnails/{key}`
@@ -280,8 +321,10 @@ python -m vfieval.cli --workspace .vfieval benchmark --model-file my_model.py --
 - `POST /api/runs` 支持 `checkpoint`、`execution_mode=single|multi_cuda|multi_npu`、`devices=["cuda:0"]` / `devices=["npu:0"]`、`batch_size_per_device`
 - `POST /api/runs/{id}/cancel`
 - `POST /api/runs/{id}/retry`
-- `DELETE /api/runs/{id}` 软删除 Run，默认运行记录不再显示
-- `POST /api/runs/{id}/cleanup-artifacts` 清理 `.vfieval/runs/{run_id}` 产物，仅允许在 `completed / failed / canceled` 后执行
+- `DELETE /api/runs/{id}` 创建持久化清理请求并返回 `202`
+- `GET /api/run-purge-requests/{request_id}`
+- `POST /api/runs/{id}/cleanup-artifacts` 使用同一幂等清理服务但保留 Run
+- `GET /api/storage/gc/preview`、`POST /api/storage/gc`（必须 `confirm=true`）
 - `GET /api/runs`
 - `GET /api/runs/{id}`
 - `GET /api/runs/{id}/videos?page=&page_size=&q=`
@@ -306,7 +349,8 @@ python -m vfieval.cli --workspace .vfieval benchmark --model-file my_model.py --
 - 预检查会在最终 device/dtype 上执行模型 dry-run，能提前暴露 CPU/NPU tensor 不匹配。
 - 新建任务页首屏只读取模型/视频分组摘要、Run 摘要、设备和指标健康；视频列表、Compare 来源和预检查会在用户加载或选择后再请求。
 - Run Detail 默认加载 `512px` 预览图，原图只在点击预览时打开；核心产物按 `图像 / Flow / Mask / Warp` 分组，避免一次性加载十张 4K 图。
-- 失败或不想看的 Run 可以删除记录；产物清理需要单独点击，避免误删结果。
+- 删除 Run 会同时进入产物清理队列；若只想释放产物并保留记录，使用 `只清产物`。详情页会显示取消、清理、失败或完成状态。
+- 推理产物发布、指标完成或产物清理会递增 `content_revision`；Run Detail 原位失效缓存并刷新，不需要刷新整个浏览器页面。
 - 指标缓存 key 会绑定 metric 名称、适配器/资产版本、当前 evaluator 环境以及 GT/Pred 文件身份；更换 manifest、权重或可执行环境后不会继续复用旧的 `unavailable` 缓存结果。
 
 每个推理 Run 会写入 `reference_key` 和 `reference_config`，用于后续确认多个模型或不同权重是否基于同一组 GT、同一视频子集、同一 frame step 和同一输出分辨率。未来 Compare 只比较相同 `reference_key` 的结果，默认最多展示 `GT + Pred A + Pred B`。

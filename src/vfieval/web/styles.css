@@ -515,6 +515,95 @@ summary {
   margin-top: 12px;
 }
 
+.alignment-plan-summary,
+.alignment-report {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.alignment-plan-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 8px;
+}
+
+.alignment-plan-grid > div {
+  display: grid;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.alignment-plan-grid span,
+.alignment-plan-grid small {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.compare-input-panel {
+  margin: 14px 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #f8fafc;
+}
+
+.compare-input-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.compare-input-tile {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #fff;
+}
+
+.compare-input-tile h4,
+.compare-input-tile p {
+  margin: 0;
+}
+
+.compare-input-variants {
+  margin-top: 8px;
+}
+
+.compare-input-tile video,
+.compare-input-tile img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+  margin: 8px 0;
+  background: #111827;
+}
+
+.alignment-report code {
+  max-width: min(100%, 22ch);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--muted);
+}
+
+.alignment-temporal-details {
+  margin: 10px 0;
+  color: var(--muted);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.compare-aspect-confirm {
+  margin-top: 10px;
+  align-items: flex-start;
+}
+
 .run-error-banner {
   display: grid;
   gap: 8px;
@@ -1141,6 +1230,22 @@ th {
 
 .sample-loading {
   margin-bottom: 10px;
+}
+
+.artifact-pending {
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #f8fafc;
+}
+
+.artifact-pending > p {
+  margin: 8px 0 0;
+}
+
+.artifact-pending .timeline-skeleton,
+.artifact-pending .skeleton-card {
+  margin-bottom: 0;
 }
 
 .timeline-skeleton,

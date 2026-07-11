@@ -24,9 +24,10 @@ raw grep, add `--glob '!*.backup.*'`.
 
 | Layer | File | Size | Role |
 |-------|------|------|------|
-| HTTP routing + handlers | `src/vfieval/server.py` | ~2700 | GET/POST/DELETE dispatch, run/compare/feedback orchestration |
-| Data layer | `src/vfieval/db.py` | ~2100 | SQLite schema, migrations, all query methods |
-| Frontend | `src/vfieval/web/app.js` | ~3400 | all UI logic; `index.html` markup; `styles.css` |
+| HTTP routing + handlers | `src/vfieval/server.py` | ~3350 | GET/POST/DELETE dispatch, run/compare/evaluation orchestration |
+| Data layer | `src/vfieval/db.py` | ~3100 | SQLite schema, migrations, all query methods |
+| Main frontend | `src/vfieval/web/app.js` | ~4400 | inference, Compare, Runs, scoped result refresh; `index.html` + `styles.css` |
+| Evaluation frontend | `src/vfieval/web/studio.js`, `blind.js` | ~800 | Studio/Media storage panels and isolated participant page |
 | File entry points | `src/vfieval/file_inputs.py` | ~1400 | scan models/checkpoints/videos, preflight, thumbnails |
 | Dataset scan | `src/vfieval/datasets.py` | ~1100 | video → triplet samples, `VideoEntry`, multi-group |
 | Inference | `src/vfieval/pipeline/inference.py` | ~1400 | `run_inference_job`, prefetch/save pools |
@@ -34,9 +35,11 @@ raw grep, add `--glob '!*.backup.*'`.
 | Compare resolution | `src/vfieval/compare_inputs.py` | ~340 | descriptor → path, strict alignment |
 | Metric health/assets | `src/vfieval/metrics/health.py` | ~1460 | manifests, downloads, availability |
 | Metric execution | `src/vfieval/pipeline/metrics_runner.py` | ~280 | scores pred/gt after inference |
-| Media catalog | `src/vfieval/media_assets.py` | ~760 | collections/assets, backfill, resolver, provenance relations |
+| Media catalog | `src/vfieval/media_assets.py` | ~860 | collections/assets, backfill, resolver, provenance relations |
 | Uploads | `src/vfieval/uploads.py` | ~390 | resumable parts, hashes, ZIP validation, quotas/cleanup |
-| Blind evaluation | `src/vfieval/evaluations.py` | ~850 | Campaigns, tasks, votes, ranking/export |
+| Run purge + cache GC | `src/vfieval/run_cleanup.py` | ~775 | persistent purge requests, cache refs/leases, preview/confirmed GC |
+| Blind evaluation V2 | `src/vfieval/evaluations_v2.py` | ~2500 | two-method Campaigns, frozen packages, opaque participant flow, analysis |
+| Legacy blind evaluation | `src/vfieval/evaluations.py` | ~850 | schema v1 read/export compatibility |
 | Execution profiles | `src/vfieval/performance.py` | ~150 | benchmark fingerprint and recommendation |
 | Multi-device finalize | `src/vfieval/pipeline/finalize_runner.py` | ~150 | merge shard manifests, encode videos, queue metrics |
 
@@ -114,14 +117,18 @@ User rating (1–5, 0.25 step) + free-text issue per run; content-scoped (video/
 - **Backing (scoped):** `db.list_samples_by_video` (L615), `list_artifacts_by_sample` (L1937), `list_metrics_by_sample` (L2022)
 - **Indices:** `idx_artifacts_sample(sample_id, kind)`, `idx_metric_results_sample(sample_id, metric_name)`, `idx_run_jobs_device(device)`
 - **Rule:** these handlers must NOT call `_run_timeline` or iterate the whole run.
-- **Frontend:** `app.js` `renderRunDetail` (L1656), `selectRun` (L1410), `loadRunVideosPage` (L1393), `loadRunVideoTimeline` (L1619), `renderMetricChart` (L1958)
-- **Tests:** `tests/test_sample_api_scope.py`, `tests/test_db_indices.py`
+- **Freshness:** `runs.content_revision`; `db.bump_run_content_revision`. Artifact publication, metric completion, and artifact cleanup increment it; list/detail payloads expose it.
+- **Frontend:** `app.js` `runContentRevisionChanged`, `invalidateRunResultCache`, `refreshRunsOnce`, `refreshRunResults`, `selectRun`, `loadRunVideoTimeline`, `loadSampleDetail`; requests carry generation/abort guards and preserve the current selection on refresh.
+- **Tests:** `tests/test_sample_api_scope.py`, `tests/test_db_indices.py`, `tests/test_run_result_freshness_ui.py`
 
 ### 10. Run lifecycle (retry / cancel / delete / cleanup)
-- **API:** `server.py` `_retry_run` (L1179), `_cleanup_run_artifacts` (L1232); batch at `POST /api/runs/batch-delete`
-- **Data:** `db.py` `request_run_cancel` (L1145), `cancel_run` (L1199), `soft_delete_run` (L1228), `rename_run` (L1241), `mark_run_artifacts_cleaned` (L1533)
-- **Routes:** `POST /api/runs/{id}` (action: cancel/hide/rename/cleanup/retry), `DELETE /api/runs/{id}`
-- **Frontend:** `app.js` `renderRuns` (L1360), `refreshRunsOnly` (L1317), delegated click handler (L3119)
+- **Service:** `run_cleanup.py` `RunCleanupService.request_delete`, `request_artifact_cleanup`, `process_pending`, `_purge_run`, `gc_preview`, `garbage_collect`; `register_run_cache_refs`, `cache_lease`
+- **Data:** `db.py` purge request CRUD/claim/recovery methods, `mark_run_deleted_after_purge`, cache entry/ref/lease helpers, `bump_run_content_revision`
+- **Routes:** `DELETE /api/runs/{id}` and legacy `/hide` return `202`; `POST /api/runs/{id}/cleanup-artifacts`, `/api/runs/batch-delete`; `GET /api/run-purge-requests/{id}`, `/api/storage/gc/preview`; `POST /api/storage/gc`
+- **Loop:** `server.py` starts `RunCleanupService.run_forever`; embedded handlers pump pending requests so restart/test servers converge.
+- **Frontend:** `app.js` `runPurgeState`, `renderRunPurgeNotice`, `deleteRun`, `batchDeleteRuns`, `cleanupRunArtifacts`; `studio.js` `previewStorageGc`, `executeStorageGc`
+- **Invariants:** only `.vfieval/runs/{id}` is deleted; `deleted_at` is written after successful purge; shared cache needs zero active refs, zero leases, and expired grace; storage GC requires preview + `confirm=true`.
+- **Tests:** `tests/test_run_cleanup.py`, `tests/test_v3_file_flow.py`
 
 ### 11. Artifact / file streaming
 - **API:** `server.py` `_send_artifact` (L477), `_send_sample_file` (L491), `_send_file` (L504), `_parse_range_header` (L554)
@@ -136,9 +143,10 @@ User rating (1–5, 0.25 step) + free-text issue per run; content-scoped (video/
 
 ### 13. Unified media catalog + resolver
 - **Data/model:** `media_assets.py` `create_collection`, `upsert_asset`, `sync_folder_assets`, `sync_run_assets`, `resolve_asset_path`, `source_assets_to_video_payload`, `soft_delete_asset`, `media_audit`
-- **Tables:** `media_collections`, `media_assets`, `media_asset_relations`, `run_media_assets`, `metric_asset_bindings`, `schema_migrations`
-- **Routes:** `GET/POST /api/media/collections`, `GET /api/media/assets`, `GET/DELETE /api/media/assets/{id}`, `GET /api/media/assets/{id}/content`, `GET /api/media/audit`
-- **Frontend:** `app.js` `loadMediaLibrary`, `renderMediaLibrary`; `#view-media`
+- **Tables:** `media_collections`, `media_assets`, `media_asset_relations`, `run_media_assets`, `metric_asset_bindings`, `schema_migrations`; frozen Campaign media uses `source_kind='evaluation_package'`
+- **Routes:** `GET/POST /api/media/collections`, `GET /api/media/assets`, `GET /api/media/sources`, `GET /api/media/run-outputs`, `GET/DELETE /api/media/assets/{id}`, `GET /api/media/assets/{id}/content`, `GET /api/media/audit`
+- **Frontend:** `app.js` owns Sources/Uploads; `studio.js` `loadRunOutputs`, `renderDerivedRuns`, `renderPackages` owns Derived Runs and Evaluation Packages; `#view-media`
+- **Visibility:** internal Run/evaluation collections are not user collections; deleted/cleaned Run outputs stay unavailable and must not be resurrected by catalog sync.
 - **Compare:** `compare_inputs.resolve_compare_descriptor(kind="media_asset")`; primary picker submits asset ids
 - **Tests:** `tests/test_media_catalog_uploads.py`, `tests/test_compare_multitrack.py`
 
@@ -159,30 +167,41 @@ User rating (1–5, 0.25 step) + free-text issue per run; content-scoped (video/
 - **Frontend:** artifact profile and pool overrides in infer form; `renderPerformanceReport`, `renderExecutionProfileRecommendation`
 - **Tests:** `tests/test_artifact_profiles.py`
 
-### 16. Blind evaluation + Campaign analysis
-- **Core:** `evaluations.py` evaluator/Campaign/candidate/task/vote CRUD, `presentation_for`, `next_task`, `campaign_analysis`, Bradley–Terry/bootstrap, CSV/JSON export
-- **Tables:** `evaluators`, `evaluation_campaigns`, `evaluation_candidates`, `evaluation_tasks`, `evaluation_votes`
-- **Routes:** `/api/evaluators/session`, `/api/evaluation-campaigns*`, `/api/evaluation-tasks/adhoc`, `/api/evaluation-tasks/{id}/votes`, task-side `/media/{reference,left,right}`
-- **Frontend:** `loadEvaluations`, `renderCampaigns`, `renderEvaluationTask`, `renderCampaignAnalysis`; `#view-evaluations`
-- **Privacy invariant:** participant task payloads expose opaque task-side URLs, never true asset/model/checkpoint/Run identity before voting
-- **Tests:** `tests/test_evaluation_campaigns.py`
+### 16. Blind evaluation V2 + frozen Campaign packages
+- **Core:** `evaluations_v2.py` `list_run_outputs`, `preview_campaign_v2`, `create_campaign_v2`, `request_publish_campaign_v2`, `run_pending_preparations`, `publish_campaign_v2`, blind session/payload/media/heartbeat/vote functions, `campaign_analysis_v2`, `campaign_export_v2`
+- **Lifecycle:** draft → preparing → published → closed/archived; failed preparation can be retried. Publish deep-validates every selected GT/A/B item, builds staging, freezes under `.vfieval/evaluations/{campaign_id}`, writes a SHA-256 manifest, registers evaluation-package assets, then creates tasks atomically.
+- **Tables:** `evaluation_campaigns_v2`, `evaluation_methods_v2`, `evaluation_items_v2`, `evaluation_bindings_v2`, `evaluation_preparations_v2`, `evaluation_tasks_v2`, `evaluation_assignments_v2`, `evaluation_votes_v2`, `evaluation_analysis_cache_v2`; shared identity table `evaluators`
+- **Admin routes:** `GET /api/evaluation-campaigns`, `POST /api/evaluation-campaigns/v2/preview`, `POST /api/evaluation-campaigns/v2`, `GET /api/evaluation-campaigns/v2/{id}[/{analysis,export}]`, `POST /api/evaluation-campaigns/v2/{id}/{publish,close,archive}`
+- **Participant routes:** `/evaluate/{opaque_token}`; `/api/blind/{token}`, `/session`, task-token `/media/{reference,left,right}`, `/vote`, `/heartbeat`
+- **Frontend:** `studio.js` + `studio.css` for method picker, common-video matrix, preparation status, packages and organizer analysis; `blind.html` + `blind.js` + `blind.css` is isolated from the main navigation.
+- **Privacy/concurrency:** participant payloads use opaque campaign/task/assignment/media URLs, stable side randomization, renewable assignment leases, and transactionally capped target votes. Results unlock only after the evaluator finishes all eligible tasks.
+- **Analysis:** pairwise ties are half-wins, Bradley–Terry/bootstrap is deterministic, and human/objective results remain separate.
+- **Legacy:** `evaluations.py` schema v1 stays read-only/exportable/archivable through `legacy_campaigns_readonly`; do not infer a V2 migration from labels.
+- **Tests:** `tests/test_evaluation_campaigns_v2.py`, `tests/test_evaluation_studio_ui.py`, `tests/test_evaluation_campaigns.py`
 
 ---
 
 ## DB schema quick map
 Tables: `models`, `datasets`, `samples`, `jobs`, `artifacts`, `metric_results`,
 `metric_cache`, `experiments`, `runs`, `run_jobs`, `workers`, `run_feedback`,
+`run_purge_requests`, `cache_entries`, `run_cache_refs`, `cache_leases`,
 `media_collections`, `media_assets`, `media_asset_relations`, `run_media_assets`,
 `metric_asset_bindings`, `upload_sessions`, `upload_parts`, `execution_profiles`,
 `evaluators`, `evaluation_campaigns`, `evaluation_candidates`, `evaluation_tasks`,
-`evaluation_votes`, `schema_migrations`.
-Schema string + `_migrate` both live in `db.py` `init` (L291). **Adding a column or
-index requires editing BOTH the SCHEMA string and `_migrate`.**
+`evaluation_votes`, `evaluation_campaigns_v2`, `evaluation_methods_v2`,
+`evaluation_items_v2`, `evaluation_bindings_v2`, `evaluation_preparations_v2`,
+`evaluation_tasks_v2`, `evaluation_assignments_v2`, `evaluation_votes_v2`,
+`evaluation_analysis_cache_v2`, `schema_migrations`.
+Core schema string + `_migrate` live in `db.py`; **adding a core column or index
+requires editing both**. Campaign V2 schema and its idempotent setup live in
+`evaluations_v2.py` `CAMPAIGN_V2_SCHEMA` / `ensure_v2_schema`.
 
 ## Frontend wiring
-Event listeners registered at bottom of `app.js` (L2909+): nav clicks, form submit,
-delegated `click`/`change`/`submit`/`toggle` handlers (L3101–3399), visibility-pause
-for the runs poll (L3399). `api()` helper at L88; `$()` = getElementById.
+Main listeners are registered at the bottom of `app.js`: nav clicks, inference/Run
+delegation, visibility-aware polling and result-cache invalidation. Evaluation Studio
+exports `window.VFIEvalStudio` from `studio.js`; the participant page boots independently
+from `blind.js` and must not depend on `app.js`. `api()` is the main-page request helper;
+Studio and blind each keep a small private request wrapper.
 
 ## Test entry points
 `python -m unittest discover -s tests` runs all. Per-subsystem tests are listed in

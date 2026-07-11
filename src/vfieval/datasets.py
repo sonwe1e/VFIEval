@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
+import math
 import re
 import shutil
 import subprocess
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
@@ -13,6 +16,7 @@ from typing import Any, Callable
 
 from PIL import Image
 
+from vfieval.alignment import materialize_aligned_frame
 from vfieval.compare_inputs import (
     compare_video_name,
     image_size,
@@ -23,9 +27,11 @@ from vfieval.compare_inputs import (
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
 from vfieval.file_inputs import VIDEO_SUFFIXES, decode_cache_dir, decode_cache_key
+from vfieval.run_cleanup import cache_lease, decode_cache_build_lock
 
 
 def _frame_resize_copy(
+    db: Database,
     workspace: WorkspaceConfig,
     src_path: Path,
     target_w: int,
@@ -52,15 +58,19 @@ def _frame_resize_copy(
     cache_dir = workspace.root / "compare_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     out_path = cache_dir / f"{cache_key}.png"
-    if out_path.exists():
-        return out_path
-    with Image.open(src_path).convert("RGB") as image:
-        image.resize((target_w, target_h), Image.LANCZOS).save(out_path)
+    with cache_lease(db, workspace, "compare_cache", cache_key, out_path):
+        if not out_path.exists():
+            with Image.open(src_path).convert("RGB") as image:
+                image.resize((target_w, target_h), Image.LANCZOS).save(out_path)
     return out_path
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 ProgressCallback = Callable[[dict[str, Any]], None]
+
+
+class DecodeCacheBuildError(RuntimeError):
+    """A recoverable decode-cache coordination or publish failure."""
 
 
 class VideoEntry:
@@ -205,6 +215,7 @@ def scan_video_dataset(
             progress_callback(payload)
 
         frames, fps, timestamps, decode_info = _decode_video_cached(
+            db,
             workspace,
             video_path,
             cache_key,
@@ -288,18 +299,26 @@ def scan_compare_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: i
     if align_mode != "strict":
         raise ValueError("compare datasets currently only support strict alignment")
 
+    alignment_plan = metadata.get("alignment_plan")
+    if alignment_plan is not None and not isinstance(alignment_plan, dict):
+        raise ValueError("compare alignment_plan must be an object")
+
     # External inputs have already passed exact strict validation. A target may
     # still be present for the platform-owned aligned-GT path.
     target_w = _optional_positive_int(metadata.get("compare_target_width"))
     target_h = _optional_positive_int(metadata.get("compare_target_height"))
+    if alignment_plan:
+        target = alignment_plan.get("target") or {}
+        target_w = _optional_positive_int(target.get("width"))
+        target_h = _optional_positive_int(target.get("height"))
     downscale_mode = "none"
     if target_w is not None and target_h is not None and target_w > 0 and target_h > 0:
         # Image-size inspection happens per-frame below; defer the decision on
         # which side to downscale until we see actual decoded sizes.
         downscale_mode = "enabled"
 
-    reference_frames, reference_fps, reference_timestamps = _load_compare_source_frames(workspace, reference_path, "compare_reference")
-    distorted_frames, distorted_fps, distorted_timestamps = _load_compare_source_frames(workspace, distorted_path, "compare_distorted")
+    reference_frames, reference_fps, reference_timestamps = _load_compare_source_frames(db, workspace, reference_path, "compare_reference")
+    distorted_frames, distorted_fps, distorted_timestamps = _load_compare_source_frames(db, workspace, distorted_path, "compare_distorted")
     validate_strict_decoded_alignment(
         reference_frames=reference_frames,
         distorted_frames=distorted_frames,
@@ -310,15 +329,21 @@ def scan_compare_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: i
     )
 
     compare_name = compare_video_name(reference_path, distorted_path)
+    reference_slot = _alignment_source_slot(alignment_plan, "gt", 0) if alignment_plan else None
+    distorted_slot = _alignment_source_slot(alignment_plan, "pred", 0) if alignment_plan else None
     added = 0
     for frame_index, (reference_frame, distorted_frame) in enumerate(zip(reference_frames, distorted_frames)):
         reference_frame, distorted_frame = _align_compare_frames(
+            db=db,
             workspace=workspace,
             reference_frame=reference_frame,
             distorted_frame=distorted_frame,
             target_w=target_w,
             target_h=target_h,
             downscale_mode=downscale_mode,
+            alignment_plan=alignment_plan,
+            reference_slot=reference_slot,
+            distorted_slot=distorted_slot,
         )
         name = f"compare_{compare_name}_{frame_index:06d}"
         db.add_sample(
@@ -341,6 +366,7 @@ def scan_compare_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: i
                     "gt": reference_timestamps[frame_index] if frame_index < len(reference_timestamps) else None,
                     "pred": distorted_timestamps[frame_index] if frame_index < len(distorted_timestamps) else None,
                 },
+                **({"alignment_fingerprint": alignment_plan.get("fingerprint")} if alignment_plan else {}),
             },
         )
         added += 1
@@ -357,6 +383,7 @@ def scan_compare_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: i
             "video_name": compare_name,
             "reference_frame_count": len(reference_frames),
             "distorted_frame_count": len(distorted_frames),
+            **({"alignment_plan": alignment_plan} if alignment_plan else {}),
             **({"compare_target_width": target_w, "compare_target_height": target_h, "downscale_mode": downscale_mode} if target_w else {}),
         },
     )
@@ -364,12 +391,16 @@ def scan_compare_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: i
 
 
 def _align_compare_frames(
+    db: Database,
     workspace: WorkspaceConfig,
     reference_frame: Path,
     distorted_frame: Path,
     target_w: int | None,
     target_h: int | None,
     downscale_mode: str,
+    alignment_plan: dict[str, Any] | None = None,
+    reference_slot: str | None = None,
+    distorted_slot: str | None = None,
 ) -> tuple[Path, Path]:
     """Resolve frame-level dimension alignment for the two compare sides.
 
@@ -377,6 +408,13 @@ def _align_compare_frames(
     the generated aligned GT to that exact resolution. External inputs already
     match, so this function does not normalize external mismatches.
     """
+    if alignment_plan is not None:
+        if not reference_slot or not distorted_slot:
+            raise ValueError("alignment plan is missing GT or Pred source slots")
+        return (
+            materialize_aligned_frame(db, workspace, alignment_plan, reference_slot, reference_frame),
+            materialize_aligned_frame(db, workspace, alignment_plan, distorted_slot, distorted_frame),
+        )
     if downscale_mode != "enabled" or target_w is None or target_h is None:
         return reference_frame, distorted_frame
     ref_size = image_size(reference_frame)
@@ -384,9 +422,9 @@ def _align_compare_frames(
     if ref_size == dist_size and ref_size == (target_w, target_h):
         return reference_frame, distorted_frame
     if ref_size != (target_w, target_h):
-        reference_frame = _frame_resize_copy(workspace, reference_frame, target_w, target_h)
+        reference_frame = _frame_resize_copy(db, workspace, reference_frame, target_w, target_h)
     if dist_size != (target_w, target_h):
-        distorted_frame = _frame_resize_copy(workspace, distorted_frame, target_w, target_h)
+        distorted_frame = _frame_resize_copy(db, workspace, distorted_frame, target_w, target_h)
     return reference_frame, distorted_frame
 
 
@@ -436,24 +474,39 @@ def _scan_multitrack_compare_dataset(
     if not tracks:
         raise ValueError("multi-track compare dataset requires at least one track")
 
+    alignment_plan = metadata.get("alignment_plan")
+    if alignment_plan is not None and not isinstance(alignment_plan, dict):
+        raise ValueError("compare alignment_plan must be an object")
+
     # Exact external resolution, or the inference resolution for indexed GT.
     target_w = _optional_positive_int(metadata.get("compare_target_width"))
     target_h = _optional_positive_int(metadata.get("compare_target_height"))
+    if alignment_plan:
+        target = alignment_plan.get("target") or {}
+        target_w = _optional_positive_int(target.get("width"))
+        target_h = _optional_positive_int(target.get("height"))
     downscale_mode = "none"
     if target_w is not None and target_h is not None and target_w > 0 and target_h > 0:
         downscale_mode = "enabled"
 
-    reference_frames, reference_fps, reference_timestamps = _load_compare_source_frames(workspace, reference_path, "compare_reference")
+    reference_frames, reference_fps, reference_timestamps = _load_compare_source_frames(db, workspace, reference_path, "compare_reference")
     video_name = str(metadata.get("video_name") or reference_path.stem)
     video_token = _sample_token(video_name)
     added = 0
     scanned_tracks: list[dict[str, Any]] = []
+    reference_slot = _alignment_source_slot(alignment_plan, "gt", 0) if alignment_plan else None
 
     for track_index, track in enumerate(tracks):
         distorted_path = resolve_compare_source_path(workspace, str(track.get("distorted_path") or ""))
         track_label = str(track.get("track_label") or track.get("label") or f"pred{track_index + 1}")
         track_token = _sample_token(track_label)
+        distorted_slot = (
+            str(track.get("alignment_slot") or _alignment_source_slot(alignment_plan, "pred", track_index))
+            if alignment_plan
+            else None
+        )
         distorted_frames, distorted_fps, distorted_timestamps = _load_compare_source_frames(
+            db,
             workspace,
             distorted_path,
             f"compare_distorted_{track_index}",
@@ -498,16 +551,21 @@ def _scan_multitrack_compare_dataset(
                 "distorted_path": str(distorted_path),
                 "frame_count": len(distorted_frames),
                 "alignment_mode": alignment_mode,
+                **({"alignment_slot": distorted_slot} if distorted_slot else {}),
             }
         )
         for frame_index, (reference_frame, distorted_frame) in enumerate(zip(track_reference_frames, distorted_frames)):
             reference_frame, distorted_frame = _align_compare_frames(
+                db=db,
                 workspace=workspace,
                 reference_frame=reference_frame,
                 distorted_frame=distorted_frame,
                 target_w=target_w,
                 target_h=target_h,
                 downscale_mode=downscale_mode,
+                alignment_plan=alignment_plan,
+                reference_slot=reference_slot,
+                distorted_slot=distorted_slot,
             )
             sample_index = track_index * len(track_reference_frames) + frame_index
             db.add_sample(
@@ -531,6 +589,7 @@ def _scan_multitrack_compare_dataset(
                     "compare_track_index": track_index,
                     "compare_track_run_id": track.get("track_run_id"),
                     "compare_track_artifact_id": track.get("artifact_id"),
+                    **({"alignment_fingerprint": alignment_plan.get("fingerprint")} if alignment_plan else {}),
                     "timestamps": {
                         "gt": track_reference_timestamps[frame_index] if frame_index < len(track_reference_timestamps) else None,
                         "pred": distorted_timestamps[frame_index] if frame_index < len(distorted_timestamps) else None,
@@ -551,10 +610,24 @@ def _scan_multitrack_compare_dataset(
             "reference_frame_count": len(reference_frames),
             "track_count": len(scanned_tracks),
             "compare_tracks": scanned_tracks,
+            **({"alignment_plan": alignment_plan} if alignment_plan else {}),
             **({"compare_target_width": target_w, "compare_target_height": target_h, "downscale_mode": downscale_mode} if target_w else {}),
         },
     )
     return added
+
+
+def _alignment_source_slot(plan: dict[str, Any] | None, role: str, index: int) -> str:
+    if not plan:
+        raise ValueError("alignment plan is required")
+    slots = [
+        str(slot)
+        for slot, report in (plan.get("sources") or {}).items()
+        if isinstance(report, dict) and str(report.get("role") or "") == role
+    ]
+    if index < 0 or index >= len(slots):
+        raise ValueError(f"alignment plan has no {role} source at index {index}")
+    return slots[index]
 
 
 def _add_video_triplets(
@@ -737,6 +810,7 @@ def _find_videos(root: Path, video_glob: str, selected_videos: Any = None) -> li
 
 
 def _load_compare_source_frames(
+    db: Database,
     workspace: WorkspaceConfig,
     source_path: Path,
     cache_prefix: str,
@@ -744,6 +818,7 @@ def _load_compare_source_frames(
     if source_path.is_file() and source_path.suffix.lower() in VIDEO_SUFFIXES:
         cache_key = decode_cache_key(source_path, cache_prefix, 1, None)
         frames, fps, timestamps, _decode_info = _decode_video_cached(
+            db,
             workspace,
             source_path,
             cache_key,
@@ -761,6 +836,7 @@ def _load_compare_source_frames(
 
 
 def _decode_video_cached(
+    db: Database,
     workspace: WorkspaceConfig,
     video_path: Path,
     cache_key: str,
@@ -771,76 +847,264 @@ def _decode_video_cached(
     decode_backend: str = "auto",
 ) -> tuple[list[Path], float, list[float], dict[str, Any]]:
     output_dir = decode_cache_dir(workspace, cache_key)
-    manifest_path = output_dir / "manifest.json"
-    if manifest_path.exists():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        frames = [Path(path) for path in manifest.get("frames", []) if Path(path).exists()]
-        timestamps = [float(value) for value in manifest.get("timestamps", [])]
-        if frames and len(timestamps) == len(frames):
-            decode_info = {
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    # Every caller, including Compare/Campaign preflight paths, now holds a
+    # normal cache lease while reading or building the entry.  The separate
+    # build lock below is intentionally not a GC lease.
+    with cache_lease(db, workspace, "decode_cache", cache_key, output_dir):
+        cached = _read_valid_decode_cache(output_dir, cache_key)
+        if cached is not None:
+            return _decode_cache_hit_result(cached, progress_callback)
+
+        last_wait_report = 0.0
+
+        def report_wait() -> None:
+            nonlocal last_wait_report
+            if progress_callback is None:
+                return
+            now = time.monotonic()
+            if now - last_wait_report < 1.0:
+                return
+            last_wait_report = now
+            progress_callback(
+                {
+                    "event": "cache_wait",
+                    "phase": "waiting_for_cache",
+                    "backend": "cache",
+                    "frames": 0,
+                }
+            )
+
+        staging_dir: Path | None = None
+        try:
+            with decode_cache_build_lock(db, cache_key, on_wait=report_wait) as build_lock:
+                # A waiter must always revalidate after it owns the producer
+                # slot: the previous producer may have published immediately
+                # before releasing its row.
+                cached = _read_valid_decode_cache(output_dir, cache_key)
+                if cached is not None:
+                    return _decode_cache_hit_result(cached, progress_callback)
+
+                # Only the active producer may remove malformed final output,
+                # legacy shared partial output, or stale private staging.
+                _remove_decode_cache_path_if_present(workspace, output_dir.with_name(output_dir.name + ".partial"))
+                _remove_decode_cache_path_if_present(workspace, output_dir)
+                staging_root = workspace.tmp_dir / "decode-cache-staging"
+                _clear_stale_decode_staging(staging_root, cache_key)
+                staging_root.mkdir(parents=True, exist_ok=True)
+                staging_dir = staging_root / f"{cache_key}.{uuid.uuid4().hex}.partial"
+                staging_dir.mkdir(parents=False, exist_ok=False)
+
+                if progress_callback:
+                    progress_callback(
+                        {"event": "cache_miss", "phase": "decoding", "backend": decode_backend, "frames": 0}
+                    )
+                frames, fps, timestamps, decode_info = _decode_video(
+                    video_path,
+                    staging_dir,
+                    max_frames,
+                    decode_backend=decode_backend,
+                    progress_callback=progress_callback,
+                )
+                width, height = _frame_size(frames[0]) if frames else (0, 0)
+                final_frames = [output_dir / path.name for path in frames]
+                manifest = {
+                    "video_name": video_path.stem,
+                    "video_file": video_path.name,
+                    "video_path": str(video_path.resolve()),
+                    "cache_key": cache_key,
+                    "fps": fps,
+                    "frames": [str(path.resolve()) for path in final_frames],
+                    "timestamps": timestamps,
+                    "frame_count": len(frames),
+                    "width": width,
+                    "height": height,
+                    "duration_seconds": float(timestamps[-1]) if timestamps else (len(frames) / fps if fps > 0 else 0.0),
+                    "valid_triplets": max(0, len(frames) - frame_step),
+                    "decode_status": "completed",
+                    "decode_mode": decode_mode,
+                    "frame_step": frame_step,
+                    "max_frames": max_frames,
+                    "decode_backend": decode_info.get("backend"),
+                    "decode_fallback_reason": decode_info.get("fallback_reason"),
+                    "color": "RGB",
+                }
+                (staging_dir / "manifest.json").write_text(
+                    json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+
+                if build_lock.lost.is_set():
+                    raise DecodeCacheBuildError(
+                        "decode cache build ownership was lost; retry the input check"
+                    )
+
+                # This short SQLite-fenced region performs the only final-dir
+                # mutation. A former producer cannot publish after expiry and
+                # takeover, and WinError 183 is handled as a winner cache hit.
+                with db.decode_cache_build_publish_guard(
+                    cache_key,
+                    build_lock.owner_token,
+                    ttl_seconds=build_lock.ttl_seconds,
+                ):
+                    cached = _read_valid_decode_cache(output_dir, cache_key)
+                    if cached is not None:
+                        return _decode_cache_hit_result(cached, progress_callback)
+                    _remove_decode_cache_path_if_present(workspace, output_dir)
+                    winner = _publish_decode_staging(staging_dir, output_dir, cache_key)
+                    if winner is not None:
+                        return _decode_cache_hit_result(winner, progress_callback)
+                    staging_dir = None
+                    published = _read_valid_decode_cache(output_dir, cache_key)
+                    if published is None:
+                        raise DecodeCacheBuildError(
+                            "decode cache publish produced an invalid manifest; retry the input check"
+                        )
+                    published_frames, published_fps, published_timestamps, _manifest = published
+                    return published_frames, published_fps, published_timestamps, decode_info
+        except TimeoutError as exc:
+            raise DecodeCacheBuildError(str(exc)) from exc
+        except DecodeCacheBuildError:
+            raise
+        except OSError as exc:
+            raise DecodeCacheBuildError(
+                f"decode cache build failed; retry the input check ({exc})"
+            ) from exc
+        finally:
+            if staging_dir is not None:
+                _remove_private_decode_staging(staging_dir)
+
+
+def _decode_cache_hit_result(
+    cached: tuple[list[Path], float, list[float], dict[str, Any]],
+    progress_callback: ProgressCallback | None,
+) -> tuple[list[Path], float, list[float], dict[str, Any]]:
+    frames, fps, timestamps, manifest = cached
+    decode_info = {
+        "backend": "cache",
+        "manifest_backend": manifest.get("decode_backend"),
+        "fallback_reason": manifest.get("decode_fallback_reason"),
+        "cache_hit": True,
+    }
+    if progress_callback:
+        progress_callback(
+            {
+                "event": "cache_hit",
+                "phase": "indexing_cached_frames",
                 "backend": "cache",
                 "manifest_backend": manifest.get("decode_backend"),
-                "fallback_reason": manifest.get("decode_fallback_reason"),
-                "cache_hit": True,
+                "frames": len(frames),
             }
-            if progress_callback:
-                progress_callback(
-                    {
-                        "event": "cache_hit",
-                        "phase": "indexing_cached_frames",
-                        "backend": "cache",
-                        "manifest_backend": manifest.get("decode_backend"),
-                        "frames": len(frames),
-                    }
-                )
-            return frames, float(manifest.get("fps") or 24.0), timestamps, decode_info
-
-    partial_dir = output_dir.with_name(output_dir.name + ".partial")
-    if partial_dir.exists():
-        shutil.rmtree(partial_dir)
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-    partial_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        if progress_callback:
-            progress_callback({"event": "cache_miss", "phase": "decoding", "backend": decode_backend, "frames": 0})
-        frames, fps, timestamps, decode_info = _decode_video(
-            video_path,
-            partial_dir,
-            max_frames,
-            decode_backend=decode_backend,
-            progress_callback=progress_callback,
         )
-        width, height = _frame_size(frames[0]) if frames else (0, 0)
-        final_frames = [output_dir / path.name for path in frames]
-        manifest = {
-            "video_name": video_path.stem,
-            "video_file": video_path.name,
-            "video_path": str(video_path.resolve()),
-            "cache_key": cache_key,
-            "fps": fps,
-            "frames": [str(path.resolve()) for path in final_frames],
-            "timestamps": timestamps,
-            "frame_count": len(frames),
-            "width": width,
-            "height": height,
-            "duration_seconds": float(timestamps[-1]) if timestamps else (len(frames) / fps if fps > 0 else 0.0),
-            "valid_triplets": max(0, len(frames) - frame_step),
-            "decode_status": "completed",
-            "decode_mode": decode_mode,
-            "frame_step": frame_step,
-            "max_frames": max_frames,
-            "decode_backend": decode_info.get("backend"),
-            "decode_fallback_reason": decode_info.get("fallback_reason"),
-            "color": "RGB",
-        }
-        (partial_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
-        partial_dir.rename(output_dir)
-        return final_frames, fps, timestamps, decode_info
-    except Exception:
-        if partial_dir.exists():
-            shutil.rmtree(partial_dir)
-        raise
+    return frames, fps, timestamps, decode_info
+
+
+def _read_valid_decode_cache(
+    output_dir: Path,
+    cache_key: str,
+) -> tuple[list[Path], float, list[float], dict[str, Any]] | None:
+    """Return a completed cache only when its manifest and every frame agree."""
+    manifest_path = output_dir / "manifest.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or str(manifest.get("cache_key") or "") != str(cache_key):
+            return None
+        raw_frames = manifest.get("frames")
+        raw_timestamps = manifest.get("timestamps")
+        if not isinstance(raw_frames, list) or not isinstance(raw_timestamps, list) or not raw_frames:
+            return None
+        if int(manifest.get("frame_count")) != len(raw_frames) or len(raw_timestamps) != len(raw_frames):
+            return None
+        fps = float(manifest.get("fps") or 24.0)
+        if not math.isfinite(fps) or fps <= 0:
+            return None
+        timestamps = [float(value) for value in raw_timestamps]
+        if not all(math.isfinite(value) for value in timestamps):
+            return None
+        root = output_dir.resolve()
+        frames = [Path(str(value)).resolve() for value in raw_frames]
+        if len(set(frames)) != len(frames):
+            return None
+        for frame in frames:
+            try:
+                frame.relative_to(root)
+            except ValueError:
+                return None
+            if not frame.is_file():
+                return None
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return frames, fps, timestamps, manifest
+
+
+def _remove_decode_cache_path_if_present(workspace: WorkspaceConfig, path: Path) -> None:
+    """Remove a final/legacy partial cache path only after a producer claim."""
+    root = (workspace.root / "decode_cache").resolve()
+    if path.parent.resolve() != root:
+        raise ValueError("decode cache cleanup path is outside the managed cache root")
+    if path.is_symlink():
+        path.unlink(missing_ok=True)
+    elif path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def _clear_stale_decode_staging(staging_root: Path, cache_key: str) -> None:
+    if not staging_root.is_dir():
+        return
+    prefix = f"{cache_key}."
+    for child in staging_root.iterdir():
+        if child.name.startswith(prefix) and child.name.endswith(".partial"):
+            _remove_private_decode_staging(child)
+
+
+def _remove_private_decode_staging(path: Path) -> None:
+    if path.is_symlink():
+        path.unlink(missing_ok=True)
+    elif path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def _publish_decode_staging(
+    staging_dir: Path,
+    output_dir: Path,
+    cache_key: str,
+) -> tuple[list[Path], float, list[float], dict[str, Any]] | None:
+    """Publish a private staging directory, accepting a valid concurrent winner."""
+    try:
+        staging_dir.rename(output_dir)
+        return None
+    except OSError as exc:
+        exists_error = isinstance(exc, FileExistsError) or exc.errno == errno.EEXIST or getattr(exc, "winerror", None) == 183
+        if not exists_error:
+            raise
+    # An old-version process may still be publishing without a build lock.
+    # Prefer its complete output instead of deleting it or surfacing WinError
+    # 183 to the input-check UI.
+    winner = _read_valid_decode_cache(output_dir, cache_key)
+    if winner is not None:
+        return winner
+    # The caller holds the SQLite publish fence and has established that the
+    # final path is malformed, so this producer may clean it and retry once.
+    if output_dir.exists() or output_dir.is_symlink():
+        if output_dir.is_symlink():
+            output_dir.unlink(missing_ok=True)
+        elif output_dir.is_dir():
+            shutil.rmtree(output_dir)
+        else:
+            output_dir.unlink()
+    try:
+        staging_dir.rename(output_dir)
+    except OSError as exc:
+        raise DecodeCacheBuildError(
+            "decode cache publish conflicted with another builder; retry the input check"
+        ) from exc
+    return None
 
 
 def _decode_video(

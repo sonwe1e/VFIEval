@@ -28,6 +28,7 @@ from vfieval.media_assets import (
     upsert_asset,
 )
 from vfieval.pipeline.inference import run_inference_job
+from vfieval.media_items import ensure_canonical_gt_item, register_external_prediction
 from vfieval.uploads import (
     complete_upload_session,
     create_upload_session,
@@ -138,6 +139,54 @@ class MediaCatalogUploadTests(unittest.TestCase):
             self.assertEqual(asset["fps"], 24)
             self.assertTrue(Path(asset["storage_path"]).is_dir())
             self.assertEqual(complete_upload_session(db, workspace, session["id"])["asset_id"], asset["id"])
+
+    def test_upload_sessions_reject_internal_collections_but_allow_sources_and_uploads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            collections = {
+                "Sources": create_collection(db, "Sources", metadata={"source_kind": "folder"}),
+                "Uploads": create_collection(db, "Uploads", metadata={"source_kind": "upload"}),
+                "Run artifacts": create_collection(
+                    db,
+                    "Run artifacts",
+                    metadata={"source_kind": "run_artifact"},
+                ),
+                "Evaluation package": create_collection(
+                    db,
+                    "Evaluation package",
+                    metadata={"source_kind": "evaluation_package"},
+                ),
+            }
+            body = {
+                "role": "pred",
+                "media_kind": "video",
+                "original_name": "pred.mp4",
+                "size_bytes": 1,
+                "sha256": "a" * 64,
+            }
+
+            for name in ("Sources", "Uploads"):
+                session = create_upload_session(
+                    db,
+                    workspace,
+                    {**body, "collection_id": collections[name]["id"], "display_name": f"{name} Pred"},
+                )
+                self.assertEqual(session["collection_id"], collections[name]["id"])
+                self.assertEqual(session["state"], "uploading")
+
+            for name in ("Run artifacts", "Evaluation package"):
+                with self.subTest(collection=name):
+                    with self.assertRaisesRegex(ValueError, "user-managed Collection"):
+                        create_upload_session(
+                            db,
+                            workspace,
+                            {
+                                **body,
+                                "collection_id": collections[name]["id"],
+                                "display_name": f"{name} Pred",
+                            },
+                        )
+            self.assertEqual(db.get("SELECT COUNT(*) AS count FROM upload_sessions")["count"], 2)
 
     def test_upload_rejects_bad_hash_mixed_dimensions_and_traversal(self) -> None:
         cases = [
@@ -334,6 +383,16 @@ class MediaCatalogUploadTests(unittest.TestCase):
                 height=8,
                 fps=5,
             )
+            item = ensure_canonical_gt_item(db, int(gt["id"]))
+            member = register_external_prediction(
+                db,
+                int(item["id"]),
+                int(pred["id"]),
+                method_key="external-pred",
+                temporal_mapping={"source_frame_indices": [0, 1, 2], "fps": 5},
+                spatial_origin={"width": 8, "height": 8},
+                aspect_stretch_confirmed=False,
+            )
             server, thread, base_url = start_server(db, workspace)
             try:
                 with patch("vfieval.server._start_local_inference_worker", return_value=None):
@@ -342,8 +401,9 @@ class MediaCatalogUploadTests(unittest.TestCase):
                         "/api/runs",
                         {
                             "run_type": "video_compare",
-                            "reference": {"kind": "media_asset", "asset_id": gt["id"]},
-                            "distorted": [{"kind": "media_asset", "asset_id": pred["id"], "label": "Pred"}],
+                            "media_item_id": int(item["id"]),
+                            "pred_member_ids": [int(member["id"])],
+                            "spatial_policy": {"mode": "smallest_pred", "filter": "lanczos"},
                             "metrics": [],
                         },
                     )

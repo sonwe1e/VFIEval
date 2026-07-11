@@ -28,8 +28,8 @@ class CompareMultitrackTests(unittest.TestCase):
             write_mp4(gt_path, [(0, 0, 0), (20, 0, 0), (40, 0, 0)])
             write_mp4(pred_a_path, [(0, 0, 0), (0, 20, 0), (0, 40, 0)])
             write_mp4(pred_b_path, [(0, 0, 0), (0, 0, 20), (0, 0, 40)])
-            run_a = add_completed_pred_run(db, workspace, "ModelA", pred_a_path)
-            run_b = add_completed_pred_run(db, workspace, "ModelB", pred_b_path)
+            run_a = add_completed_pred_run(db, workspace, "ModelA", pred_a_path, source_video_path=gt_path)
+            run_b = add_completed_pred_run(db, workspace, "ModelB", pred_b_path, source_video_path=gt_path)
 
             payload = {
                 "run_type": "video_compare",
@@ -67,17 +67,14 @@ class CompareMultitrackTests(unittest.TestCase):
                 pred_videos = db.list_run_artifacts(run_id, kind="pred_video")
                 diff_videos = db.list_run_artifacts(run_id, kind="diff_video")
                 gt_videos = db.list_run_artifacts(run_id, kind="gt_video")
-                self.assertEqual(len(pred_videos), 2)
+                self.assertEqual(pred_videos, [])
                 self.assertEqual(len(diff_videos), 2)
                 self.assertEqual(len(gt_videos), 1)
-                pred_paths = {Path(row["path"]).relative_to(workspace.runs_dir / str(run_id)).as_posix() for row in pred_videos}
-                self.assertIn("videos/clip/ModelA/pred.mp4", pred_paths)
-                self.assertIn("videos/clip/ModelB/pred.mp4", pred_paths)
                 diff_paths = {Path(row["path"]).relative_to(workspace.runs_dir / str(run_id)).as_posix() for row in diff_videos}
                 self.assertIn("videos/clip/ModelA/diff.mp4", diff_paths)
                 self.assertIn("videos/clip/ModelB/diff.mp4", diff_paths)
                 self.assertEqual(Path(gt_videos[0]["path"]).relative_to(workspace.runs_dir / str(run_id)).as_posix(), "videos/clip/gt.mp4")
-                self.assertEqual({row["metadata"]["compare_track_label"] for row in pred_videos}, {"ModelA", "ModelB"})
+                self.assertEqual({row["metadata"]["compare_track_label"] for row in diff_videos}, {"ModelA", "ModelB"})
 
                 pred_sample_artifacts = db.list_artifacts_by_sample(int(samples[0]["id"]), kind="pred")
                 self.assertIn(pred_sample_artifacts[0]["metadata"]["compare_track_label"], {"ModelA", "ModelB"})
@@ -112,7 +109,8 @@ class CompareMultitrackTests(unittest.TestCase):
             self.assertEqual(_gt_probe["frame_count"], 12)
             self.assertEqual(_pred_probe["frame_count"], 11)
             pred_run = add_completed_pred_run(
-                db, workspace, "Pred", pred_path, video_name="clip", sample_count=11, size=(8, 8)
+                db, workspace, "Pred", pred_path, video_name="clip", sample_count=11, size=(8, 8),
+                source_video_path=gt_path,
             )
 
             payload = {
@@ -130,8 +128,8 @@ class CompareMultitrackTests(unittest.TestCase):
                 stop_server(server, thread)
 
 
-    def test_compare_with_mismatched_resolution_is_rejected(self) -> None:
-        # External inputs are never silently resized.
+    def test_compare_with_mismatched_resolution_builds_explicit_alignment_plan(self) -> None:
+        # Item-bound model outputs keep strict time but normalize spatial size.
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": tmp}, clear=False):
             workspace, db = make_workspace(tmp)
             gt_path = Path(tmp) / "videos" / "anime" / "clip-gt.mp4"
@@ -141,7 +139,8 @@ class CompareMultitrackTests(unittest.TestCase):
             write_mp4(gt_path, [(10, 20, 30)] * 3, size=(16, 8))
             write_mp4(pred_path, [(30, 20, 10)] * 3, size=(8, 8))
             pred_run = add_completed_pred_run(
-                db, workspace, "PredHigh", pred_path, video_name="clip", sample_count=3, size=(8, 8)
+                db, workspace, "PredHigh", pred_path, video_name="clip", sample_count=3, size=(8, 8),
+                source_video_path=gt_path,
             )
 
             payload = {
@@ -153,8 +152,12 @@ class CompareMultitrackTests(unittest.TestCase):
             server, thread, base_url = start_server(db, workspace)
             try:
                 preflight = post_json(base_url, "/api/preflight", payload)
-                self.assertFalse(preflight["ok"], preflight)
-                self.assertIn("matching dimensions", preflight["errors"][0]["message"])
+                self.assertTrue(preflight["ok"], preflight)
+                self.assertEqual(preflight["alignment_plan"]["target"]["width"], 8)
+                self.assertEqual(preflight["alignment_plan"]["target"]["height"], 8)
+                gt_report = preflight["alignment_plan"]["sources"]["gt"]
+                self.assertEqual(gt_report["direction"], "downscale")
+                self.assertTrue(gt_report["aspect_changed"])
             finally:
                 stop_server(server, thread)
 
@@ -173,8 +176,8 @@ class CompareMultitrackTests(unittest.TestCase):
             write_mp4(gt_path, [(0, 0, 0), (20, 0, 0), (40, 0, 0)])
             write_mp4(pred_a_path, [(0, 0, 0), (0, 20, 0), (0, 40, 0)])
             write_mp4(pred_b_path, [(0, 0, 0), (0, 0, 20), (0, 0, 40)])
-            run_a = add_completed_pred_run(db, workspace, "ModelA", pred_a_path)
-            run_b = add_completed_pred_run(db, workspace, "ModelB", pred_b_path)
+            run_a = add_completed_pred_run(db, workspace, "ModelA", pred_a_path, source_video_path=gt_path)
+            run_b = add_completed_pred_run(db, workspace, "ModelB", pred_b_path, source_video_path=gt_path)
 
             # Both tracks intentionally carry the SAME label.
             payload = {
@@ -202,10 +205,13 @@ class CompareMultitrackTests(unittest.TestCase):
                 # Two tracks × 3 frames = 6 samples; a collision would drop to 3.
                 samples = db.list_samples(int(run["dataset_id"]))
                 self.assertEqual(len(samples), 6)
-                # Both preds must survive as distinct artifacts.
+                # Both preds must survive as distinct tracks, while Compare
+                # still publishes no reusable pred_video artifact.
                 pred_videos = db.list_run_artifacts(run_id, kind="pred_video")
-                self.assertEqual(len(pred_videos), 2)
-                labels = {row["metadata"].get("compare_track_label") for row in pred_videos}
+                self.assertEqual(pred_videos, [])
+                diff_videos = db.list_run_artifacts(run_id, kind="diff_video")
+                self.assertEqual(len(diff_videos), 2)
+                labels = {row["metadata"].get("compare_track_label") for row in diff_videos}
                 self.assertEqual(len(labels), 2, labels)
             finally:
                 stop_server(server, thread)
@@ -304,7 +310,7 @@ class CompareMultitrackTests(unittest.TestCase):
             try:
                 preflight = post_json(base_url, "/api/preflight", payload)
                 self.assertFalse(preflight["ok"], preflight)
-                self.assertIn("outside the reference clip", preflight["errors"][0]["message"])
+                self.assertIn("outside the reference", preflight["errors"][0]["message"])
             finally:
                 stop_server(server, thread)
 

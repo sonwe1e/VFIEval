@@ -20,6 +20,7 @@ from vfieval.pipeline.decode_runner import run_decode_job
 from vfieval.pipeline.inference import RunCanceled, run_inference_job
 from vfieval.pipeline.finalize_runner import run_finalize_job
 from vfieval.pipeline.metrics_runner import run_metric_job
+from vfieval.run_cleanup import RunCleanupService
 from vfieval.metrics import METRIC_NAMES
 
 
@@ -230,3 +231,11 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
                 db.fail_run(int(run_id), error)
             if options.once:
                 return
+        finally:
+            # A delete request may have been waiting for this exact worker
+            # boundary. Persistent purge state lets any worker safely resume it;
+            # the SQLite claim prevents two workers from deleting concurrently.
+            try:
+                RunCleanupService(db, workspace).process_pending(limit=20)
+            except Exception as exc:
+                print(f"run cleanup coordinator failed: {type(exc).__name__}: {exc}")

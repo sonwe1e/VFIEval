@@ -45,6 +45,9 @@ def _valid_sha256(value: str) -> str:
 def create_upload_session(db: Database, workspace: WorkspaceConfig, body: dict[str, Any]) -> dict[str, Any]:
     collection_id = int(body.get("collection_id") or 0)
     collection = get_collection(db, collection_id)
+    collection_source_kind = str((collection.get("metadata") or {}).get("source_kind") or "")
+    if collection_source_kind in {"run_artifact", "evaluation_package"}:
+        raise ValueError("uploads must target a user-managed Collection, not an internal Run or evaluation package")
     role = str(body.get("role") or "").strip()
     media_kind = str(body.get("media_kind") or "video").strip()
     display_name = str(body.get("display_name") or "").strip()

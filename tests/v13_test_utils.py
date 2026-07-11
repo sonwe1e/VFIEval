@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import threading
 import time
@@ -18,6 +19,8 @@ from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
 from vfieval.pipeline.inference import _write_mp4
 from vfieval.server import _make_handler
+from vfieval.media_assets import bind_run_asset, sync_folder_assets, sync_run_assets
+from vfieval.media_items import bind_run_source, ensure_canonical_gt_item
 
 
 def make_workspace(tmp: str | Path) -> tuple[WorkspaceConfig, Database]:
@@ -76,8 +79,30 @@ def add_completed_pred_run(
         "cpu",
         "fp32",
         [],
-        metadata={"output_dir": str(workspace.runs_dir / name)},
+        metadata={"output_dir": str(workspace.runs_dir / name), "run_type": "model_inference"},
     )
+    managed_pred_path = workspace.runs_dir / str(run_id) / "videos" / video_name / "pred.mp4"
+    managed_pred_path.parent.mkdir(parents=True, exist_ok=True)
+    if pred_video_path.resolve() != managed_pred_path.resolve():
+        shutil.copy2(pred_video_path, managed_pred_path)
+    pred_video_path = managed_pred_path
+    if source_video_path is not None:
+        sync_folder_assets(db, workspace)
+        source_asset = db.get(
+            "SELECT id FROM media_assets WHERE storage_path = ? AND state = 'ready' AND deleted_at IS NULL",
+            (str(source_video_path.resolve()),),
+        )
+        if source_asset is None:
+            raise ValueError(f"test source video is not a catalog GT asset: {source_video_path}")
+        item = ensure_canonical_gt_item(db, int(source_asset["id"]))
+        bind_run_asset(
+            db,
+            run_id,
+            int(source_asset["id"]),
+            "source",
+            video_name=source_video_path.name,
+        )
+        bind_run_source(db, run_id, int(item["id"]), video_name=source_video_path.name)
     job_id = int(db.get_run(run_id)["inference_job_id"])
     pred_metadata = {"video_name": video_name, "frames": sample_count, "width": size[0], "height": size[1], "fps": fps}
     # Preds produced after the source-clip-GT change carry the mapping Compare
@@ -85,6 +110,8 @@ def add_completed_pred_run(
     # without these fields remain valid only when exact strict alignment holds.
     if source_video_path is not None:
         pred_metadata["source_video_path"] = str(source_video_path.resolve())
+        pred_metadata["source_video_group"] = source_video_path.parent.name
+        pred_metadata["source_video_file"] = source_video_path.name
     if source_frame_indices is not None:
         pred_metadata["source_frame_indices"] = list(source_frame_indices)
     if frame_step is not None:
@@ -113,6 +140,7 @@ def add_completed_pred_run(
     db.add_artifact(job_id, sample_id, "flowt_0", str(flow_path), "image/png", {"sample": f"{video_name}_000000"})
     db.add_artifact(job_id, sample_id, "mask0", str(mask_path), "image/png", {"sample": f"{video_name}_000000"})
     db.complete_run_inference(run_id, {"output_dir": str(workspace.runs_dir / name)}, db.summarize_artifacts(job_id), "completed")
+    sync_run_assets(db, workspace, run_id)
     return run_id
 
 

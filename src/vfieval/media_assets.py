@@ -15,7 +15,7 @@ from vfieval.file_inputs import VIDEO_SUFFIXES, inspect_video, list_video_groups
 
 MEDIA_ROLES = {"source", "gt", "pred"}
 MEDIA_KINDS = {"video", "frame_sequence"}
-SOURCE_KINDS = {"folder", "upload", "run_artifact"}
+SOURCE_KINDS = {"folder", "upload", "run_artifact", "evaluation_package"}
 MEDIA_STATES = {"ready", "unavailable", "deleted", "invalid"}
 
 
@@ -108,7 +108,7 @@ def get_collection(db: Database, collection_id: int) -> dict[str, Any]:
     return row
 
 
-def list_collections(db: Database) -> list[dict[str, Any]]:
+def list_collections(db: Database, *, include_internal: bool = False) -> list[dict[str, Any]]:
     rows = db.query(
         """
         SELECT c.*, COUNT(a.id) AS asset_count
@@ -121,6 +121,13 @@ def list_collections(db: Database) -> list[dict[str, Any]]:
     for row in rows:
         row["metadata"] = _loads(row.pop("metadata_json", None))
         row["asset_count"] = int(row.get("asset_count") or 0)
+    if not include_internal:
+        rows = [
+            row
+            for row in rows
+            if str((row.get("metadata") or {}).get("source_kind") or "")
+            not in {"run_artifact", "evaluation_package"}
+        ]
     return rows
 
 
@@ -218,7 +225,15 @@ def upsert_asset(
                 """,
                 (*values, state, now, asset_id),
             )
-    return get_asset(db, asset_id, include_deleted=True)
+    asset = get_asset(db, asset_id, include_deleted=True)
+    if source_kind in {"folder", "upload"} and role == "gt":
+        # Media Item identity is created only for authoritative GT sources.
+        # Run outputs deliberately require an explicit post-upgrade binding and
+        # are never inferred here from names, hashes, or legacy provenance.
+        from vfieval.media_items import ensure_canonical_gt_item
+
+        ensure_canonical_gt_item(db, asset_id)
+    return asset
 
 
 def _decode_asset(row: dict[str, Any]) -> dict[str, Any]:
@@ -229,6 +244,87 @@ def _decode_asset(row: dict[str, Any]) -> dict[str, Any]:
     row["width"] = int(row.get("width") or 0)
     row["height"] = int(row.get("height") or 0)
     return row
+
+
+def _object(value: Any) -> dict[str, Any]:
+    """Decode persisted JSON defensively for provenance-policy checks."""
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        decoded = _loads(value)
+        return dict(decoded) if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _run_is_video_compare(row: dict[str, Any] | None) -> bool:
+    if row is None:
+        return False
+    metadata = _object(row.get("metadata"))
+    if not metadata:
+        metadata = _object(row.get("metadata_json"))
+    return str(metadata.get("run_type") or "model_inference") == "video_compare"
+
+
+def is_compare_derived_asset(db: Database, asset: dict[str, Any]) -> bool:
+    """Whether a managed Run artifact is owned by a video-Compare Run.
+
+    A model Pred is also bound to a Compare Run as an *input*, so a bare
+    ``run_media_assets`` association is not enough to classify it as derived.
+    We first use the output asset's provenance (or immutable snapshot marker),
+    then only fall back to a non-input binding owned by a Compare Run.  This
+    keeps model/external sources reusable while preventing Compare outputs and
+    cleanup snapshots from becoming new Compare inputs through legacy asset
+    descriptors.
+    """
+    if str(asset.get("source_kind") or "") != "run_artifact":
+        return False
+
+    provenance = _object(asset.get("provenance"))
+    if not provenance:
+        provenance = _object(asset.get("provenance_json"))
+    metadata = _object(asset.get("metadata"))
+    if not metadata:
+        metadata = _object(asset.get("metadata_json"))
+    if bool(provenance.get("compare_snapshot")) or bool(metadata.get("compare_snapshot")):
+        return True
+    if bool(provenance.get("video_compare_derived")) or bool(metadata.get("video_compare_derived")):
+        return True
+
+    for candidate in (provenance.get("run_id"), provenance.get("compare_run_id")):
+        try:
+            owner_run_id = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        try:
+            if _run_is_video_compare(db.get_run(owner_run_id)):
+                return True
+        except KeyError:
+            # An incomplete/stale provenance record must not make a normal
+            # catalog lookup fail. The authoritative binding fallback below
+            # still catches a known Compare-owned asset.
+            continue
+
+    asset_id = asset.get("id")
+    try:
+        normalized_asset_id = int(asset_id)
+    except (TypeError, ValueError):
+        return False
+    bindings = db.query(
+        """
+        SELECT r.metadata_json AS run_metadata_json, rma.metadata_json AS binding_metadata_json
+        FROM run_media_assets rma
+        JOIN runs r ON r.id = rma.run_id
+        WHERE rma.asset_id = ?
+        """,
+        (normalized_asset_id,),
+    )
+    for binding in bindings:
+        if not _run_is_video_compare({"metadata_json": binding.get("run_metadata_json")}):
+            continue
+        binding_metadata = _object(binding.get("binding_metadata_json"))
+        if not bool(binding_metadata.get("input")):
+            return True
+    return False
 
 
 def get_asset(db: Database, asset_id: int, include_deleted: bool = False) -> dict[str, Any]:
@@ -253,6 +349,8 @@ def list_assets(
     collection_id: int | None = None,
     role: str | None = None,
     source_kind: str | None = None,
+    source_kinds: list[str] | tuple[str, ...] | None = None,
+    valid_run_outputs: bool = False,
     state: str | None = "ready",
     query: str = "",
     page: int = 1,
@@ -269,6 +367,29 @@ def list_assets(
     if source_kind:
         clauses.append("a.source_kind = ?")
         params.append(str(source_kind))
+    elif source_kinds:
+        normalized_source_kinds = [str(value) for value in source_kinds if str(value)]
+        if normalized_source_kinds:
+            clauses.append(
+                f"a.source_kind IN ({','.join('?' for _value in normalized_source_kinds)})"
+            )
+            params.extend(normalized_source_kinds)
+    if valid_run_outputs:
+        clauses.append(
+            """
+            EXISTS (
+                SELECT 1
+                FROM run_media_assets rma
+                JOIN runs r ON r.id = rma.run_id
+                WHERE rma.asset_id = a.id
+                  AND rma.role = 'pred'
+                  AND r.status IN ('completed', 'metric_queued', 'metric_running')
+                  AND r.deleted_at IS NULL
+                  AND r.artifact_cleaned_at IS NULL
+                  AND COALESCE(json_extract(r.metadata_json, '$.run_type'), 'model_inference') = 'model_inference'
+            )
+            """
+        )
     if state:
         clauses.append("a.state = ?")
         params.append(str(state))
@@ -498,6 +619,41 @@ def bind_metric_result(
         )
 
 
+def _folder_collection_slug(db: Database, group_name: str) -> str:
+    """Return a stable, collision-safe Collection slug for ``videos/<group>``.
+
+    ``slugify`` intentionally normalizes punctuation, so two valid folder
+    names such as ``"a b"`` and ``"a-b"`` share the same readable slug.  A
+    folder Collection is part of a canonical GT Item's identity boundary; in
+    that case reusing the first Collection would silently put distinct source
+    folders in one GT picker group.  Retain the historical readable slug when
+    it already belongs to this exact folder, otherwise add a deterministic
+    hash of the unnormalized group name.
+    """
+    base = f"videos-{slugify(group_name)}"
+
+    def is_this_folder(row: dict[str, Any]) -> bool:
+        metadata = _loads(row.get("metadata_json"))
+        if not isinstance(metadata, dict):
+            return False
+        return (
+            str(metadata.get("source_kind") or "") == "folder"
+            and str(metadata.get("video_group") or "") == str(group_name)
+        )
+
+    existing = db.get("SELECT * FROM media_collections WHERE slug = ?", (base,))
+    if existing is None or is_this_folder(existing):
+        return base
+
+    digest = hashlib.sha256(str(group_name).encode("utf-8")).hexdigest()
+    for length in (10, 16, 24, 64):
+        candidate = f"{base}-{digest[:length]}"
+        collision = db.get("SELECT * FROM media_collections WHERE slug = ?", (candidate,))
+        if collision is None or is_this_folder(collision):
+            return candidate
+    raise RuntimeError(f"could not allocate a distinct Collection slug for videos/{group_name}")
+
+
 def sync_folder_assets(db: Database, workspace: WorkspaceConfig) -> int:
     seen: set[str] = set()
     count = 0
@@ -506,7 +662,7 @@ def sync_folder_assets(db: Database, workspace: WorkspaceConfig) -> int:
         collection = ensure_collection(
             db,
             f"videos/{group_name}",
-            f"videos-{slugify(group_name)}",
+            _folder_collection_slug(db, group_name),
             {"source_kind": "folder", "video_group": group_name},
         )
         for video in group.get("videos") or []:
@@ -547,6 +703,9 @@ def sync_folder_assets(db: Database, workspace: WorkspaceConfig) -> int:
                     "UPDATE media_assets SET state = 'unavailable', updated_at = ? WHERE id = ?",
                     (utc_ts(), int(row["id"])),
                 )
+    from vfieval.media_items import sync_canonical_gt_items
+
+    sync_canonical_gt_items(db)
     return count
 
 
@@ -569,6 +728,9 @@ def folder_asset_id_map(db: Database, group_name: str) -> dict[str, int]:
 
 def sync_run_assets(db: Database, workspace: WorkspaceConfig, run_id: int) -> list[dict[str, Any]]:
     run = db.get_run(int(run_id))
+    if run.get("deleted_at") is not None or run.get("artifact_cleaned_at") is not None:
+        db.invalidate_run_media_assets(int(run_id))
+        return []
     metadata = run.get("metadata") or {}
     artifact_groups = [
         (kind, role, db.list_run_artifacts(int(run_id), kind=kind))
@@ -617,6 +779,11 @@ def sync_run_assets(db: Database, workspace: WorkspaceConfig, run_id: int) -> li
                 "model_name": metadata.get("model_file") or run.get("model_name"),
                 "checkpoint": metadata.get("checkpoint"),
             }
+            if is_compare:
+                # Catalog entries remain useful for viewing a legacy Compare
+                # result, but must carry an explicit non-reusable origin.
+                provenance["video_compare_derived"] = True
+                asset_metadata["video_compare_derived"] = True
             if is_compare and kind == "gt_video" and reference_asset_id:
                 provenance.update({"aligned_gt": True, "source_asset_id": reference_asset_id})
                 asset_metadata.update({"aligned_gt": True, "source_asset_id": reference_asset_id})
@@ -652,6 +819,55 @@ def sync_run_assets(db: Database, workspace: WorkspaceConfig, run_id: int) -> li
                 checkpoint=str(metadata.get("checkpoint") or ""),
                 metadata={"artifact_id": int(artifact["id"]), "artifact_kind": kind},
             )
+            if not is_compare and kind == "pred_video" and state == "ready":
+                # Only Runs that were explicitly bound to a canonical Item at
+                # creation time can publish a reusable prediction. This is the
+                # upgrade boundary: catalog sync never guesses bindings for
+                # legacy Run outputs from names, labels, or file hashes.
+                from vfieval.media_items import find_run_source_item, register_model_prediction
+
+                source_item = find_run_source_item(
+                    db,
+                    int(run_id),
+                    video_name,
+                    source_video_group=str(artifact_meta.get("source_video_group") or ""),
+                    source_video_file=str(artifact_meta.get("source_video_file") or ""),
+                )
+                if source_item is not None:
+                    request_metadata = metadata.get("request") or {}
+                    if not isinstance(request_metadata, dict):
+                        request_metadata = {}
+                    temporal_mapping = {
+                        key: artifact_meta[key]
+                        for key in (
+                            "source_frame_indices",
+                            "frame_step",
+                            "fps",
+                            "timestamps",
+                            "source_timestamps",
+                        )
+                        if artifact_meta.get(key) is not None
+                    }
+                    spatial_origin = {
+                        "width": int(artifact_meta.get("width") or 0),
+                        "height": int(artifact_meta.get("height") or 0),
+                        "source_width": artifact_meta.get("source_width"),
+                        "source_height": artifact_meta.get("source_height"),
+                        "resolution_mode": request_metadata.get("resolution_mode"),
+                    }
+                    register_model_prediction(
+                        db,
+                        int(run_id),
+                        int(source_item["id"]),
+                        int(asset["id"]),
+                        temporal_mapping=temporal_mapping,
+                        spatial_origin=spatial_origin,
+                        metadata={
+                            "artifact_id": int(artifact["id"]),
+                            "artifact_kind": kind,
+                            "video_name": video_name,
+                        },
+                    )
             if is_compare and reference_asset_id:
                 if kind == "gt_video":
                     add_relation(db, reference_asset_id, int(asset["id"]), "generated_from")
@@ -712,14 +928,24 @@ def sync_run_assets(db: Database, workspace: WorkspaceConfig, run_id: int) -> li
 
 def sync_catalog(db: Database, workspace: WorkspaceConfig, include_runs: bool = True) -> dict[str, int]:
     folders = sync_folder_assets(db, workspace)
+    from vfieval.media_items import sync_canonical_gt_items
+
+    item_sync = sync_canonical_gt_items(db)
     run_assets = 0
     if include_runs:
-        for run in db.list_runs(limit=10000, include_deleted=True):
+        for run in db.list_runs(limit=10000, include_deleted=False):
+            if run.get("artifact_cleaned_at") is not None:
+                db.invalidate_run_media_assets(int(run["id"]))
+                continue
             try:
                 run_assets += len(sync_run_assets(db, workspace, int(run["id"])))
             except (KeyError, ValueError):
                 continue
-    return {"folder_assets": folders, "run_assets": run_assets}
+    return {
+        "folder_assets": folders,
+        "run_assets": run_assets,
+        "media_items": int(item_sync["total"]),
+    }
 
 
 def resolve_asset_path(
@@ -748,6 +974,7 @@ def resolve_asset_path(
         "folder": videos_dir(workspace).resolve(),
         "upload": workspace.media_dir.resolve(),
         "run_artifact": workspace.runs_dir.resolve(),
+        "evaluation_package": workspace.evaluations_dir.resolve(),
     }[str(asset["source_kind"])]
     try:
         path.relative_to(allowed)
@@ -760,6 +987,12 @@ def soft_delete_asset(db: Database, workspace: WorkspaceConfig, asset_id: int) -
     asset = get_asset(db, int(asset_id), include_deleted=True)
     if asset.get("deleted_at") is not None:
         return asset
+    # Frozen evaluation packages are the only playback source for published
+    # blind Campaigns after a source Run is cleaned.  They are immutable by
+    # contract: even a catalog-level soft delete must not mark them unavailable
+    # or make participant playback/history disappear.
+    if asset["source_kind"] == "evaluation_package":
+        raise ValueError("frozen evaluation package media is immutable and cannot be deleted")
     references = db.get(
         """
         SELECT
@@ -799,6 +1032,10 @@ def soft_delete_asset(db: Database, workspace: WorkspaceConfig, asset_id: int) -
             """,
             ("unavailable" if protected else "deleted", now, now, int(asset_id)),
         )
+    if asset["source_kind"] in {"folder", "upload"} and asset["role"] == "gt":
+        from vfieval.media_items import ensure_canonical_gt_item
+
+        ensure_canonical_gt_item(db, int(asset_id))
     result = get_asset(db, int(asset_id), include_deleted=True)
     result["protected_by_evaluation"] = protected
     result["content_removed"] = content_removed

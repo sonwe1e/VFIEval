@@ -6,6 +6,7 @@ from vfieval.config import WorkspaceConfig
 from vfieval.datasets import scan_dataset
 from vfieval.db import Database
 from vfieval.pipeline.inference import RunCanceled
+from vfieval.run_cleanup import register_run_cache_refs
 
 
 def run_decode_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dict[str, Any]:
@@ -36,7 +37,7 @@ def run_decode_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
         if run_id is None:
             return
         run = db.get_run(run_id)
-        if run["status"] == "cancel_requested":
+        if run["status"] in {"cancel_requested", "canceled"}:
             error = {"message": "用户取消了解码任务", "type": "RunCanceled", "phase": "decode"}
             db.cancel_job(job_id, error)
             db.cancel_run(run_id, error)
@@ -94,6 +95,9 @@ def run_decode_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
     ensure_not_canceled()
     if samples <= 0:
         raise ValueError("视频解码未生成可推理的样本")
+
+    if run_id is not None:
+        register_run_cache_refs(db, workspace, run_id)
 
     if int(state.get("cache_hits") or 0) > 0 and int(state.get("cache_misses") or 0) == 0:
         state["phase"] = "indexing_cached_frames"

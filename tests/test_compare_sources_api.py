@@ -42,7 +42,9 @@ class CompareSourcesApiTests(unittest.TestCase):
             gt_path.parent.mkdir(parents=True, exist_ok=True)
             write_mp4(gt_path, [(0, 0, 0), (20, 0, 0), (40, 0, 0)])
             write_mp4(pred_path, [(0, 0, 0), (0, 20, 0), (0, 40, 0)])
-            run_id = add_completed_pred_run(db, workspace, "ModelA", pred_path)
+            run_id = add_completed_pred_run(
+                db, workspace, "ModelA", pred_path, source_video_path=gt_path
+            )
 
             server, thread, base_url = start_server(db, workspace)
             try:
@@ -51,8 +53,9 @@ class CompareSourcesApiTests(unittest.TestCase):
                 self.assertEqual(gt_sources[0]["video"], "clip.mp4")
 
                 pred_sources = get_json(base_url, "/api/compare-sources/pred")["sources"]
+                self.assertEqual(pred_sources[0]["kind"], "media_item_member")
                 self.assertEqual(pred_sources[0]["run_id"], run_id)
-                self.assertEqual(pred_sources[0]["video"], "clip")
+                self.assertEqual(pred_sources[0]["video"], "clip.mp4")
                 self.assertGreater(pred_sources[0]["artifact_id"], 0)
 
                 flow_sources = get_json(base_url, f"/api/compare-sources/flow?run_id={run_id}&video=clip")["sources"]
@@ -112,8 +115,14 @@ class CompareSourcesApiTests(unittest.TestCase):
             pred_b = workspace.root / "pred-b.mp4"
             write_mp4(pred_a, [(0, 0, 0), (20, 0, 0), (40, 0, 0)])
             write_mp4(pred_b, [(0, 0, 0), (0, 20, 0), (0, 40, 0)])
-            add_completed_pred_run(db, workspace, "ModelA", pred_a, video_name="clip-a")
-            run_b = add_completed_pred_run(db, workspace, "ModelB", pred_b, video_name="clip-b")
+            add_completed_pred_run(
+                db, workspace, "ModelA", pred_a, video_name="clip-a",
+                source_video_path=gt_dir / "clip-a.mp4",
+            )
+            run_b = add_completed_pred_run(
+                db, workspace, "ModelB", pred_b, video_name="clip-b",
+                source_video_path=gt_dir / "clip-b.mp4",
+            )
 
             server, thread, base_url = start_server(db, workspace)
             try:
@@ -124,7 +133,7 @@ class CompareSourcesApiTests(unittest.TestCase):
                 pred_payload = get_json(base_url, "/api/compare-sources/pred?q=ModelB&video=clip-b&page=1&page_size=1")
                 self.assertEqual(pred_payload["filtered_count"], 1)
                 self.assertEqual(pred_payload["sources"][0]["run_id"], run_b)
-                self.assertEqual(pred_payload["sources"][0]["video"], "clip-b")
+                self.assertEqual(pred_payload["sources"][0]["video"], "clip-b.mp4")
             finally:
                 stop_server(server, thread)
 

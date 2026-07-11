@@ -21,7 +21,7 @@ from vfieval.db import Database
 from vfieval.metrics import METRIC_NAMES, create_metric
 from vfieval.metrics.base import MetricResult, MetricUnavailable
 from vfieval.metrics.health import metric_cache_config, metric_health, prepare_metric_asset_manifest
-from vfieval.pipeline.metrics_runner import _evaluate_with_cache, metric_cache_key
+from vfieval.pipeline.metrics_runner import _evaluate_with_cache, metric_cache_key, run_metric_job
 
 
 class MetricTests(unittest.TestCase):
@@ -445,6 +445,191 @@ class MetricTests(unittest.TestCase):
             self.assertEqual(first[1], 0.125)
             self.assertEqual(second[2]["cached"], True)
             self.assertEqual(calls, ["evaluate"])
+
+    def test_metric_cache_isolated_by_alignment_plan_fingerprint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            workspace = WorkspaceConfig.from_root(tmp_path / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            reference, distorted = _write_image_pair(tmp_path)
+            calls: list[str] = []
+
+            class FakeMetric:
+                def evaluate(self, _reference: Path, _distorted: Path, _work_dir: Path):
+                    calls.append("evaluate")
+                    return MetricResult("completed", 0.125, {"source": "fake"})
+
+            with patch("vfieval.pipeline.metrics_runner.create_metric", return_value=FakeMetric()):
+                first = _evaluate_with_cache(
+                    db=db,
+                    workspace=workspace,
+                    metric_name="lpips_vit_patch",
+                    reference_path=reference,
+                    distorted_path=distorted,
+                    sample_id=1,
+                    cache_config={"status": "available", "backbone": "fake"},
+                    alignment_context={"plan_fingerprint": "alignment-a"},
+                )
+                cached = _evaluate_with_cache(
+                    db=db,
+                    workspace=workspace,
+                    metric_name="lpips_vit_patch",
+                    reference_path=reference,
+                    distorted_path=distorted,
+                    sample_id=1,
+                    cache_config={"status": "available", "backbone": "fake"},
+                    alignment_context={"plan_fingerprint": "alignment-a"},
+                )
+                changed_plan = _evaluate_with_cache(
+                    db=db,
+                    workspace=workspace,
+                    metric_name="lpips_vit_patch",
+                    reference_path=reference,
+                    distorted_path=distorted,
+                    sample_id=1,
+                    cache_config={"status": "available", "backbone": "fake"},
+                    alignment_context={"plan_fingerprint": "alignment-b"},
+                )
+
+            self.assertEqual(first[0], "completed")
+            self.assertTrue(cached[2]["cached"])
+            self.assertEqual(changed_plan[0], "completed")
+            self.assertEqual(calls, ["evaluate", "evaluate"])
+
+    def test_item_compare_video_metrics_use_private_aligned_cache_for_each_track(self) -> None:
+        """Item Compare video metrics must not depend on a reusable pred_video."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            workspace = WorkspaceConfig.from_root(tmp_path / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("compare-metric", "dummy", None, 4, 4, {})
+            plan = {
+                "fingerprint": "item-compare-alignment-v1",
+                "target": {"width": 4, "height": 4, "source_slot": "pred_a"},
+                "temporal": {"frame_count": 2, "fps": 24.0},
+            }
+            dataset_id = db.create_dataset(
+                "item-compare-metric",
+                str(tmp_path),
+                has_gt=True,
+                source_type="compare",
+                decode_mode="compare",
+                metadata={"alignment_plan": plan},
+            )
+            run_id = db.create_run(
+                name="item-compare-metric",
+                model_id=model_id,
+                dataset_id=dataset_id,
+                height=4,
+                width=4,
+                batch_size=1,
+                device="cpu",
+                precision="fp32",
+                metrics=["vmaf", "cgvqm"],
+                metadata={
+                    "run_type": "video_compare",
+                    "media_item_id": 101,
+                    "publish_compare_pred_video": False,
+                    "request": {"media_item_id": 101, "publish_compare_pred_video": False},
+                },
+                create_inference_job=False,
+            )
+            inference_job_id = db.add_run_job(
+                run_id,
+                "inference",
+                {"run_id": run_id, "dataset_id": dataset_id},
+                progress_total=4,
+            )
+            for track_index, (track_key, track_label, color) in enumerate(
+                [("pred_a", "Method A", (32, 64, 96)), ("pred_b", "Method B", (128, 160, 192))]
+            ):
+                for frame_index in range(2):
+                    gt_path = tmp_path / f"gt-{frame_index}.png"
+                    pred_path = tmp_path / f"pred-{track_key}-{frame_index}.png"
+                    if not gt_path.exists():
+                        Image.new("RGB", (4, 4), (frame_index, 12, 24)).save(gt_path)
+                    Image.new("RGB", (4, 4), color).save(pred_path)
+                    sample_id = db.add_sample(
+                        dataset_id,
+                        f"clip__{track_key}__{frame_index:06d}",
+                        str(gt_path),
+                        str(pred_path),
+                        str(gt_path),
+                        {
+                            "source_type": "compare",
+                            "video_name": "clip",
+                            "compare_group": "clip",
+                            "compare_track_index": track_index,
+                            "compare_track_key": track_key,
+                            "compare_track_label": track_label,
+                            "frame_index": frame_index,
+                            "sample_index": frame_index,
+                            "fps": 24.0,
+                            "alignment_fingerprint": plan["fingerprint"],
+                        },
+                    )
+                    db.add_artifact(inference_job_id, sample_id, "gt", str(gt_path), "image/png", {})
+                    db.add_artifact(inference_job_id, sample_id, "pred", str(pred_path), "image/png", {})
+
+            metric_job_id = db.add_run_job(
+                run_id,
+                "metric",
+                {
+                    "run_id": run_id,
+                    "inference_job_id": inference_job_id,
+                    "dataset_id": dataset_id,
+                    "metric_names": ["vmaf", "cgvqm"],
+                    "metric_device": "cpu",
+                },
+                progress_total=4,
+            )
+            encoded: list[tuple[list[Path], Path, float]] = []
+            evaluated: list[tuple[Path, Path]] = []
+
+            def fake_write_mp4(frame_paths: list[Path], output: Path, fps: float) -> None:
+                encoded.append((list(frame_paths), output, fps))
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(b"private metric input")
+
+            class FakeVideoMetric:
+                def evaluate(self, reference: Path, distorted: Path, _work_dir: Path):
+                    evaluated.append((reference, distorted))
+                    return MetricResult("completed", 91.25, {"implementation": "fake-video"})
+
+            with patch("vfieval.pipeline.inference._write_mp4", side_effect=fake_write_mp4), patch(
+                "vfieval.pipeline.metrics_runner.create_metric", return_value=FakeVideoMetric()
+            ):
+                result = run_metric_job(db, workspace, metric_job_id)
+
+            self.assertEqual(result["summary"]["vmaf"]["completed"], 2)
+            self.assertEqual(result["summary"]["cgvqm"]["completed"], 2)
+            self.assertEqual(len(encoded), 3, "one shared GT plus one Pred cache video per track")
+            self.assertEqual(len(evaluated), 4)
+            self.assertTrue(
+                all(path.parent == workspace.root / "compare_cache" and path.suffix == ".mp4" for pair in evaluated for path in pair)
+            )
+            self.assertEqual(db.list_artifacts(inference_job_id, kind="pred_video"), [])
+            results = db.list_metric_results(inference_job_id)
+            self.assertEqual({row["metric_name"] for row in results}, {"vmaf", "cgvqm"})
+            self.assertEqual({row["details"]["compare_track_label"] for row in results}, {"Method A", "Method B"})
+            self.assertTrue(all(row["details"]["video_input"] == "aligned_compare_cache" for row in results))
+            self.assertTrue(
+                all(row["details"]["alignment_fingerprint"] == plan["fingerprint"] for row in results)
+            )
+            cache_entries = [
+                entry
+                for entry in db.list_cache_entries()
+                if entry.get("metadata", {}).get("purpose") == "item_compare_video_metric_input"
+            ]
+            self.assertEqual(len(cache_entries), 3)
+            self.assertTrue(all(Path(entry["storage_path"]).is_file() for entry in cache_entries))
+            self.assertTrue(
+                all(entry["metadata"]["alignment_fingerprint"] == plan["fingerprint"] for entry in cache_entries)
+            )
 
     def test_cli_smoke_metric_runs_manifest_driver_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

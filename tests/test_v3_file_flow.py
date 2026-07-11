@@ -422,6 +422,31 @@ class Model:
                 self.assertIn("gt_video", kinds)
                 self.assertIn("diff_video", kinds)
                 self.assertEqual(kinds.count("pred_video"), 1)
+                # New folder-entrypoint inference Runs bind their exact selected
+                # canonical GT Item before decoding.  Once the Pred video is
+                # published, catalog sync may create a reusable model member
+                # only through that explicit source binding (never by a stem
+                # or file-hash guess).
+                source_item_rows = db.query(
+                    """
+                    SELECT item_id FROM run_media_item_bindings
+                    WHERE run_id = ? AND binding_role = 'source'
+                    """,
+                    (run_id,),
+                )
+                self.assertEqual(len(source_item_rows), 1)
+                pred_members = db.query(
+                    """
+                    SELECT item_id, member_role, producer_kind, reusable_as_pred
+                    FROM media_item_members
+                    WHERE producer_run_id = ? AND member_role = 'model_pred'
+                    """,
+                    (run_id,),
+                )
+                self.assertEqual(len(pred_members), 1)
+                self.assertEqual(int(pred_members[0]["item_id"]), int(source_item_rows[0]["item_id"]))
+                self.assertEqual(pred_members[0]["producer_kind"], "model_inference")
+                self.assertEqual(int(pred_members[0]["reusable_as_pred"]), 1)
                 pred_video = next(artifact for artifact in artifacts if artifact["kind"] == "pred_video")
                 range_request = urllib.request.Request(
                     f"{base_url}/api/files/{pred_video['id']}",
@@ -554,8 +579,11 @@ class Model:
                 self.assertEqual(heartbeat["status"], "heartbeat")
 
                 cleanup = _post(base_url, f"/api/runs/{run_id}/cleanup-artifacts", {})
-                self.assertTrue(cleanup["artifact_cleaned"])
-                self.assertFalse(Path(cleanup["output_dir"]).exists())
+                self.assertEqual(cleanup["purge_status"], "requested")
+                cleanup_request = _wait_for_purge(base_url, int(cleanup["request_id"]))
+                self.assertEqual(cleanup_request["status"], "completed")
+                self.assertTrue(cleanup_request["report"]["artifact_cleaned"])
+                self.assertFalse(Path(cleanup_request["report"]["output_dir"]).exists())
                 cleaned_run = _get(base_url, f"/api/runs/{run_id}")
                 self.assertEqual(cleaned_run["artifact_summary"]["total"], 0)
                 self.assertIsNotNone(cleaned_run["artifact_cleaned_at"])
@@ -565,7 +593,8 @@ class Model:
                 self.assertFalse(cleaned_timeline["samples"][0]["has_artifacts"])
 
                 hidden = _delete(base_url, f"/api/runs/{run_id}")
-                self.assertTrue(hidden["deleted"])
+                self.assertFalse(hidden["deleted"])
+                _wait_for_purge(base_url, int(hidden["request_id"]))
                 visible_runs = _get(base_url, "/api/runs")
                 self.assertNotIn(run_id, [int(item["id"]) for item in visible_runs])
                 all_runs = _get(base_url, "/api/runs?include_deleted=1")
@@ -1411,13 +1440,24 @@ class Model:
                     self.assertTrue(running_seen, "run never entered running state before delete")
 
                     deleted = _delete(base_url, f"/api/runs/{run_id}")
-                    self.assertTrue(deleted["deleted"])
+                    self.assertFalse(deleted["deleted"])
+                    self.assertTrue(deleted["deleting"])
+                    self.assertEqual(deleted["purge_status"], "canceling")
 
                     visible_runs = _get(base_url, "/api/runs")
-                    self.assertNotIn(run_id, [int(item["id"]) for item in visible_runs])
+                    if run_id not in [int(item["id"]) for item in visible_runs]:
+                        self.assertEqual(
+                            _get(base_url, f"/api/run-purge-requests/{int(deleted['request_id'])}")["status"],
+                            "completed",
+                        )
 
                     canceled_run = _wait_for_run(base_url, run_id)
                     self.assertEqual(canceled_run["status"], "canceled", canceled_run)
+                    purge = _wait_for_purge(base_url, int(deleted["request_id"]))
+                    self.assertEqual(purge["status"], "completed")
+
+                    visible_runs = _get(base_url, "/api/runs")
+                    self.assertNotIn(run_id, [int(item["id"]) for item in visible_runs])
 
                     all_runs = _get(base_url, "/api/runs?include_deleted=1")
                     self.assertIn(run_id, [int(item["id"]) for item in all_runs])
@@ -1499,9 +1539,14 @@ class Model:
                     self.assertIsNone(db.get_run(run_id).get("artifact_cleaned_at"))
 
                     deleted = _delete(base_url, f"/api/runs/{run_id}")
-                    self.assertTrue(deleted["deleted"])
+                    self.assertFalse(deleted["deleted"])
+                    self.assertTrue(deleted["deleting"])
                     canceled_run = _wait_for_run(base_url, run_id)
                     self.assertEqual(canceled_run["status"], "canceled", canceled_run)
+                    self.assertEqual(
+                        _wait_for_purge(base_url, int(deleted["request_id"]))["status"],
+                        "completed",
+                    )
             finally:
                 server.shutdown()
                 server.server_close()
@@ -1552,8 +1597,11 @@ class Model:
             base_url = f"http://127.0.0.1:{server.server_address[1]}"
             try:
                 cleanup = _post(base_url, f"/api/runs/{run_id}/cleanup-artifacts", {})
-                self.assertTrue(cleanup["artifact_cleaned"])
-                self.assertEqual(Path(cleanup["output_dir"]), run_dir)
+                self.assertEqual(cleanup["purge_status"], "requested")
+                cleanup_request = _wait_for_purge(base_url, int(cleanup["request_id"]))
+                self.assertEqual(cleanup_request["status"], "completed")
+                self.assertTrue(cleanup_request["report"]["artifact_cleaned"])
+                self.assertEqual(Path(cleanup_request["report"]["output_dir"]), run_dir)
                 self.assertFalse(run_dir.exists())
                 self.assertTrue(sibling_dir.exists())
                 self.assertEqual(sibling_marker.read_text(encoding="utf-8"), "sibling")
@@ -1573,7 +1621,9 @@ class Model:
             write_mp4(gt_path, [(index * 20, 0, 0) for index in range(3)])
             pred_path = workspace.root / "pred.mp4"
             write_mp4(pred_path, [(0, index * 20, 0) for index in range(3)])
-            run_a = add_completed_pred_run(db, workspace, "ModelA", pred_path)
+            run_a = add_completed_pred_run(
+                db, workspace, "ModelA", pred_path, source_video_path=gt_path
+            )
 
             payload = {
                 "run_type": "video_compare",
@@ -1601,7 +1651,8 @@ class Model:
                 run_videos = _get(base_url, f"/api/runs/{run_id}/videos")
                 self.assertEqual(len(run_videos["videos"]), 1)
                 self.assertEqual(run_videos["videos"][0]["sample_count"], 3)
-                self.assertIn("pred_video", run_videos["videos"][0]["video_artifacts"])
+                self.assertNotIn("pred_video", run_videos["videos"][0]["video_artifacts"])
+                self.assertIn("diff_video", run_videos["videos"][0]["video_artifacts"])
 
                 timeline = _get(base_url, f"/api/runs/{run_id}/timeline")
                 sample = timeline["videos"][0]["samples"][0]
@@ -1622,7 +1673,9 @@ class Model:
             write_mp4(gt_path, [(index * 20, 0, 0) for index in range(3)])
             pred_path = workspace.root / "pred.mp4"
             write_mp4(pred_path, [(0, index * 20, 0) for index in range(3)])
-            run_a = add_completed_pred_run(db, workspace, "ModelA", pred_path)
+            run_a = add_completed_pred_run(
+                db, workspace, "ModelA", pred_path, source_video_path=gt_path
+            )
 
             payload = {
                 "run_type": "video_compare",
@@ -2655,6 +2708,16 @@ def _wait_for_run(base_url: str, run_id: int) -> dict:
             return run
         time.sleep(0.25)
     raise AssertionError(f"run {run_id} did not finish")
+
+
+def _wait_for_purge(base_url: str, request_id: int) -> dict:
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        request = _get(base_url, f"/api/run-purge-requests/{request_id}")
+        if request["status"] in {"completed", "failed"}:
+            return request
+        time.sleep(0.1)
+    raise AssertionError(f"run purge request {request_id} did not finish")
 
 
 if __name__ == "__main__":

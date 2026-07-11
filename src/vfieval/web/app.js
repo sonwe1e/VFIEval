@@ -38,6 +38,7 @@ const state = {
   metricSummary: null,
   runVideosPage: null,
   runVideoTimelines: {},
+  compareInputsByRun: {},
   timelineWindowStartByVideo: {},
   sampleDetails: {},
   sampleDetailLoading: {},
@@ -55,18 +56,18 @@ const state = {
   expandedExtraArtifactsBySample: {},
   selectedCudaDevices: new Set(),
   selectedNpuDevices: new Set(),
-  compareSources: { gt: [], pred: [] },
-  compareSourcesMeta: { gt: null, pred: null },
-  comparePredByArtifact: {},
+  compareItemGroups: [],
+  compareItems: [],
+  compareItemsMeta: null,
+  comparePredictions: [],
+  comparePredByMember: {},
   compareSourcesLoaded: false,
-  compareGtQuery: "",
-  comparePredQuery: "",
-  compareGtPage: 1,
-  comparePredPage: 1,
-  selectedCompareGtKey: "",
-  selectedComparePredArtifacts: new Set(),
-  selectedCompareLayerKinds: new Set(),
-  compareTrackLabels: {},
+  compareItemQuery: "",
+  compareItemPage: 1,
+  selectedCompareGroupId: "",
+  selectedCompareItemId: null,
+  selectedComparePredMembers: new Set(),
+  compareSourceRequestGeneration: 0,
   preflightAbortController: null,
   preflightPayloadKey: "",
   comparePreflight: null,
@@ -75,6 +76,17 @@ const state = {
   comparePreflightAbortController: null,
   sampleAbortControllers: {},
   timelineAbortController: null,
+  timelineAbortRunId: null,
+  runSelectAbortController: null,
+  runSelectRequestGeneration: 0,
+  runSelectionGeneration: 0,
+  timelineRequestGeneration: 0,
+  runResultGenerations: {},
+  runContentRevisions: {},
+  runsRefreshPromise: null,
+  runsRefreshQueued: false,
+  runsRefreshPendingForce: false,
+  runsRefreshGeneration: 0,
   compareGridColumns: 3,
   slotSelectionBySample: {},
   compareSlotLayout: "side",
@@ -85,6 +97,10 @@ const state = {
   statsFilters: { dataset: "", model: "", checkpoint: "", video: "" },
   mediaCollections: [],
   mediaAssets: [],
+  externalPredItemGroups: [],
+  externalPredItems: [],
+  selectedExternalPredGroupId: "",
+  externalPredItemRequestGeneration: 0,
   activeUpload: null,
   uploadPaused: false,
   evaluatorId: localStorage.getItem("vfieval-evaluator-id") || "",
@@ -506,114 +522,141 @@ function videoSelectionPager(page, groupName) {
   `;
 }
 
-function compareGtKey(row) {
-  if (row.asset_id) return `asset:${row.asset_id}`;
-  // GT is always a source clip now (one card per videos/ clip). The pred-aligned
-  // GT is reconstructed backend-side from the pred's recorded source frame
-  // indices, so there is no per-run GT card to disambiguate.
-  return `${row.group || ""}::${row.video || ""}`;
+function compareItemId(row) {
+  return Number(row?.item_id || row?.id || 0);
+}
+
+function compareMemberId(row) {
+  return Number(row?.member_id || row?.id || 0);
 }
 
 function selectedCompareGt() {
-  return (state.compareSources.gt || []).find((row) => compareGtKey(row) === state.selectedCompareGtKey) || null;
+  return (state.compareItems || []).find((row) => compareItemId(row) === Number(state.selectedCompareItemId)) || null;
 }
 
 function selectedComparePredRows() {
-  return Array.from(state.selectedComparePredArtifacts)
-    .map((artifactId) => state.comparePredByArtifact[Number(artifactId)])
+  return Array.from(state.selectedComparePredMembers)
+    .map((memberId) => state.comparePredByMember[Number(memberId)])
     .filter(Boolean)
     .map((row) => ({ ...row, track_label: compareTrackLabel(row) }));
 }
 
 function compareTrackLabel(row) {
-  const artifactId = Number(row.artifact_id);
-  return state.compareTrackLabels[artifactId] || row.compare_track_label || row.run_name || `run-${row.run_id}`;
+  return row.method_label
+    || row.track_label
+    || row.display_name
+    || row.run_name
+    || `Run #${row.run_id || row.producer_run_id || "-"}`;
 }
 
-// External assets must match exactly. VFIEval-generated Pred assets may carry
-// source_frame_indices; only that platform-owned mapping can construct an
-// aligned GT at the inference resolution.
-function compareCompatibility(gt, predRow) {
-  if (!gt) return null;
-  const reasons = [];
-  const gtFrames = Number(gt.frame_count || 0);
-  const predFrames = Number(predRow.frame_count || 0);
-  const mapped = Array.isArray(predRow.source_frame_indices)
-    && predRow.source_frame_indices.length === predFrames;
-  // GT is now the source clip (N frames); a pred is the interpolated subset
-  // (N-step frames), so pred < gt is the expected relationship — the backend
-  // reconstructs the aligned GT from the pred's recorded source frame indices.
-  // Only a pred with MORE frames than the source clip is genuinely anomalous.
-  if (gtFrames && predFrames && gtFrames !== predFrames && !mapped) {
-    reasons.push(`strict 帧数不一致：${predFrames} vs ${gtFrames}`);
+function compareTemporalSummary(row) {
+  const mapping = row?.temporal_mapping && typeof row.temporal_mapping === "object"
+    ? row.temporal_mapping
+    : {};
+  const indices = Array.isArray(row?.source_frame_indices)
+    ? row.source_frame_indices
+    : mapping.source_frame_indices;
+  if (Array.isArray(indices)) {
+    if (!indices.length) return "indexed temporal mapping (0 frames)";
+    const first = Number(indices[0]);
+    const last = Number(indices[indices.length - 1]);
+    return `indexed temporal mapping: ${indices.length} frames (${first}–${last})`;
   }
-  const gtW = Number(gt.width || 0);
-  const gtH = Number(gt.height || 0);
-  const predW = Number(predRow.width || 0);
-  const predH = Number(predRow.height || 0);
-  if (gtW && gtH && predW && predH && (gtW !== predW || gtH !== predH) && !mapped) {
-    reasons.push(`strict 分辨率不一致：${predW}x${predH} vs ${gtW}x${gtH}`);
-  }
-  return { ok: reasons.length === 0, reasons };
+  const timestamps = Array.isArray(mapping.timestamps)
+    ? mapping.timestamps
+    : (Array.isArray(mapping.source_timestamps) ? mapping.source_timestamps : null);
+  if (timestamps?.length) return `exact temporal alignment · ${timestamps.length} recorded timestamps`;
+  return "exact temporal alignment";
+}
+
+function compareSlotLabel(index) {
+  return index < 0 ? "available Pred" : `Pred ${String.fromCharCode(65 + index)}`;
+}
+
+function compareSpatialTarget(predRows = selectedComparePredRows()) {
+  const sized = predRows.filter((row) => Number(row.width) > 0 && Number(row.height) > 0);
+  if (!sized.length) return null;
+  return [...sized].sort((left, right) => {
+    const area = Number(left.width) * Number(left.height) - Number(right.width) * Number(right.height);
+    if (area) return area;
+    const edge = Math.max(Number(left.width), Number(left.height)) - Math.max(Number(right.width), Number(right.height));
+    if (edge) return edge;
+    return Number(left.width) - Number(right.width) || Number(left.height) - Number(right.height);
+  })[0];
 }
 
 function ensureCompareSelection() {
-  const gtRows = state.compareSources.gt || [];
-  if ((!state.selectedCompareGtKey || !gtRows.some((row) => compareGtKey(row) === state.selectedCompareGtKey)) && gtRows.length) {
-    state.selectedCompareGtKey = compareGtKey(gtRows[0]);
+  const itemIds = new Set((state.compareItems || []).map(compareItemId));
+  if (state.selectedCompareItemId && !itemIds.has(Number(state.selectedCompareItemId))) {
+    state.selectedCompareItemId = null;
+    state.selectedComparePredMembers.clear();
   }
-  for (const row of state.compareSources.pred || []) {
-    const artifactId = Number(row.artifact_id);
-    state.comparePredByArtifact[artifactId] = row;
-    if (!state.compareTrackLabels[artifactId]) {
-      state.compareTrackLabels[artifactId] = compareTrackLabel(row);
-    }
+  const available = new Set();
+  for (const row of state.comparePredictions || []) {
+    const memberId = compareMemberId(row);
+    if (!memberId) continue;
+    available.add(memberId);
+    state.comparePredByMember[memberId] = row;
+  }
+  for (const memberId of Array.from(state.selectedComparePredMembers)) {
+    if (!available.has(Number(memberId))) state.selectedComparePredMembers.delete(memberId);
   }
 }
 
-function comparePredFilterVideo() {
-  const gt = selectedCompareGt();
-  return gt?.video_name || (gt?.video ? String(gt.video).replace(/\.[^.]+$/, "") : "");
-}
-
-function compareSourcePager(meta, type) {
+function compareSourcePager(meta) {
   if (!meta || Number(meta.total_pages || 1) <= 1) return "";
   return `
     <div class="pager compact-pager">
-      <button class="secondary" data-compare-page="${type}" data-page="${Number(meta.page || 1) - 1}" ${Number(meta.page || 1) <= 1 ? "disabled" : ""} type="button">上一页</button>
+      <button class="secondary" data-compare-page data-page="${Number(meta.page || 1) - 1}" ${Number(meta.page || 1) <= 1 ? "disabled" : ""} type="button">上一页</button>
       <span class="muted">第 ${escapeHtml(meta.page || 1)} / ${escapeHtml(meta.total_pages || 1)} 页，${escapeHtml(meta.filtered_count || 0)} 条</span>
-      <button class="secondary" data-compare-page="${type}" data-page="${Number(meta.page || 1) + 1}" ${Number(meta.page || 1) >= Number(meta.total_pages || 1) ? "disabled" : ""} type="button">下一页</button>
+      <button class="secondary" data-compare-page data-page="${Number(meta.page || 1) + 1}" ${Number(meta.page || 1) >= Number(meta.total_pages || 1) ? "disabled" : ""} type="button">下一页</button>
     </div>
   `;
 }
 
 async function loadCompareSources(options = {}) {
-  if (options.gtPage !== undefined) state.compareGtPage = Math.max(1, Number(options.gtPage || 1));
-  if (options.predPage !== undefined) state.comparePredPage = Math.max(1, Number(options.predPage || 1));
-  const gtPayload = await api(`/api/media/assets?role=gt&page=${state.compareGtPage}&page_size=50&q=${encodeURIComponent(state.compareGtQuery)}`);
-  state.compareSources.gt = (gtPayload.assets || []).map((row) => ({
-    ...row,
-    kind: "media_asset",
-    asset_id: row.id,
-    group: row.collection_name,
-    video: row.original_name || row.display_name,
-    video_name: row.provenance?.video_name || row.provenance?.video || row.display_name,
-  }));
-  state.compareSourcesMeta.gt = { ...gtPayload, total_pages: gtPayload.page_count, filtered_count: gtPayload.total };
+  const generation = ++state.compareSourceRequestGeneration;
+  if (options.page !== undefined || options.gtPage !== undefined) {
+    state.compareItemPage = Math.max(1, Number(options.page || options.gtPage || 1));
+  }
+  if (options.reset) {
+    state.selectedCompareGroupId = "";
+    state.selectedCompareItemId = null;
+    state.selectedComparePredMembers.clear();
+  }
+  const groupPayload = await api("/api/media/item-groups?role=gt");
+  if (generation !== state.compareSourceRequestGeneration) return;
+  state.compareItemGroups = groupPayload.groups || groupPayload.item_groups || [];
+  const groupIds = new Set(state.compareItemGroups.map((row) => String(row.group_id || row.collection_id || row.id)));
+  if (!groupIds.has(String(state.selectedCompareGroupId))) {
+    state.selectedCompareGroupId = String(state.compareItemGroups[0]?.group_id || state.compareItemGroups[0]?.collection_id || state.compareItemGroups[0]?.id || "");
+    state.selectedCompareItemId = null;
+    state.selectedComparePredMembers.clear();
+  }
+  if (!state.selectedCompareGroupId) {
+    state.compareItems = [];
+    state.comparePredictions = [];
+    state.compareItemsMeta = null;
+    state.compareSourcesLoaded = true;
+    renderCompareSelection();
+    return;
+  }
+  const itemsPayload = await api(`/api/media/items?group_id=${encodeURIComponent(state.selectedCompareGroupId)}&q=${encodeURIComponent(state.compareItemQuery)}&page=${state.compareItemPage}&page_size=50`);
+  if (generation !== state.compareSourceRequestGeneration) return;
+  state.compareItems = itemsPayload.items || [];
+  state.compareItemsMeta = {
+    ...itemsPayload,
+    total_pages: itemsPayload.total_pages || itemsPayload.page_count,
+    filtered_count: itemsPayload.filtered_count ?? itemsPayload.total ?? state.compareItems.length,
+  };
   ensureCompareSelection();
-  const predPayload = await api(`/api/media/assets?role=pred&page=${state.comparePredPage}&page_size=50&q=${encodeURIComponent(state.comparePredQuery)}`);
-  state.compareSources.pred = (predPayload.assets || []).map((row) => ({
-    ...row,
-    kind: "media_asset",
-    artifact_id: row.id,
-    asset_id: row.id,
-    run_id: row.provenance?.run_id,
-    run_name: row.provenance?.run_name || row.display_name,
-    video: row.provenance?.video_name || row.display_name,
-    compare_track_label: row.provenance?.track_label || "",
-    source_frame_indices: row.metadata?.source_frame_indices || null,
-  }));
-  state.compareSourcesMeta.pred = { ...predPayload, total_pages: predPayload.page_count, filtered_count: predPayload.total };
+  if (state.selectedCompareItemId) {
+    const predPayload = await api(`/api/media/items/${Number(state.selectedCompareItemId)}/predictions`);
+    if (generation !== state.compareSourceRequestGeneration) return;
+    state.comparePredictions = predPayload.predictions || predPayload.members || [];
+  } else {
+    state.comparePredictions = [];
+  }
   state.compareSourcesLoaded = true;
   ensureCompareSelection();
   renderCompareSelection();
@@ -755,47 +798,23 @@ function payloadFromForm() {
 }
 
 function comparePayloadFromForm() {
-  const data = formData($("compare-form"));
   const gt = selectedCompareGt();
   const predRows = selectedComparePredRows();
-  if (!gt || predRows.length < 1) {
+  if (!gt || predRows.length < 1 || predRows.length > 2) {
     return null;
-  }
-  // With a GT selected, it is the reference and every pred is a distorted
-  // track. Without a GT (preds-only comparison), promote the first pred to the
-  // reference role — the backend accepts a run_artifact as reference.
-  let reference;
-  let distortedRows;
-  if (gt) {
-    // GT is always a source clip now; the backend reconstructs each pred's
-    // aligned GT from the clip using the pred's recorded source_frame_indices.
-    reference = { kind: "media_asset", asset_id: Number(gt.asset_id || gt.id) };
-    distortedRows = predRows;
-  } else {
-    const head = predRows[0];
-    reference = {
-      kind: "media_asset",
-      asset_id: Number(head.asset_id || head.artifact_id),
-      label: head.track_label || compareTrackLabel(head),
-    };
-    distortedRows = predRows.slice(1);
   }
   return {
     run_type: "video_compare",
-    reference,
-    distorted: distortedRows.map((row) => ({
-      kind: "media_asset",
-      asset_id: Number(row.asset_id || row.artifact_id),
-      label: row.track_label || compareTrackLabel(row),
-    })),
-    extra_layers: state.selectedCompareLayerKinds.size
-      ? distortedRows.filter((row) => row.run_id).map((row) => ({
-          source: "run_artifact",
-          run_id: Number(row.run_id),
-          kinds: Array.from(state.selectedCompareLayerKinds),
-        }))
-      : [],
-    align_mode: data.align_mode || "strict",
+    media_item_id: compareItemId(gt),
+    pred_member_ids: predRows.map(compareMemberId),
+    spatial_policy: {
+      mode: "smallest_pred",
+      filter: "lanczos",
+      allow_known_aspect_stretch: true,
+      allow_external_aspect_stretch: Boolean(
+        $("compare-form").elements.allow_external_aspect_stretch?.checked,
+      ),
+    },
     metrics: compareSelectedMetrics(),
   };
 }
@@ -1056,24 +1075,29 @@ function renderPreflight() {
   `;
 }
 
-function renderCompareGtCards(gtRows) {
-  if (!gtRows.length) return "<p class=\"muted\">videos/ 下暂无可用 GT。</p>";
-  // GT is always a source clip now. The backend reconstructs the pred-aligned
-  // GT subset from this clip using each pred's recorded source_frame_indices,
-  // so one card per clip is enough — no per-run GT duplicates.
-  return gtRows.map((row) => {
-    const key = compareGtKey(row);
-    const active = state.selectedCompareGtKey === key;
-    const title = `${escapeHtml(row.group)}/${escapeHtml(row.video)}`;
+function compareItemGt(row) {
+  return row?.canonical_gt || row?.gt || row?.canonical_asset || row || {};
+}
+
+function compareItemTitle(row) {
+  return row?.display_name || row?.item_key || row?.video_name || `Media Item #${compareItemId(row)}`;
+}
+
+function renderCompareGtCards(items) {
+  if (!items.length) return "<p class=\"muted\">这个文件夹中没有匹配的 GT Media Item。</p>";
+  return items.map((row) => {
+    const itemId = compareItemId(row);
+    const active = Number(state.selectedCompareItemId) === itemId;
+    const gt = compareItemGt(row);
     return `
       <label class="source-card${active ? " selected" : ""}">
-        <input type="radio" name="compare_gt_pick" data-compare-gt="${escapeHtml(key)}" ${active ? "checked" : ""}>
+        <input type="radio" name="compare_gt_pick" data-compare-item="${itemId}" ${active ? "checked" : ""}>
         <span class="source-card-body">
-          <span class="source-card-title">${title} <span class="compat-badge">${escapeHtml(row.source_kind || "asset")}</span></span>
+          <span class="source-card-title">${escapeHtml(compareItemTitle(row))} <span class="compat-badge">canonical GT</span></span>
           <span class="source-card-meta">
-            <span>${escapeHtml(row.frame_count || 0)} 帧</span>
-            <span>${escapeHtml(row.width || "-")}×${escapeHtml(row.height || "-")}</span>
-            <span>${formatNumber(row.fps)} fps</span>
+            <span>${escapeHtml(gt.frame_count || row.frame_count || 0)} 帧</span>
+            <span>${escapeHtml(gt.width || row.width || "-")}×${escapeHtml(gt.height || row.height || "-")}</span>
+            <span>${formatNumber(gt.fps ?? row.fps)} fps</span>
           </span>
         </span>
       </label>
@@ -1082,43 +1106,66 @@ function renderCompareGtCards(gtRows) {
 }
 
 function renderComparePredCards(predRows, selectedPreds) {
-  if (!predRows.length) return "<p class=\"muted\">暂无已完成 Run 的 pred 产物。</p>";
-  const gt = selectedCompareGt();
+  if (!state.selectedCompareItemId) return "<p class=\"muted\">先选择一个 GT 视频。</p>";
+  if (!predRows.length) return "<p class=\"muted\">这个 GT 还没有可复用的模型 Pred 或已绑定 External Pred。</p>";
+  const selectedMemberIds = Array.from(selectedPreds).map(Number);
   return predRows.map((row) => {
-    const artifactId = Number(row.artifact_id);
-    const active = selectedPreds.has(artifactId);
-    const compat = compareCompatibility(gt, row);
-    const badge = compat
-      ? (compat.ok
-          ? "<span class=\"compat-badge compat-ok\">对齐</span>"
-          : `<span class="compat-badge compat-warn" title="${escapeHtml(compat.reasons.join("；"))}">strict 不匹配</span>`)
-      : "";
-    const warning = compat && !compat.ok
-      ? `<span class="source-card-warn">${escapeHtml(compat.reasons.join("；"))}</span>`
-      : "";
-    // Keep the row selectable so preflight can return a precise per-track
-    // strict-alignment error; the server never normalizes external inputs.
+    const memberId = compareMemberId(row);
+    const active = selectedPreds.has(memberId);
+    const atLimit = selectedPreds.size >= 2 && !active;
+    const external = String(row.member_role || row.producer_kind || "").includes("external");
+    const temporal = row.temporal_mapping_summary || compareTemporalSummary(row);
+    const slot = compareSlotLabel(selectedMemberIds.indexOf(memberId));
     return `
-      <div class="source-card${active ? " selected" : ""}${compat && !compat.ok ? " incompatible" : ""}">
+      <div class="source-card${active ? " selected" : ""}">
         <label class="source-card-pick">
-          <input type="checkbox" data-compare-pred="${escapeHtml(row.artifact_id)}" ${active ? "checked" : ""}>
+          <input type="checkbox" data-compare-pred="${memberId}" ${active ? "checked" : ""} ${atLimit ? "disabled" : ""}>
           <span class="source-card-body">
-            <span class="source-card-title">${row.run_id ? `#${escapeHtml(row.run_id)} ` : ""}${escapeHtml(row.run_name || row.display_name || "External Pred")} ${badge}</span>
+            <span class="source-card-title">${row.run_id || row.producer_run_id ? `#${escapeHtml(row.run_id || row.producer_run_id)} ` : ""}${escapeHtml(compareTrackLabel(row))} <span class="compat-badge">${external ? "External" : "model Pred"}</span>${active ? ` <span class="compat-badge compat-ok">${escapeHtml(slot)}</span>` : ""}</span>
             <span class="source-card-meta">
-              <span>${escapeHtml(row.video || "-")}</span>
               <span>${escapeHtml(row.frame_count || 0)} 帧</span>
               <span>${escapeHtml(row.width || "-")}×${escapeHtml(row.height || "-")}</span>
+              <span>${formatNumber(row.fps)} fps</span>
             </span>
-            ${warning}
+            <span class="source-card-warn">${escapeHtml(temporal)}</span>
           </span>
-        </label>
-        <label class="source-card-track">
-          <span>Track</span>
-          <input data-compare-track-label="${escapeHtml(row.artifact_id)}" value="${escapeHtml(compareTrackLabel(row))}">
         </label>
       </div>
     `;
   }).join("");
+}
+
+function compareResizeKind(width, height, targetWidth, targetHeight) {
+  if (!width || !height || !targetWidth || !targetHeight) return "unknown";
+  if (width === targetWidth && height === targetHeight) return "none";
+  const x = targetWidth / width;
+  const y = targetHeight / height;
+  if (x >= 1 && y >= 1) return "upscale";
+  if (x <= 1 && y <= 1) return "downscale";
+  return "mixed";
+}
+
+function renderCompareAlignmentSummary(item, preds) {
+  if (!item || !preds.length) return "<p class=\"muted\">选择 Pred 后显示空间规范化计划。时间身份、帧映射、FPS 与时间戳仍由服务端严格验证。</p>";
+  const target = compareSpatialTarget(preds);
+  if (!target) return "<p class=\"muted\">所选 Pred 缺少尺寸元数据；预检查将给出具体原因。</p>";
+  const targetWidth = Number(target.width);
+  const targetHeight = Number(target.height);
+  const gt = compareItemGt(item);
+  const rows = [
+    { label: "GT", width: Number(gt.width || item.width), height: Number(gt.height || item.height) },
+    ...preds.map((row, index) => ({ label: `Pred ${String.fromCharCode(65 + index)} · ${compareTrackLabel(row)}`, width: Number(row.width), height: Number(row.height) })),
+  ];
+  return `
+    <div class="alignment-plan-summary">
+      <div class="panel-head"><div><h3>预期空间规范化</h3><p class="muted">目标 ${targetWidth}×${targetHeight} · LANCZOS；原始文件不会被覆盖。</p></div><span class="compat-badge compat-ok">时间严格</span></div>
+      <div class="alignment-plan-grid">${rows.map((row) => {
+        const scaleX = row.width ? targetWidth / row.width : 0;
+        const scaleY = row.height ? targetHeight / row.height : 0;
+        const aspectChanged = scaleX && scaleY && Math.abs(scaleX - scaleY) > 1e-6;
+        return `<div><strong>${escapeHtml(row.label)}</strong><span>${row.width || "-"}×${row.height || "-"} → ${targetWidth}×${targetHeight}</span><small>${escapeHtml(compareResizeKind(row.width, row.height, targetWidth, targetHeight))}${scaleX ? ` · ${scaleX.toFixed(4)}×${scaleY.toFixed(4)}` : ""}${aspectChanged ? " · 宽高比变化（已记录）" : ""}</small></div>`;
+      }).join("")}</div>
+    </div>`;
 }
 
 function renderCompareSelection() {
@@ -1128,7 +1175,7 @@ function renderCompareSelection() {
       <div class="panel-head">
         <div>
           <h2>对比来源</h2>
-          <p class="muted">选择一个 GT 和至少一个 Pred，或至少两个 Pred（可留空 GT）。</p>
+          <p class="muted">先选择 GT 文件夹，再选择其中一个 Media Item。</p>
         </div>
         <button class="secondary" data-refresh-compare-sources type="button">加载来源</button>
       </div>
@@ -1136,64 +1183,54 @@ function renderCompareSelection() {
     `;
     return;
   }
-  const gtRows = state.compareSources.gt || [];
-  const predRows = state.compareSources.pred || [];
-  const selectedPreds = state.selectedComparePredArtifacts;
-  const selectedLayerCount = state.selectedCompareLayerKinds.size;
-  const estimatedLayers = selectedPreds.size * selectedLayerCount;
-  const trackCount = selectedPreds.size + (state.selectedCompareGtKey ? 1 : 0);
+  const gtRows = state.compareItems || [];
+  const predRows = state.comparePredictions || [];
+  const selectedPreds = state.selectedComparePredMembers;
+  const selectedRows = selectedComparePredRows();
+  const groups = state.compareItemGroups || [];
   $("compare-selection").innerHTML = `
     <div class="panel-head">
       <div>
         <h2>对比来源</h2>
-        <p class="muted">GT 来自 videos/，Pred 来自已完成 Run 的 pred_video 产物。GT 可留空做纯预测对比。</p>
+        <p class="muted">GT 使用精确 canonical Media Item 身份；Pred 只显示绑定到该 Item 的有效模型输出或 External Pred。Compare Run 的输出不会再次出现。</p>
       </div>
       <div class="metric-summary">
-        <span>GT ${escapeHtml(state.compareSourcesMeta.gt?.filtered_count ?? gtRows.length)}</span>
-        <span>Pred ${escapeHtml(state.compareSourcesMeta.pred?.filtered_count ?? predRows.length)}</span>
-        <span>已选 ${escapeHtml(trackCount)} 条轨道</span>
+        <span>${escapeHtml(groups.length)} 个文件夹</span>
+        <span>${escapeHtml(state.compareItemsMeta?.filtered_count ?? gtRows.length)} 个 GT</span>
+        <span>已选 ${escapeHtml(selectedPreds.size)} / 2 Pred</span>
       </div>
     </div>
     <div class="compare-source-grid">
       <section class="compare-source-col">
         <div class="compare-col-head">
-          <h3>GT（可选）</h3>
-          <button class="secondary" data-compare-gt-clear type="button">清除 GT</button>
+          <h3>1. GT 文件夹与视频</h3>
         </div>
         <div class="source-tools">
           <label>
-            <span>搜索</span>
-            <input data-compare-query="gt" value="${escapeHtml(state.compareGtQuery)}" placeholder="group 或文件名">
+            <span>文件夹</span>
+            <select data-compare-group>
+              ${groups.map((row) => {
+                const id = String(row.group_id || row.collection_id || row.id);
+                return `<option value="${escapeHtml(id)}" ${id === String(state.selectedCompareGroupId) ? "selected" : ""}>${escapeHtml(row.name || row.display_name || row.collection_name || id)} (${Number(row.item_count || row.count || 0)})</option>`;
+              }).join("")}
+            </select>
+          </label>
+          <label>
+            <span>筛选当前文件夹</span>
+            <input data-compare-query="item" value="${escapeHtml(state.compareItemQuery)}" placeholder="视频文件名">
           </label>
         </div>
         <div class="source-card-list">${renderCompareGtCards(gtRows)}</div>
-        ${compareSourcePager(state.compareSourcesMeta.gt, "gt")}
+        ${compareSourcePager(state.compareItemsMeta)}
       </section>
       <section class="compare-source-col">
         <div class="compare-col-head">
-          <h3>Pred tracks</h3>
-        </div>
-        <div class="source-tools">
-          <label>
-            <span>搜索</span>
-            <input data-compare-query="pred" value="${escapeHtml(state.comparePredQuery)}" placeholder="Run、视频或 track">
-          </label>
+          <h3>2. 对应 Pred（1–2 份）</h3>
         </div>
         <div class="source-card-list">${renderComparePredCards(predRows, selectedPreds)}</div>
-        ${compareSourcePager(state.compareSourcesMeta.pred, "pred")}
       </section>
     </div>
-    <details class="compare-layer-picker">
-      <summary>Extra layers (${escapeHtml(estimatedLayers)} previews)</summary>
-      <div class="checkbox-row">
-        ${["flowt_0", "flowt_1", "mask0", "mask1", "warp0", "warp1", "blend"].map((kind) => `
-          <label class="check-item">
-            <input type="checkbox" data-compare-layer-kind="${escapeHtml(kind)}" ${state.selectedCompareLayerKinds.has(kind) ? "checked" : ""}>
-            <span>${escapeHtml(kind)}</span>
-          </label>
-        `).join("")}
-      </div>
-    </details>
+    ${renderCompareAlignmentSummary(selectedCompareGt(), selectedRows)}
   `;
 }
 
@@ -1255,19 +1292,84 @@ function renderComparePreflightError(error) {
   renderComparePreflight();
 }
 
+function alignmentTemporal(plan) {
+  const temporal = plan?.temporal;
+  return temporal && typeof temporal === "object" && !Array.isArray(temporal) ? temporal : {};
+}
+
+function alignmentTransformRows(plan) {
+  const source = Array.isArray(plan?.transforms)
+    ? plan.transforms
+    : Object.entries(plan?.transforms || plan?.sources || {}).map(([label, row]) => ({ label, ...row }));
+  return source.filter((row) => row && typeof row === "object");
+}
+
+function alignmentDirection(row) {
+  return String(row?.direction || row?.resize_kind || row?.operation || "none");
+}
+
+function alignmentTemporalSummary(plan) {
+  const temporal = alignmentTemporal(plan);
+  const mode = temporal.mode || plan?.temporal_summary || plan?.temporal_status || "strict";
+  const details = [];
+  if (temporal.frame_count != null) details.push(`${Number(temporal.frame_count)} 帧`);
+  if (temporal.mapping_count != null) {
+    const range = temporal.mapping_first != null && temporal.mapping_last != null
+      ? ` (${temporal.mapping_first}–${temporal.mapping_last})`
+      : "";
+    details.push(`映射 ${Number(temporal.mapping_count)}${range}`);
+  }
+  if (temporal.fps != null) details.push(`${Number(temporal.fps).toFixed(3)} fps`);
+  if (typeof temporal.timestamps_verified === "boolean") {
+    details.push(temporal.timestamps_verified ? "时间戳已核验" : "无可核验时间戳");
+  }
+  return { mode: String(mode), details };
+}
+
+function renderAlignmentPlan(plan) {
+  if (!plan || !Object.keys(plan).length) return "";
+  const target = plan.target || plan.target_size || {};
+  const targetWidth = Number(plan.target_width || target.width || plan.width || 0);
+  const targetHeight = Number(plan.target_height || target.height || plan.height || 0);
+  const transforms = alignmentTransformRows(plan);
+  const temporal = alignmentTemporalSummary(plan);
+  return `
+    <section class="alignment-report">
+      <div class="panel-head"><div><h3>Alignment Plan</h3><p class="muted">时间映射严格校验；空间变换实际用于 Diff 与指标。</p></div>${plan.fingerprint ? `<code>${escapeHtml(String(plan.fingerprint).slice(0, 16))}</code>` : ""}</div>
+      <div class="summary-grid">
+        <div><span>目标尺寸</span><strong>${targetWidth || "-"}×${targetHeight || "-"}</strong></div>
+        <div><span>空间策略</span><strong>${escapeHtml(plan.mode || plan.spatial_mode || "smallest_pred")}</strong></div>
+        <div><span>插值</span><strong>${escapeHtml(plan.filter || plan.interpolation || "lanczos")}</strong></div>
+        <div><span>时间</span><strong>${escapeHtml(temporal.mode)}</strong></div>
+      </div>
+      ${temporal.details.length ? `<p class="alignment-temporal-details">${escapeHtml(temporal.details.join(" · "))}</p>` : ""}
+      ${transforms.length ? `<div class="alignment-plan-grid">${transforms.map((row) => {
+        const original = row.original || row.source || {};
+        const width = Number(row.original_width || original.width || row.width || 0);
+        const height = Number(row.original_height || original.height || row.height || 0);
+        const scaleX = row.scale_x == null ? (width && targetWidth ? targetWidth / width : null) : Number(row.scale_x);
+        const scaleY = row.scale_y == null ? (height && targetHeight ? targetHeight / height : null) : Number(row.scale_y);
+        return `<div><strong>${escapeHtml(row.label || row.slot || row.kind || "source")}</strong><span>${width || "-"}×${height || "-"} → ${targetWidth || "-"}×${targetHeight || "-"}</span><small>${escapeHtml(alignmentDirection(row))}${scaleX != null && scaleY != null ? ` · ${scaleX.toFixed(4)}×${scaleY.toFixed(4)}` : ""}${row.aspect_changed ? " · 宽高比变化" : ""}</small></div>`;
+      }).join("")}</div>` : ""}
+    </section>`;
+}
+
 function renderComparePreflight() {
   const result = state.comparePreflight;
   const start = $("start-compare");
   if (!result) {
     start.disabled = true;
     $("compare-preflight").innerHTML = state.compareSourcesLoaded
-      ? "<p class=\"muted\">选好 GT + Pred，或至少两个 Pred 后会自动预检查。</p>"
+      ? "<p class=\"muted\">选好一个 GT Media Item 和一至两份对应 Pred 后会自动预检查。</p>"
       : "<p class=\"muted\">先加载对比来源。</p>";
     return;
   }
   start.disabled = !result.ok;
-  const tracks = result.distorted_tracks || (result.distorted ? [result.distorted] : []);
-  const trackLabels = tracks.map((track) => track.track_label || track.label || track.name).filter(Boolean).join(", ");
+  const predictions = result.predictions || result.pred_members || result.distorted_tracks || [];
+  const trackLabels = predictions.map((track) => track.method_label || track.track_label || track.label || track.name).filter(Boolean).join(", ");
+  const plan = result.alignment_plan || result.alignment || {};
+  const target = plan.target || plan.target_size || {};
+  const temporal = alignmentTemporal(plan);
   $("compare-preflight").innerHTML = `
     <div class="panel-head">
       <h2>运行前预检查</h2>
@@ -1275,15 +1377,16 @@ function renderComparePreflight() {
     </div>
     <div class="summary-grid">
       <div><span>模式</span><strong>video_compare</strong></div>
-      <div><span>参考</span><strong>${escapeHtml(result.reference?.name || "-")}</strong></div>
-      <div><span>对比轨道</span><strong>${escapeHtml(`${tracks.length || 0} track(s)`)}</strong></div>
-      <div><span>Tracks</span><strong>${escapeHtml(trackLabels || "-")}</strong></div>
-      <div><span>帧数</span><strong>${escapeHtml(result.alignment?.frame_count ?? "-")}</strong></div>
-      <div><span>分辨率</span><strong>${escapeHtml(`${result.alignment?.width || "-"}x${result.alignment?.height || "-"}`)}</strong></div>
-      <div><span>FPS</span><strong>${formatNumber(result.alignment?.fps)}</strong></div>
+      <div><span>GT Item</span><strong>${escapeHtml(result.item?.display_name || selectedCompareGt()?.display_name || "-")}</strong></div>
+      <div><span>Pred</span><strong>${escapeHtml(`${predictions.length || selectedComparePredRows().length} 个`)}</strong></div>
+      <div><span>方法</span><strong>${escapeHtml(trackLabels || selectedComparePredRows().map(compareTrackLabel).join(", ") || "-")}</strong></div>
+      <div><span>帧数</span><strong>${escapeHtml(temporal.frame_count ?? plan.frame_count ?? result.frame_count ?? "-")}</strong></div>
+      <div><span>目标分辨率</span><strong>${escapeHtml(`${plan.target_width || target.width || plan.width || "-"}x${plan.target_height || target.height || plan.height || "-"}`)}</strong></div>
+      <div><span>FPS</span><strong>${formatNumber(temporal.fps ?? plan.fps ?? result.fps)}</strong></div>
     </div>
     ${renderMessages("errors", result.errors || [])}
     ${renderMessages("warnings", result.warnings || [])}
+    ${renderAlignmentPlan(plan)}
     ${renderPortableMetricHealthTable(result.metrics?.health || {})}
   `;
 }
@@ -1292,7 +1395,7 @@ async function startCompareRun(event) {
   event.preventDefault();
   const payload = comparePayloadFromForm();
   if (!payload) {
-    toast("请至少选择两条对比轨道（GT+Pred 或两个 Pred）");
+    toast("请选择一个 GT Media Item 和一至两份对应 Pred");
     return;
   }
   await runComparePreflight({ force: true });
@@ -1314,22 +1417,16 @@ async function createAdhocEvaluation() {
   const gt = selectedCompareGt();
   const preds = selectedComparePredRows();
   if (!gt || preds.length !== 2) {
-    throw new Error("自由盲评需要选择一份 GT 和恰好两份 Pred");
+    throw new Error("Campaign V2 需要一个 GT Media Item 和恰好两份对应 Pred");
   }
-  const created = await api("/api/evaluation-tasks/adhoc", {
-    method: "POST",
-    body: JSON.stringify({
-      reference_asset_id: Number(gt.asset_id || gt.id),
-      candidate_asset_ids: preds.map((row) => Number(row.asset_id || row.id)),
-      video_name: gt.video_name || gt.video || gt.display_name || "adhoc",
-      name: `Adhoc · ${gt.display_name || gt.video || "Compare"}`,
-      target_votes: 1,
-    }),
-  });
-  state.selectedCampaignId = Number(created.campaign.id);
   switchView("evaluations");
-  await loadEvaluations();
-  toast("自由盲评任务已生成");
+  if (!window.VFIEvalStudio) throw new Error("Evaluation Studio 尚未加载");
+  await window.VFIEvalStudio.prefillFromCompare({
+    groupId: state.selectedCompareGroupId,
+    item: gt,
+    predictions: preds,
+  });
+  toast("已将 GT Media Item 与两份方法带入 Evaluation Studio");
 }
 
 function table(rows, columns, options = {}) {
@@ -1374,17 +1471,103 @@ function statusBadge(status) {
   return `<span class="status ${escapeHtml(status)}">${escapeHtml(STATUS_LABELS[status] || status)}</span>`;
 }
 
+function runPurgeState(run) {
+  return String(run?.purge_request?.status || "");
+}
+
+function runPurgeDeletesRecord(run) {
+  return String(run?.purge_request?.request_type || "") === "delete_run";
+}
+
+function runStatusDisplay(run) {
+  const purge = runPurgeState(run);
+  if (["requested", "canceling", "purging"].includes(purge)) {
+    return `${statusBadge(run.status)} <span class="status deleting">${runPurgeDeletesRecord(run) ? "正在删除" : "正在清理产物"}</span>`;
+  }
+  if (purge === "failed") {
+    return `${statusBadge(run.status)} <span class="status failed">清理失败</span>`;
+  }
+  return statusBadge(run.status);
+}
+
+function runContentRevision(run) {
+  if (run?.content_revision === undefined || run?.content_revision === null) return null;
+  const revision = Number(run.content_revision);
+  return Number.isFinite(revision) ? revision : null;
+}
+
+function currentRunResultGeneration(runId) {
+  return Number(state.runResultGenerations[Number(runId)] || 0);
+}
+
+function abortSampleRequestsForRun(runId) {
+  const prefix = `${Number(runId)}:`;
+  for (const [key, controller] of Object.entries(state.sampleAbortControllers)) {
+    if (!key.startsWith(prefix)) continue;
+    controller.abort();
+    delete state.sampleAbortControllers[key];
+    delete state.sampleDetailLoading[key];
+  }
+}
+
+function abortTimelineRequest(runId = null) {
+  if (!state.timelineAbortController) return;
+  if (runId !== null && Number(state.timelineAbortRunId) !== Number(runId)) return;
+  state.timelineAbortController.abort();
+  state.timelineAbortController = null;
+  state.timelineAbortRunId = null;
+  state.timelineRequestGeneration += 1;
+}
+
+function abortRunDetailRequests(runId) {
+  abortSampleRequestsForRun(runId);
+  abortTimelineRequest(runId);
+}
+
+function clearRunScopedEntries(target, runId) {
+  const prefix = `${Number(runId)}:`;
+  for (const key of Object.keys(target)) {
+    if (key.startsWith(prefix)) delete target[key];
+  }
+}
+
+function invalidateRunResultCache(runId, options = {}) {
+  const id = Number(runId);
+  state.runResultGenerations[id] = currentRunResultGeneration(id) + 1;
+  abortRunDetailRequests(id);
+  clearRunScopedEntries(state.runVideoTimelines, id);
+  clearRunScopedEntries(state.sampleDetails, id);
+  clearRunScopedEntries(state.sampleDetailLoading, id);
+  delete state.compareInputsByRun[id];
+  if (Number(state.selectedRun?.id) === id) {
+    state.runVideosPage = null;
+    if (options.render !== false) renderRunDetail();
+  }
+}
+
+function runContentRevisionChanged(nextRun) {
+  const nextRevision = runContentRevision(nextRun);
+  const observedRevision = state.runContentRevisions[Number(nextRun?.id)];
+  return nextRevision !== null
+    && observedRevision !== undefined
+    && Number(observedRevision) !== nextRevision;
+}
+
 function shouldRefreshSelectedRun(nextRun) {
   if (!state.selectedRun || !nextRun) return false;
   if (!TERMINAL_STATUSES.has(nextRun.status)) return true;
-  return Number(nextRun.updated_at || 0) !== Number(state.selectedRun.updated_at || 0)
+  return runContentRevisionChanged(nextRun)
+    || Number(nextRun.updated_at || 0) !== Number(state.selectedRun.updated_at || 0)
     || String(nextRun.status || "") !== String(state.selectedRun.status || "")
     || Number(nextRun.progress_current || 0) !== Number(state.selectedRun.progress_current || 0)
     || Number(nextRun.progress_total || 0) !== Number(state.selectedRun.progress_total || 0);
 }
 
-async function refreshRunsOnly() {
-  state.runs = await api("/api/runs");
+async function refreshRunsOnce(options = {}) {
+  const requestGeneration = ++state.runsRefreshGeneration;
+  const nextRuns = await api("/api/runs");
+  if (requestGeneration !== state.runsRefreshGeneration) return;
+  state.runs = nextRuns;
   renderRuns();
   if (!isRunsViewActive()) {
     return;
@@ -1392,10 +1575,22 @@ async function refreshRunsOnly() {
   if (state.selectedRun) {
     const nextRun = state.runs.find((item) => Number(item.id) === Number(state.selectedRun.id));
     if (!nextRun) {
+      abortRunDetailRequests(state.selectedRun.id);
       state.selectedRun = null;
+      state.runVideosPage = null;
       renderEmptyRunDetail();
-    } else if (shouldRefreshSelectedRun(nextRun)) {
-      await selectRun(state.selectedRun.id, { quiet: true });
+    } else {
+      const becameTerminal = !TERMINAL_STATUSES.has(state.selectedRun.status)
+        && TERMINAL_STATUSES.has(nextRun.status);
+      const cleanedChanged = String(nextRun.artifact_cleaned_at || "")
+        !== String(state.selectedRun.artifact_cleaned_at || "");
+      const invalidateResults = !!options.forceSelected
+        || runContentRevisionChanged(nextRun)
+        || becameTerminal
+        || cleanedChanged;
+      if (invalidateResults || shouldRefreshSelectedRun(nextRun)) {
+        await selectRun(state.selectedRun.id, { quiet: true, invalidateResults });
+      }
     }
   }
   if (!state.selectedRun && state.runs.length) {
@@ -1405,6 +1600,29 @@ async function refreshRunsOnly() {
   if (!state.selectedRun) {
     renderEmptyRunDetail();
   }
+}
+
+function refreshRunsOnly(options = {}) {
+  if (options.forceSelected && state.selectedRun) {
+    invalidateRunResultCache(state.selectedRun.id);
+  }
+  state.runsRefreshQueued = true;
+  state.runsRefreshPendingForce = state.runsRefreshPendingForce || !!options.forceSelected;
+  if (state.runsRefreshPromise) return state.runsRefreshPromise;
+
+  const refreshLoop = async () => {
+    while (state.runsRefreshQueued) {
+      const forceSelected = state.runsRefreshPendingForce;
+      state.runsRefreshQueued = false;
+      state.runsRefreshPendingForce = false;
+      await refreshRunsOnce({ forceSelected });
+    }
+  };
+  const promise = refreshLoop().finally(() => {
+    if (state.runsRefreshPromise === promise) state.runsRefreshPromise = null;
+  });
+  state.runsRefreshPromise = promise;
+  return promise;
 }
 
 function runSourceLabel(run) {
@@ -1450,7 +1668,7 @@ function renderRuns() {
     },
     { label: "Run", render: (run) => `#${escapeHtml(run.id)}` },
     { label: "名称", render: (run) => escapeHtml(run.name || "-") },
-    { label: "状态", render: (run) => statusBadge(run.status) },
+    { label: "状态", render: (run) => runStatusDisplay(run) },
     { label: "类型", render: (run) => escapeHtml(run.metadata?.run_type || "model_inference") },
     { label: "来源", render: (run) => escapeHtml(runSourceLabel(run)) },
     { label: "进度", render: (run) => `${escapeHtml(run.progress_current || 0)}/${escapeHtml(run.progress_total || 0)}` },
@@ -1460,12 +1678,17 @@ function renderRuns() {
 }
 
 async function loadRunVideosPage(runId, page = 1) {
-  state.runVideosPage = await api(`/api/runs/${runId}/videos?page=${page}&page_size=20`);
+  const selectionGeneration = state.runSelectionGeneration;
+  const resultGeneration = currentRunResultGeneration(runId);
+  const payload = await api(`/api/runs/${runId}/videos?page=${page}&page_size=20`);
+  if (selectionGeneration !== state.runSelectionGeneration
+      || resultGeneration !== currentRunResultGeneration(runId)
+      || Number(state.selectedRun?.id) !== Number(runId)) return null;
+  state.runVideosPage = payload;
   state.runVideoPageByRun[runId] = Number(state.runVideosPage?.page || page || 1);
   const videos = state.runVideosPage?.videos || [];
   if (!videos.length) {
-    delete state.selectedVideoByRun[runId];
-    return;
+    return payload;
   }
   const selectedVideoName = state.selectedVideoByRun[runId];
   const selectedIsVisible = videos.some((item) => item.video_name === selectedVideoName);
@@ -1474,20 +1697,72 @@ async function loadRunVideosPage(runId, page = 1) {
   if (nextVideoName && !state.runVideoTimelines[`${runId}:${nextVideoName}`]) {
     await loadRunVideoTimeline(runId, nextVideoName);
   }
+  return payload;
 }
 
 async function selectRun(runId, options = {}) {
-  const previousRunId = state.selectedRun?.id;
-  state.selectedRun = await api(`/api/runs/${runId}`);
-  if (previousRunId !== state.selectedRun.id) {
-    state.sampleDetails = {};
-    state.sampleDetailLoading = {};
-    state.runVideoTimelines = {};
+  const id = Number(runId);
+  const selectionChanged = Number(state.selectedRun?.id) !== id;
+  if (selectionChanged) {
+    state.runSelectionGeneration += 1;
+    if (state.selectedRun) abortRunDetailRequests(state.selectedRun.id);
   }
-  state.metricSummary = await api(`/api/runs/${runId}/metric-summary`);
-  await loadRunVideosPage(runId, state.runVideoPageByRun[runId] || 1);
-  renderRunDetail();
-  if (!options.quiet) switchView("runs");
+  const selectionGeneration = state.runSelectionGeneration;
+  const selectRequestGeneration = ++state.runSelectRequestGeneration;
+  if (state.runSelectAbortController) state.runSelectAbortController.abort();
+  const controller = new AbortController();
+  state.runSelectAbortController = controller;
+  try {
+    const [run, metricSummary] = await Promise.all([
+      api(`/api/runs/${id}`, { signal: controller.signal }),
+      api(`/api/runs/${id}/metric-summary`, { signal: controller.signal }),
+    ]);
+    if (selectRequestGeneration !== state.runSelectRequestGeneration
+        || selectionGeneration !== state.runSelectionGeneration) return null;
+
+    const previousRunId = state.selectedRun?.id;
+    if (previousRunId !== undefined && Number(previousRunId) !== id) {
+      abortRunDetailRequests(previousRunId);
+      state.runVideosPage = null;
+    }
+    state.selectedRun = run;
+    state.metricSummary = metricSummary;
+
+    const revision = runContentRevision(run);
+    const observedRevision = state.runContentRevisions[id];
+    const revisionChanged = revision !== null
+      && observedRevision !== undefined
+      && Number(observedRevision) !== revision;
+    if (options.invalidateResults || revisionChanged) {
+      invalidateRunResultCache(id, { render: false });
+    }
+    if (revision !== null) state.runContentRevisions[id] = revision;
+
+    // Render the preserved video/frame selection as a skeleton while its fresh
+    // page and timeline are loading, rather than leaving stale artifact URLs.
+    renderRunDetail();
+    if (isCompareRun(run)) {
+      state.compareInputsByRun[id] = await api(`/api/runs/${id}/compare-inputs`, { signal: controller.signal })
+        .catch((error) => ({ error: error.message }));
+      if (selectRequestGeneration !== state.runSelectRequestGeneration
+          || selectionGeneration !== state.runSelectionGeneration) return null;
+    } else {
+      delete state.compareInputsByRun[id];
+    }
+    await loadRunVideosPage(id, state.runVideoPageByRun[id] || 1);
+    if (selectRequestGeneration !== state.runSelectRequestGeneration
+        || selectionGeneration !== state.runSelectionGeneration) return null;
+    renderRunDetail();
+    if (!options.quiet) switchView("runs");
+    return run;
+  } catch (error) {
+    if (error.name === "AbortError") return null;
+    throw error;
+  } finally {
+    if (state.runSelectAbortController === controller) {
+      state.runSelectAbortController = null;
+    }
+  }
 }
 
 function renderInferencePhase(run) {
@@ -1643,6 +1918,21 @@ function renderOutputHealthReport(run) {
     ? `<ul>${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join("")}</ul>`
     : "";
   return `<div class="${cls}"><p><strong>Output health</strong>: ${escapeHtml(summary)}</p>${detail}</div>`;
+}
+
+function renderRunPurgeNotice(run) {
+  const request = run?.purge_request;
+  if (!request) return "";
+  const state = String(request.status || "");
+  if (["requested", "canceling", "purging"].includes(state)) {
+    const phase = request.report?.phase || state;
+    const deleting = String(request.request_type || "") === "delete_run";
+    return `<div class="message warn"><p><strong>${deleting ? "正在删除" : "正在清理产物"}</strong>: ${escapeHtml(phase)}。VFIEval 会等待 worker 完全停止并安全清理 Run 产物和缓存引用${deleting ? "，完成后再隐藏记录" : ""}。</p></div>`;
+  }
+  if (state === "failed") {
+    return `<div class="message error"><p><strong>删除清理失败</strong>: ${escapeHtml(request.error?.message || "unknown error")}。再次点击“删除记录”即可重试。</p></div>`;
+  }
+  return "";
 }
 
 class Sha256Hasher {
@@ -1826,22 +2116,33 @@ async function loadRunVideoTimeline(runId, videoName, options = {}) {
   const windowStart = Number(
     options.windowStart ?? state.timelineWindowStartByVideo[windowKey] ?? 0,
   );
-  if (state.timelineAbortController) state.timelineAbortController.abort();
+  abortTimelineRequest();
   const controller = new AbortController();
+  const requestGeneration = ++state.timelineRequestGeneration;
+  const resultGeneration = currentRunResultGeneration(runId);
+  const selectionGeneration = state.runSelectionGeneration;
   state.timelineAbortController = controller;
+  state.timelineAbortRunId = Number(runId);
   try {
     const payload = await api(
       `/api/runs/${runId}/videos/${encodeURIComponent(videoName)}/timeline?bucket_count=160&window_start=${windowStart}&window_size=${TIMELINE_WINDOW_SIZE}${metric ? `&metric=${encodeURIComponent(metric)}` : ""}`,
       { signal: controller.signal },
     );
+    if (requestGeneration !== state.timelineRequestGeneration
+        || selectionGeneration !== state.runSelectionGeneration
+        || resultGeneration !== currentRunResultGeneration(runId)
+        || Number(state.selectedRun?.id) !== Number(runId)) return null;
     state.runVideoTimelines[windowKey] = payload;
     state.timelineWindowStartByVideo[windowKey] = Number(payload.window_start || 0);
     return payload;
   } catch (error) {
-    if (error.name === "AbortError") return state.runVideoTimelines[`${runId}:${videoName}`] || null;
+    if (error.name === "AbortError") return null;
     throw error;
   } finally {
-    if (state.timelineAbortController === controller) state.timelineAbortController = null;
+    if (state.timelineAbortController === controller) {
+      state.timelineAbortController = null;
+      state.timelineAbortRunId = null;
+    }
   }
 }
 
@@ -1855,6 +2156,71 @@ function renderRunVideosPager() {
       <button class="secondary" data-run-videos-page="${Number(page.page || 1) + 1}" ${Number(page.page || 1) >= Number(page.total_pages || 1) ? "disabled" : ""} type="button">下一页</button>
     </div>
   `;
+}
+
+function renderRunResultPlaceholder(run) {
+  if (!state.runVideosPage) {
+    return `
+      <div class="artifact-pending" aria-live="polite" aria-busy="true">
+        <div class="timeline-skeleton"><span></span><span></span><span></span></div>
+        <p class="muted">正在刷新这个 Run 的结果…</p>
+      </div>
+    `;
+  }
+  if (!TERMINAL_STATUSES.has(run.status) && !run.artifact_cleaned_at) {
+    return `
+      <div class="artifact-pending" aria-live="polite" aria-busy="true">
+        <div class="timeline-skeleton"><span></span><span></span><span></span></div>
+        <p class="muted">产物生成中，完成后会自动显示，无需刷新整个页面。</p>
+      </div>
+    `;
+  }
+  const reason = run.artifact_cleaned_at
+    ? "这个 Run 的产物已清理。"
+    : "这个 Run 完成刷新后仍没有可查看的产物。";
+  return `<div class="message warn"><p><strong>没有可加载的产物</strong>: ${escapeHtml(reason)}</p></div>`;
+}
+
+function compareInputRows(payload) {
+  if (Array.isArray(payload?.inputs)) return payload.inputs;
+  if (Array.isArray(payload?.slots)) return payload.slots;
+  const rows = [];
+  if (payload?.gt || payload?.reference) rows.push({ slot: "gt", label: "GT", ...(payload.gt || payload.reference) });
+  for (const [index, row] of (payload?.predictions || payload?.preds || []).entries()) {
+    rows.push({ slot: row.slot || `pred_${index + 1}`, label: row.label || row.method_label || `Pred ${String.fromCharCode(65 + index)}`, ...row });
+  }
+  return rows;
+}
+
+function compareInputSlotLabel(slot) {
+  const normalized = String(slot || "").toLowerCase();
+  if (normalized === "gt" || normalized === "reference") return "GT";
+  const match = normalized.match(/^pred_?([a-z])$/);
+  return match ? `Pred ${match[1].toUpperCase()}` : String(slot || "input");
+}
+
+function renderCompareInputMedia(runId, row) {
+  const slot = String(row.slot || row.kind || "");
+  if (!slot) return "";
+  const label = row.label || row.method_label || row.display_name || row.item_display_name || slot;
+  const slotLabel = compareInputSlotLabel(slot);
+  const base = `/api/runs/${Number(runId)}/compare-inputs/${encodeURIComponent(slot)}/media`;
+  const aligned = `${base}?variant=aligned`;
+  const original = `${base}?variant=original`;
+  const media = String(row.media_kind || row.kind || "video") === "frame_sequence"
+    ? `<img data-compare-input-media data-compare-input-base="${escapeHtml(base)}" loading="lazy" src="${aligned}" alt="${escapeHtml(`${slotLabel} ${label} aligned`)}">`
+    : `<video data-compare-input-media data-compare-input-base="${escapeHtml(base)}" controls playsinline preload="metadata" src="${aligned}"></video>`;
+  return `<article class="compare-input-tile" data-compare-input-slot="${escapeHtml(slot)}"><div class="panel-head"><div><h4>${escapeHtml(`${slotLabel} · ${label}`)}</h4><p class="muted">${escapeHtml([row.width && row.height ? `${row.width}×${row.height}` : "", row.frame_count ? `${row.frame_count} 帧` : ""].filter(Boolean).join(" · "))}</p></div><span class="compat-badge">${escapeHtml(`${slotLabel} · ${row.snapshot_active ? "snapshot" : "original member"}`)}</span></div><div class="segmented compare-input-variants" role="group" aria-label="${escapeHtml(`${slotLabel} input variant`)}"><button class="secondary active" data-compare-input-variant="aligned" type="button" aria-pressed="true">Aligned</button><button class="secondary" data-compare-input-variant="original" type="button" aria-pressed="false">Original</button></div>${media}<a href="${original}" target="_blank" rel="noreferrer">在新标签页打开原始输入</a></article>`;
+}
+
+function renderCompareInputs(run) {
+  if (!isCompareRun(run)) return "";
+  const payload = state.compareInputsByRun[Number(run.id)];
+  if (!payload) return `<section class="compare-input-panel" aria-busy="true"><div class="timeline-skeleton"><span></span><span></span><span></span></div><p class="muted">正在加载 Compare 输入与 Alignment Plan…</p></section>`;
+  if (payload.error) return `<div class="message warn"><p>Compare 输入暂时不可用：${escapeHtml(payload.error)}</p></div>`;
+  const rows = compareInputRows(payload);
+  const plan = payload.alignment_plan || payload.alignment || run.result?.alignment_plan || run.metadata?.alignment_plan || {};
+  return `<section class="compare-input-panel"><div class="panel-head"><div><h3>Compare 输入</h3><p class="muted">这些 Pred 引用原模型输出；Compare 不发布新的可复用 Pred。来源删除前会先切换到不可复用快照。</p></div></div>${renderAlignmentPlan(plan)}<div class="compare-input-grid">${rows.map((row) => renderCompareInputMedia(run.id, row)).join("")}</div></section>`;
 }
 
 function renderRunDetail() {
@@ -1873,12 +2239,13 @@ function renderRunDetail() {
         <p class="muted">${escapeHtml(runSourceLabel(run))}</p>
       </div>
       <div class="actions">
-        ${statusBadge(run.status)}
+        ${runStatusDisplay(run)}
+        <button class="secondary" data-refresh-run-results="${run.id}" type="button">刷新结果</button>
         <button class="secondary" data-rename-run="${run.id}" type="button">重命名</button>
         <button class="secondary" data-cancel-run="${run.id}" ${TERMINAL_STATUSES.has(run.status) ? "disabled" : ""} type="button">取消</button>
         <button class="secondary" data-retry-run="${run.id}" type="button">重试</button>
-        <button class="secondary danger" data-delete-run="${run.id}" type="button">删除记录</button>
-        <button class="secondary" data-cleanup-run="${run.id}" ${TERMINAL_STATUSES.has(run.status) && !run.artifact_cleaned_at ? "" : "disabled"} type="button">清理产物</button>
+        <button class="secondary danger" data-delete-run="${run.id}" ${["requested", "canceling", "purging"].includes(runPurgeState(run)) ? "disabled" : ""} type="button">${runPurgeState(run) === "failed" && runPurgeDeletesRecord(run) ? "重试删除" : "删除记录"}</button>
+        <button class="secondary" data-cleanup-run="${run.id}" ${TERMINAL_STATUSES.has(run.status) && !run.artifact_cleaned_at && !["requested", "canceling", "purging"].includes(runPurgeState(run)) ? "" : "disabled"} type="button">清理产物</button>
       </div>
     </div>
     <details class="run-meta" ${state.runMetaCollapsed ? "" : "open"}>
@@ -1892,6 +2259,7 @@ function renderRunDetail() {
         <div><span>产物数</span><strong>${escapeHtml(run.artifact_summary?.total || 0)}</strong></div>
       </div>
       ${renderRunError(run)}
+      ${renderRunPurgeNotice(run)}
       ${renderCleanedArtifactsNotice(run)}
       ${renderModelLoadReport(run)}
       ${renderOutputHealthReport(run)}
@@ -1901,6 +2269,7 @@ function renderRunDetail() {
       ${renderPortableMetricHealthTable(run.metadata?.metric_health || {})}
       ${renderRunJobs(run)}
     </details>
+    ${renderCompareInputs(run)}
     <div class="run-workspace">
       <aside class="video-tabs">
         <h3>视频</h3>
@@ -1909,11 +2278,11 @@ function renderRunDetail() {
             <strong>${escapeHtml(item.video_file || item.video_name)}</strong>
             <span>${escapeHtml(item.sample_count || 0)} samples</span>
           </button>
-        `).join("") : "<p class=\"muted\">运行完成后这里会显示可查看的视频。</p>"}
+        `).join("") : `<p class="muted">${TERMINAL_STATUSES.has(run.status) ? "没有可查看的视频。" : "产物生成中…"}</p>`}
         ${renderRunVideosPager()}
       </aside>
       <section class="sample-viewer">
-        ${video ? renderVideoTimeline(video) : (selectedVideoName ? "<div class=\"timeline-skeleton\" aria-busy=\"true\"><span></span><span></span><span></span></div>" : "<p class=\"muted\">暂无结果。</p>")}
+        ${video ? renderVideoTimeline(video) : renderRunResultPlaceholder(run)}
       </section>
     </div>
     ${renderRunFeedback(run, selectedVideoName, video)}
@@ -2435,8 +2804,11 @@ function sampleDetail(sampleId) {
 
 async function loadSampleDetail(sampleId) {
   if (!state.selectedRun) return;
-  const key = `${state.selectedRun.id}:${sampleId}`;
+  const runId = Number(state.selectedRun.id);
+  const key = `${runId}:${sampleId}`;
   if (state.sampleDetails[key] || state.sampleDetailLoading[key]) return;
+  const resultGeneration = currentRunResultGeneration(runId);
+  const selectionGeneration = state.runSelectionGeneration;
   state.sampleDetailLoading[key] = true;
   // Each sample gets its own abort controller so sibling loads in a compare
   // frame group (GT + predA + predB share a frame) do not cancel each other.
@@ -2444,16 +2816,30 @@ async function loadSampleDetail(sampleId) {
   const controller = new AbortController();
   state.sampleAbortControllers[key] = controller;
   try {
-    state.sampleDetails[key] = await api(`/api/runs/${state.selectedRun.id}/samples/${sampleId}`, { signal: controller.signal });
+    const payload = await api(`/api/runs/${runId}/samples/${sampleId}`, { signal: controller.signal });
+    if (state.sampleAbortControllers[key] !== controller
+        || selectionGeneration !== state.runSelectionGeneration
+        || resultGeneration !== currentRunResultGeneration(runId)
+        || Number(state.selectedRun?.id) !== runId) return;
+    state.sampleDetails[key] = payload;
   } catch (error) {
     if (error.name === "AbortError") return;
-    state.sampleDetails[key] = { sample_id: sampleId, artifacts: {}, extra_artifacts: [], load_error: error.message };
+    if (selectionGeneration === state.runSelectionGeneration
+        && resultGeneration === currentRunResultGeneration(runId)
+        && Number(state.selectedRun?.id) === runId) {
+      state.sampleDetails[key] = { sample_id: sampleId, artifacts: {}, extra_artifacts: [], load_error: error.message };
+    }
   } finally {
-    if (state.sampleAbortControllers[key] === controller) delete state.sampleAbortControllers[key];
-    delete state.sampleDetailLoading[key];
+    if (state.sampleAbortControllers[key] === controller) {
+      delete state.sampleAbortControllers[key];
+      delete state.sampleDetailLoading[key];
+    }
     // Prefer an in-place frame update so late-arriving sample detail does not
     // recreate the video players; fall back to a full render if unavailable.
-    if (!updateFrameRegion()) renderRunDetail();
+    if (selectionGeneration === state.runSelectionGeneration
+        && resultGeneration === currentRunResultGeneration(runId)
+        && Number(state.selectedRun?.id) === runId
+        && !updateFrameRegion()) renderRunDetail();
   }
 }
 
@@ -2662,6 +3048,24 @@ function renderCompareFrameGroup(video, sample) {
 }
 
 function renderSamplePreview(sample, video) {
+  const artifactsPending = sample.has_artifacts === false
+    && !sample.error
+    && !state.selectedRun?.artifact_cleaned_at
+    && !TERMINAL_STATUSES.has(state.selectedRun?.status);
+  if (artifactsPending) {
+    return `
+      <div class="sample-meta">
+        <strong>${escapeHtml(sample.sample_name)}</strong>
+        <span>frame ${escapeHtml(sample.frame_index)}</span>
+        <span>${sample.timestamp === null || sample.timestamp === undefined ? "-" : `${formatNumber(sample.timestamp)}s`}</span>
+        ${renderSampleMetrics(sample)}
+      </div>
+      <div class="artifact-pending sample-loading" aria-live="polite" aria-busy="true">
+        <div class="skeleton-card"><span></span><span></span></div>
+        <p class="muted">产物生成中，保存完成后会自动加载。</p>
+      </div>
+    `;
+  }
   if (video && isCompareRun(state.selectedRun)) {
     return renderCompareFrameGroup(video, sample);
   }
@@ -2731,10 +3135,16 @@ function renderSamplePreview(sample, video) {
 
 function setSampleIndex(videoName, index) {
   if (!state.selectedRun) return;
-  const video = state.runVideoTimelines[`${state.selectedRun.id}:${videoName}`];
+  const runId = Number(state.selectedRun.id);
+  const video = state.runVideoTimelines[`${runId}:${videoName}`];
   if (!video) return;
   const max = Math.max(0, (video.samples || []).length - 1);
-  state.selectedSampleByVideo[`${state.selectedRun.id}:${videoName}`] = Math.max(0, Math.min(max, index));
+  const key = `${runId}:${videoName}`;
+  const nextIndex = Math.max(0, Math.min(max, index));
+  if (Number(state.selectedSampleByVideo[key] || 0) !== nextIndex) {
+    abortSampleRequestsForRun(runId);
+  }
+  state.selectedSampleByVideo[key] = nextIndex;
   // Update only the frame-dependent region so the video players are not
   // recreated (which would reload and stutter). Fall back to a full render if
   // the region is not on the page (e.g. video not yet rendered).
@@ -2769,18 +3179,22 @@ function highlightTimelineFrame(frameIndex) {
 
 async function setSampleByFrame(videoName, frameIndex) {
   if (!state.selectedRun) return;
-  let video = state.runVideoTimelines[`${state.selectedRun.id}:${videoName}`];
+  const runId = Number(state.selectedRun.id);
+  abortSampleRequestsForRun(runId);
+  let video = state.runVideoTimelines[`${runId}:${videoName}`];
   if (!video) {
-    video = await loadRunVideoTimeline(state.selectedRun.id, videoName);
+    video = await loadRunVideoTimeline(runId, videoName);
   }
+  if (!video || Number(state.selectedRun?.id) !== runId) return;
   let index = (video.samples || []).findIndex((sample) => Number(sample.frame_index) === Number(frameIndex));
   if (index < 0) {
     const windowStart = Math.max(0, Number(frameIndex) - 150);
-    video = await loadRunVideoTimeline(state.selectedRun.id, videoName, { windowStart });
+    video = await loadRunVideoTimeline(runId, videoName, { windowStart });
+    if (!video || Number(state.selectedRun?.id) !== runId) return;
     index = (video.samples || []).findIndex((sample) => Number(sample.frame_index) === Number(frameIndex));
   }
-  state.selectedVideoByRun[state.selectedRun.id] = video.video_name;
-  state.selectedSampleByVideo[`${state.selectedRun.id}:${video.video_name}`] = Math.max(0, index);
+  state.selectedVideoByRun[runId] = video.video_name;
+  state.selectedSampleByVideo[`${runId}:${video.video_name}`] = Math.max(0, index);
   renderRunDetail();
 }
 
@@ -2788,6 +3202,14 @@ async function cancelRun(runId) {
   await api(`/api/runs/${runId}/cancel`, { method: "POST", body: "{}" });
   toast("已请求取消");
   await refreshRunsOnly();
+}
+
+async function refreshRunResults(runId = null) {
+  if (runId !== null && Number(state.selectedRun?.id) !== Number(runId)) {
+    await selectRun(runId, { quiet: true });
+  }
+  await refreshRunsOnly({ forceSelected: !!state.selectedRun });
+  toast(state.selectedRun ? `Run #${state.selectedRun.id} 结果已刷新` : "运行列表已刷新");
 }
 
 async function retryRun(runId) {
@@ -2798,16 +3220,9 @@ async function retryRun(runId) {
 }
 
 async function deleteRun(runId) {
-  const wasSelected = Number(state.selectedRun?.id) === Number(runId);
-  await api(`/api/runs/${runId}`, { method: "DELETE" });
-  toast(`Run #${runId} 已从列表隐藏`);
-  if (wasSelected) {
-    state.selectedRun = null;
-  }
+  const result = await api(`/api/runs/${runId}`, { method: "DELETE" });
+  toast(result.deleted ? `Run #${runId} 已清理并删除` : `Run #${runId} 已进入删除队列`);
   await refreshRunsOnly();
-  if (!state.selectedRun) {
-    renderEmptyRunDetail();
-  }
 }
 
 async function renameRun(runId) {
@@ -2837,23 +3252,21 @@ async function batchDeleteRuns() {
     method: "POST",
     body: JSON.stringify({ run_ids: ids }),
   });
+  const accepted = new Set((result.accepted || result.deleted || []).map(Number));
   const deleted = new Set((result.deleted || []).map(Number));
   if (state.selectedRun && deleted.has(Number(state.selectedRun.id))) {
     state.selectedRun = null;
   }
   state.selectedRunIds.clear();
-  toast(`已删除 ${result.deleted?.length || 0} 条记录`);
+  toast(`已受理 ${accepted.size} 条删除${result.failures?.length ? `，${result.failures.length} 条失败` : ""}`);
   await refreshRunsOnly();
   if (!state.selectedRun) renderEmptyRunDetail();
 }
 
 async function cleanupRunArtifacts(runId) {
-  await api(`/api/runs/${runId}/cleanup-artifacts`, { method: "POST", body: "{}" });
-  toast(`Run #${runId} 产物已清理`);
-  await refreshRunsOnly();
-  if (state.selectedRun?.id === runId) {
-    await selectRun(runId, { quiet: true });
-  }
+  const result = await api(`/api/runs/${runId}/cleanup-artifacts`, { method: "POST", body: "{}" });
+  toast(result.artifact_cleaned ? `Run #${runId} 产物已清理` : `Run #${runId} 已进入清理队列`);
+  await refreshRunsOnly({ forceSelected: Number(state.selectedRun?.id) === Number(runId) });
 }
 
 async function submitRunFeedback(runId, form) {
@@ -3098,6 +3511,93 @@ function mediaAssetContent(asset) {
   return `<a href="/api/media/assets/${Number(asset.id)}/content" target="_blank" rel="noreferrer">查看首帧</a>`;
 }
 
+function externalPredictionAssets() {
+  return (state.mediaAssets || []).filter((asset) =>
+    asset.source_kind === "upload"
+    && asset.role === "pred"
+    && asset.state === "ready",
+  );
+}
+
+function renderExternalPredictionBinding() {
+  const form = $("external-pred-binding-form");
+  if (!form) return;
+  const groups = state.externalPredItemGroups || [];
+  const groupSelect = form.elements.group_id;
+  const itemSelect = form.elements.item_id;
+  const assetSelect = form.elements.asset_id;
+  const submit = $("bind-external-pred");
+  const status = $("external-pred-binding-status");
+  const previousItem = String(itemSelect.value || "");
+  const previousAsset = String(assetSelect.value || "");
+  groupSelect.innerHTML = groups.length
+    ? groups.map((group) => {
+        const id = String(group.group_id || group.collection_id || group.id || "");
+        return `<option value="${escapeHtml(id)}" ${id === String(state.selectedExternalPredGroupId) ? "selected" : ""}>${escapeHtml(group.name || group.display_name || group.collection_name || id)} (${Number(group.item_count || group.count || 0)})</option>`;
+      }).join("")
+    : '<option value="">No canonical GT Collection</option>';
+  const items = state.externalPredItems || [];
+  itemSelect.innerHTML = items.length
+    ? items.map((item) => {
+        const id = compareItemId(item);
+        const metadata = [
+          item.width && item.height ? `${item.width}×${item.height}` : "",
+          item.frame_count ? `${item.frame_count} frames` : "",
+          item.fps != null ? `${formatNumber(item.fps)} fps` : "",
+        ].filter(Boolean).join(" · ");
+        return `<option value="${id}">${escapeHtml(compareItemTitle(item))}${metadata ? ` · ${escapeHtml(metadata)}` : ""}</option>`;
+      }).join("")
+    : '<option value="">No canonical GT Item</option>';
+  if (items.some((item) => String(compareItemId(item)) === previousItem)) itemSelect.value = previousItem;
+  const assets = externalPredictionAssets();
+  assetSelect.innerHTML = assets.length
+    ? assets.map((asset) => {
+        const metadata = [
+          asset.width && asset.height ? `${asset.width}×${asset.height}` : "",
+          asset.frame_count ? `${asset.frame_count} frames` : "",
+          asset.fps != null ? `${formatNumber(asset.fps)} fps` : "",
+          asset.collection_name || "",
+        ].filter(Boolean).join(" · ");
+        return `<option value="${Number(asset.id)}">${escapeHtml(asset.display_name || asset.original_name || `Uploaded Pred #${asset.id}`)}${metadata ? ` · ${escapeHtml(metadata)}` : ""}</option>`;
+      }).join("")
+    : '<option value="">Upload an External Pred first</option>';
+  if (assets.some((asset) => String(asset.id) === previousAsset)) assetSelect.value = previousAsset;
+  const ready = Boolean(groups.length && items.length && assets.length);
+  if (submit) submit.disabled = !ready;
+  if (status) {
+    status.textContent = ready
+      ? "This is an explicit GT Item binding. It does not make unbound or Compare-derived media reusable."
+      : (!groups.length
+        ? "Create or sync a Collection with a canonical GT Item first."
+        : (!items.length
+          ? "The selected Collection has no ready canonical GT Item."
+          : "Upload a ready External Pred before binding it."));
+  }
+}
+
+async function loadExternalPredictionBindingItems() {
+  const generation = ++state.externalPredItemRequestGeneration;
+  const groupId = Number(state.selectedExternalPredGroupId || 0);
+  if (!groupId) {
+    state.externalPredItems = [];
+    renderExternalPredictionBinding();
+    return;
+  }
+  const first = await api(`/api/media/items?group_id=${encodeURIComponent(groupId)}&page=1&page_size=200`);
+  const pageCount = Math.max(1, Number(first.total_pages || first.page_count || 1));
+  const pages = pageCount > 1
+    ? await Promise.all(Array.from({ length: pageCount - 1 }, (_row, index) =>
+      api(`/api/media/items?group_id=${encodeURIComponent(groupId)}&page=${index + 2}&page_size=200`)))
+    : [];
+  if (generation !== state.externalPredItemRequestGeneration) return;
+  const byId = new Map();
+  for (const item of [first, ...pages].flatMap((page) => page.items || [])) {
+    byId.set(compareItemId(item), item);
+  }
+  state.externalPredItems = Array.from(byId.values());
+  renderExternalPredictionBinding();
+}
+
 function renderMediaLibrary() {
   const collectionSelect = $("upload-form")?.elements.collection_id;
   if (collectionSelect) {
@@ -3119,15 +3619,30 @@ function renderMediaLibrary() {
     { label: "状态", render: (asset) => statusBadge(asset.state || "ready") },
     { label: "操作", render: (asset) => asset.source_kind === "upload" ? `<button class="danger secondary" data-media-delete="${Number(asset.id)}" type="button">软删除</button>` : "-" },
   ])}</div>`;
+  renderExternalPredictionBinding();
 }
 
 async function loadMediaLibrary() {
-  const [collectionsPayload, assetsPayload] = await Promise.all([
+  const [collectionsPayload, assetsPayload, groupsPayload] = await Promise.all([
     api("/api/media/collections"),
-    api("/api/media/assets?page_size=200&state="),
+    api("/api/media/sources?page_size=200&state="),
+    api("/api/media/item-groups?role=gt"),
   ]);
   state.mediaCollections = collectionsPayload.collections || [];
   state.mediaAssets = assetsPayload.assets || [];
+  state.externalPredItemGroups = groupsPayload.groups || groupsPayload.item_groups || [];
+  const groupIds = new Set(state.externalPredItemGroups.map((group) =>
+    String(group.group_id || group.collection_id || group.id || ""),
+  ));
+  if (!groupIds.has(String(state.selectedExternalPredGroupId))) {
+    state.selectedExternalPredGroupId = String(
+      state.externalPredItemGroups[0]?.group_id
+      || state.externalPredItemGroups[0]?.collection_id
+      || state.externalPredItemGroups[0]?.id
+      || "",
+    );
+  }
+  await loadExternalPredictionBindingItems();
   renderMediaLibrary();
 }
 
@@ -3232,6 +3747,61 @@ async function uploadExternalMedia(event) {
   setProgress("上传完成");
   await loadMediaLibrary();
   toast("媒体资产已上传");
+}
+
+function optionalJsonObject(value, label) {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (_error) {
+    throw new Error(`${label} must be valid JSON`);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`${label} must be a JSON object`);
+  }
+  return parsed;
+}
+
+async function bindExternalPrediction(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const itemId = Number(form.elements.item_id.value || 0);
+  const assetId = Number(form.elements.asset_id.value || 0);
+  const methodKey = String(form.elements.method_key.value || "").trim();
+  if (!itemId || !assetId || !methodKey) {
+    throw new Error("Select one canonical GT Item, one uploaded Pred, and a method key");
+  }
+  const temporalMapping = optionalJsonObject(form.elements.temporal_mapping.value, "Temporal mapping");
+  const spatialOrigin = optionalJsonObject(form.elements.spatial_origin.value, "Spatial origin");
+  const payload = {
+    asset_id: assetId,
+    method_key: methodKey,
+    aspect_stretch_confirmed: Boolean(form.elements.aspect_stretch_confirmed.checked),
+  };
+  if (temporalMapping) payload.temporal_mapping = temporalMapping;
+  if (spatialOrigin) payload.spatial_origin = spatialOrigin;
+  await api(`/api/media/items/${itemId}/external-predictions`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  form.elements.temporal_mapping.value = "";
+  form.elements.spatial_origin.value = "";
+  form.elements.aspect_stretch_confirmed.checked = false;
+  await loadMediaLibrary();
+  if (state.compareSourcesLoaded) {
+    await loadCompareSources();
+    scheduleComparePreflight(0);
+  }
+  toast("External Pred is now explicitly bound to the selected GT Media Item");
+}
+
+async function selectExternalPredictionBindingGroup(event) {
+  state.selectedExternalPredGroupId = event.target.value || "";
+  state.externalPredItems = [];
+  renderExternalPredictionBinding();
+  await loadExternalPredictionBindingItems();
 }
 
 async function deleteMediaAsset(assetId) {
@@ -3559,6 +4129,26 @@ async function refreshCatalog() {
   }
 }
 
+document.addEventListener("click", (event) => {
+  const button = event.target.closest?.("[data-compare-input-variant]");
+  if (!button) return;
+  const tile = button.closest("[data-compare-input-slot]");
+  const media = tile?.querySelector("[data-compare-input-media]");
+  const variant = button.dataset.compareInputVariant;
+  const base = media?.dataset.compareInputBase;
+  if (!media || !base || !["original", "aligned"].includes(variant)) return;
+  const next = `${base}?variant=${variant}`;
+  if (media.src !== new URL(next, window.location.origin).href) {
+    media.src = next;
+    if (media.tagName === "VIDEO") media.load();
+  }
+  tile.querySelectorAll("[data-compare-input-variant]").forEach((item) => {
+    const active = item === button;
+    item.classList.toggle("active", active);
+    item.setAttribute("aria-pressed", String(active));
+  });
+});
+
 document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("click", () => {
   (async () => {
     const view = item.dataset.view;
@@ -3579,10 +4169,12 @@ document.querySelectorAll(".nav-item").forEach((item) => item.addEventListener("
     }
     if (view === "media") {
       await loadMediaLibrary();
+      await window.VFIEvalStudio?.load?.();
       return;
     }
     if (view === "evaluations") {
-      await loadEvaluations();
+      if (!window.VFIEvalStudio) throw new Error("Evaluation Studio 尚未加载");
+      await window.VFIEvalStudio.load();
       return;
     }
     if (view !== "runs") {
@@ -3605,16 +4197,18 @@ $("compare-form").addEventListener("submit", (event) => startCompareRun(event).c
 $("create-adhoc-evaluation").addEventListener("click", () => createAdhocEvaluation().catch((error) => toast(error.message)));
 $("collection-form").addEventListener("submit", (event) => createMediaCollection(event).catch((error) => toast(error.message)));
 $("upload-form").addEventListener("submit", (event) => uploadExternalMedia(event).catch((error) => toast(error.message)));
+$("external-pred-binding-form").addEventListener("submit", (event) => bindExternalPrediction(event).catch((error) => toast(error.message)));
+$("external-pred-item-group").addEventListener("change", (event) => selectExternalPredictionBindingGroup(event).catch((error) => toast(error.message)));
 $("evaluator-form").addEventListener("submit", (event) => saveEvaluator(event).catch((error) => toast(error.message)));
 $("campaign-form").addEventListener("submit", (event) => createEvaluationCampaign(event).catch((error) => toast(error.message)));
 $("candidate-form").addEventListener("submit", (event) => addEvaluationCandidate(event).catch((error) => toast(error.message)));
-$("refresh").addEventListener("click", () => refreshRunsOnly().catch((error) => toast(error.message)));
+$("refresh").addEventListener("click", () => refreshRunResults().catch((error) => toast(error.message)));
 $("refresh-files").addEventListener("click", () => refreshCatalog().then(() => toast("文件列表已刷新")).catch((error) => toast(error.message)));
 $("refresh-compare-sources").addEventListener("click", () => loadCompareSources({ gtPage: 1, predPage: 1 }).then(() => scheduleComparePreflight(0)).then(() => toast("对比来源已刷新")).catch((error) => toast(error.message)));
 $("refresh-stats").addEventListener("click", () => loadStats().then(() => toast("统计数据已刷新")).catch((error) => toast(error.message)));
 $("infer-form").addEventListener("input", () => schedulePreflight());
 $("compare-form").addEventListener("input", () => scheduleComparePreflight());
-$("refresh-media").addEventListener("click", () => loadMediaLibrary().then(() => toast("媒体资产已刷新")).catch((error) => toast(error.message)));
+$("refresh-media").addEventListener("click", () => Promise.all([loadMediaLibrary(), window.VFIEvalStudio?.load?.()]).then(() => toast("媒体资产已刷新")).catch((error) => toast(error.message)));
 $("pause-upload").addEventListener("click", () => {
   state.uploadPaused = true;
   toast(state.activeUpload ? "将在当前分片完成后暂停" : "当前没有进行中的上传");
@@ -3666,49 +4260,45 @@ document.addEventListener("change", (event) => {
     schedulePreflight(0);
     return;
   }
-  const compareGt = event.target.closest("[data-compare-gt]");
-  if (compareGt) {
-    state.selectedCompareGtKey = compareGt.dataset.compareGt;
-    state.selectedComparePredArtifacts = new Set();
-    state.comparePredPage = 1;
-    loadCompareSources({ predPage: 1 }).then(() => scheduleComparePreflight(0)).catch((error) => toast(error.message));
+  const compareGroup = event.target.closest("[data-compare-group]");
+  if (compareGroup) {
+    state.selectedCompareGroupId = compareGroup.value || "";
+    state.selectedCompareItemId = null;
+    state.selectedComparePredMembers.clear();
+    state.compareItemQuery = "";
+    state.compareItemPage = 1;
+    loadCompareSources({ page: 1 }).then(() => scheduleComparePreflight(0)).catch((error) => toast(error.message));
+    return;
+  }
+  const compareItem = event.target.closest("[data-compare-item]");
+  if (compareItem) {
+    state.selectedCompareItemId = Number(compareItem.dataset.compareItem);
+    state.selectedComparePredMembers.clear();
+    loadCompareSources().then(() => scheduleComparePreflight(0)).catch((error) => toast(error.message));
     return;
   }
   const comparePred = event.target.closest("[data-compare-pred]");
   if (comparePred) {
-    const artifactId = Number(comparePred.dataset.comparePred);
-    if (comparePred.checked) state.selectedComparePredArtifacts.add(artifactId);
-    else state.selectedComparePredArtifacts.delete(artifactId);
-    renderCompareSelection();
-    scheduleComparePreflight(0);
-    return;
-  }
-  const compareLayerKind = event.target.closest("[data-compare-layer-kind]");
-  if (compareLayerKind) {
-    const kind = compareLayerKind.dataset.compareLayerKind;
-    if (compareLayerKind.checked) state.selectedCompareLayerKinds.add(kind);
-    else state.selectedCompareLayerKinds.delete(kind);
+    const memberId = Number(comparePred.dataset.comparePred);
+    if (comparePred.checked) {
+      if (state.selectedComparePredMembers.size >= 2) {
+        comparePred.checked = false;
+        toast("Compare 最多选择两份 Pred");
+        return;
+      }
+      state.selectedComparePredMembers.add(memberId);
+    } else state.selectedComparePredMembers.delete(memberId);
     renderCompareSelection();
     scheduleComparePreflight(0);
     return;
   }
   const compareQuery = event.target.closest("[data-compare-query]");
   if (compareQuery) {
-    if (compareQuery.dataset.compareQuery === "gt") {
-      state.compareGtQuery = compareQuery.value || "";
-      state.compareGtPage = 1;
-      state.comparePredPage = 1;
-    } else {
-      state.comparePredQuery = compareQuery.value || "";
-      state.comparePredPage = 1;
-    }
+    state.compareItemQuery = compareQuery.value || "";
+    state.compareItemPage = 1;
+    state.selectedCompareItemId = null;
+    state.selectedComparePredMembers.clear();
     loadCompareSources().then(() => scheduleComparePreflight(0)).catch((error) => toast(error.message));
-    return;
-  }
-  const compareTrackLabel = event.target.closest("[data-compare-track-label]");
-  if (compareTrackLabel) {
-    state.compareTrackLabels[Number(compareTrackLabel.dataset.compareTrackLabel)] = compareTrackLabel.value || "";
-    scheduleComparePreflight(0);
     return;
   }
   const compareMetric = event.target.closest("#compare-metrics-options input[name='compare_metrics']");
@@ -3888,20 +4478,12 @@ document.addEventListener("click", async (event) => {
     scheduleComparePreflight(0);
     return;
   }
-  if (event.target.closest("[data-compare-gt-clear]")) {
-    state.selectedCompareGtKey = "";
-    renderCompareSelection();
-    scheduleComparePreflight(0);
-    return;
-  }
   const comparePage = event.target.closest("[data-compare-page]");
   if (comparePage) {
     const page = Number(comparePage.dataset.page || 1);
-    if (comparePage.dataset.comparePage === "gt") {
-      await loadCompareSources({ gtPage: page, predPage: 1 });
-    } else {
-      await loadCompareSources({ predPage: page });
-    }
+    state.selectedCompareItemId = null;
+    state.selectedComparePredMembers.clear();
+    await loadCompareSources({ page });
     scheduleComparePreflight(0);
     return;
   }
@@ -3962,6 +4544,11 @@ document.addEventListener("click", async (event) => {
     await selectRun(Number(runButton.dataset.runId));
     return;
   }
+  const refreshResultsButton = event.target.closest("[data-refresh-run-results]");
+  if (refreshResultsButton) {
+    await refreshRunResults(Number(refreshResultsButton.dataset.refreshRunResults));
+    return;
+  }
   const cancelButton = event.target.closest("[data-cancel-run]");
   if (cancelButton) {
     await cancelRun(Number(cancelButton.dataset.cancelRun));
@@ -3989,6 +4576,7 @@ document.addEventListener("click", async (event) => {
   }
   const runVideosPage = event.target.closest("[data-run-videos-page]");
   if (runVideosPage && state.selectedRun) {
+    abortSampleRequestsForRun(state.selectedRun.id);
     await loadRunVideosPage(state.selectedRun.id, Number(runVideosPage.dataset.runVideosPage));
     renderRunDetail();
     return;
@@ -4019,6 +4607,7 @@ document.addEventListener("click", async (event) => {
   }
   const videoTab = event.target.closest("[data-run-video]");
   if (videoTab && state.selectedRun) {
+    abortSampleRequestsForRun(state.selectedRun.id);
     state.selectedVideoByRun[state.selectedRun.id] = videoTab.dataset.runVideo;
     if (!state.runVideoTimelines[`${state.selectedRun.id}:${videoTab.dataset.runVideo}`]) {
       await loadRunVideoTimeline(state.selectedRun.id, videoTab.dataset.runVideo);
@@ -4030,6 +4619,7 @@ document.addEventListener("click", async (event) => {
   if (windowNav && state.selectedRun) {
     const videoName = state.selectedVideoByRun[state.selectedRun.id];
     const nextStart = Math.max(0, Number(windowNav.dataset.windowStart || 0));
+    abortSampleRequestsForRun(state.selectedRun.id);
     await loadRunVideoTimeline(state.selectedRun.id, videoName, { windowStart: nextStart });
     // Reset the in-window selection to the first frame of the new window.
     state.selectedSampleByVideo[`${state.selectedRun.id}:${videoName}`] = 0;
@@ -4116,12 +4706,27 @@ document.addEventListener("toggle", (event) => {
 }, true);
 
 function startRunsPoll() {
-  setInterval(() => {
-    if (document.hidden) return;
-    refreshRunsOnly().catch(() => {});
-  }, 2000);
+  let timer = null;
+  const schedule = (delay = 2000) => {
+    if (timer !== null) clearTimeout(timer);
+    timer = setTimeout(async () => {
+      timer = null;
+      if (!document.hidden) await refreshRunsOnly().catch(() => {});
+      const hasActiveRun = state.runs.some((run) =>
+        !TERMINAL_STATUSES.has(run.status)
+        || ["requested", "canceling", "purging"].includes(runPurgeState(run)));
+      schedule(hasActiveRun ? 2000 : 10000);
+    }, delay);
+  };
+  schedule();
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) refreshRunsOnly().catch(() => {});
+    if (document.hidden) {
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      return;
+    }
+    refreshRunsOnly().catch(() => {});
+    schedule(state.runs.some((run) => !TERMINAL_STATUSES.has(run.status)) ? 2000 : 10000);
   });
 }
 

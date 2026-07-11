@@ -8,6 +8,7 @@ from PIL import Image
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
 from vfieval.file_inputs import VIDEO_SUFFIXES, inspect_video, project_root, resolve_video_group
+from vfieval.alignment import plan_alignment, validate_temporal_alignment
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
@@ -111,9 +112,141 @@ def resolve_compare_descriptor(
         info = _resolve_media_asset_descriptor(workspace, db, descriptor, role=role)
         info.update({"descriptor_kind": "media_asset", "role": role or "distorted"})
         return info
+    if kind == "media_item":
+        if "path" in descriptor:
+            raise ValueError("media_item descriptors must not include client-supplied paths")
+        if role not in {None, "reference"}:
+            raise ValueError("media_item descriptors are only valid for the compare reference")
+        info = _resolve_media_item_descriptor(workspace, db, descriptor)
+        info.update({"descriptor_kind": "media_item", "role": "reference"})
+        return info
+    if kind == "media_item_member":
+        if "path" in descriptor:
+            raise ValueError("media_item_member descriptors must not include client-supplied paths")
+        if role == "reference":
+            raise ValueError("media_item_member descriptors are only valid for compare predictions")
+        info = _resolve_media_item_member_descriptor(workspace, db, descriptor, role=role)
+        info.update({"descriptor_kind": "media_item_member", "role": role or "distorted"})
+        return info
     if not kind and "path" in descriptor:
         raise ValueError("structured compare descriptors must use server-resolved sources, not path fields")
     raise ValueError(f"unsupported compare source descriptor kind: {kind or '<missing>'}")
+
+
+def _resolve_media_item_descriptor(
+    workspace: WorkspaceConfig,
+    db: Database,
+    descriptor: dict[str, Any],
+) -> dict[str, Any]:
+    from vfieval.media_items import resolve_item_reference
+
+    item_id = _positive_int(descriptor.get("item_id"), "media_item descriptor requires item_id")
+    item, member, asset, path = resolve_item_reference(db, workspace, item_id)
+    return _item_source_info(
+        workspace,
+        descriptor,
+        item=item,
+        member=member,
+        asset=asset,
+        path=path,
+        default_label=str(item.get("display_name") or f"item-{item_id}"),
+    )
+
+
+def _resolve_media_item_member_descriptor(
+    workspace: WorkspaceConfig,
+    db: Database,
+    descriptor: dict[str, Any],
+    *,
+    role: str | None,
+) -> dict[str, Any]:
+    from vfieval.media_assets import is_compare_derived_asset
+    from vfieval.media_items import resolve_item_member
+
+    member_id = _positive_int(
+        descriptor.get("member_id"),
+        "media_item_member descriptor requires member_id",
+    )
+    item, member, asset, path = resolve_item_member(
+        db,
+        workspace,
+        member_id,
+        require_reusable=role in {None, "distorted"},
+    )
+    if role in {None, "distorted"} and is_compare_derived_asset(db, asset):
+        raise ValueError("video_compare derived media cannot be reused as Compare input")
+    if role in {None, "distorted"} and str(member.get("member_role") or "") not in {
+        "model_pred",
+        "external_pred",
+    }:
+        raise ValueError("compare Pred must be a reusable model or external prediction member")
+    return _item_source_info(
+        workspace,
+        descriptor,
+        item=item,
+        member=member,
+        asset=asset,
+        path=path,
+        default_label=str(member.get("run_name") or member.get("display_name") or f"member-{member_id}"),
+    )
+
+
+def _item_source_info(
+    workspace: WorkspaceConfig,
+    descriptor: dict[str, Any],
+    *,
+    item: dict[str, Any],
+    member: dict[str, Any],
+    asset: dict[str, Any],
+    path: Path,
+    default_label: str,
+) -> dict[str, Any]:
+    info = inspect_compare_path(workspace, path)
+    temporal = dict(member.get("temporal_mapping") or {})
+    spatial_origin = dict(member.get("spatial_origin") or {})
+    member_metadata = dict(member.get("metadata") or {})
+    asset_metadata = dict(asset.get("metadata") or {})
+    provenance = dict(asset.get("provenance") or {})
+    label = str(descriptor.get("label") or descriptor.get("track_label") or default_label)
+    temporal_fps = temporal.get("fps")
+    if temporal_fps in {None, ""}:
+        temporal_fps = member.get("fps") or asset.get("fps") or item.get("fps")
+    if info.get("fps") is None and temporal_fps not in {None, ""}:
+        info["fps"] = float(temporal_fps)
+    info.update(
+        {
+            "item_id": int(item["id"]),
+            "item_key": item.get("item_key"),
+            "canonical_gt_asset_id": int(item["canonical_gt_asset_id"]),
+            "member_id": int(member["id"]),
+            "asset_id": int(member["asset_id"]),
+            "member_role": member.get("member_role"),
+            "producer_kind": member.get("producer_kind"),
+            "producer_run_id": member.get("producer_run_id"),
+            "method_key": member.get("method_key"),
+            "reusable_as_pred": bool(member.get("reusable_as_pred")),
+            "temporal_mapping": temporal,
+            "spatial_origin": spatial_origin,
+            "allow_aspect_stretch": bool(member_metadata.get("aspect_stretch_confirmed")),
+            "source_frame_indices": temporal.get("source_frame_indices"),
+            "temporal_fps": temporal_fps,
+            "temporal_timestamps": temporal.get("timestamps"),
+            "timestamps": temporal.get("timestamps"),
+            "source_kind": asset.get("source_kind"),
+            "media_kind": asset.get("media_kind"),
+            "asset_role": asset.get("role"),
+            "asset_metadata": asset_metadata,
+            "run_id": member.get("producer_run_id"),
+            "track_run_id": member.get("producer_run_id"),
+            "artifact_id": provenance.get("artifact_id"),
+            "artifact_kind": provenance.get("artifact_kind"),
+            "video": provenance.get("video_name") or provenance.get("video") or path.stem,
+            "video_name": provenance.get("video_name") or provenance.get("video") or path.stem,
+            "label": label,
+            "track_label": label,
+        }
+    )
+    return info
 
 
 def _resolve_media_asset_descriptor(
@@ -122,10 +255,12 @@ def _resolve_media_asset_descriptor(
     descriptor: dict[str, Any],
     role: str | None,
 ) -> dict[str, Any]:
-    from vfieval.media_assets import resolve_asset_path
+    from vfieval.media_assets import is_compare_derived_asset, resolve_asset_path
 
     asset_id = _positive_int(descriptor.get("asset_id"), "media_asset descriptor requires asset_id")
     asset, path = resolve_asset_path(db, workspace, asset_id, role=role)
+    if is_compare_derived_asset(db, asset):
+        raise ValueError("video_compare derived media cannot be reused as Compare input")
     info = inspect_compare_path(workspace, path)
     provenance = asset.get("provenance") or {}
     metadata = asset.get("metadata") or {}
@@ -187,6 +322,8 @@ def _resolve_run_artifact_descriptor(
     run_id = _positive_int(descriptor.get("run_id"), "run_artifact descriptor requires run_id")
     artifact_kind = str(descriptor.get("artifact_kind") or "pred_video")
     run = db.get_run(run_id)
+    if str((run.get("metadata") or {}).get("run_type") or "model_inference") == "video_compare":
+        raise ValueError("video_compare Run artifacts cannot be reused as Compare predictions")
     if run.get("artifact_cleaned_at") is not None:
         raise ValueError(f"run {run_id} artifacts have been cleaned")
     if str(run.get("status") or "") not in COMPARE_SOURCE_RUN_STATUSES:
@@ -313,6 +450,31 @@ def validate_strict_alignment(reference: dict[str, Any], distorted: dict[str, An
         "distorted_needs_downscale": False,
         "fps": reference_fps if reference_fps is not None else distorted_fps,
     }
+
+
+def plan_compare_alignment(
+    reference: dict[str, Any],
+    distorted_tracks: list[dict[str, Any]],
+    *,
+    spatial_policy: dict[str, Any] | None = None,
+    temporal_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the shared Compare/Campaign alignment report.
+
+    Media Item identity is intentionally outside this function: the API layer
+    must first prove that GT and every Pred belong to the same canonical Item.
+    Here we validate temporal identity and describe the explicit LANCZOS
+    normalization that downstream sample materialization and metrics must use.
+    """
+
+    if temporal_summary is None:
+        temporal_summary = validate_temporal_alignment(reference, distorted_tracks)
+    return plan_alignment(
+        reference,
+        distorted_tracks,
+        spatial_policy=spatial_policy,
+        temporal_summary=temporal_summary,
+    )
 
 
 def validate_strict_decoded_alignment(

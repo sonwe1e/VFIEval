@@ -13,8 +13,6 @@ class CompareUiHookTests(unittest.TestCase):
         styles = (ROOT / "src" / "vfieval" / "web" / "styles.css").read_text(encoding="utf-8")
 
         self.assertIn("compare_layers", app_js)
-        self.assertIn("extra_layers", app_js)
-        self.assertIn("data-compare-layer-kind", app_js)
         self.assertIn("data-compare-grid-columns", app_js)
         self.assertIn("data-master-video-play", app_js)
         self.assertIn("data-layer-frame", app_js)
@@ -55,12 +53,85 @@ class CompareUiHookTests(unittest.TestCase):
         self.assertIn("data-video-sort", app_js)
         self.assertIn("preflightAbortController", app_js)
         self.assertIn("preflightPayloadKey", app_js)
-        self.assertIn("compareTrackLabels", app_js)
-        self.assertIn("data-compare-track-label", app_js)
-        self.assertIn("selectedCompareLayerKinds: new Set()", app_js)
+        self.assertIn('api("/api/media/item-groups?role=gt")', app_js)
+        self.assertIn("/api/media/items?group_id=", app_js)
+        self.assertIn("/predictions", app_js)
+        self.assertIn("pred_member_ids", app_js)
+        self.assertIn('mode: "smallest_pred"', app_js)
+        self.assertIn('filter: "lanczos"', app_js)
+        self.assertIn("state.selectedComparePredMembers.size >= 2", app_js)
+        self.assertIn("/compare-inputs`,", app_js)
+        self.assertIn("/compare-inputs/${encodeURIComponent(slot)}/media", app_js)
+        self.assertIn("variant=aligned", app_js)
+        self.assertIn("renderAlignmentPlan", app_js)
         self.assertNotIn("填写 GT / Pred 路径", app_js)
         self.assertNotIn("reference_path ||", app_js)
         self.assertNotIn("distorted_path ||", app_js)
+
+    def test_gt_first_picker_never_loads_global_pred_catalog(self) -> None:
+        app_js = (ROOT / "src" / "vfieval" / "web" / "app.js").read_text(encoding="utf-8")
+        loader = app_js.split("async function loadCompareSources", 1)[1].split(
+            "function renderGroupVideoTable", 1
+        )[0]
+        self.assertIn("/api/media/item-groups?role=gt", loader)
+        self.assertIn("/api/media/items?group_id=", loader)
+        self.assertIn("/predictions", loader)
+        self.assertNotIn("/api/media/assets?role=pred", loader)
+        self.assertNotIn("/api/compare-sources/pred", loader)
+
+    def test_alignment_report_uses_the_real_plan_and_external_confirmation(self) -> None:
+        web = ROOT / "src" / "vfieval" / "web"
+        app_js = (web / "app.js").read_text(encoding="utf-8")
+        index_html = (web / "index.html").read_text(encoding="utf-8")
+        styles = (web / "styles.css").read_text(encoding="utf-8")
+
+        self.assertIn("function alignmentTemporal(plan)", app_js)
+        self.assertIn("function alignmentDirection(row)", app_js)
+        self.assertIn("temporal.frame_count", app_js)
+        self.assertIn("temporal.timestamps_verified", app_js)
+        self.assertIn("row?.direction || row?.resize_kind", app_js)
+        self.assertIn("allow_external_aspect_stretch", app_js)
+        self.assertIn('name="allow_external_aspect_stretch"', index_html)
+        self.assertIn(".alignment-temporal-details", styles)
+        self.assertIn(".compare-aspect-confirm", styles)
+
+    def test_item_picker_exposes_member_temporal_mapping_and_slots(self) -> None:
+        app_js = (ROOT / "src" / "vfieval" / "web" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("function compareTemporalSummary(row)", app_js)
+        self.assertIn("mapping.source_frame_indices", app_js)
+        self.assertIn("function compareSlotLabel(index)", app_js)
+        self.assertIn('compat-badge compat-ok', app_js)
+        self.assertIn("selectedMemberIds.indexOf(memberId)", app_js)
+
+    def test_compare_input_tiles_can_switch_between_original_and_aligned_media(self) -> None:
+        web = ROOT / "src" / "vfieval" / "web"
+        app_js = (web / "app.js").read_text(encoding="utf-8")
+        styles = (web / "styles.css").read_text(encoding="utf-8")
+
+        self.assertIn("function compareInputSlotLabel(slot)", app_js)
+        self.assertIn("data-compare-input-variant=\"aligned\"", app_js)
+        self.assertIn("data-compare-input-variant=\"original\"", app_js)
+        self.assertIn("data-compare-input-media", app_js)
+        self.assertIn("media.load()", app_js)
+        self.assertIn("data-compare-input-slot", app_js)
+        self.assertIn(".compare-input-variants", styles)
+
+    def test_external_pred_binding_is_an_explicit_item_scoped_advanced_action(self) -> None:
+        web = ROOT / "src" / "vfieval" / "web"
+        app_js = (web / "app.js").read_text(encoding="utf-8")
+        index_html = (web / "index.html").read_text(encoding="utf-8")
+
+        self.assertIn('id="external-pred-binding-form"', index_html)
+        self.assertIn('id="external-pred-item-group"', index_html)
+        self.assertIn('id="external-pred-item"', index_html)
+        self.assertIn('id="external-pred-asset"', index_html)
+        self.assertIn('name="aspect_stretch_confirmed"', index_html)
+        self.assertIn("function bindExternalPrediction(event)", app_js)
+        self.assertIn("/api/media/items/${itemId}/external-predictions", app_js)
+        self.assertIn("function optionalJsonObject(value, label)", app_js)
+        self.assertIn("asset.source_kind === \"upload\"", app_js)
+        self.assertNotIn('name="path"', index_html)
 
 
 if __name__ == "__main__":

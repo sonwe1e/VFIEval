@@ -25,7 +25,7 @@ def _loads(text: str | None) -> Any:
     return json.loads(text)
 
 
-LATEST_SCHEMA_VERSION = "2026-07-media-evaluation-v1"
+LATEST_SCHEMA_VERSION = "2026-07-media-items-v2-cache-build-locks"
 
 
 def _rating_key(score: float) -> str:
@@ -227,6 +227,7 @@ CREATE TABLE IF NOT EXISTS runs (
     result_json TEXT NOT NULL DEFAULT '{}',
     error_json TEXT NOT NULL DEFAULT '{}',
     metadata_json TEXT NOT NULL DEFAULT '{}',
+    content_revision INTEGER NOT NULL DEFAULT 0,
     deleted_at REAL,
     artifact_cleaned_at REAL,
     created_at REAL NOT NULL,
@@ -237,6 +238,79 @@ CREATE TABLE IF NOT EXISTS runs (
 
 CREATE INDEX IF NOT EXISTS idx_runs_status_created ON runs(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_jobs ON runs(inference_job_id, metric_job_id);
+
+CREATE TABLE IF NOT EXISTS run_purge_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    request_type TEXT NOT NULL CHECK(request_type IN ('delete_run', 'cleanup_artifacts')),
+    status TEXT NOT NULL CHECK(status IN ('requested', 'canceling', 'purging', 'failed', 'completed')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    reclaimed_bytes INTEGER NOT NULL DEFAULT 0,
+    report_json TEXT NOT NULL DEFAULT '{}',
+    error_json TEXT NOT NULL DEFAULT '{}',
+    claim_token TEXT NOT NULL DEFAULT '',
+    requested_at REAL NOT NULL,
+    started_at REAL,
+    completed_at REAL,
+    updated_at REAL NOT NULL,
+    UNIQUE(run_id, request_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_purge_requests_status
+ON run_purge_requests(status, updated_at);
+
+CREATE TABLE IF NOT EXISTS cache_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cache_type TEXT NOT NULL CHECK(cache_type IN ('decode_cache', 'compare_cache')),
+    cache_key TEXT NOT NULL,
+    storage_path TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'ready' CHECK(state IN ('ready', 'missing', 'deleting', 'deleted', 'failed')),
+    size_bytes INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    last_used_at REAL NOT NULL,
+    gc_after REAL,
+    deleted_at REAL,
+    updated_at REAL NOT NULL,
+    UNIQUE(cache_type, cache_key)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cache_entries_gc
+ON cache_entries(state, gc_after, cache_type);
+
+CREATE TABLE IF NOT EXISTS run_cache_refs (
+    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    cache_entry_id INTEGER NOT NULL REFERENCES cache_entries(id) ON DELETE CASCADE,
+    created_at REAL NOT NULL,
+    released_at REAL,
+    PRIMARY KEY(run_id, cache_entry_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_cache_refs_entry
+ON run_cache_refs(cache_entry_id, run_id);
+
+CREATE TABLE IF NOT EXISTS cache_leases (
+    cache_entry_id INTEGER NOT NULL REFERENCES cache_entries(id) ON DELETE CASCADE,
+    lease_id TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(cache_entry_id, lease_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cache_leases_expiry
+ON cache_leases(expires_at, cache_entry_id);
+
+CREATE TABLE IF NOT EXISTS decode_cache_build_locks (
+    cache_key TEXT PRIMARY KEY,
+    owner_token TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_decode_cache_build_locks_expiry
+ON decode_cache_build_locks(expires_at, cache_key);
 
 CREATE TABLE IF NOT EXISTS run_jobs (
     run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -291,7 +365,7 @@ CREATE TABLE IF NOT EXISTS media_assets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     collection_id INTEGER REFERENCES media_collections(id) ON DELETE SET NULL,
     source_key TEXT NOT NULL UNIQUE,
-    source_kind TEXT NOT NULL CHECK(source_kind IN ('folder', 'upload', 'run_artifact')),
+    source_kind TEXT NOT NULL CHECK(source_kind IN ('folder', 'upload', 'run_artifact', 'evaluation_package')),
     media_kind TEXT NOT NULL CHECK(media_kind IN ('video', 'frame_sequence')),
     role TEXT NOT NULL CHECK(role IN ('source', 'gt', 'pred')),
     display_name TEXT NOT NULL,
@@ -342,6 +416,89 @@ CREATE TABLE IF NOT EXISTS run_media_assets (
 CREATE INDEX IF NOT EXISTS idx_run_media_assets_run
 ON run_media_assets(run_id, role, video_name, track_label);
 CREATE INDEX IF NOT EXISTS idx_run_media_assets_asset ON run_media_assets(asset_id);
+
+CREATE TABLE IF NOT EXISTS media_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    collection_id INTEGER NOT NULL REFERENCES media_collections(id) ON DELETE RESTRICT,
+    item_key TEXT NOT NULL UNIQUE,
+    canonical_gt_asset_id INTEGER NOT NULL UNIQUE REFERENCES media_assets(id) ON DELETE RESTRICT,
+    display_name TEXT NOT NULL,
+    media_kind TEXT NOT NULL CHECK(media_kind IN ('video', 'frame_sequence')),
+    state TEXT NOT NULL DEFAULT 'ready' CHECK(state IN ('ready', 'unavailable', 'deleted')),
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    deleted_at REAL,
+    UNIQUE(collection_id, display_name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_media_items_group
+ON media_items(collection_id, state, display_name, id);
+
+CREATE TABLE IF NOT EXISTS media_item_members (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id INTEGER NOT NULL REFERENCES media_items(id) ON DELETE RESTRICT,
+    asset_id INTEGER NOT NULL REFERENCES media_assets(id) ON DELETE RESTRICT,
+    member_role TEXT NOT NULL CHECK(member_role IN (
+        'canonical_gt', 'model_pred', 'external_pred', 'compare_snapshot',
+        'evaluation_gt', 'evaluation_pred'
+    )),
+    producer_kind TEXT NOT NULL CHECK(producer_kind IN (
+        'source', 'model_inference', 'external', 'video_compare', 'evaluation_package'
+    )),
+    producer_run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL,
+    method_key TEXT NOT NULL DEFAULT '',
+    reusable_as_pred INTEGER NOT NULL DEFAULT 0 CHECK(reusable_as_pred IN (0, 1)),
+    temporal_mapping_json TEXT NOT NULL DEFAULT '{}',
+    spatial_origin_json TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL DEFAULT 'ready' CHECK(state IN ('ready', 'unavailable', 'deleted')),
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    deleted_at REAL,
+    UNIQUE(item_id, asset_id, member_role),
+    UNIQUE(asset_id, member_role),
+    CHECK(
+        reusable_as_pred = 0
+        OR (member_role = 'model_pred' AND producer_kind = 'model_inference')
+        OR (member_role = 'external_pred' AND producer_kind = 'external')
+    ),
+    CHECK(member_role != 'canonical_gt' OR (producer_kind = 'source' AND producer_run_id IS NULL)),
+    CHECK(member_role != 'model_pred' OR (producer_kind = 'model_inference' AND producer_run_id IS NOT NULL)),
+    CHECK(member_role != 'external_pred' OR (producer_kind = 'external' AND producer_run_id IS NULL)),
+    CHECK(member_role != 'compare_snapshot' OR producer_kind = 'video_compare'),
+    CHECK(member_role NOT IN ('evaluation_gt', 'evaluation_pred') OR producer_kind = 'evaluation_package')
+);
+
+CREATE INDEX IF NOT EXISTS idx_media_item_members_item
+ON media_item_members(item_id, reusable_as_pred, state, member_role, method_key);
+CREATE INDEX IF NOT EXISTS idx_media_item_members_producer
+ON media_item_members(producer_run_id, member_role, state);
+CREATE INDEX IF NOT EXISTS idx_media_item_members_asset
+ON media_item_members(asset_id, item_id, member_role);
+
+CREATE TABLE IF NOT EXISTS run_media_item_bindings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    item_id INTEGER NOT NULL REFERENCES media_items(id) ON DELETE RESTRICT,
+    binding_role TEXT NOT NULL CHECK(binding_role IN (
+        'source', 'pred_output', 'compare_gt', 'compare_pred'
+    )),
+    slot TEXT NOT NULL DEFAULT '',
+    original_member_id INTEGER NOT NULL REFERENCES media_item_members(id) ON DELETE RESTRICT,
+    active_member_id INTEGER NOT NULL REFERENCES media_item_members(id) ON DELETE RESTRICT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(run_id, item_id, binding_role, slot)
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_media_item_bindings_run
+ON run_media_item_bindings(run_id, binding_role, item_id, slot);
+CREATE INDEX IF NOT EXISTS idx_run_media_item_bindings_active
+ON run_media_item_bindings(active_member_id, binding_role, run_id);
+CREATE INDEX IF NOT EXISTS idx_run_media_item_bindings_original
+ON run_media_item_bindings(original_member_id, binding_role, run_id);
 
 CREATE TABLE IF NOT EXISTS metric_asset_bindings (
     metric_result_id INTEGER PRIMARY KEY REFERENCES metric_results(id) ON DELETE CASCADE,
@@ -577,6 +734,69 @@ class Database:
                 updated_at REAL
             );
             CREATE INDEX IF NOT EXISTS idx_run_feedback_run ON run_feedback(run_id, created_at);
+            CREATE TABLE IF NOT EXISTS run_purge_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                request_type TEXT NOT NULL CHECK(request_type IN ('delete_run', 'cleanup_artifacts')),
+                status TEXT NOT NULL CHECK(status IN ('requested', 'canceling', 'purging', 'failed', 'completed')),
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                reclaimed_bytes INTEGER NOT NULL DEFAULT 0,
+                report_json TEXT NOT NULL DEFAULT '{}',
+                error_json TEXT NOT NULL DEFAULT '{}',
+                claim_token TEXT NOT NULL DEFAULT '',
+                requested_at REAL NOT NULL,
+                started_at REAL,
+                completed_at REAL,
+                updated_at REAL NOT NULL,
+                UNIQUE(run_id, request_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_run_purge_requests_status
+            ON run_purge_requests(status, updated_at);
+            CREATE TABLE IF NOT EXISTS cache_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cache_type TEXT NOT NULL CHECK(cache_type IN ('decode_cache', 'compare_cache')),
+                cache_key TEXT NOT NULL,
+                storage_path TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'ready' CHECK(state IN ('ready', 'missing', 'deleting', 'deleted', 'failed')),
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                last_used_at REAL NOT NULL,
+                gc_after REAL,
+                deleted_at REAL,
+                updated_at REAL NOT NULL,
+                UNIQUE(cache_type, cache_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cache_entries_gc
+            ON cache_entries(state, gc_after, cache_type);
+            CREATE TABLE IF NOT EXISTS run_cache_refs (
+                run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                cache_entry_id INTEGER NOT NULL REFERENCES cache_entries(id) ON DELETE CASCADE,
+                created_at REAL NOT NULL,
+                released_at REAL,
+                PRIMARY KEY(run_id, cache_entry_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_run_cache_refs_entry
+            ON run_cache_refs(cache_entry_id, run_id);
+            CREATE TABLE IF NOT EXISTS cache_leases (
+                cache_entry_id INTEGER NOT NULL REFERENCES cache_entries(id) ON DELETE CASCADE,
+                lease_id TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(cache_entry_id, lease_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_cache_leases_expiry
+            ON cache_leases(expires_at, cache_entry_id);
+            CREATE TABLE IF NOT EXISTS decode_cache_build_locks (
+                cache_key TEXT PRIMARY KEY,
+                owner_token TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_decode_cache_build_locks_expiry
+            ON decode_cache_build_locks(expires_at, cache_key);
             """
         )
         feedback_columns = {row["name"] for row in conn.execute("PRAGMA table_info(run_feedback)").fetchall()}
@@ -612,11 +832,20 @@ class Database:
                 conn.execute(f"ALTER TABLE datasets ADD COLUMN {name} {definition}")
         run_columns = {row["name"] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
         for name, definition in {
+            "content_revision": "INTEGER NOT NULL DEFAULT 0",
             "deleted_at": "REAL",
             "artifact_cleaned_at": "REAL",
         }.items():
             if name not in run_columns:
                 conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
+        cache_ref_columns = {row["name"] for row in conn.execute("PRAGMA table_info(run_cache_refs)").fetchall()}
+        if "released_at" not in cache_ref_columns:
+            conn.execute("ALTER TABLE run_cache_refs ADD COLUMN released_at REAL")
+        purge_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(run_purge_requests)").fetchall()
+        }
+        if "claim_token" not in purge_columns:
+            conn.execute("ALTER TABLE run_purge_requests ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''")
         profile_columns = {row["name"] for row in conn.execute("PRAGMA table_info(execution_profiles)").fetchall()}
         if "device_model" not in profile_columns:
             conn.execute("ALTER TABLE execution_profiles ADD COLUMN device_model TEXT NOT NULL DEFAULT ''")
@@ -1214,6 +1443,7 @@ class Database:
         )
         for row in rows:
             self._decode_run(row)
+            row["purge_request"] = self.get_run_purge_request(int(row["id"]))
         return rows
 
     def get_run(self, run_id: int) -> dict[str, Any]:
@@ -1235,6 +1465,7 @@ class Database:
         if row is None:
             raise KeyError(f"run {run_id} not found")
         self._decode_run(row)
+        row["purge_request"] = self.get_run_purge_request(run_id)
         return row
 
     def get_run_by_job(self, job_id: int) -> dict[str, Any] | None:
@@ -1258,6 +1489,7 @@ class Database:
         if row is None:
             return None
         self._decode_run(row)
+        row["purge_request"] = self.get_run_purge_request(int(row["id"]))
         return row
 
     def update_run_progress(
@@ -1341,6 +1573,7 @@ class Database:
                 SET status = ?,
                     result_json = ?,
                     artifact_summary_json = ?,
+                    content_revision = content_revision + 1,
                     finished_at = COALESCE(?, finished_at),
                     updated_at = ?
                 WHERE id = ?
@@ -1356,12 +1589,35 @@ class Database:
                 UPDATE runs
                 SET status = 'completed',
                     metric_summary_json = ?,
+                    content_revision = content_revision + 1,
                     finished_at = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
                 (_json(metric_summary), now, now, run_id),
             )
+
+    def bump_run_content_revision(self, run_id: int) -> int:
+        """Invalidate all client-side result caches for a Run.
+
+        The revision is deliberately monotonic and updated in SQLite together
+        with the state change that made cached result payloads stale.
+        """
+        now = utc_ts()
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE runs
+                SET content_revision = content_revision + 1,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, run_id),
+            )
+            row = conn.execute("SELECT content_revision FROM runs WHERE id = ?", (run_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"run {run_id} not found")
+        return int(row["content_revision"])
 
     def fail_run(self, run_id: int, error: dict[str, Any]) -> None:
         now = utc_ts()
@@ -1371,6 +1627,7 @@ class Database:
                 UPDATE runs
                 SET status = 'failed',
                     error_json = ?,
+                    content_revision = content_revision + 1,
                     finished_at = ?,
                     updated_at = ?
                 WHERE id = ?
@@ -1403,7 +1660,7 @@ class Database:
         has_running_job = any(str(row.get("status") or "") == "running" for row in job_rows)
         with self.connection() as conn:
             if (
-                run["status"] in {"queued", "metric_queued", "decoding"}
+                run["status"] not in {"completed", "failed", "canceled"}
                 and not has_running_job
                 and (inference_job_id is not None or metric_job_id is not None or run_job_ids)
             ):
@@ -1423,18 +1680,28 @@ class Database:
                         finished_at = ?
                     WHERE id IN ({placeholders}) AND status = 'queued'
                     """,
-                    (_json({"message": "用户取消了排队中的 Run"}), now, *target_ids),
+                    (
+                        _json({"message": "用户取消了排队中的 Run", "type": "RunCanceled"}),
+                        now,
+                        *target_ids,
+                    ),
                 )
                 conn.execute(
                     """
-                    UPDATE runs
-                    SET status = 'canceled',
-                        error_json = ?,
-                        finished_at = ?,
-                        updated_at = ?
-                    WHERE id = ?
+                UPDATE runs
+                SET status = 'canceled',
+                    error_json = ?,
+                    content_revision = content_revision + 1,
+                    finished_at = ?,
+                    updated_at = ?
+                WHERE id = ?
                     """,
-                    (_json({"message": "用户取消了排队中的 Run"}), now, now, run_id),
+                    (
+                        _json({"message": "用户取消了排队中的 Run", "type": "RunCanceled"}),
+                        now,
+                        now,
+                        run_id,
+                    ),
                 )
             elif run["status"] not in {"completed", "failed", "canceled"}:
                 conn.execute(
@@ -1455,6 +1722,7 @@ class Database:
                 UPDATE runs
                 SET status = 'canceled',
                     error_json = ?,
+                    content_revision = content_revision + 1,
                     finished_at = ?,
                     updated_at = ?
                 WHERE id = ?
@@ -1475,6 +1743,22 @@ class Database:
                 """,
                 (_json(error or {"message": "Job 已取消"}), now, job_id),
             )
+
+    def cancel_queued_run_jobs(self, run_id: int, reason: str = "Run cleanup requested") -> int:
+        now = utc_ts()
+        with self.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'canceled',
+                    error_json = ?,
+                    finished_at = ?
+                WHERE status = 'queued'
+                  AND id IN (SELECT job_id FROM run_jobs WHERE run_id = ?)
+                """,
+                (_json({"message": reason, "type": "RunCanceled"}), now, run_id),
+            )
+            return int(cur.rowcount)
 
     def soft_delete_run(self, run_id: int) -> None:
         now = utc_ts()
@@ -1874,13 +2158,751 @@ class Database:
             conn.execute(
                 """
                 UPDATE runs
-                SET artifact_cleaned_at = ?,
+                SET artifact_cleaned_at = COALESCE(artifact_cleaned_at, ?),
                     artifact_summary_json = ?,
+                    content_revision = content_revision + 1,
                     updated_at = ?
                 WHERE id = ?
                 """,
                 (now, _json({"total": 0, "by_kind": {}}), now, run_id),
             )
+
+    def mark_run_deleted_after_purge(self, run_id: int) -> None:
+        """Hide a Run only after its managed output cleanup has succeeded."""
+        now = utc_ts()
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT artifact_cleaned_at FROM runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"run {run_id} not found")
+            if row["artifact_cleaned_at"] is None:
+                raise ValueError("run artifacts must be cleaned before the run can be deleted")
+            conn.execute(
+                """
+                UPDATE runs
+                SET deleted_at = COALESCE(deleted_at, ?),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, run_id),
+            )
+
+    def request_run_purge(self, run_id: int, request_type: str) -> dict[str, Any]:
+        if request_type not in {"delete_run", "cleanup_artifacts"}:
+            raise ValueError("request_type must be delete_run or cleanup_artifacts")
+        now = utc_ts()
+        with self.connection() as conn:
+            if conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone() is None:
+                raise KeyError(f"run {run_id} not found")
+            row = conn.execute(
+                "SELECT * FROM run_purge_requests WHERE run_id = ? AND request_type = ?",
+                (run_id, request_type),
+            ).fetchone()
+            if row is None:
+                cur = conn.execute(
+                    """
+                    INSERT INTO run_purge_requests(
+                        run_id, request_type, status, requested_at, updated_at
+                    )
+                    VALUES (?, ?, 'requested', ?, ?)
+                    """,
+                    (run_id, request_type, now, now),
+                )
+                request_id = int(cur.lastrowid)
+            else:
+                request_id = int(row["id"])
+                if str(row["status"]) == "failed":
+                    conn.execute(
+                        """
+                        UPDATE run_purge_requests
+                        SET status = 'requested',
+                            report_json = '{}',
+                            error_json = '{}',
+                            claim_token = '',
+                            reclaimed_bytes = 0,
+                            requested_at = ?,
+                            started_at = NULL,
+                            completed_at = NULL,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (now, now, request_id),
+                    )
+        return self.get_run_purge_request_by_id(request_id)
+
+    def get_run_purge_request_by_id(self, request_id: int) -> dict[str, Any]:
+        row = self.get("SELECT * FROM run_purge_requests WHERE id = ?", (request_id,))
+        if row is None:
+            raise KeyError(f"run purge request {request_id} not found")
+        self._decode_run_purge_request(row)
+        return row
+
+    def get_run_purge_request(
+        self,
+        run_id: int,
+        request_type: str | None = None,
+    ) -> dict[str, Any] | None:
+        if request_type is None:
+            row = self.get(
+                "SELECT * FROM run_purge_requests WHERE run_id = ? ORDER BY id DESC LIMIT 1",
+                (run_id,),
+            )
+        else:
+            row = self.get(
+                "SELECT * FROM run_purge_requests WHERE run_id = ? AND request_type = ?",
+                (run_id, request_type),
+            )
+        if row is not None:
+            self._decode_run_purge_request(row)
+        return row
+
+    def list_pending_run_purge_requests(self, limit: int = 100) -> list[dict[str, Any]]:
+        rows = self.query(
+            """
+            SELECT * FROM run_purge_requests
+            WHERE status IN ('requested', 'canceling')
+            ORDER BY requested_at, id
+            LIMIT ?
+            """,
+            (min(1000, max(1, int(limit))),),
+        )
+        for row in rows:
+            self._decode_run_purge_request(row)
+        return rows
+
+    def recover_stale_run_purge_requests(self, stale_before: float) -> int:
+        """Return abandoned purge claims to the durable queue after a crash."""
+        now = utc_ts()
+        with self.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE run_purge_requests
+                SET status = 'requested',
+                    error_json = ?,
+                    claim_token = '',
+                    updated_at = ?
+                WHERE status = 'purging' AND updated_at < ?
+                """,
+                (
+                    _json({"type": "InterruptedPurge", "message": "resuming an interrupted purge request"}),
+                    now,
+                    float(stale_before),
+                ),
+            )
+            return int(cur.rowcount)
+
+    def update_run_purge_request(
+        self,
+        request_id: int,
+        status: str,
+        *,
+        report: dict[str, Any] | None = None,
+        error: dict[str, Any] | None = None,
+        reclaimed_bytes: int | None = None,
+        expected_claim_token: str | None = None,
+    ) -> dict[str, Any]:
+        if status not in {"requested", "canceling", "purging", "failed", "completed"}:
+            raise ValueError(f"unsupported purge status: {status}")
+        now = utc_ts()
+        started = now if status == "purging" else None
+        completed = now if status == "completed" else None
+        where = "WHERE id = ?"
+        params: list[Any] = [
+            status,
+            _json(report) if report is not None else None,
+            _json(error) if error is not None else None,
+            int(reclaimed_bytes) if reclaimed_bytes is not None else None,
+            started,
+            started,
+            completed,
+            completed,
+            status,
+            now,
+        ]
+        if expected_claim_token is not None:
+            where += " AND claim_token = ?"
+        params.append(request_id)
+        if expected_claim_token is not None:
+            params.append(str(expected_claim_token))
+        with self.connection() as conn:
+            cur = conn.execute(
+                f"""
+                UPDATE run_purge_requests
+                SET status = ?,
+                    report_json = COALESCE(?, report_json),
+                    error_json = COALESCE(?, error_json),
+                    reclaimed_bytes = COALESCE(?, reclaimed_bytes),
+                    started_at = CASE WHEN ? IS NULL THEN started_at ELSE COALESCE(started_at, ?) END,
+                    completed_at = CASE WHEN ? IS NULL THEN completed_at ELSE ? END,
+                    attempt_count = attempt_count + CASE WHEN ? = 'purging' THEN 1 ELSE 0 END,
+                    claim_token = CASE WHEN ? IN ('completed', 'failed') THEN '' ELSE claim_token END,
+                    updated_at = ?
+                {where}
+                """,
+                (*params[:9], status, *params[9:]),
+            )
+            if cur.rowcount != 1:
+                if expected_claim_token is not None:
+                    raise RuntimeError(f"run purge request {request_id} claim was lost")
+                raise KeyError(f"run purge request {request_id} not found")
+        return self.get_run_purge_request_by_id(request_id)
+
+    def claim_run_purge_request(self, request_id: int, claim_token: str = "") -> bool:
+        now = utc_ts()
+        with self.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE run_purge_requests
+                SET status = 'purging',
+                    started_at = COALESCE(started_at, ?),
+                    attempt_count = attempt_count + 1,
+                    error_json = '{}',
+                    claim_token = ?,
+                    updated_at = ?
+                WHERE id = ? AND status IN ('requested', 'canceling')
+                """,
+                (now, str(claim_token), now, request_id),
+            )
+            return cur.rowcount == 1
+
+    def heartbeat_run_purge_request(self, request_id: int, claim_token: str) -> bool:
+        """Renew a destructive purge claim while filesystem work is in flight."""
+        with self.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE run_purge_requests
+                SET updated_at = ?
+                WHERE id = ? AND status = 'purging' AND claim_token = ?
+                """,
+                (utc_ts(), int(request_id), str(claim_token)),
+            )
+            return cur.rowcount == 1
+
+    def upsert_cache_entry(
+        self,
+        cache_type: str,
+        cache_key: str,
+        storage_path: str | Path,
+        *,
+        state: str = "ready",
+        size_bytes: int = 0,
+        metadata: dict[str, Any] | None = None,
+        last_used_at: float | None = None,
+        gc_after: float | None = None,
+    ) -> dict[str, Any]:
+        if cache_type not in {"decode_cache", "compare_cache"}:
+            raise ValueError("cache_type must be decode_cache or compare_cache")
+        if state not in {"ready", "missing", "deleting", "deleted", "failed"}:
+            raise ValueError(f"unsupported cache state: {state}")
+        key = str(cache_key).strip()
+        if not key:
+            raise ValueError("cache_key must not be empty")
+        now = utc_ts()
+        used_at = float(last_used_at if last_used_at is not None else now)
+        with self.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO cache_entries(
+                    cache_type, cache_key, storage_path, state, size_bytes,
+                    metadata_json, created_at, last_used_at, gc_after, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cache_type, cache_key) DO UPDATE SET
+                    storage_path = excluded.storage_path,
+                    state = CASE
+                        WHEN cache_entries.state = 'deleting' THEN cache_entries.state
+                        ELSE excluded.state
+                    END,
+                    size_bytes = excluded.size_bytes,
+                    metadata_json = excluded.metadata_json,
+                    last_used_at = MAX(cache_entries.last_used_at, excluded.last_used_at),
+                    gc_after = CASE
+                        WHEN EXISTS (
+                            SELECT 1 FROM run_cache_refs
+                            WHERE cache_entry_id = cache_entries.id AND released_at IS NULL
+                        ) THEN NULL
+                        ELSE COALESCE(cache_entries.gc_after, excluded.gc_after)
+                    END,
+                    deleted_at = CASE WHEN excluded.state = 'deleted' THEN cache_entries.deleted_at ELSE NULL END,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    cache_type,
+                    key,
+                    str(Path(storage_path).resolve()),
+                    state,
+                    max(0, int(size_bytes)),
+                    _json(metadata),
+                    used_at,
+                    used_at,
+                    gc_after,
+                    now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM cache_entries WHERE cache_type = ? AND cache_key = ?",
+                (cache_type, key),
+            ).fetchone()
+        assert row is not None
+        result = dict(row)
+        self._decode_cache_entry(result)
+        return result
+
+    def get_cache_entry(self, cache_type: str, cache_key: str) -> dict[str, Any] | None:
+        row = self.get(
+            "SELECT * FROM cache_entries WHERE cache_type = ? AND cache_key = ?",
+            (cache_type, cache_key),
+        )
+        if row is not None:
+            self._decode_cache_entry(row)
+        return row
+
+    def list_cache_entries(self, include_deleted: bool = False) -> list[dict[str, Any]]:
+        clause = "" if include_deleted else "WHERE deleted_at IS NULL AND state != 'deleted'"
+        rows = self.query(
+            f"SELECT * FROM cache_entries {clause} ORDER BY cache_type, cache_key"
+        )
+        for row in rows:
+            self._decode_cache_entry(row)
+        return rows
+
+    def replace_run_cache_refs(
+        self,
+        run_id: int,
+        cache_entry_ids: Iterable[int],
+        *,
+        grace_seconds: float = 600.0,
+    ) -> dict[str, int]:
+        entry_ids = sorted({int(entry_id) for entry_id in cache_entry_ids})
+        now = utc_ts()
+        gc_after = now + max(0.0, float(grace_seconds))
+        with self.connection() as conn:
+            if conn.execute("SELECT 1 FROM runs WHERE id = ?", (run_id,)).fetchone() is None:
+                raise KeyError(f"run {run_id} not found")
+            if entry_ids:
+                placeholders = ",".join("?" for _ in entry_ids)
+                deleting = conn.execute(
+                    f"SELECT id FROM cache_entries WHERE id IN ({placeholders}) AND state = 'deleting'",
+                    tuple(entry_ids),
+                ).fetchone()
+                if deleting is not None:
+                    raise RuntimeError(
+                        f"cache entry {int(deleting['id'])} is being garbage-collected; retry registration"
+                    )
+            previous = {
+                int(row["cache_entry_id"])
+                for row in conn.execute(
+                    "SELECT cache_entry_id FROM run_cache_refs WHERE run_id = ? AND released_at IS NULL",
+                    (run_id,),
+                ).fetchall()
+            }
+            wanted = set(entry_ids)
+            for entry_id in wanted:
+                conn.execute(
+                    """
+                    INSERT INTO run_cache_refs(run_id, cache_entry_id, created_at, released_at)
+                    VALUES (?, ?, ?, NULL)
+                    ON CONFLICT(run_id, cache_entry_id) DO UPDATE SET released_at = NULL
+                    """,
+                    (run_id, entry_id, now),
+                )
+                conn.execute(
+                    """
+                    UPDATE cache_entries
+                    SET last_used_at = ?, gc_after = NULL, deleted_at = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, entry_id),
+                )
+            released = previous - wanted
+            if released:
+                placeholders = ",".join("?" for _ in released)
+                conn.execute(
+                    f"UPDATE run_cache_refs SET released_at = ? WHERE run_id = ? AND cache_entry_id IN ({placeholders})",
+                    (now, run_id, *sorted(released)),
+                )
+                conn.execute(
+                    f"""
+                    UPDATE cache_entries
+                    SET gc_after = COALESCE(gc_after, ?), updated_at = ?
+                    WHERE id IN ({placeholders})
+                      AND NOT EXISTS (
+                          SELECT 1 FROM run_cache_refs rcr
+                          WHERE rcr.cache_entry_id = cache_entries.id AND rcr.released_at IS NULL
+                      )
+                    """,
+                    (gc_after, now, *sorted(released)),
+                )
+        return {"added": len(wanted - previous), "released": len(released), "total": len(wanted)}
+
+    def release_run_cache_refs(self, run_id: int, *, grace_seconds: float = 600.0) -> list[int]:
+        now = utc_ts()
+        gc_after = now + max(0.0, float(grace_seconds))
+        with self.connection() as conn:
+            entry_ids = [
+                int(row["cache_entry_id"])
+                for row in conn.execute(
+                    "SELECT cache_entry_id FROM run_cache_refs WHERE run_id = ? AND released_at IS NULL",
+                    (run_id,),
+                ).fetchall()
+            ]
+            conn.execute(
+                "UPDATE run_cache_refs SET released_at = ? WHERE run_id = ? AND released_at IS NULL",
+                (now, run_id),
+            )
+            if entry_ids:
+                placeholders = ",".join("?" for _ in entry_ids)
+                conn.execute(
+                    f"""
+                    UPDATE cache_entries
+                    SET gc_after = COALESCE(gc_after, ?), updated_at = ?
+                    WHERE id IN ({placeholders})
+                      AND NOT EXISTS (
+                          SELECT 1 FROM run_cache_refs rcr
+                          WHERE rcr.cache_entry_id = cache_entries.id AND rcr.released_at IS NULL
+                      )
+                    """,
+                    (gc_after, now, *entry_ids),
+                )
+        return entry_ids
+
+    def acquire_cache_lease(self, cache_entry_id: int, lease_id: str, ttl_seconds: float = 21600.0) -> None:
+        now = utc_ts()
+        expires_at = now + max(1.0, float(ttl_seconds))
+        with self.connection() as conn:
+            conn.execute("DELETE FROM cache_leases WHERE expires_at <= ?", (now,))
+            row = conn.execute(
+                "SELECT state, deleted_at FROM cache_entries WHERE id = ?",
+                (int(cache_entry_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"cache entry {cache_entry_id} not found")
+            if row["state"] == "deleting":
+                raise RuntimeError(f"cache entry {cache_entry_id} is being garbage-collected; retry acquisition")
+            conn.execute(
+                """
+                INSERT INTO cache_leases(cache_entry_id, lease_id, expires_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(cache_entry_id, lease_id) DO UPDATE SET
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at
+                """,
+                (cache_entry_id, str(lease_id), expires_at, now, now),
+            )
+
+    def release_cache_lease(self, cache_entry_id: int, lease_id: str) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                "DELETE FROM cache_leases WHERE cache_entry_id = ? AND lease_id = ?",
+                (cache_entry_id, str(lease_id)),
+            )
+
+    def claim_decode_cache_build_lock(
+        self,
+        cache_key: str,
+        owner_token: str,
+        *,
+        ttl_seconds: float = 5 * 60,
+    ) -> bool:
+        """Atomically acquire or take over one decode-cache build lock.
+
+        This is deliberately separate from ``cache_leases``: a cache lease
+        prevents storage GC from removing an in-use entry, while this lock
+        makes one process the sole producer for a cache key.
+        """
+        key = str(cache_key).strip()
+        owner = str(owner_token).strip()
+        if not key:
+            raise ValueError("decode cache build lock requires a cache key")
+        if not owner:
+            raise ValueError("decode cache build lock requires an owner token")
+        now = utc_ts()
+        expires_at = now + max(0.01, float(ttl_seconds))
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM decode_cache_build_locks WHERE expires_at <= ?", (now,))
+            row = conn.execute(
+                "SELECT owner_token FROM decode_cache_build_locks WHERE cache_key = ?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    """
+                    INSERT INTO decode_cache_build_locks(
+                        cache_key, owner_token, expires_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (key, owner, expires_at, now, now),
+                )
+                return True
+            if str(row["owner_token"]) != owner:
+                return False
+            conn.execute(
+                """
+                UPDATE decode_cache_build_locks
+                SET expires_at = ?, updated_at = ?
+                WHERE cache_key = ? AND owner_token = ?
+                """,
+                (expires_at, now, key, owner),
+            )
+            return True
+
+    def renew_decode_cache_build_lock(
+        self,
+        cache_key: str,
+        owner_token: str,
+        *,
+        ttl_seconds: float = 5 * 60,
+    ) -> bool:
+        """Extend a lock only when this producer still owns an unexpired row."""
+        key = str(cache_key).strip()
+        owner = str(owner_token).strip()
+        if not key or not owner:
+            return False
+        now = utc_ts()
+        expires_at = now + max(0.01, float(ttl_seconds))
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                """
+                UPDATE decode_cache_build_locks
+                SET expires_at = ?, updated_at = ?
+                WHERE cache_key = ? AND owner_token = ? AND expires_at > ?
+                """,
+                (expires_at, now, key, owner, now),
+            )
+            return cur.rowcount == 1
+
+    def owns_decode_cache_build_lock(self, cache_key: str, owner_token: str) -> bool:
+        """Return whether an unexpired build lock still belongs to ``owner_token``."""
+        key = str(cache_key).strip()
+        owner = str(owner_token).strip()
+        if not key or not owner:
+            return False
+        now = utc_ts()
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM decode_cache_build_locks
+                WHERE cache_key = ? AND owner_token = ? AND expires_at > ?
+                """,
+                (key, owner, now),
+            ).fetchone()
+        return row is not None
+
+    def release_decode_cache_build_lock(self, cache_key: str, owner_token: str) -> None:
+        """Release only the caller's build lock; never clear a new owner's row."""
+        with self.connection() as conn:
+            conn.execute(
+                "DELETE FROM decode_cache_build_locks WHERE cache_key = ? AND owner_token = ?",
+                (str(cache_key).strip(), str(owner_token).strip()),
+            )
+
+    @contextmanager
+    def decode_cache_build_publish_guard(
+        self,
+        cache_key: str,
+        owner_token: str,
+        *,
+        ttl_seconds: float = 5 * 60,
+    ) -> Iterator[None]:
+        """Fence the filesystem publish step for one decode-cache producer.
+
+        The guard holds SQLite's writer lock only while the completed private
+        staging directory is being published.  It asserts the lock is still
+        owned and unexpired, refreshes its expiry, then removes the build lock
+        only after the caller exits successfully.  A former producer therefore
+        cannot publish after another process has taken over its expired lock.
+        """
+        key = str(cache_key).strip()
+        owner = str(owner_token).strip()
+        if not key or not owner:
+            raise ValueError("decode cache publish requires a cache key and owner token")
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            now = utc_ts()
+            expires_at = now + max(0.01, float(ttl_seconds))
+            cur = conn.execute(
+                """
+                UPDATE decode_cache_build_locks
+                SET expires_at = ?, updated_at = ?
+                WHERE cache_key = ? AND owner_token = ? AND expires_at > ?
+                """,
+                (expires_at, now, key, owner, now),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                raise RuntimeError("decode cache build lock was lost before publish; retry the operation")
+            try:
+                yield
+            except BaseException:
+                conn.rollback()
+                raise
+            else:
+                conn.execute(
+                    "DELETE FROM decode_cache_build_locks WHERE cache_key = ? AND owner_token = ?",
+                    (key, owner),
+                )
+                conn.commit()
+        finally:
+            conn.close()
+
+    def cache_gc_inventory(self) -> list[dict[str, Any]]:
+        now = utc_ts()
+        with self.connection() as conn:
+            conn.execute("DELETE FROM cache_leases WHERE expires_at <= ?", (now,))
+            rows = conn.execute(
+                """
+                SELECT ce.*,
+                       COUNT(DISTINCT rcr.run_id) AS active_run_refs,
+                       COUNT(DISTINCT cl.lease_id) AS active_leases
+                FROM cache_entries ce
+                LEFT JOIN run_cache_refs rcr ON rcr.cache_entry_id = ce.id AND rcr.released_at IS NULL
+                LEFT JOIN cache_leases cl ON cl.cache_entry_id = ce.id AND cl.expires_at > ?
+                WHERE ce.deleted_at IS NULL AND ce.state != 'deleted'
+                GROUP BY ce.id
+                ORDER BY ce.cache_type, ce.cache_key
+                """,
+                (now,),
+            ).fetchall()
+        result = [dict(row) for row in rows]
+        for row in result:
+            self._decode_cache_entry(row)
+        return result
+
+    def claim_cache_entry_for_gc(self, cache_entry_id: int) -> dict[str, Any] | None:
+        """Atomically reserve an otherwise-unreferenced cache for deletion.
+
+        Preview is advisory.  This conditional transition is the destructive
+        boundary: a new Run reference or lease added after preview makes the
+        claim fail instead of allowing GC to remove an in-use cache.
+        """
+        now = utc_ts()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM cache_leases WHERE expires_at <= ?", (now,))
+            entry = conn.execute(
+                "SELECT cache_type, cache_key FROM cache_entries WHERE id = ?",
+                (int(cache_entry_id),),
+            ).fetchone()
+            if entry is None:
+                conn.commit()
+                return None
+
+            # A decode writes into ``<key>.partial`` while holding the lease
+            # for its eventual ``<key>`` cache entry.  Treat that base entry's
+            # activity as protection for the partial directory too; otherwise
+            # a concurrent catalog/GC pass can remove live decoder output.
+            companion_clause = ""
+            companion_params: list[Any] = []
+            cache_type = str(entry["cache_type"])
+            cache_key = str(entry["cache_key"])
+            if cache_type == "decode_cache" and cache_key.endswith(".partial"):
+                base = conn.execute(
+                    "SELECT id FROM cache_entries WHERE cache_type = ? AND cache_key = ?",
+                    (cache_type, cache_key[: -len(".partial")]),
+                ).fetchone()
+                if base is not None:
+                    base_id = int(base["id"])
+                    companion_clause = """
+                      AND NOT EXISTS (
+                          SELECT 1 FROM cache_entries base
+                          WHERE base.id = ? AND base.state = 'deleting'
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM run_cache_refs rcr
+                          WHERE rcr.cache_entry_id = ?
+                            AND rcr.released_at IS NULL
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM cache_leases cl
+                          WHERE cl.cache_entry_id = ?
+                            AND cl.expires_at > ?
+                      )
+                    """
+                    companion_params = [base_id, base_id, base_id, now]
+            cur = conn.execute(
+                f"""
+                UPDATE cache_entries
+                SET state = 'deleting', updated_at = ?
+                WHERE id = ?
+                  AND deleted_at IS NULL
+                  AND state IN ('ready', 'missing', 'failed')
+                  AND gc_after IS NOT NULL AND gc_after <= ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM run_cache_refs rcr
+                      WHERE rcr.cache_entry_id = cache_entries.id
+                        AND rcr.released_at IS NULL
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM cache_leases cl
+                      WHERE cl.cache_entry_id = cache_entries.id
+                        AND cl.expires_at > ?
+                  )
+                {companion_clause}
+                """,
+                (now, int(cache_entry_id), now, now, *companion_params),
+            )
+            if cur.rowcount != 1:
+                conn.commit()
+                return None
+            row = conn.execute("SELECT * FROM cache_entries WHERE id = ?", (int(cache_entry_id),)).fetchone()
+            conn.commit()
+        assert row is not None
+        result = dict(row)
+        self._decode_cache_entry(result)
+        return result
+
+    def mark_cache_entry_state(
+        self,
+        cache_entry_id: int,
+        state: str,
+        *,
+        size_bytes: int | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if state not in {"ready", "missing", "deleting", "deleted", "failed"}:
+            raise ValueError(f"unsupported cache state: {state}")
+        now = utc_ts()
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE cache_entries
+                SET state = ?,
+                    size_bytes = COALESCE(?, size_bytes),
+                    metadata_json = COALESCE(?, metadata_json),
+                    deleted_at = CASE WHEN ? = 'deleted' THEN ? ELSE deleted_at END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    state,
+                    int(size_bytes) if size_bytes is not None else None,
+                    _json(metadata) if metadata is not None else None,
+                    state,
+                    now,
+                    now,
+                    cache_entry_id,
+                ),
+            )
+
+    def invalidate_run_media_assets(self, run_id: int) -> int:
+        now = utc_ts()
+        with self.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE media_assets
+                SET state = 'unavailable', updated_at = ?
+                WHERE source_kind = 'run_artifact'
+                  AND id IN (SELECT asset_id FROM run_media_assets WHERE run_id = ?)
+                """,
+                (now, run_id),
+            )
+            return int(cur.rowcount)
 
     def summarize_artifacts(self, job_id: int) -> dict[str, Any]:
         rows = self.query(
@@ -2151,9 +3173,18 @@ class Database:
                     SELECT j.*
                     FROM jobs j
                     JOIN run_jobs rj ON rj.job_id = j.id
+                    JOIN runs r ON r.id = rj.run_id
                     WHERE j.status = 'queued'
                       AND j.kind IN ({placeholders})
                       AND rj.device = ?
+                      AND r.deleted_at IS NULL
+                      AND r.artifact_cleaned_at IS NULL
+                      AND r.status NOT IN ('completed', 'cancel_requested', 'canceled', 'failed')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM run_purge_requests pr
+                          WHERE pr.run_id = r.id
+                            AND pr.status IN ('requested', 'canceling', 'purging')
+                      )
                     ORDER BY j.created_at, j.id
                     LIMIT 1
                     """,
@@ -2162,8 +3193,24 @@ class Database:
             else:
                 row = conn.execute(
                     f"""
-                    SELECT * FROM jobs
-                    WHERE status = 'queued' AND kind IN ({placeholders})
+                    SELECT j.* FROM jobs j
+                    WHERE j.status = 'queued' AND j.kind IN ({placeholders})
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM run_jobs rj
+                          JOIN runs r ON r.id = rj.run_id
+                          WHERE rj.job_id = j.id
+                            AND (
+                                r.deleted_at IS NOT NULL
+                                OR r.artifact_cleaned_at IS NOT NULL
+                                OR r.status IN ('completed', 'cancel_requested', 'canceled', 'failed')
+                                OR EXISTS (
+                                    SELECT 1 FROM run_purge_requests pr
+                                    WHERE pr.run_id = r.id
+                                      AND pr.status IN ('requested', 'canceling', 'purging')
+                                )
+                            )
+                      )
                     ORDER BY created_at, id
                     LIMIT 1
                     """,
@@ -2264,6 +3311,7 @@ class Database:
                 """,
                 (job_id, sample_id, kind, str(Path(path).resolve()), mime_type, _json(metadata), now),
             )
+            self._bump_run_revision_for_result_publish(conn, (int(job_id),), now)
             return int(cur.lastrowid)
 
     def add_artifacts_bulk(self, job_id: int, records: Iterable[dict[str, Any]]) -> list[int]:
@@ -2290,7 +3338,46 @@ class Database:
                     ),
                 )
                 ids.append(int(cur.lastrowid))
+            # Artifact batches are the publication boundary for lazy Run Detail
+            # views. Bump once per committed batch (rather than per image) so
+            # clients can invalidate scoped caches without turning the save pool
+            # into a stream of SQLite writes.
+            self._bump_run_revision_for_result_publish(conn, (int(job_id),), now)
         return ids
+
+    @staticmethod
+    def _bump_run_revision_for_result_publish(
+        conn: sqlite3.Connection,
+        job_ids: Iterable[int],
+        now: float,
+    ) -> None:
+        """Mark result payloads stale when a linked job publishes results.
+
+        A job may be a standalone legacy job, so this intentionally becomes a
+        no-op unless it belongs to a Run.  Both modern ``run_jobs`` rows and the
+        older ``runs.inference_job_id`` / ``metric_job_id`` links are checked.
+        Keeping this update in the insert transaction means a client can never
+        observe a newer revision that points at an uncommitted result batch.
+        """
+        ids = sorted({int(job_id) for job_id in job_ids})
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        conn.execute(
+            f"""
+            UPDATE runs
+            SET content_revision = content_revision + 1,
+                updated_at = ?
+            WHERE id IN (
+                SELECT run_id FROM run_jobs WHERE job_id IN ({placeholders})
+                UNION
+                SELECT id FROM runs
+                WHERE inference_job_id IN ({placeholders})
+                   OR metric_job_id IN ({placeholders})
+            )
+            """,
+            (now, *ids, *ids, *ids),
+        )
 
     def list_artifacts(self, job_id: int | None = None, kind: str | None = None) -> list[dict[str, Any]]:
         clauses: list[str] = []
@@ -2377,6 +3464,11 @@ class Database:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (job_id, inference_job_id, sample_id, metric_name, status, value, _json(details), now),
+            )
+            self._bump_run_revision_for_result_publish(
+                conn,
+                (int(job_id), int(inference_job_id)),
+                now,
             )
             return int(cur.lastrowid)
 
@@ -2489,3 +3581,12 @@ class Database:
         row["result"] = _loads(row.pop("result_json"))
         row["error"] = _loads(row.pop("error_json"))
         row["metadata"] = _loads(row.pop("metadata_json"))
+
+    @staticmethod
+    def _decode_run_purge_request(row: dict[str, Any]) -> None:
+        row["report"] = _loads(row.pop("report_json", None))
+        row["error"] = _loads(row.pop("error_json", None))
+
+    @staticmethod
+    def _decode_cache_entry(row: dict[str, Any]) -> None:
+        row["metadata"] = _loads(row.pop("metadata_json", None))

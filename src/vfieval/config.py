@@ -11,6 +11,7 @@ class WorkspaceConfig:
     db_path: Path
     artifacts_dir: Path
     runs_dir: Path
+    evaluations_dir: Path
     tmp_dir: Path
     media_dir: Path
     uploads_dir: Path
@@ -24,6 +25,7 @@ class WorkspaceConfig:
             db_path=resolved_root / "vfieval.sqlite",
             artifacts_dir=resolved_root / "artifacts",
             runs_dir=resolved_root / "runs",
+            evaluations_dir=resolved_root / "evaluations",
             tmp_dir=resolved_root / "tmp",
             media_dir=resolved_root / "media",
             uploads_dir=resolved_root / "tmp" / "uploads",
@@ -34,6 +36,7 @@ class WorkspaceConfig:
         self.root.mkdir(parents=True, exist_ok=True)
         self.artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.runs_dir.mkdir(parents=True, exist_ok=True)
+        self.evaluations_dir.mkdir(parents=True, exist_ok=True)
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
         self.media_dir.mkdir(parents=True, exist_ok=True)
         self.uploads_dir.mkdir(parents=True, exist_ok=True)

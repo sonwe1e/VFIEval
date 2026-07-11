@@ -5,16 +5,16 @@ import json
 import mimetypes
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from vfieval.config import WorkspaceConfig
 from vfieval.datasets import _sample_token, scan_dataset
@@ -56,7 +56,25 @@ from vfieval.media_assets import (
     sync_folder_assets,
     sync_run_assets,
 )
+from vfieval.media_items import (
+    bind_compare_input,
+    bind_run_source,
+    ensure_canonical_gt_item,
+    get_media_item,
+    get_media_item_member,
+    list_item_groups,
+    list_item_predictions,
+    list_media_items,
+    list_methods_for_items,
+    list_unbound_predictions,
+    register_external_prediction,
+    resolve_media_item_compare,
+    resolve_item_member,
+    resolve_item_reference,
+    sync_canonical_gt_items,
+)
 from vfieval.orchestration import start_decode_worker
+from vfieval.run_cleanup import RunCleanupService, register_run_cache_refs
 from vfieval.pipeline.inference import DEFAULT_VISUALIZE_HEIGHT, DEFAULT_VISUALIZE_WIDTH
 from vfieval.performance import recommend_execution_profile
 from vfieval.worker import WorkerOptions, detect_capabilities, run_worker
@@ -87,6 +105,30 @@ from vfieval.evaluations import (
     task_media_asset_id,
     upsert_evaluator,
 )
+from vfieval.evaluations_v2 import (
+    EvaluationConflict,
+    archive_campaign_v2,
+    archive_legacy_campaign,
+    blind_heartbeat,
+    blind_media_asset,
+    blind_payload,
+    blind_session,
+    blind_submit_vote,
+    campaign_analysis_v2,
+    campaign_export_v2,
+    close_campaign_v2,
+    create_campaign_v2,
+    discard_empty_legacy_draft,
+    ensure_v2_schema,
+    get_campaign_v2,
+    get_preparation_v2,
+    legacy_campaigns_readonly,
+    list_campaigns_v2,
+    list_run_outputs,
+    preview_campaign_v2,
+    request_publish_campaign_v2,
+    run_pending_preparations,
+)
 
 
 TERMINAL_RUN_STATUSES = {"completed", "failed", "canceled"}
@@ -100,35 +142,96 @@ class _RequestBodyTooLarge(ValueError):
 
 def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -> None:
     cleanup_stale_uploads(db, workspace)
-    handler = _make_handler(db, workspace)
+    ensure_v2_schema(db)
+    cleanup_service = RunCleanupService(db, workspace)
+    handler = _make_handler(db, workspace, cleanup_service=cleanup_service)
     server = ThreadingHTTPServer((host, port), handler)
+    cleanup_stop = threading.Event()
+    cleanup_thread = threading.Thread(
+        target=cleanup_service.run_forever,
+        args=(cleanup_stop,),
+        name="vfieval-run-cleanup",
+        daemon=True,
+    )
+    cleanup_thread.start()
+    preparation_stop = threading.Event()
+    preparation_thread = threading.Thread(
+        target=_run_evaluation_preparations_forever,
+        args=(db, workspace, preparation_stop),
+        name="vfieval-evaluation-preparation",
+        daemon=True,
+    )
+    preparation_thread.start()
     print(f"VFIEval listening on http://{host}:{port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        cleanup_stop.set()
+        preparation_stop.set()
+        cleanup_thread.join(timeout=5)
+        preparation_thread.join(timeout=5)
 
 
-def _make_handler(db: Database, workspace: WorkspaceConfig):
+def _run_evaluation_preparations_forever(
+    db: Database,
+    workspace: WorkspaceConfig,
+    stop_event: threading.Event,
+) -> None:
+    while not stop_event.is_set():
+        try:
+            run_pending_preparations(db, workspace, limit=1)
+        except Exception as exc:
+            print(f"evaluation preparation loop failed: {type(exc).__name__}: {exc}")
+        stop_event.wait(1.0)
+
+
+def _make_handler(
+    db: Database,
+    workspace: WorkspaceConfig,
+    cleanup_service: RunCleanupService | None = None,
+):
     # Idempotent startup backfill keeps legacy folder/run resources addressable
     # by stable asset IDs. Subsequent asset-list requests only rescan folders;
     # workers synchronize new Run artifacts when they are finalized.
+    ensure_v2_schema(db)
     sync_catalog(db, workspace, include_runs=True)
+    sync_canonical_gt_items(db)
+    cleanup_service = cleanup_service or RunCleanupService(db, workspace)
+    cleanup_service.ensure_backfilled()
+    cleanup_service.process_pending()
 
     class VFIEvalHandler(BaseHTTPRequestHandler):
         server_version = "VFIEval/0.1"
 
         def do_GET(self) -> None:
             try:
+                # The production server has a dedicated cleanup loop. This
+                # lightweight pump also makes embedded/test servers converge
+                # without requiring their own lifecycle thread.
+                cleanup_service.process_pending(limit=20)
                 parsed = urlparse(self.path)
                 path = parsed.path
                 query = parse_qs(parsed.query)
                 if path == "/":
                     return self._send_static("index.html")
-                if path in {"/app.js", "/styles.css"}:
+                if re.fullmatch(r"/evaluate/[A-Za-z0-9_-]+", path):
+                    return self._send_static("blind.html")
+                if path in {"/app.js", "/styles.css", "/studio.js", "/studio.css", "/blind.js", "/blind.css"}:
                     return self._send_static(path.lstrip("/"))
                 if path == "/api/health":
                     return self._json({"ok": True, "metrics": list(METRIC_NAMES)})
+                if path == "/api/storage/gc/preview":
+                    return self._json(
+                        cleanup_service.gc_preview(
+                            _query_int_values(query, "entry_id") or None,
+                            _query_int_values(query, "run_id") or None,
+                        )
+                    )
+                match = re.fullmatch(r"/api/run-purge-requests/(\d+)", path)
+                if match:
+                    return self._json(db.get_run_purge_request_by_id(int(match.group(1))))
                 if path == "/api/dashboard":
                     return self._json(_dashboard(db))
                 if path == "/api/model-files":
@@ -144,12 +247,28 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     if query.get("sync", ["1"])[0] not in {"0", "false", "no"}:
                         sync_folder_assets(db, workspace)
                     collection_id = _optional_int(query.get("collection_id", [None])[0])
+                    requested_source_kind = query.get("source_kind", [None])[0] or None
                     return self._json(
                         list_assets(
                             db,
                             collection_id=collection_id,
                             role=query.get("role", [None])[0] or None,
-                            source_kind=query.get("source_kind", [None])[0] or None,
+                            source_kind=requested_source_kind,
+                            valid_run_outputs=requested_source_kind == "run_artifact",
+                            state=query.get("state", ["ready"])[0] or None,
+                            query=query.get("q", [""])[0],
+                            page=int(query.get("page", ["1"])[0] or 1),
+                            page_size=int(query.get("page_size", ["50"])[0] or 50),
+                        )
+                    )
+                if path == "/api/media/sources":
+                    if query.get("sync", ["1"])[0] not in {"0", "false", "no"}:
+                        sync_folder_assets(db, workspace)
+                    return self._json(
+                        list_assets(
+                            db,
+                            role=query.get("role", [None])[0] or None,
+                            source_kinds=["folder", "upload"],
                             state=query.get("state", ["ready"])[0] or None,
                             query=query.get("q", [""])[0],
                             page=int(query.get("page", ["1"])[0] or 1),
@@ -158,6 +277,45 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     )
                 if path == "/api/media/audit":
                     return self._json(media_audit(db))
+                if path == "/api/media/run-outputs":
+                    return self._json({"runs": _bound_run_outputs(db)})
+                if path == "/api/media/item-groups":
+                    if query.get("role", ["gt"])[0] not in {"", "gt"}:
+                        raise ValueError("media item groups currently support role=gt only")
+                    sync_folder_assets(db, workspace)
+                    sync_canonical_gt_items(db)
+                    return self._json(list_item_groups(db))
+                if path == "/api/media/items":
+                    sync_folder_assets(db, workspace)
+                    sync_canonical_gt_items(db)
+                    group_id = _optional_int(query.get("group_id", [None])[0])
+                    if group_id is None:
+                        raise ValueError("group_id is required")
+                    return self._json(
+                        list_media_items(
+                            db,
+                            group_id,
+                            query=query.get("q", [""])[0],
+                            page=int(query.get("page", ["1"])[0] or 1),
+                            page_size=int(query.get("page_size", ["50"])[0] or 50),
+                        )
+                    )
+                match = re.fullmatch(r"/api/media/items/(\d+)/predictions", path)
+                if match:
+                    return self._json(list_item_predictions(db, int(match.group(1))))
+                if path == "/api/media/methods":
+                    item_ids = _query_int_values(query, "item_id")
+                    if not item_ids:
+                        raise ValueError("at least one item_id is required")
+                    return self._json(list_methods_for_items(db, item_ids))
+                if path == "/api/media/unbound-predictions":
+                    return self._json(
+                        list_unbound_predictions(
+                            db,
+                            page=int(query.get("page", ["1"])[0] or 1),
+                            page_size=int(query.get("page_size", ["50"])[0] or 50),
+                        )
+                    )
                 match = re.fullmatch(r"/api/media/assets/(\d+)(?:/(content))?", path)
                 if match:
                     asset_id = int(match.group(1))
@@ -174,7 +332,54 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                 if match:
                     return self._json(get_upload_session(db, match.group(1)))
                 if path == "/api/evaluation-campaigns":
-                    return self._json({"campaigns": list_campaigns(db)})
+                    campaigns = [*list_campaigns_v2(db), *legacy_campaigns_readonly(db)]
+                    campaigns.sort(key=lambda row: float(row.get("created_at") or 0), reverse=True)
+                    return self._json({"campaigns": campaigns})
+                match = re.fullmatch(r"/api/evaluation-campaigns/v2/(\d+)(?:/(analysis|export|preparation))?", path)
+                if match:
+                    campaign_id = int(match.group(1))
+                    section = match.group(2)
+                    if section == "analysis":
+                        return self._json(campaign_analysis_v2(db, campaign_id))
+                    if section == "preparation":
+                        return self._json(
+                            {
+                                "campaign_id": campaign_id,
+                                "preparation": get_preparation_v2(db, campaign_id),
+                            }
+                        )
+                    if section == "export":
+                        payload = json.dumps(campaign_export_v2(db, campaign_id), indent=2, ensure_ascii=False, default=str).encode("utf-8")
+                        return self._send_bytes(
+                            payload,
+                            "application/json; charset=utf-8",
+                            f"campaign-v2-{campaign_id}-export.json",
+                        )
+                    return self._json(_evaluation_campaign_v2_payload(db, campaign_id))
+                match = re.fullmatch(r"/api/blind/([A-Za-z0-9_-]+)(?:/tasks/([A-Za-z0-9_-]+)/media/(reference|left|right))?", path)
+                if match:
+                    token, task_token, side = match.groups()
+                    if task_token and side:
+                        assignment_token = str(query.get("assignment", [""])[0]).strip()
+                        if not assignment_token:
+                            return self._error(HTTPStatus.BAD_REQUEST, "opaque assignment token is required")
+                        _asset, media_path = blind_media_asset(
+                            db, workspace, token, task_token, side, assignment_token
+                        )
+                        if media_path.is_dir():
+                            files = sorted(child for child in media_path.iterdir() if child.is_file())
+                            if not files:
+                                return self._error(HTTPStatus.NOT_FOUND, "frame sequence is empty")
+                            frame_index = int(query.get("frame", ["0"])[0] or 0)
+                            if frame_index < 0 or frame_index >= len(files):
+                                return self._error(
+                                    HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE,
+                                    "frame index is out of range",
+                                )
+                            media_path = files[frame_index]
+                        return self._send_file(media_path, cache_control="no-store")
+                    evaluator_id = str(query.get("evaluator_id", [""])[0]).strip()
+                    return self._json(blind_payload(db, token, evaluator_id))
                 match = re.fullmatch(r"/api/evaluation-campaigns/(\d+)(?:/(candidates|next|analysis|export))?", path)
                 if match:
                     campaign_id = int(match.group(1))
@@ -182,10 +387,10 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     if section == "candidates":
                         return self._json({"campaign_id": campaign_id, "candidates": list_candidates(db, campaign_id)})
                     if section == "next":
-                        evaluator_id = str(query.get("evaluator_id", [""])[0]).strip()
-                        if not evaluator_id:
-                            return self._error(HTTPStatus.BAD_REQUEST, "evaluator_id is required")
-                        return self._json(next_task(db, campaign_id, evaluator_id))
+                        return self._error(
+                            HTTPStatus.GONE,
+                            "legacy Campaign V1 is read-only; participants must use an opaque Campaign V2 /evaluate URL",
+                        )
                     if section == "analysis":
                         analysis = campaign_analysis(
                             db,
@@ -215,23 +420,13 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                                 f"campaign-{campaign_id}-export.csv",
                             )
                         return self._json(exported)
-                    return self._json(get_campaign(db, campaign_id))
+                    return self._json(_legacy_evaluation_campaign_payload(db, campaign_id))
                 match = re.fullmatch(r"/api/evaluation-tasks/(\d+)/media/(reference|left|right)", path)
                 if match:
-                    evaluator_id = str(query.get("evaluator_id", [""])[0]).strip()
-                    if not evaluator_id:
-                        return self._error(HTTPStatus.BAD_REQUEST, "evaluator_id is required")
-                    asset_id = task_media_asset_id(db, int(match.group(1)), match.group(2), evaluator_id)
-                    _asset, media_path = resolve_asset_path(db, workspace, asset_id)
-                    if media_path.is_dir():
-                        files = sorted(child for child in media_path.iterdir() if child.is_file())
-                        if not files:
-                            return self._error(HTTPStatus.NOT_FOUND, "frame sequence is empty")
-                        frame_index = int(query.get("frame", ["0"])[0] or 0)
-                        if frame_index < 0 or frame_index >= len(files):
-                            return self._error(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE, "frame index is out of range")
-                        media_path = files[frame_index]
-                    return self._send_file(media_path, cache_control="no-store")
+                    return self._error(
+                        HTTPStatus.GONE,
+                        "legacy Campaign V1 is read-only; participant media is available only through opaque Campaign V2 URLs",
+                    )
                 if path == "/api/video-groups":
                     summary = query.get("summary", ["0"])[0] in {"1", "true", "yes"}
                     return self._json(list_video_groups(workspace, include_videos=not summary))
@@ -290,6 +485,32 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                 if match:
                     run_id = int(match.group(1))
                     return self._json({"run_id": run_id, "feedback": db.list_run_feedback(run_id)})
+                match = re.fullmatch(r"/api/runs/(\d+)/compare-inputs", path)
+                if match:
+                    return self._json(_compare_inputs_payload(db, int(match.group(1))))
+                match = re.fullmatch(r"/api/runs/(\d+)/compare-inputs/([^/]+)/media", path)
+                if match:
+                    run_id = int(match.group(1))
+                    slot = unquote(match.group(2))
+                    media_path = _compare_input_media(
+                        db,
+                        workspace,
+                        run_id,
+                        slot,
+                        variant=str(query.get("variant", ["original"])[0] or "original"),
+                    )
+                    if media_path.is_dir():
+                        files = sorted(child for child in media_path.iterdir() if child.is_file())
+                        if not files:
+                            return self._error(HTTPStatus.NOT_FOUND, "frame sequence is empty")
+                        frame_index = int(query.get("frame", ["0"])[0] or 0)
+                        if frame_index < 0 or frame_index >= len(files):
+                            return self._error(
+                                HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE,
+                                "frame index is out of range",
+                            )
+                        media_path = files[frame_index]
+                    return self._send_file(media_path, cache_control="no-store")
                 match = re.fullmatch(r"/api/runs/(\d+)/samples/(\d+)", path)
                 if match:
                     return self._json(_run_sample_payload(db, int(match.group(1)), int(match.group(2))))
@@ -364,6 +585,8 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                 self._error(HTTPStatus.NOT_FOUND, str(exc), type(exc).__name__)
             except FileNotFoundError as exc:
                 self._error(HTTPStatus.NOT_FOUND, str(exc), type(exc).__name__)
+            except EvaluationConflict as exc:
+                self._error(HTTPStatus.CONFLICT, str(exc), type(exc).__name__)
             except ValueError as exc:
                 self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
             except Exception as exc:
@@ -377,6 +600,18 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     body = self._read_json()
                 except _RequestBodyTooLarge as exc:
                     return self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, str(exc), "RequestBodyTooLarge")
+                if path == "/api/storage/gc":
+                    try:
+                        result = cleanup_service.garbage_collect(
+                            confirmed=body.get("confirm") is True,
+                            entry_ids=body.get("entry_ids") if isinstance(body.get("entry_ids"), list) else None,
+                            run_ids=body.get("run_ids") if isinstance(body.get("run_ids"), list) else None,
+                            preview_token=str(body.get("preview_token") or ""),
+                            require_preview_token=True,
+                        )
+                    except ValueError as exc:
+                        return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
+                    return self._json(result)
                 if path == "/api/media/collections":
                     try:
                         collection = create_collection(
@@ -388,6 +623,30 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     except ValueError as exc:
                         return self._error(HTTPStatus.CONFLICT, str(exc), type(exc).__name__)
                     return self._json({"collection": collection}, status=HTTPStatus.CREATED)
+                match = re.fullmatch(r"/api/media/items/(\d+)/external-predictions", path)
+                if match:
+                    try:
+                        member = register_external_prediction(
+                            db,
+                            int(match.group(1)),
+                            int(body.get("asset_id")),
+                            method_key=str(body.get("method_key") or ""),
+                            temporal_mapping=(
+                                body.get("temporal_mapping")
+                                if isinstance(body.get("temporal_mapping"), dict)
+                                else None
+                            ),
+                            spatial_origin=(
+                                body.get("spatial_origin")
+                                if isinstance(body.get("spatial_origin"), dict)
+                                else None
+                            ),
+                            aspect_stretch_confirmed=body.get("aspect_stretch_confirmed") is True,
+                            metadata=body.get("metadata") if isinstance(body.get("metadata"), dict) else None,
+                        )
+                    except (TypeError, ValueError) as exc:
+                        return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
+                    return self._json({"member": member}, status=HTTPStatus.CREATED)
                 if path == "/api/uploads":
                     try:
                         upload = create_upload_session(db, workspace, body)
@@ -407,47 +666,99 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                         return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
                     return self._json(completed)
                 if path == "/api/evaluators/session":
+                    return self._error(
+                        HTTPStatus.GONE,
+                        "legacy Campaign V1 is read-only; create evaluator sessions through an opaque Campaign V2 URL",
+                    )
+                if path == "/api/evaluation-campaigns/v2/preview":
                     try:
-                        evaluator = upsert_evaluator(db, body)
+                        return self._json(preview_campaign_v2(db, workspace, body))
                     except ValueError as exc:
                         return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
-                    return self._json({"evaluator": evaluator}, status=HTTPStatus.CREATED)
-                if path == "/api/evaluation-campaigns":
+                if path == "/api/evaluation-campaigns/v2":
                     try:
-                        campaign = create_campaign(db, body)
+                        campaign = create_campaign_v2(db, workspace, body)
                     except ValueError as exc:
                         return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
                     return self._json({"campaign": campaign}, status=HTTPStatus.CREATED)
-                match = re.fullmatch(r"/api/evaluation-campaigns/(\d+)/(candidates|publish|close)", path)
+                match = re.fullmatch(r"/api/evaluation-campaigns/v2/(\d+)/(publish|close|archive)", path)
+                if match:
+                    campaign_id = int(match.group(1))
+                    action = match.group(2)
+                    try:
+                        if action == "publish":
+                            result = request_publish_campaign_v2(db, campaign_id)
+                            threading.Thread(
+                                target=run_pending_preparations,
+                                args=(db, workspace),
+                                kwargs={"limit": 1},
+                                name=f"vfieval-evaluation-{campaign_id}",
+                                daemon=True,
+                            ).start()
+                            return self._json(result, status=HTTPStatus.ACCEPTED)
+                        if action == "close":
+                            campaign = close_campaign_v2(db, campaign_id)
+                        else:
+                            campaign = archive_campaign_v2(db, campaign_id)
+                        return self._json({"campaign": campaign})
+                    except EvaluationConflict as exc:
+                        return self._error(HTTPStatus.CONFLICT, str(exc), type(exc).__name__)
+                    except ValueError as exc:
+                        return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
+                match = re.fullmatch(r"/api/evaluation-campaigns/(\d+)/(archive|discard)", path)
                 if match:
                     campaign_id = int(match.group(1))
                     try:
-                        if match.group(2) == "candidates":
-                            candidate = add_candidate(db, workspace, campaign_id, body)
-                            return self._json({"candidate": candidate}, status=HTTPStatus.CREATED)
-                        if match.group(2) == "close":
-                            campaign = close_campaign(db, campaign_id)
-                            return self._json({"campaign": campaign})
-                        campaign = publish_campaign(db, workspace, campaign_id)
-                        return self._json({"campaign": campaign})
+                        if match.group(2) == "archive":
+                            return self._json({"campaign": archive_legacy_campaign(db, campaign_id)})
+                        discard_empty_legacy_draft(db, campaign_id)
+                        return self._json({"campaign_id": campaign_id, "discarded": True})
                     except ValueError as exc:
                         return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
-                if path == "/api/evaluation-tasks/adhoc":
-                    try:
-                        created = create_adhoc_task(db, workspace, body)
-                    except ValueError as exc:
-                        return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
-                    return self._json(created, status=HTTPStatus.CREATED)
-                match = re.fullmatch(r"/api/evaluation-tasks/(\d+)/votes", path)
+                match = re.fullmatch(r"/api/blind/([A-Za-z0-9_-]+)/session", path)
                 if match:
+                    try:
+                        return self._json(blind_session(db, match.group(1), body), status=HTTPStatus.CREATED)
+                    except ValueError as exc:
+                        return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
+                match = re.fullmatch(r"/api/blind/([A-Za-z0-9_-]+)/tasks/([A-Za-z0-9_-]+)/(vote|heartbeat)", path)
+                if match:
+                    token, task_token, action = match.groups()
                     evaluator_id = str(body.get("evaluator_id") or "").strip()
                     if not evaluator_id:
                         return self._error(HTTPStatus.BAD_REQUEST, "evaluator_id is required")
                     try:
-                        vote = submit_vote(db, int(match.group(1)), evaluator_id, body)
+                        if action == "heartbeat":
+                            return self._json(blind_heartbeat(db, token, task_token, evaluator_id))
+                        return self._json(
+                            blind_submit_vote(db, token, task_token, evaluator_id, body)
+                        )
+                    except EvaluationConflict as exc:
+                        return self._error(HTTPStatus.CONFLICT, str(exc), type(exc).__name__)
                     except ValueError as exc:
                         return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
-                    return self._json({"vote": vote})
+                if path == "/api/evaluation-campaigns":
+                    return self._error(
+                        HTTPStatus.GONE,
+                        "legacy Campaign V1 is read-only; create Campaigns with /api/evaluation-campaigns/v2",
+                    )
+                match = re.fullmatch(r"/api/evaluation-campaigns/(\d+)/(candidates|publish|close)", path)
+                if match:
+                    return self._error(
+                        HTTPStatus.GONE,
+                        "legacy Campaign V1 is read-only; use Campaign V2 for candidate, publish, and close operations",
+                    )
+                if path == "/api/evaluation-tasks/adhoc":
+                    return self._error(
+                        HTTPStatus.GONE,
+                        "legacy Campaign V1 is read-only; ad-hoc tasks are no longer available",
+                    )
+                match = re.fullmatch(r"/api/evaluation-tasks/(\d+)/votes", path)
+                if match:
+                    return self._error(
+                        HTTPStatus.GONE,
+                        "legacy Campaign V1 is read-only; votes are accepted only through opaque Campaign V2 task URLs",
+                    )
                 if path == "/api/models":
                     adapter = body["adapter"]
                     if not adapter.startswith("file:") and adapter != "dummy":
@@ -496,6 +807,7 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     return self._json({"worker_id": worker_id, "worker": db.get_worker(worker_id)})
                 if path == "/api/preflight":
                     prepared = source_assets_to_video_payload(db, workspace, body)
+                    prepared = _prepare_media_item_compare_payload(db, workspace, prepared)
                     result = preflight_run(db, workspace, prepared)
                     profile_request = dict(prepared)
                     profile_request.update(
@@ -509,6 +821,7 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     return self._json(result)
                 if path == "/api/runs":
                     body = source_assets_to_video_payload(db, workspace, body)
+                    body = _prepare_media_item_compare_payload(db, workspace, body)
                     run_type = str(body.get("run_type") or "")
                     if run_type == "video_compare":
                         created = _create_video_compare_run(db, workspace, body)
@@ -556,15 +869,13 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     run_id = int(match.group(1))
                     action = match.group(2)
                     if action == "hide":
-                        if db.get_run(run_id)["status"] not in TERMINAL_RUN_STATUSES:
-                            db.request_run_cancel(run_id)
-                        db.soft_delete_run(run_id)
-                        return self._json({"run_id": run_id, "deleted": True})
+                        request = cleanup_service.request_delete(run_id)
+                        return self._json(_purge_response(request), status=HTTPStatus.ACCEPTED)
                     try:
-                        cleaned = _cleanup_run_artifacts(db, workspace, run_id)
+                        request = cleanup_service.request_artifact_cleanup(run_id)
                     except ValueError as exc:
                         return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
-                    return self._json(cleaned)
+                    return self._json(_purge_response(request), status=HTTPStatus.ACCEPTED)
                 match = re.fullmatch(r"/api/runs/(\d+)/metrics/retry", path)
                 if match:
                     run_id = int(match.group(1))
@@ -601,14 +912,30 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     raw_ids = body.get("run_ids") or []
                     if not isinstance(raw_ids, list) or not raw_ids:
                         return self._error(HTTPStatus.BAD_REQUEST, "run_ids must be a non-empty list")
-                    deleted = []
+                    accepted = []
+                    failures = []
                     for raw in raw_ids:
-                        run_id = int(raw)
-                        if db.get_run(run_id)["status"] not in TERMINAL_RUN_STATUSES:
-                            db.request_run_cancel(run_id)
-                        db.soft_delete_run(run_id)
-                        deleted.append(run_id)
-                    return self._json({"deleted": deleted, "count": len(deleted)})
+                        try:
+                            run_id = int(raw)
+                            accepted.append(_purge_response(cleanup_service.request_delete(run_id)))
+                        except Exception as exc:
+                            failures.append(
+                                {
+                                    "run_id": raw,
+                                    "type": type(exc).__name__,
+                                    "message": str(exc),
+                                }
+                            )
+                    return self._json(
+                        {
+                            "requests": accepted,
+                            "accepted": [int(row["run_id"]) for row in accepted],
+                            "deleted": [int(row["run_id"]) for row in accepted if row["deleted"]],
+                            "failures": failures,
+                            "count": len(accepted),
+                        },
+                        status=HTTPStatus.ACCEPTED,
+                    )
                 if path == "/api/jobs":
                     kind = body["kind"]
                     if kind not in {"decode", "inference", "metric"}:
@@ -642,6 +969,10 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                     db.touch_job(job_id)
                     return self._json({"job_id": job_id, "status": "heartbeat"})
                 self._error(HTTPStatus.NOT_FOUND, "not found")
+            except EvaluationConflict as exc:
+                self._error(HTTPStatus.CONFLICT, str(exc), type(exc).__name__)
+            except ValueError as exc:
+                self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
             except KeyError as exc:
                 self._error(HTTPStatus.BAD_REQUEST, f"missing field {exc}")
             except Exception as exc:
@@ -711,10 +1042,8 @@ def _make_handler(db: Database, workspace: WorkspaceConfig):
                 if not match:
                     return self._error(HTTPStatus.NOT_FOUND, "not found")
                 run_id = int(match.group(1))
-                if db.get_run(run_id)["status"] not in TERMINAL_RUN_STATUSES:
-                    db.request_run_cancel(run_id)
-                db.soft_delete_run(run_id)
-                return self._json({"run_id": run_id, "deleted": True})
+                request = cleanup_service.request_delete(run_id)
+                return self._json(_purge_response(request), status=HTTPStatus.ACCEPTED)
             except KeyError as exc:
                 self._error(HTTPStatus.NOT_FOUND, str(exc), type(exc).__name__)
             except ValueError as exc:
@@ -981,52 +1310,76 @@ def _compare_pred_sources(
     query: dict[str, list[str]],
     run_id: int | None = None,
 ) -> dict:
-    runs = [db.get_run(run_id)] if run_id is not None else db.list_runs(limit=10000)
     rows: list[dict[str, object]] = []
     text_filter = str(query.get("q", [""])[0] or "").strip().lower()
     video_filter = str(query.get("video", [""])[0] or "").strip()
-    for run in runs:
-        if run.get("deleted_at") is not None or run.get("artifact_cleaned_at") is not None:
-            continue
-        if str(run.get("status") or "") not in COMPARE_SOURCE_RUN_STATUSES:
-            continue
-        for artifact in db.list_run_artifacts(int(run["id"]), kind="pred_video"):
-            metadata = artifact.get("metadata") or {}
-            path = Path(str(artifact["path"])).resolve()
+    item_filter = _optional_int(query.get("item_id", [None])[0])
+    item_rows = (
+        [{"id": item_filter}]
+        if item_filter is not None
+        else db.query(
+            """
+            SELECT DISTINCT item_id AS id FROM media_item_members
+            WHERE reusable_as_pred = 1 AND state = 'ready' AND deleted_at IS NULL
+            ORDER BY item_id
+            """
+        )
+    )
+    for item_row in item_rows:
+        payload = list_item_predictions(db, int(item_row["id"]))
+        item = payload["item"]
+        for prediction in payload["predictions"]:
+            prediction_run_id = prediction.get("producer_run_id")
+            # ``list_item_predictions`` already enforces this contract, but
+            # keep the legacy source endpoint defensive if a hand-edited DB
+            # row claims to be reusable. Compare-derived output is viewable in
+            # its Run Detail, never a new Compare source.
+            run_metadata = prediction.get("run_metadata") or {}
+            if (
+                prediction_run_id is not None
+                and isinstance(run_metadata, dict)
+                and str(run_metadata.get("run_type") or "model_inference") == "video_compare"
+            ):
+                continue
+            if run_id is not None and int(prediction_run_id or 0) != int(run_id):
+                continue
             row = {
-                "kind": "run_artifact",
-                "run_id": int(run["id"]),
-                "run_name": run.get("name"),
-                "video": metadata.get("video_name") or path.stem,
-                "artifact_id": int(artifact["id"]),
-                "frame_count": int(metadata.get("frames") or 0),
-                "width": _optional_int(metadata.get("width")),
-                "height": _optional_int(metadata.get("height")),
-                "fps": metadata.get("fps"),
-                "created_at": artifact.get("created_at"),
-                "compare_track_label": metadata.get("compare_track_label"),
-                "compare_track_run_id": metadata.get("compare_track_run_id"),
+                "kind": "media_item_member",
+                "item_id": int(item["id"]),
+                "member_id": int(prediction["id"]),
+                "asset_id": int(prediction["asset_id"]),
+                "run_id": int(prediction_run_id) if prediction_run_id is not None else None,
+                "run_name": prediction.get("run_name"),
+                "video": str(item.get("display_name") or ""),
+                "video_name": str(item.get("display_name") or ""),
+                "artifact_id": (prediction.get("metadata") or {}).get("artifact_id"),
+                "frame_count": int(prediction.get("frame_count") or 0),
+                "width": int(prediction.get("width") or 0),
+                "height": int(prediction.get("height") or 0),
+                "fps": prediction.get("fps"),
+                "method_key": prediction.get("method_key"),
+                "member_role": prediction.get("member_role"),
+                "reusable_as_pred": True,
             }
-            if (not row["frame_count"] or not row["width"] or not row["height"]) and path.exists():
-                try:
-                    info = inspect_video(path, workspace, exact=True)
-                    row.update(
-                        {
-                            "frame_count": int(row["frame_count"] or info.get("frame_count") or 0),
-                            "width": int(row["width"] or info.get("width") or 0),
-                            "height": int(row["height"] or info.get("height") or 0),
-                            "fps": row["fps"] or info.get("fps"),
-                        }
-                    )
-                except Exception:
-                    pass
-            searchable = f"{row.get('run_name') or ''} {row.get('video') or ''} {row.get('compare_track_label') or ''}".lower()
+            searchable = (
+                f"{row.get('run_name') or ''} {row.get('video') or ''} "
+                f"{row.get('method_key') or ''}"
+            ).lower()
             if text_filter and text_filter not in searchable:
                 continue
-            if video_filter and str(row.get("video") or "") != video_filter and Path(str(row.get("video") or "")).stem != video_filter:
+            if video_filter and str(row.get("video") or "") != video_filter and Path(
+                str(row.get("video") or "")
+            ).stem != video_filter:
                 continue
             rows.append(row)
-    rows = sorted(rows, key=lambda item: (str(item.get("video") or ""), str(item.get("run_name") or ""), int(item["artifact_id"])))
+    rows = sorted(
+        rows,
+        key=lambda item: (
+            str(item.get("video") or ""),
+            str(item.get("run_name") or ""),
+            int(item.get("member_id") or 0),
+        ),
+    )
     page, page_size = _source_pagination(query)
     total = len(rows)
     start = (page - 1) * page_size
@@ -1061,6 +1414,19 @@ def _source_page_payload(
 def _compare_layer_sources(db: Database, run_id: int, source_type: str, video_name: str | None = None) -> list[dict[str, object]]:
     run = db.get_run(run_id)
     if run.get("deleted_at") is not None or run.get("artifact_cleaned_at") is not None:
+        return []
+    if str((run.get("metadata") or {}).get("run_type") or "model_inference") == "video_compare":
+        return []
+    reusable = db.get(
+        """
+        SELECT 1 AS present FROM media_item_members
+        WHERE producer_run_id = ? AND member_role = 'model_pred'
+          AND reusable_as_pred = 1 AND state = 'ready' AND deleted_at IS NULL
+        LIMIT 1
+        """,
+        (int(run_id),),
+    )
+    if reusable is None:
         return []
     kinds = ["mask0", "mask1"] if source_type == "mask" else ["flowt_0", "flowt_1", "warp0", "warp1", "blend"]
     groups: dict[tuple[str, str, str], dict[str, object]] = {}
@@ -1123,6 +1489,273 @@ def _compare_samples(db: Database, query: dict[str, list[str]]) -> dict:
             }
         )
     return {"compatible": compatible, "video_name": video_name, "frame_index": frame_index, "samples": samples}
+
+
+def _bound_run_outputs(db: Database) -> list[dict[str, Any]]:
+    """Compatibility view backed only by reusable, Item-bound predictions.
+
+    Historical Run artifacts and Compare-derived media intentionally never
+    appear here.  New clients should use the GT-first Item endpoints instead.
+    """
+    rows = db.query(
+        """
+        SELECT r.id AS run_id, r.name AS run_name, r.created_at AS run_created_at,
+               mi.id AS item_id, mi.display_name AS video_name,
+               mim.id AS member_id, mim.method_key,
+               ma.id AS asset_id, ma.display_name, ma.frame_count, ma.width,
+               ma.height, ma.fps
+        FROM media_item_members mim
+        JOIN media_items mi ON mi.id = mim.item_id
+        JOIN media_assets ma ON ma.id = mim.asset_id
+        JOIN runs r ON r.id = mim.producer_run_id
+        WHERE mim.member_role = 'model_pred'
+          AND mim.producer_kind = 'model_inference'
+          AND mim.reusable_as_pred = 1
+          AND mim.state = 'ready' AND mim.deleted_at IS NULL
+          AND mi.state = 'ready' AND mi.deleted_at IS NULL
+          AND ma.state = 'ready' AND ma.deleted_at IS NULL
+          AND r.status IN ('completed', 'metric_queued', 'metric_running')
+          AND r.deleted_at IS NULL AND r.artifact_cleaned_at IS NULL
+          AND COALESCE(json_extract(r.metadata_json, '$.run_type'), 'model_inference') = 'model_inference'
+        ORDER BY r.created_at DESC, r.id DESC, mi.display_name, mim.id DESC
+        """
+    )
+    grouped: dict[int, dict[str, Any]] = {}
+    for row in rows:
+        run_id = int(row["run_id"])
+        run = grouped.setdefault(
+            run_id,
+            {
+                "run_id": run_id,
+                "run_name": str(row["run_name"] or f"Run {run_id}"),
+                "created_at": row["run_created_at"],
+                "videos": [],
+            },
+        )
+        run["videos"].append(
+            {
+                "item_id": int(row["item_id"]),
+                "video_name": str(row["video_name"]),
+                "tracks": [
+                    {
+                        "member_id": int(row["member_id"]),
+                        "asset_id": int(row["asset_id"]),
+                        "track_label": str(row["method_key"] or row["run_name"] or ""),
+                        "display_name": str(row["display_name"] or ""),
+                        "frame_count": int(row["frame_count"] or 0),
+                        "width": int(row["width"] or 0),
+                        "height": int(row["height"] or 0),
+                        "fps": row["fps"],
+                    }
+                ],
+            }
+        )
+    for run in grouped.values():
+        run["video_count"] = len(run["videos"])
+        run["track_count"] = sum(len(video["tracks"]) for video in run["videos"])
+    return list(grouped.values())
+
+
+def _compare_input_binding_rows(db: Database, run_id: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    run = db.get_run(int(run_id))
+    if str((run.get("metadata") or {}).get("run_type") or "") != "video_compare":
+        raise ValueError(f"Run {run_id} is not a video_compare Run")
+    rows = db.query(
+        """
+        SELECT b.*, mi.display_name AS item_display_name,
+               active.member_role, active.producer_kind,
+               active.producer_run_id, active.method_key,
+               active.reusable_as_pred, active.asset_id,
+               original.asset_id AS original_asset_id,
+               ma.display_name AS asset_display_name,
+               ma.media_kind, ma.frame_count, ma.width, ma.height, ma.fps,
+               ma.source_kind, ma.state AS asset_state, ma.deleted_at AS asset_deleted_at
+        FROM run_media_item_bindings b
+        JOIN media_items mi ON mi.id = b.item_id
+        JOIN media_item_members active ON active.id = b.active_member_id
+        JOIN media_item_members original ON original.id = b.original_member_id
+        JOIN media_assets ma ON ma.id = active.asset_id
+        WHERE b.run_id = ? AND b.binding_role IN ('compare_gt', 'compare_pred')
+        ORDER BY CASE b.binding_role WHEN 'compare_gt' THEN 0 ELSE 1 END, b.slot, b.id
+        """,
+        (int(run_id),),
+    )
+    if not rows:
+        raise ValueError("this Compare Run has no Item-bound inputs")
+    for row in rows:
+        row["metadata"] = json.loads(row.pop("metadata_json") or "{}")
+        row["reusable_as_pred"] = bool(row.get("reusable_as_pred"))
+    return run, rows
+
+
+def _compare_inputs_payload(db: Database, run_id: int) -> dict[str, Any]:
+    run, rows = _compare_input_binding_rows(db, int(run_id))
+    plan = dict((run.get("metadata") or {}).get("alignment_plan") or {})
+    reports = plan.get("sources") or {}
+    inputs: list[dict[str, Any]] = []
+    for row in rows:
+        slot = str(row["slot"] or ("gt" if row["binding_role"] == "compare_gt" else "pred"))
+        inputs.append(
+            {
+                "slot": slot,
+                "role": "gt" if row["binding_role"] == "compare_gt" else "pred",
+                "item_id": int(row["item_id"]),
+                "item_display_name": str(row["item_display_name"] or ""),
+                "original_member_id": int(row["original_member_id"]),
+                "active_member_id": int(row["active_member_id"]),
+                "snapshot_active": int(row["active_member_id"]) != int(row["original_member_id"]),
+                "member_role": str(row["member_role"] or ""),
+                "producer_kind": str(row["producer_kind"] or ""),
+                "method_key": str(row["method_key"] or ""),
+                "display_name": str(row["asset_display_name"] or ""),
+                "media_kind": str(row["media_kind"] or "video"),
+                "frame_count": int(row["frame_count"] or 0),
+                "width": int(row["width"] or 0),
+                "height": int(row["height"] or 0),
+                "fps": row["fps"],
+                "alignment": reports.get(slot) or {},
+                "original_url": f"/api/runs/{int(run_id)}/compare-inputs/{quote(slot)}/media?variant=original",
+                "aligned_url": f"/api/runs/{int(run_id)}/compare-inputs/{quote(slot)}/media?variant=aligned",
+            }
+        )
+    return {
+        "run_id": int(run_id),
+        "media_item_id": int(rows[0]["item_id"]),
+        "alignment_plan": plan,
+        "inputs": inputs,
+    }
+
+
+def _compare_input_media(
+    db: Database,
+    workspace: WorkspaceConfig,
+    run_id: int,
+    slot: str,
+    *,
+    variant: str,
+) -> Path:
+    if variant not in {"original", "aligned"}:
+        raise ValueError("compare input media variant must be original or aligned")
+    run, rows = _compare_input_binding_rows(db, int(run_id))
+    binding = next((row for row in rows if str(row["slot"]) == str(slot)), None)
+    if binding is None:
+        raise KeyError(f"Compare input slot not found: {slot}")
+    _item, _member, _asset, original_path = resolve_item_member(
+        db,
+        workspace,
+        int(binding["active_member_id"]),
+        require_reusable=False,
+    )
+    if variant == "original":
+        return original_path
+
+    plan = dict((run.get("metadata") or {}).get("alignment_plan") or {})
+    if not plan or not plan.get("fingerprint"):
+        raise ValueError("Compare Run has no Alignment Plan")
+    frame_paths, fps = _compare_aligned_frame_paths(db, run, binding)
+    if not frame_paths:
+        raise FileNotFoundError(f"Compare input {slot} has no aligned frames")
+    if str(binding.get("media_kind") or "video") == "frame_sequence":
+        # The HTTP route accepts an optional frame index for original
+        # directories.  The current detail UI requests one representative
+        # aligned frame, so return the first already-materialized sample.
+        return frame_paths[0]
+    signature_rows = []
+    for path in frame_paths:
+        stat = path.stat()
+        signature_rows.append((path.as_posix(), int(stat.st_size), int(stat.st_mtime_ns)))
+    cache_key = hashlib.sha256(
+        json.dumps(
+            {
+                "run_id": int(run_id),
+                "slot": str(slot),
+                "active_member_id": int(binding["active_member_id"]),
+                "alignment_fingerprint": str(plan["fingerprint"]),
+                "frames": signature_rows,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    # Cache entries are intentionally direct children of compare_cache so the
+    # shared cache catalog/lease service can validate and GC them safely.
+    cache_root = (workspace.root / "compare_cache").resolve()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    output = (cache_root / f"{cache_key}.mp4").resolve()
+    if output.parent != cache_root:
+        raise ValueError("invalid Compare aligned media cache path")
+    from vfieval.pipeline.inference import _write_mp4
+    from vfieval.run_cleanup import CACHE_GRACE_SECONDS, cache_lease
+
+    with cache_lease(db, workspace, "compare_cache", cache_key, output):
+        if not output.is_file() or output.stat().st_size <= 0:
+            temporary = output.with_name(f"{output.stem}.{uuid.uuid4().hex}.tmp.mp4")
+            try:
+                _write_mp4(frame_paths, temporary, fps or 24.0)
+                os.replace(temporary, output)
+            finally:
+                try:
+                    temporary.unlink()
+                except FileNotFoundError:
+                    pass
+        now = time.time()
+        db.upsert_cache_entry(
+            "compare_cache",
+            cache_key,
+            output,
+            state="ready",
+            size_bytes=int(output.stat().st_size),
+            metadata={
+                "run_id": int(run_id),
+                "slot": str(slot),
+                "alignment_fingerprint": str(plan["fingerprint"]),
+            },
+            last_used_at=now,
+            gc_after=now + CACHE_GRACE_SECONDS,
+        )
+    return output
+
+
+def _compare_aligned_frame_paths(
+    db: Database,
+    run: dict[str, Any],
+    binding: dict[str, Any],
+) -> tuple[list[Path], float]:
+    samples = db.list_samples(int(run["dataset_id"]))
+    binding_metadata = binding.get("metadata") or {}
+    track_label = str(binding_metadata.get("track_label") or "")
+    is_gt = str(binding["binding_role"]) == "compare_gt"
+    selected: list[tuple[int, dict[str, Any]]] = []
+    for sample in samples:
+        metadata = sample.get("metadata") or {}
+        if is_gt:
+            if int(metadata.get("compare_track_index") or 0) != 0:
+                continue
+        elif track_label and str(metadata.get("compare_track_label") or "") != track_label:
+            continue
+        elif not track_label:
+            expected_index = max(0, ord(str(binding["slot"])[-1:].lower() or "a") - ord("a"))
+            if int(metadata.get("compare_track_index") or 0) != expected_index:
+                continue
+        selected.append((int(metadata.get("frame_index") or 0), sample))
+    selected.sort(key=lambda pair: pair[0])
+    paths: list[Path] = []
+    fps = 0.0
+    for _index, sample in selected:
+        metadata = sample.get("metadata") or {}
+        fps = fps or float(metadata.get("fps") or 0.0)
+        kind = "gt" if is_gt else "pred"
+        artifact = next(
+            (row for row in db.list_artifacts_by_sample(int(sample["id"])) if row.get("kind") == kind),
+            None,
+        )
+        candidate = Path(str(artifact["path"])) if artifact else Path(
+            str(sample.get("gt_path") if is_gt else sample.get("img1_path"))
+        )
+        if not candidate.is_file():
+            raise FileNotFoundError(f"aligned Compare frame is unavailable: {candidate}")
+        paths.append(candidate.resolve())
+    return paths, fps or float(binding.get("fps") or 24.0)
 
 
 def _find_run_sample_by_frame(db: Database, run_id: int, video_name: str, frame_index: int) -> dict | None:
@@ -1226,6 +1859,36 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
             "source_assets": body.get("source_assets") or [],
         },
     )
+    # Bind every selected source clip to its exact canonical Item before the
+    # Run starts.  This is deliberately based on the resolved group/file
+    # selection, never a stem/hash guess, so a later pred can be reusable only
+    # for the GT Item it actually came from.
+    sync_folder_assets(db, workspace)
+    source_bindings: list[dict[str, Any]] = []
+    source_maps = {group: folder_asset_id_map(db, group) for group in groups}
+    for selected_video in selected_videos:
+        if multi_group:
+            group_name, separator, file_name = selected_video.partition("/")
+            if not separator or not group_name or not file_name:
+                raise ValueError(f"invalid qualified source video selection: {selected_video}")
+            timeline_name = f"{group_name}/{Path(file_name).stem}"
+        else:
+            group_name = groups[0]
+            file_name = selected_video
+            timeline_name = Path(file_name).stem
+        asset_id = source_maps.get(group_name, {}).get(file_name)
+        if asset_id is None:
+            raise ValueError(f"selected source media was not cataloged: {group_name}/{file_name}")
+        item = ensure_canonical_gt_item(db, int(asset_id))
+        source_bindings.append(
+            {
+                "asset_id": int(asset_id),
+                "item_id": int(item["id"]),
+                "video_name": timeline_name,
+                "group": group_name,
+                "file_name": file_name,
+            }
+        )
     metadata = {
         "run_type": "model_inference",
         "source": "folder_flow",
@@ -1295,20 +1958,30 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         metadata={**metadata, "output_dir": output_dir},
         create_inference_job=False,
     )
-    for descriptor in body.get("source_assets") or []:
-        if not isinstance(descriptor, dict) or descriptor.get("asset_id") in {None, ""}:
-            continue
-        asset = get_asset(db, int(descriptor["asset_id"]))
-        provenance = asset.get("provenance") or {}
+    for source_binding in source_bindings:
         bind_run_asset(
             db,
             run_id,
-            int(asset["id"]),
+            int(source_binding["asset_id"]),
             "source",
-            video_name=str(provenance.get("video") or asset.get("original_name") or asset.get("display_name") or ""),
+            video_name=str(source_binding["video_name"]),
             model_name=model_path.name,
             checkpoint=str(checkpoint_relative or ""),
-            metadata={"input": True},
+            metadata={
+                "input": True,
+                "video_group": source_binding["group"],
+                "video_file": source_binding["file_name"],
+            },
+        )
+        bind_run_source(
+            db,
+            run_id,
+            int(source_binding["item_id"]),
+            video_name=str(source_binding["video_name"]),
+            metadata={
+                "video_group": source_binding["group"],
+                "video_file": source_binding["file_name"],
+            },
         )
     total_decode_frames = _decode_progress_total(video_infos, max_frames)
     db.add_run_job(
@@ -1357,7 +2030,229 @@ def _dedupe_track_labels(distorted_tracks: list[dict[str, Any]]) -> list[str]:
     return labels
 
 
+def _prepare_media_item_compare_payload(
+    db: Database,
+    workspace: WorkspaceConfig,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate and translate the GT-first Compare request to descriptors.
+
+    The public request contains only opaque Item/Member ids.  Filesystem paths
+    are resolved later by ``compare_inputs`` and never accepted from clients.
+    Legacy structured descriptors remain readable through the old path.
+    """
+    if str(body.get("run_type") or "") != "video_compare":
+        return body
+    raw_reference = body.get("reference")
+    raw_distorted = body.get("distorted")
+    raw_descriptors = raw_distorted if isinstance(raw_distorted, list) else [raw_distorted]
+    if any(
+        isinstance(descriptor, dict) and "path" in descriptor
+        for descriptor in [raw_reference, *raw_descriptors]
+    ):
+        raise ValueError("Compare descriptors must not include client-supplied paths")
+    item_value = body.get("media_item_id")
+    member_values = body.get("pred_member_ids")
+    if item_value in {None, ""} and member_values is None:
+        inferred = _infer_legacy_compare_item_ids(db, workspace, body)
+        if inferred is None:
+            # Descriptor compatibility is deliberately an adapter onto the
+            # Item contract, not a second source-selection path.  Letting an
+            # unresolved legacy body continue would send it through the old
+            # preflight branch, where an unbound historical artifact (or a
+            # Compare result) could bypass canonical GT identity checks.
+            raise ValueError(
+                "legacy Compare descriptors must resolve to one canonical media item "
+                "and one or two reusable prediction members"
+            )
+        item_value, member_values = inferred
+    try:
+        item_id = int(item_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("video_compare requires a positive media_item_id") from exc
+    if item_id <= 0:
+        raise ValueError("video_compare requires a positive media_item_id")
+    if not isinstance(member_values, list) or not 1 <= len(member_values) <= 2:
+        raise ValueError("video_compare requires one or two pred_member_ids")
+    try:
+        member_ids = [int(value) for value in member_values]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("pred_member_ids must contain positive integers") from exc
+    if any(value <= 0 for value in member_ids) or len(set(member_ids)) != len(member_ids):
+        raise ValueError("pred_member_ids must contain one or two distinct positive integers")
+
+    # This is the authoritative Item resolver: it enforces exact canonical-GT
+    # identity, trusted managed paths, reusable-role constraints, and rejects
+    # Compare/evaluation/snapshot sources even if malformed DB rows claim they
+    # are reusable.  Keep the HTTP layer deliberately descriptor-only.
+    resolved = resolve_media_item_compare(db, workspace, item_id, member_ids)
+    item = resolved["item"]
+    canonical_member_id = int(resolved["reference"]["member_id"])
+    members = list(resolved["members"])
+
+    prepared = dict(body)
+    prepared["media_item_id"] = item_id
+    prepared["pred_member_ids"] = member_ids
+    prepared["reference"] = {"kind": "media_item", "item_id": item_id}
+    prepared["distorted"] = [
+        {
+            "kind": "media_item_member",
+            "member_id": int(member["id"]),
+            "label": str(member.get("run_name") or member.get("method_key") or f"Pred {index + 1}"),
+        }
+        for index, member in enumerate(members)
+    ]
+    prepared["align_mode"] = "strict"
+    prepared["media_item_compare"] = True
+    prepared["canonical_gt_member_id"] = canonical_member_id
+    spatial_policy = dict(prepared.get("spatial_policy") or {})
+    spatial_policy.setdefault("mode", "smallest_pred")
+    spatial_policy.setdefault("filter", "lanczos")
+    spatial_policy.setdefault("allow_known_aspect_stretch", True)
+    prepared["spatial_policy"] = spatial_policy
+    return prepared
+
+
+def _infer_legacy_compare_item_ids(
+    db: Database,
+    workspace: WorkspaceConfig,
+    body: dict[str, Any],
+) -> tuple[int, list[int]] | None:
+    """Resolve compatibility descriptors to exact Item/Member identities.
+
+    This is intentionally a lookup, not a historical backfill: an old Run
+    artifact without a trustworthy Item member remains unselectable.
+    """
+    reference = body.get("reference")
+    distorted = body.get("distorted")
+    if not isinstance(reference, dict):
+        return None
+    descriptors = distorted if isinstance(distorted, list) else [distorted]
+    if not descriptors or any(not isinstance(descriptor, dict) for descriptor in descriptors):
+        return None
+    sync_folder_assets(db, workspace)
+    reference_kind = str(reference.get("kind") or "")
+    if reference_kind == "media_item":
+        reference_item_id = int(reference.get("item_id") or 0)
+        get_media_item(db, reference_item_id)
+    elif reference_kind == "media_asset":
+        asset_id = int(reference.get("asset_id") or 0)
+        item = db.get(
+            """
+            SELECT id FROM media_items
+            WHERE canonical_gt_asset_id = ? AND state = 'ready' AND deleted_at IS NULL
+            """,
+            (asset_id,),
+        )
+        if item is None:
+            raise ValueError("legacy Compare GT does not resolve to a canonical media item")
+        reference_item_id = int(item["id"])
+    elif reference_kind == "video_group":
+        group = str(reference.get("group") or "").strip()
+        video = str(reference.get("video") or "").strip()
+        asset = db.get(
+            """
+            SELECT id FROM media_assets
+            WHERE source_key = ? AND state = 'ready' AND deleted_at IS NULL
+            """,
+            (f"folder:{group}/{video}",),
+        )
+        if asset is None:
+            raise ValueError("legacy Compare GT does not resolve to a canonical media item")
+        reference_item_id = int(ensure_canonical_gt_item(db, int(asset["id"]))["id"])
+    else:
+        return None
+
+    member_ids: list[int] = []
+    for descriptor in descriptors:
+        kind = str(descriptor.get("kind") or "")
+        if kind == "media_item_member":
+            member_id = int(descriptor.get("member_id") or 0)
+        elif kind == "run_artifact":
+            run_id = int(descriptor.get("run_id") or 0)
+            source_run = db.get_run(run_id)
+            if str((source_run.get("metadata") or {}).get("run_type") or "model_inference") == "video_compare":
+                raise ValueError("legacy Compare cannot reuse artifacts produced by a video_compare Run")
+            artifact_id = _optional_int(descriptor.get("artifact_id"))
+            artifact_kind = str(descriptor.get("artifact_kind") or "pred_video")
+            artifacts = db.list_run_artifacts(run_id, kind=artifact_kind)
+            if artifact_id is None:
+                video = str(descriptor.get("video") or "")
+                matches = [
+                    artifact
+                    for artifact in artifacts
+                    if not video
+                    or str((artifact.get("metadata") or {}).get("video_name") or Path(str(artifact["path"])).stem)
+                    in {video, Path(video).stem}
+                ]
+                if len(matches) != 1:
+                    raise ValueError("legacy Run artifact descriptor is ambiguous or unavailable")
+                artifact_id = int(matches[0]["id"])
+            elif not any(int(artifact["id"]) == artifact_id for artifact in artifacts):
+                raise ValueError("legacy Run artifact descriptor does not belong to its declared Run")
+            media = db.get(
+                "SELECT id FROM media_assets WHERE source_key = ? AND state = 'ready' AND deleted_at IS NULL",
+                (f"run_artifact:{artifact_id}",),
+            )
+            if media is None:
+                sync_run_assets(db, workspace, run_id)
+                media = db.get(
+                    "SELECT id FROM media_assets WHERE source_key = ? AND state = 'ready' AND deleted_at IS NULL",
+                    (f"run_artifact:{artifact_id}",),
+                )
+            member_id = _legacy_reusable_member_id(
+                db,
+                int(media["id"]) if media is not None else None,
+                source_name="legacy Run Pred",
+            )
+            if member_id is None:
+                raise ValueError(
+                    "legacy Run Pred has no trustworthy media item binding; create a new bound inference Run"
+                )
+        elif kind == "media_asset":
+            member_id = _legacy_reusable_member_id(
+                db,
+                _optional_int(descriptor.get("asset_id")),
+                source_name="legacy Pred asset",
+            )
+            if member_id is None:
+                raise ValueError("legacy Pred asset has no trustworthy media item binding")
+        else:
+            return None
+        member_ids.append(member_id)
+    return reference_item_id, member_ids
+
+
+def _legacy_reusable_member_id(
+    db: Database,
+    asset_id: int | None,
+    *,
+    source_name: str,
+) -> int | None:
+    """Return the sole reusable Item member for a legacy Pred asset.
+
+    Legacy descriptors carry a physical asset/run id, not a semantic Item id.
+    Ambiguous bindings must not be resolved by row order: choosing one would
+    silently reinterpret a historical asset as a different GT Item.
+    """
+    if asset_id is None or int(asset_id) <= 0:
+        return None
+    rows = db.query(
+        """
+        SELECT id FROM media_item_members
+        WHERE asset_id = ? AND reusable_as_pred = 1
+          AND state = 'ready' AND deleted_at IS NULL
+        ORDER BY id
+        """,
+        (int(asset_id),),
+    )
+    if len(rows) > 1:
+        raise ValueError(f"{source_name} resolves to multiple media item bindings")
+    return int(rows[0]["id"]) if rows else None
+
+
 def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: dict) -> dict:
+    body = _prepare_media_item_compare_payload(db, workspace, dict(body))
     payload = dict(body)
     payload["run_type"] = "video_compare"
     preflight = preflight_run(db, workspace, payload)
@@ -1377,6 +2272,8 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
     # External tracks use their exact strict dimensions. Platform-owned indexed
     # tracks use the inference resolution for generated aligned GT frames.
     alignment = preflight.get("alignment") or {}
+    alignment_plan = dict(preflight.get("alignment_plan") or {})
+    is_item_compare = bool(body.get("media_item_compare") or body.get("media_item_id") is not None)
     width = int(alignment.get("width") or 0)
     height = int(alignment.get("height") or 0)
     target_width = int(alignment.get("target_width") or 0)
@@ -1406,6 +2303,9 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
             "source_video_path": track.get("source_video_path"),
             "source_frame_indices": track.get("source_frame_indices"),
             "frame_step": track.get("frame_step"),
+            "member_id": track.get("member_id"),
+            "item_id": track.get("item_id"),
+            "alignment_slot": track.get("alignment_slot") or f"pred_{chr(ord('a') + index)}",
         }
         for index, track in enumerate(distorted_tracks)
     ]
@@ -1453,6 +2353,7 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
             "reference_needs_downscale": reference_needs_downscale,
             # Exact post-selection frame count; no implicit truncation occurs.
             "compare_effective_frame_count": effective_frame_count,
+            **({"alignment_plan": alignment_plan} if alignment_plan else {}),
         },
     )
     samples = scan_dataset(db, workspace, dataset_id)
@@ -1473,6 +2374,10 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
         "compare_target_height": target_height,
         "reference_needs_downscale": reference_needs_downscale,
         "compare_effective_frame_count": effective_frame_count,
+        "media_item_id": int(body["media_item_id"]) if is_item_compare else None,
+        "pred_member_ids": [int(value) for value in (body.get("pred_member_ids") or [])],
+        "alignment_plan": alignment_plan,
+        "publish_compare_pred_video": not is_item_compare,
         "metric_health": preflight.get("metrics", {}).get("health", {}),
         "request": {
             "run_type": "video_compare",
@@ -1481,6 +2386,10 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
             "extra_layers": body.get("extra_layers") if "extra_layers" in body else None,
             "align_mode": "strict",
             "metrics": metrics,
+            "media_item_id": int(body["media_item_id"]) if is_item_compare else None,
+            "pred_member_ids": [int(value) for value in (body.get("pred_member_ids") or [])],
+            "spatial_policy": body.get("spatial_policy") or {},
+            "publish_compare_pred_video": not is_item_compare,
         },
         "preflight": preflight,
     }
@@ -1498,6 +2407,7 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
         metrics=metrics,
         metadata={**metadata, "output_dir": str(workspace.runs_dir / str(db.next_run_id()))},
     )
+    register_run_cache_refs(db, workspace, run_id)
     if reference.get("asset_id") is not None:
         from vfieval.media_assets import bind_run_asset
 
@@ -1520,6 +2430,40 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
                 video_name=video_name,
                 track_label=str(track.get("track_label") or ""),
                 metadata={"input": True},
+            )
+    if is_item_compare:
+        item_id = int(body["media_item_id"])
+        canonical_member_id = int(
+            body.get("canonical_gt_member_id")
+            or reference.get("member_id")
+            or 0
+        )
+        if canonical_member_id <= 0:
+            raise ValueError("Item Compare canonical GT member is missing")
+        bind_compare_input(
+            db,
+            run_id,
+            item_id,
+            canonical_member_id,
+            binding_role="compare_gt",
+            slot="gt",
+            metadata={"alignment_fingerprint": alignment_plan.get("fingerprint")},
+        )
+        for index, track in enumerate(compare_tracks):
+            member_id = int(track.get("member_id") or 0)
+            if member_id <= 0:
+                raise ValueError("Item Compare prediction member is missing")
+            bind_compare_input(
+                db,
+                run_id,
+                item_id,
+                member_id,
+                binding_role="compare_pred",
+                slot=str(track.get("alignment_slot") or f"pred_{chr(ord('a') + index)}"),
+                metadata={
+                    "track_label": str(track.get("track_label") or ""),
+                    "alignment_fingerprint": alignment_plan.get("fingerprint"),
+                },
             )
     _start_local_inference_worker(db, workspace)
     return {"run_id": run_id, "run": db.get_run(run_id), "preflight": preflight}
@@ -1579,17 +2523,10 @@ def _worker_launch_metadata(execution_mode: str, devices: list[str], has_metrics
 
 
 def _cleanup_run_artifacts(db: Database, workspace: WorkspaceConfig, run_id: int) -> dict:
-    run = db.get_run(run_id)
-    if str(run.get("status") or "") not in TERMINAL_RUN_STATUSES:
-        raise ValueError("cleanup-artifacts is only allowed after a run is completed, failed, or canceled")
-    run_dir = (workspace.runs_dir / str(run_id)).resolve()
-    runs_root = workspace.runs_dir.resolve()
-    if not _is_relative_to(run_dir, runs_root):
-        raise ValueError("run output directory is outside workspace runs directory")
-    if run_dir.exists():
-        shutil.rmtree(run_dir)
-    db.mark_run_artifacts_cleaned(run_id)
-    return {"run_id": run_id, "artifact_cleaned": True, "output_dir": str(run_dir)}
+    request = RunCleanupService(db, workspace).request_artifact_cleanup(run_id)
+    if request.get("status") != "completed":
+        raise ValueError((request.get("error") or {}).get("message") or "artifact cleanup did not complete")
+    return dict(request.get("report") or {})
 
 
 def _checkpoint_relative(workspace: WorkspaceConfig, checkpoint_path: Path | None) -> str | None:
@@ -3057,6 +3994,89 @@ def _optional_int(value) -> int | None:
     if value in {None, ""}:
         return None
     return int(value)
+
+
+def _query_int_values(query: dict[str, list[str]], key: str) -> list[int]:
+    return [
+        int(part)
+        for raw in query.get(key, [])
+        for part in str(raw).split(",")
+        if part.strip()
+    ]
+
+
+def _purge_response(request: dict[str, Any]) -> dict[str, Any]:
+    report = dict(request.get("report") or {})
+    completed = str(request.get("status") or "") == "completed"
+    delete_run = str(request.get("request_type") or "") == "delete_run"
+    return {
+        **report,
+        "run_id": int(request["run_id"]),
+        "request_id": int(request["id"]),
+        "purge_status": request.get("status"),
+        "deleting": not completed and delete_run,
+        "deleted": completed and delete_run,
+        "artifact_cleaned": completed and bool(report.get("artifact_cleaned")),
+        "request": request,
+    }
+
+
+def _evaluation_campaign_v2_payload(db: Database, campaign_id: int) -> dict[str, Any]:
+    campaign = get_campaign_v2(db, int(campaign_id))
+    preparation_row = get_preparation_v2(db, int(campaign_id))
+    preparation: dict[str, Any] = {}
+    if preparation_row is not None:
+        report = dict(preparation_row.get("report") or {})
+        error = dict(preparation_row.get("error") or {})
+        state = str(preparation_row.get("state") or "")
+        total = int(report.get("total") or campaign.get("item_count") or 0)
+        current_default = total if state == "completed" else 0
+        preparation = {
+            "state": state,
+            "phase": report.get("phase") or state,
+            "current": int(report.get("current") or current_default),
+            "total": total,
+            "attempt_count": int(preparation_row.get("attempt_count") or 0),
+            "error": error,
+            "report": report,
+            "updated_at": preparation_row.get("updated_at"),
+            "completed_at": preparation_row.get("completed_at"),
+        }
+        campaign["preparation_status"] = state
+        if error:
+            campaign["preparation_error"] = error
+    analysis = None
+    if campaign.get("status") in {"published", "closed", "archived"}:
+        analysis = campaign_analysis_v2(db, int(campaign_id), bootstrap_samples=200)
+    return {
+        "campaign": campaign,
+        "preparation": preparation,
+        "coverage": {
+            "items": int(campaign.get("item_count") or 0),
+            "tasks": int(campaign.get("task_count") or 0),
+            "votes": int(campaign.get("vote_count") or 0),
+        },
+        "analysis": analysis,
+        "share_url": campaign.get("share_url"),
+    }
+
+
+def _legacy_evaluation_campaign_payload(db: Database, campaign_id: int) -> dict[str, Any]:
+    campaign = get_campaign(db, int(campaign_id))
+    metadata = dict(campaign.get("metadata") or {})
+    campaign.update(
+        {
+            "schema_version": 1,
+            "campaign_key": f"v1:{int(campaign_id)}",
+            "public_title": metadata.get("public_title") or campaign.get("name"),
+            "archived": bool(metadata.get("archived_at")),
+            "read_only": True,
+            "item_count": int(campaign.get("tasks") or 0),
+            "task_count": int(campaign.get("tasks") or 0),
+            "vote_count": int(campaign.get("votes") or 0),
+        }
+    )
+    return campaign
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:

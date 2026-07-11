@@ -673,7 +673,20 @@ def _run_video_compare_job(
 ) -> InferenceJobResult:
     run_dir = workspace.runs_dir / (str(run_id) if run_id is not None else f"inference_{job_id:06d}")
     run_dir.mkdir(parents=True, exist_ok=True)
-    _write_run_metadata(run_dir, job, db.get_model(int(job["payload"]["model_id"])), db.get_dataset(dataset_id) if dataset_id else None)
+    dataset = db.get_dataset(dataset_id) if dataset_id else None
+    _write_run_metadata(run_dir, job, db.get_model(int(job["payload"]["model_id"])), dataset)
+    alignment_plan = dict(((dataset or {}).get("metadata") or {}).get("alignment_plan") or {})
+    if alignment_plan:
+        _write_compare_alignment_report(db, job_id, run_dir, alignment_plan)
+
+    run_metadata = (run or {}).get("metadata") or {}
+    request_metadata = run_metadata.get("request") or {}
+    publish_pred_video = bool(
+        run_metadata.get(
+            "publish_compare_pred_video",
+            request_metadata.get("publish_compare_pred_video", True),
+        )
+    )
 
     db.update_job_progress(job_id, 0, len(samples))
     if run_id is not None:
@@ -718,7 +731,13 @@ def _run_video_compare_job(
         save_seconds += time.perf_counter() - t0
 
     if video_groups:
-        _write_video_artifacts(db, job_id, run_dir, video_groups)
+        _write_video_artifacts(
+            db,
+            job_id,
+            run_dir,
+            video_groups,
+            publish_pred_video=publish_pred_video,
+        )
 
     result = InferenceJobResult(
         samples=processed,
@@ -1021,7 +1040,7 @@ def _raise_if_canceled(db: Database, run_id: int | None, job_id: int) -> None:
     if run_id is None:
         return
     run = db.get_run(run_id)
-    if run["status"] == "cancel_requested":
+    if run["status"] in {"cancel_requested", "canceled"}:
         error = {"message": "用户取消了 Run", "type": "RunCanceled"}
         db.cancel_job(job_id, error)
         db.cancel_run(run_id, error)
@@ -1075,6 +1094,11 @@ def _collect_video_frame(
             # (pred[i] ≈ source_frames[gt_index]); Compare uses the ordered
             # list of these to head-offset the source clip into an aligned GT.
             "source_frame_index": metadata.get("gt_index"),
+            # Encoded Pred videos begin at t=0 even when their first output
+            # represents source frame 1. Preserve the semantic GT timestamp
+            # alongside the index so Item Compare can validate the mapping
+            # without treating that container origin as a temporal offset.
+            "source_timestamp": (metadata.get("timestamps") or {}).get("gt"),
         }
     )
 
@@ -1117,6 +1141,8 @@ def _write_video_artifacts(
     job_id: int,
     run_dir: Path,
     video_groups: dict[str, dict[str, Any]],
+    *,
+    publish_pred_video: bool = True,
 ) -> None:
     for group in video_groups.values():
         frames = sorted(group["frames"], key=lambda item: item["order"])
@@ -1125,23 +1151,34 @@ def _write_video_artifacts(
         video_name = sanitize_name(str(group["video_name"]))
         fps = float(group["fps"] or 24.0)
         if any(frame.get("track_label") for frame in frames):
-            _write_multitrack_compare_video_artifacts(db, job_id, run_dir, group, frames, video_name, fps)
+            _write_multitrack_compare_video_artifacts(
+                db,
+                job_id,
+                run_dir,
+                group,
+                frames,
+                video_name,
+                fps,
+                publish_pred_video=publish_pred_video,
+            )
             continue
         video_dir = run_dir / "videos" / video_name
         video_dir.mkdir(parents=True, exist_ok=True)
         pred_frame_paths = [Path(frame["pred_path"]) for frame in frames]
-        pred_video_path = video_dir / "pred.mp4"
-        _write_mp4(pred_frame_paths, pred_video_path, fps)
-        pred_metadata = _video_artifact_metadata(group["video_name"], frames, pred_frame_paths, fps)
-        pred_metadata.update(_source_mapping_metadata(group, frames))
-        db.add_artifact(
-            job_id,
-            None,
-            "pred_video",
-            str(pred_video_path),
-            "video/mp4",
-            pred_metadata,
-        )
+        pred_video_path = None
+        if publish_pred_video:
+            pred_video_path = video_dir / "pred.mp4"
+            _write_mp4(pred_frame_paths, pred_video_path, fps)
+            pred_metadata = _video_artifact_metadata(group["video_name"], frames, pred_frame_paths, fps)
+            pred_metadata.update(_source_mapping_metadata(group, frames))
+            db.add_artifact(
+                job_id,
+                None,
+                "pred_video",
+                str(pred_video_path),
+                "video/mp4",
+                pred_metadata,
+            )
 
         gt_paths = [frame["gt_path"] for frame in frames if frame["gt_path"] is not None]
         if len(gt_paths) == len(frames):
@@ -1177,7 +1214,7 @@ def _write_video_artifacts(
             "video_name": group["video_name"],
             "fps": fps,
             "frames": len(frames),
-            "pred_video": str(pred_video_path.resolve()),
+            "pred_video": str(pred_video_path.resolve()) if pred_video_path else None,
             "gt_video": str((video_dir / "gt.mp4").resolve()) if (video_dir / "gt.mp4").exists() else None,
             "diff_video": str((video_dir / "diff.mp4").resolve()) if (video_dir / "diff.mp4").exists() else None,
         }
@@ -1192,6 +1229,8 @@ def _write_multitrack_compare_video_artifacts(
     frames: list[dict[str, Any]],
     video_name: str,
     fps: float,
+    *,
+    publish_pred_video: bool = True,
 ) -> None:
     video_dir = run_dir / "videos" / video_name
     tracks: dict[str, list[dict[str, Any]]] = {}
@@ -1227,8 +1266,10 @@ def _write_multitrack_compare_video_artifacts(
         track_dir = video_dir / sanitize_name(track_label)
         track_dir.mkdir(parents=True, exist_ok=True)
         pred_frame_paths = [Path(frame["pred_path"]) for frame in ordered]
-        pred_video_path = track_dir / "pred.mp4"
-        _write_mp4(pred_frame_paths, pred_video_path, fps)
+        pred_video_path = None
+        if publish_pred_video:
+            pred_video_path = track_dir / "pred.mp4"
+            _write_mp4(pred_frame_paths, pred_video_path, fps)
         diff_frame_paths = [Path(frame["diff_path"]) for frame in ordered]
         diff_video_path = track_dir / "diff.mp4"
         _write_mp4(diff_frame_paths, diff_video_path, fps)
@@ -1238,14 +1279,15 @@ def _write_multitrack_compare_video_artifacts(
             "compare_track_run_id": ordered[0].get("track_run_id"),
             "compare_track_artifact_id": ordered[0].get("track_artifact_id"),
         }
-        db.add_artifact(
-            job_id,
-            None,
-            "pred_video",
-            str(pred_video_path),
-            "video/mp4",
-            {**_video_artifact_metadata(group["video_name"], ordered, pred_frame_paths, fps), **track_metadata},
-        )
+        if pred_video_path is not None:
+            db.add_artifact(
+                job_id,
+                None,
+                "pred_video",
+                str(pred_video_path),
+                "video/mp4",
+                {**_video_artifact_metadata(group["video_name"], ordered, pred_frame_paths, fps), **track_metadata},
+            )
         db.add_artifact(
             job_id,
             None,
@@ -1260,7 +1302,7 @@ def _write_multitrack_compare_video_artifacts(
                 "track_label": track_label,
                 "track_key": track_key,
                 "frames": len(ordered),
-                "pred_video": str(pred_video_path.resolve()),
+                "pred_video": str(pred_video_path.resolve()) if pred_video_path else None,
                 "diff_video": str(diff_video_path.resolve()),
                 "compare_track_run_id": ordered[0].get("track_run_id"),
                 "compare_track_artifact_id": ordered[0].get("track_artifact_id"),
@@ -1276,6 +1318,31 @@ def _write_multitrack_compare_video_artifacts(
     }
     video_dir.mkdir(parents=True, exist_ok=True)
     (video_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _write_compare_alignment_report(
+    db: Database,
+    job_id: int,
+    run_dir: Path,
+    alignment_plan: dict[str, Any],
+) -> Path:
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    path = logs_dir / "alignment.json"
+    path.write_text(json.dumps(alignment_plan, indent=2, ensure_ascii=False), encoding="utf-8")
+    db.add_artifact(
+        job_id,
+        None,
+        "alignment_report",
+        str(path),
+        "application/json",
+        {
+            "alignment_fingerprint": alignment_plan.get("fingerprint"),
+            "target": alignment_plan.get("target"),
+            "filter": alignment_plan.get("filter"),
+        },
+    )
+    return path
 
 
 def _video_artifact_metadata(
@@ -1318,6 +1385,9 @@ def _source_mapping_metadata(
         "source_video_path": str(source_path),
         "source_frame_indices": [int(index) for index in indices],
     }
+    timestamps = [frame.get("source_timestamp") for frame in frames]
+    if timestamps and all(timestamp is not None for timestamp in timestamps):
+        mapping["timestamps"] = [float(timestamp) for timestamp in timestamps]
     if group.get("source_video_group") is not None:
         mapping["source_video_group"] = group.get("source_video_group")
     if group.get("source_video_file") is not None:

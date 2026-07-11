@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>VFIEval Blind Vote</title>
+    <link rel="stylesheet" href="/blind.css">
+  </head>
+  <body>
+    <main class="blind-shell">
+      <header class="blind-header">
+        <div>
+          <p class="eyebrow">VFIEval</p>
+          <h1 id="campaign-title">匿名视频质量评测</h1>
+        </div>
+        <div id="progress" class="progress-pill" aria-live="polite">准备中</div>
+      </header>
+
+      <section id="session-panel" class="panel">
+        <h2>开始评测</h2>
+        <p class="muted">显示名只用于统计参与进度；候选身份会在您完成全部任务后显示。</p>
+        <form id="session-form" class="session-form">
+          <label>
+            <span>评测员显示名</span>
+            <input name="display_name" maxlength="120" autocomplete="name" required>
+          </label>
+          <button type="submit">进入盲评</button>
+        </form>
+      </section>
+
+      <section id="task-panel" class="panel hidden" aria-live="polite">
+        <div class="task-head">
+          <div>
+            <p class="eyebrow">匿名任务</p>
+            <h2 id="task-video">视频</h2>
+          </div>
+          <p class="muted">参考 GT 仅用于观察；请选择质量更好的候选，或选择平局。</p>
+        </div>
+
+        <div id="playback-controls" class="playback-controls">
+          <button id="master-play" type="button">全部播放</button>
+          <label class="seek-label"><span>时间</span><input id="master-seek" type="range" min="0" max="1000" value="0"></label>
+          <label><span>倍速</span><select id="master-rate"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
+          <label class="check"><input id="master-loop" type="checkbox" checked>循环</label>
+        </div>
+
+        <div id="media-grid" class="media-grid"></div>
+        <div id="frame-control" class="frame-control hidden">
+          <label><span id="frame-label">帧 1/1</span><input id="frame-range" type="range" min="0" max="0" value="0"></label>
+        </div>
+
+        <form id="vote-form">
+          <fieldset>
+            <legend>判断依据（可多选）</legend>
+            <div id="quality-reasons" class="reason-grid"></div>
+          </fieldset>
+          <div class="vote-meta">
+            <label><span>置信度</span><select name="confidence"><option value="">未填写</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select></label>
+            <label class="note"><span>备注</span><textarea name="note" maxlength="4000" rows="2"></textarea></label>
+          </div>
+          <div class="vote-actions">
+            <button name="choice" value="left" type="submit">候选 A 更好</button>
+            <button name="choice" value="tie" class="secondary" type="submit">平局</button>
+            <button name="choice" value="right" type="submit">候选 B 更好</button>
+          </div>
+        </form>
+      </section>
+
+      <section id="complete-panel" class="panel hidden">
+        <h2>个人任务已完成</h2>
+        <p class="muted">以下为当前实时结果；新投票进入后统计可能继续变化。</p>
+        <div id="live-results"></div>
+      </section>
+
+      <section id="message-panel" class="panel hidden" role="alert"></section>
+    </main>
+    <div id="toast" role="status"></div>
+    <script src="/blind.js"></script>
+  </body>
+</html>

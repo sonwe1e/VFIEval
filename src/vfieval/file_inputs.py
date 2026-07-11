@@ -343,8 +343,191 @@ def resolve_video_group_root(videos_root: Path, video_group: str) -> Path:
     return path
 
 
+def _preflight_media_item_compare(
+    db: Database,
+    workspace: WorkspaceConfig,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Preflight an Item-bound Compare with strict time and explicit resize."""
+    from vfieval.alignment import plan_alignment, validate_temporal_alignment
+    from vfieval.compare_inputs import resolve_compare_descriptor
+    from vfieval.datasets import _load_compare_source_frames
+
+    health = metrics_health(workspace)
+    selected_metrics = [str(name) for name in (payload.get("metrics") or [])]
+    result: dict[str, Any] = {
+        "ok": True,
+        "run_type": "video_compare",
+        "errors": [],
+        "warnings": [],
+        "reference": {},
+        "distorted": {},
+        "distorted_tracks": [],
+        "alignment": {"mode": "strict"},
+        "alignment_plan": {},
+        "metrics": {
+            "requested": selected_metrics,
+            "health": {
+                name: health["metrics"][name]
+                for name in selected_metrics
+                if name in health["metrics"]
+            },
+        },
+        "output_dir": str(workspace.runs_dir / str(db.next_run_id())),
+    }
+    try:
+        reference = resolve_compare_descriptor(
+            workspace, db, payload.get("reference"), role="reference"
+        )
+        raw_distorted = payload.get("distorted")
+        descriptors = raw_distorted if isinstance(raw_distorted, list) else [raw_distorted]
+        descriptors = [
+            descriptor for descriptor in descriptors if descriptor is not None and descriptor != ""
+        ]
+        if not 1 <= len(descriptors) <= 2:
+            raise ValueError("video_compare requires one or two prediction members")
+        predictions = [
+            resolve_compare_descriptor(workspace, db, descriptor, role="distorted")
+            for descriptor in descriptors
+        ]
+        item_id = int(payload.get("media_item_id") or reference.get("item_id") or 0)
+        if item_id <= 0 or int(reference.get("item_id") or 0) != item_id:
+            raise ValueError("Compare reference must resolve to the selected canonical media item")
+        if any(int(prediction.get("item_id") or 0) != item_id for prediction in predictions):
+            raise ValueError("all Compare predictions must belong to the selected media item")
+
+        reference_frames, reference_fps, reference_timestamps = _load_compare_source_frames(
+            db,
+            workspace,
+            Path(str(reference["path"])),
+            "compare_item_reference",
+        )
+        reference.update(
+            {
+                "slot": "gt",
+                "frame_count": len(reference_frames),
+                "fps": reference_fps if reference_fps is not None else reference.get("fps"),
+                "timestamps": reference_timestamps,
+            }
+        )
+        decoded_predictions: list[dict[str, Any]] = []
+        for index, prediction in enumerate(predictions):
+            frames, fps, timestamps = _load_compare_source_frames(
+                db,
+                workspace,
+                Path(str(prediction["path"])),
+                f"compare_item_pred_{index}",
+            )
+            temporal_mapping = prediction.get("temporal_mapping") or {}
+            mapping = prediction.get("source_frame_indices")
+            if (mapping is None or mapping == "") and isinstance(temporal_mapping, dict):
+                mapping = temporal_mapping.get("source_frame_indices")
+            mapped_timestamps = (
+                temporal_mapping.get("timestamps")
+                or temporal_mapping.get("source_timestamps")
+                if isinstance(temporal_mapping, dict)
+                else None
+            )
+            member_metadata = prediction.get("member_metadata") or prediction.get("metadata") or {}
+            decoded = dict(prediction)
+            decoded.update(
+                {
+                    "slot": f"pred_{chr(ord('a') + index)}",
+                    "track_index": index,
+                    "track_label": str(
+                        prediction.get("track_label")
+                        or prediction.get("label")
+                        or f"Pred {index + 1}"
+                    ),
+                    "frame_count": len(frames),
+                    "fps": fps if fps is not None else prediction.get("fps"),
+                    # A re-encoded Pred video normally starts at PTS=0 even
+                    # when it represents nonzero source indices.  In indexed
+                    # mode only preserved source timestamps are meaningful;
+                    # otherwise the trusted mapping + FPS is the temporal
+                    # contract and relative container PTS must not reject it.
+                    "timestamps": mapped_timestamps if mapping is not None else timestamps,
+                    "source_frame_indices": mapping,
+                    "allow_aspect_stretch": bool(
+                        prediction.get("allow_aspect_stretch")
+                        or (
+                            isinstance(member_metadata, dict)
+                            and member_metadata.get("aspect_stretch_confirmed")
+                        )
+                    ),
+                }
+            )
+            decoded_predictions.append(decoded)
+
+        temporal = validate_temporal_alignment(reference, decoded_predictions)
+        plan = plan_alignment(
+            reference,
+            decoded_predictions,
+            spatial_policy=payload.get("spatial_policy") or {},
+            temporal_summary=temporal,
+        )
+        target = plan["target"]
+        for prediction in decoded_predictions:
+            prediction["alignment"] = plan["sources"][prediction["slot"]]
+            prediction["alignment_mode"] = temporal["mode"]
+            prediction["alignment_slot"] = prediction["slot"]
+        reference["alignment_slot"] = "gt"
+        result["reference"] = reference
+        result["distorted"] = decoded_predictions[0]
+        result["distorted_tracks"] = decoded_predictions
+        result["alignment_plan"] = plan
+        result["alignment"] = {
+            "mode": "strict_time_explicit_spatial",
+            "frame_count": int(temporal["frame_count"]),
+            "reference_frame_count": int(temporal["reference_frame_count"]),
+            "width": int(reference["width"]),
+            "height": int(reference["height"]),
+            "target_width": int(target["width"]),
+            "target_height": int(target["height"]),
+            "fps": temporal.get("fps"),
+            "track_count": len(decoded_predictions),
+            "verified_with": "decoded_frames_and_item_mapping",
+            "fingerprint": plan["fingerprint"],
+            "sources": plan["sources"],
+        }
+        resized = [
+            report
+            for report in plan["sources"].values()
+            if str(report.get("direction") or "none") != "none"
+        ]
+        if resized:
+            result["warnings"].append(
+                {
+                    "title": "将按 Alignment Plan 规范化空间尺寸",
+                    "message": (
+                        f"GT/Pred 将使用 LANCZOS 规范化到 {target['width']}x{target['height']}；"
+                        "原始媒体不会被覆盖，完整缩放与宽高比变化会写入报告。"
+                    ),
+                    "type": "SpatialNormalization",
+                    "details": {"fingerprint": plan["fingerprint"], "sources": plan["sources"]},
+                }
+            )
+    except Exception as exc:
+        result["ok"] = False
+        result["errors"].append(
+            {"title": "对比输入检查失败", "message": str(exc), "type": type(exc).__name__}
+        )
+    for name, row in result["metrics"]["health"].items():
+        if not row.get("available"):
+            result["warnings"].append(
+                {
+                    "title": f"metric {name}",
+                    "message": row.get("reason") or row.get("status") or "metric is unavailable",
+                    "type": "MetricUnavailable",
+                }
+            )
+    return result
+
+
 def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, Any]) -> dict[str, Any]:
     if str(payload.get("run_type") or "model_inference") == "video_compare":
+        if payload.get("media_item_compare") or payload.get("media_item_id") is not None:
+            return _preflight_media_item_compare(db, workspace, payload)
         from vfieval.compare_inputs import (
             resolve_compare_descriptor,
             validate_strict_alignment,
@@ -384,6 +567,7 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
             if not distorted_descriptors:
                 raise ValueError("video_compare requires at least one distorted track")
             reference_frames, reference_fps, reference_timestamps = _load_compare_source_frames(
+                db,
                 workspace,
                 Path(str(reference["path"])),
                 "compare_reference",
@@ -395,6 +579,7 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
                 track_label = str(distorted.get("track_label") or distorted.get("label") or f"pred{track_index + 1}")
                 try:
                     distorted_frames, distorted_fps, distorted_timestamps = _load_compare_source_frames(
+                        db,
                         workspace,
                         Path(str(distorted["path"])),
                         f"compare_distorted_{track_index}",

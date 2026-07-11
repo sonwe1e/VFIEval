@@ -209,7 +209,7 @@ def publish_campaign(db: Database, workspace: WorkspaceConfig, campaign_id: int)
         from vfieval.datasets import _load_compare_source_frames
 
         reference_frames, decoded_reference_fps, reference_timestamps = _load_compare_source_frames(
-            workspace, reference_path, f"campaign_{campaign_id}_reference"
+            db, workspace, reference_path, f"campaign_{campaign_id}_reference"
         )
         reference_fps = reference_asset.get("fps") or decoded_reference_fps
         for candidate in rows:
@@ -221,6 +221,7 @@ def publish_campaign(db: Database, workspace: WorkspaceConfig, campaign_id: int)
                 reference_info, distorted_info
             )
             distorted_frames, decoded_distorted_fps, distorted_timestamps = _load_compare_source_frames(
+                db,
                 workspace,
                 distorted_path,
                 f"campaign_{campaign_id}_candidate_{int(candidate['id'])}",

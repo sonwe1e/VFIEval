@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>VFIEval 推理工具</title>
     <link rel="stylesheet" href="/styles.css">
+    <link rel="stylesheet" href="/studio.css">
   </head>
   <body>
     <div class="layout">
@@ -17,7 +18,7 @@
           <button class="nav-item active" data-view="create" type="button">新建任务</button>
           <button class="nav-item" data-view="compare" type="button">视频对比</button>
           <button class="nav-item" data-view="media" type="button">Media Library</button>
-          <button class="nav-item" data-view="evaluations" type="button">多人盲评</button>
+          <button class="nav-item" data-view="evaluations" type="button">Evaluation Studio</button>
           <button class="nav-item" data-view="runs" type="button">运行记录</button>
           <button class="nav-item" data-view="stats" type="button">评分统计</button>
         </nav>
@@ -180,20 +181,18 @@
       <section id="view-compare" class="view">
         <div class="view-head">
           <h2>视频对比</h2>
-          <p class="muted">从服务器已有资源里挑选 GT 与预测结果，任意两两或三三对比。GT 可留空做纯预测对比。</p>
+          <p class="muted">先选择 GT 文件夹和其中一个视频，再选择这个 GT 对应的一至两份模型输出。不同 GT 的预测结果不能混用。</p>
         </div>
         <form id="compare-form" class="panel infer-grid">
           <fieldset class="field-group">
-            <legend>对齐方式</legend>
-            <div class="field-grid">
-              <label>
-                <span>对齐方式</span>
-                <select name="align_mode">
-                  <option value="strict">strict</option>
-                </select>
-              </label>
-            </div>
+            <legend>对齐策略</legend>
+            <p class="muted">时间与 GT 身份保持严格一致；空间尺寸按所选 Pred 自动规范化。单 Pred 使用自身尺寸，双 Pred 使用像素面积较小者的完整尺寸，缩放采用 LANCZOS。</p>
+            <input name="spatial_policy" type="hidden" value="smallest_pred">
           </fieldset>
+          <label class="check-item compare-aspect-confirm">
+            <input name="allow_external_aspect_stretch" type="checkbox">
+            <span>External Pred 若需改变宽高比，确认按 Alignment Plan 拉伸并记录该变换</span>
+          </label>
           <details class="advanced">
             <summary>可选指标</summary>
             <div class="metric-options">
@@ -202,7 +201,7 @@
           </details>
           <button id="refresh-compare-sources" class="secondary" type="button">刷新对比来源</button>
           <button id="start-compare" type="submit" disabled>开始对比</button>
-          <button id="create-adhoc-evaluation" class="secondary" type="button">生成自由盲评任务</button>
+          <button id="create-adhoc-evaluation" class="secondary" type="button">带入 Evaluation Studio</button>
         </form>
 
         <section id="compare-selection" class="panel video-selection"></section>
@@ -213,7 +212,7 @@
         <section class="panel">
           <div class="panel-head">
             <h2>运行记录</h2>
-            <button id="refresh" class="secondary" type="button">刷新</button>
+            <button id="refresh" class="secondary" type="button">刷新当前结果</button>
           </div>
           <div id="runs-table" class="table"></div>
         </section>
@@ -245,9 +244,47 @@
           <button type="submit">分片上传</button>
           <button id="pause-upload" class="secondary" type="button">暂停（可重新提交续传）</button>
         </form>
+        <details id="external-pred-binding" class="panel advanced">
+          <summary>Bind uploaded External Pred to a GT Media Item</summary>
+          <p class="muted">Advanced only: select the canonical GT Collection and Item first, then explicitly bind one uploaded Pred. This never infers identity from filename, label, or hash. The uploaded file remains a physical asset; only the resulting Item Member is reusable.</p>
+          <form id="external-pred-binding-form" class="infer-grid">
+            <div class="field-grid">
+              <label><span>GT Collection</span><select id="external-pred-item-group" name="group_id" required></select></label>
+              <label><span>GT Media Item</span><select id="external-pred-item" name="item_id" required></select></label>
+              <label><span>Uploaded Pred</span><select id="external-pred-asset" name="asset_id" required></select></label>
+              <label><span>Method key</span><input name="method_key" maxlength="240" required placeholder="e.g. external:model-a"></label>
+            </div>
+            <details class="advanced">
+              <summary>Temporal / spatial provenance (advanced)</summary>
+              <p class="muted">Use a JSON object only when this Pred has an explicit source-frame mapping or known spatial origin. Without a mapping, strict exact temporal validation still applies.</p>
+              <div class="field-grid">
+                <label><span>Temporal mapping JSON</span><textarea name="temporal_mapping" rows="3" placeholder='{"source_frame_indices":[0,1,2],"timestamps":[0.0,0.04,0.08]}'></textarea></label>
+                <label><span>Spatial origin JSON</span><textarea name="spatial_origin" rows="3" placeholder='{"width":1920,"height":1080}'></textarea></label>
+              </div>
+            </details>
+            <label class="check-item compare-aspect-confirm">
+              <input name="aspect_stretch_confirmed" type="checkbox">
+              <span>Confirm that this External Pred may undergo an aspect-ratio-changing Alignment Plan. The confirmation is recorded on its Item Member.</span>
+            </label>
+            <div id="external-pred-binding-status" class="muted"></div>
+            <button id="bind-external-pred" type="submit" disabled>Bind External Pred</button>
+          </form>
+        </details>
         <section class="panel">
           <div class="panel-head"><h2>资产</h2><button id="refresh-media" class="secondary" type="button">刷新</button></div>
           <div id="media-content"></div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><div><h2>Derived Runs</h2><p class="muted">只展示完成、未删除、未清理的 Run 输出；按 Run → 视频 → Track 懒展开。</p></div></div>
+          <div id="media-derived-content"><p class="muted">打开 Media 后加载。</p></div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><div><h2>Evaluation Packages</h2><p class="muted">发布时冻结的评测包独立于 Run 生命周期。</p></div></div>
+          <div id="media-packages-content"><p class="muted">还没有可显示的评测包。</p></div>
+        </section>
+        <section class="panel">
+          <div class="panel-head"><div><h2>存储清理</h2><p class="muted">先预览历史 Run 残留与无引用 decode/compare cache；只有确认后才删除。</p></div><div class="actions"><button id="storage-gc-preview" class="secondary" type="button">预览</button><button id="storage-gc-run" class="danger secondary" type="button" disabled>确认清理</button></div></div>
+          <div id="storage-gc-content"><p class="muted">尚未生成清理预览。</p></div>
         </section>
       </section>
 
@@ -266,42 +303,74 @@
 
       <section id="view-evaluations" class="view">
         <div class="view-head">
-          <h2>多人盲评与 Campaign</h2>
-          <p class="muted">浏览器使用稳定本地 UUID；投票前只显示匿名左右轨道，不泄露模型、权重、Run 或资产编号。</p>
+          <h2>Evaluation Studio</h2>
+          <p class="muted">先从一个 GT 文件夹选择评测视频，再选择完整覆盖这些 Media Item 的两种方法；参与者通过独立匿名链接投票。</p>
         </div>
-        <form id="evaluator-form" class="panel field-grid">
-          <label><span>评测员显示名</span><input name="display_name" maxlength="120" required></label>
-          <button type="submit">保存评测员</button>
-        </form>
-        <form id="campaign-form" class="panel field-grid">
-          <label><span>Campaign 名称</span><input name="name" maxlength="240" required></label>
-          <label><span>每个候选对目标票数</span><input name="target_votes" type="number" min="1" max="1000" value="3"></label>
-          <button type="submit">创建 Campaign</button>
-        </form>
-        <section class="panel">
-          <div class="panel-head"><h3>Campaign</h3><button id="refresh-evaluations" class="secondary" type="button">刷新</button></div>
-          <div id="campaign-list"></div>
+        <section class="studio-layout">
+          <div class="panel">
+            <div class="panel-head"><div><h3>Campaign</h3><p class="muted">v2 可管理；v1 历史只读。</p></div><button id="studio-refresh" class="secondary" type="button">刷新</button></div>
+            <div id="studio-campaign-list"></div>
+          </div>
+          <div id="studio-campaign-detail" class="panel"><p class="muted">选择 Campaign 查看准备进度、分享链接和结果。</p></div>
         </section>
-        <form id="candidate-form" class="panel infer-grid">
+
+        <form id="studio-wizard-form" class="panel infer-grid">
           <fieldset class="field-group">
-            <legend>添加候选</legend>
+            <legend>新建 Campaign V2 · 基本信息</legend>
             <div class="field-grid">
-              <label><span>Campaign</span><select name="campaign_id"></select></label>
-              <label><span>GT 资产</span><select name="reference_asset_id"></select></label>
-              <label><span>Pred 资产</span><select name="asset_id"></select></label>
-              <label><span>视频标识</span><input name="video_name" maxlength="240" required></label>
-              <label><span>候选快照标签</span><input name="label" maxlength="240"></label>
+              <label><span>内部名称</span><input name="name" maxlength="240" required placeholder="例如 RIFE-vs-EMA · test_style"></label>
+              <label><span>参与页公开标题</span><input name="public_title" maxlength="240" required value="匿名视频质量评测"></label>
+              <label><span>每视频目标票数</span><input name="target_votes" type="number" min="1" max="1000" value="3"></label>
             </div>
           </fieldset>
-          <button type="submit">添加候选</button>
+          <fieldset class="field-group">
+            <legend>GT 文件夹与评测视频</legend>
+            <div class="field-grid">
+              <label><span>GT 文件夹</span><select id="studio-item-group" required></select></label>
+              <label><span>筛选视频</span><input id="studio-item-query" placeholder="输入文件名"></label>
+            </div>
+            <div id="studio-items"><p class="muted">选择 GT 文件夹后加载 Media Item。</p></div>
+          </fieldset>
+          <fieldset class="field-group">
+            <legend>两份 Pred 方法</legend>
+            <div class="field-grid">
+              <label><span>方法 A 来源</span><select id="studio-method-a-source"><option value="run" selected>模型 Run</option><option value="external">External Pred（高级）</option></select></label>
+              <label><span>方法 A</span><select id="studio-method-a" required></select></label>
+              <label><span>方法 B 来源</span><select id="studio-method-b-source"><option value="run" selected>模型 Run</option><option value="external">External Pred（高级）</option></select></label>
+              <label><span>方法 B</span><select id="studio-method-b" required></select></label>
+            </div>
+            <details id="studio-upload-advanced" class="advanced studio-upload-advanced">
+              <summary>External Pred（高级）</summary>
+              <p class="muted">External Pred 必须先显式绑定到上方选中的每个 Media Item；这里不会按文件名、标签或哈希猜测 GT。缺少任一 Item 的方法不可发布。</p>
+              <label class="check-item compare-aspect-confirm">
+                <input id="studio-allow-external-aspect-stretch" type="checkbox">
+                <span>确认允许 External Pred 按 Alignment Plan 改变宽高比；每个变换会写入冻结报告</span>
+              </label>
+            </details>
+            <button id="studio-preview" class="secondary" type="button">检查覆盖与对齐</button>
+          </fieldset>
+          <fieldset class="field-group">
+            <legend>视频覆盖与对齐报告</legend>
+            <div id="studio-coverage"><p class="muted">选择视频和两份方法后检查覆盖与对齐。</p></div>
+          </fieldset>
+          <button type="submit">创建并发布冻结评测包</button>
         </form>
-        <section id="evaluation-task" class="panel"></section>
-        <section id="campaign-analysis" class="panel"></section>
+
+        <div hidden aria-hidden="true">
+          <form id="evaluator-form"><input name="display_name"></form>
+          <form id="campaign-form"><input name="name"><input name="target_votes"></form>
+          <form id="candidate-form"><select name="campaign_id"></select><select name="reference_asset_id"></select><select name="asset_id"></select><input name="video_name"><input name="label"></form>
+          <button id="refresh-evaluations" type="button"></button>
+          <div id="campaign-list"></div>
+          <section id="evaluation-task"></section>
+          <section id="campaign-analysis"></section>
+        </div>
       </section>
     </main>
     </div>
 
     <div id="toast" role="status"></div>
     <script src="/app.js"></script>
+    <script src="/studio.js"></script>
   </body>
 </html>
