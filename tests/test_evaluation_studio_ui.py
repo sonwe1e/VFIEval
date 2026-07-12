@@ -61,6 +61,25 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn("/session`,", self.blind_js)
         self.assertIn("display_name: displayName", self.blind_js)
 
+    def test_blind_page_generates_an_evaluator_id_without_secure_random_uuid(self) -> None:
+        self.assertIn("function newEvaluatorId()", self.blind_js)
+        self.assertIn("globalThis.crypto?.randomUUID?.()", self.blind_js)
+        self.assertIn("browser-${Date.now()}-${Math.random().toString(16).slice(2)}", self.blind_js)
+        self.assertIn('localStorage.getItem("vfieval-evaluator-id") || newEvaluatorId()', self.blind_js)
+        self.assertNotIn('|| crypto.randomUUID()', self.blind_js)
+
+    def test_blind_vote_captures_its_form_before_await(self) -> None:
+        start = self.blind_js.index("async function submitVote(event)")
+        end = self.blind_js.index("\nfunction activeVideos()", start)
+        handler = self.blind_js[start:end]
+        self.assertIn("const voteForm = event.currentTarget;", handler)
+        self.assertIn('const buttons = voteForm.querySelectorAll("button");', handler)
+        self.assertIn("const form = new FormData(voteForm);", handler)
+        self.assertIn("voteForm.reset();", handler)
+        self.assertLess(handler.index("const voteForm = event.currentTarget;"), handler.index("await blindApi"))
+        self.assertNotIn("event.currentTarget", handler[handler.index("await blindApi"):])
+        self.assertNotIn("event.currentTarget.reset()", handler)
+
     def test_blind_playback_and_lease_state_are_reset_between_tasks(self) -> None:
         self.assertIn('video.playbackRate = Number(byId("master-rate")', self.blind_js)
         self.assertIn('video.loop = Boolean(byId("master-loop")', self.blind_js)

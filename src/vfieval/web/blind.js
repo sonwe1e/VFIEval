@@ -1,6 +1,11 @@
+function newEvaluatorId() {
+  return globalThis.crypto?.randomUUID?.()
+    || `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 const blindState = {
   token: decodeURIComponent(location.pathname.split("/").filter(Boolean).pop() || ""),
-  evaluatorId: localStorage.getItem("vfieval-evaluator-id") || crypto.randomUUID(),
+  evaluatorId: localStorage.getItem("vfieval-evaluator-id") || newEvaluatorId(),
   evaluatorName: localStorage.getItem("vfieval-evaluator-name") || "",
   payload: null,
   taskStartedAt: 0,
@@ -213,12 +218,13 @@ async function saveSession(event) {
 
 async function submitVote(event) {
   event.preventDefault();
+  const voteForm = event.currentTarget;
   const submitter = event.submitter;
   const task = blindState.payload?.task || blindState.payload?.next_task;
   if (!task || !submitter?.value) return;
-  const buttons = event.currentTarget.querySelectorAll("button");
+  const buttons = voteForm.querySelectorAll("button");
   buttons.forEach((button) => { button.disabled = true; });
-  const form = new FormData(event.currentTarget);
+  const form = new FormData(voteForm);
   try {
     const payload = await blindApi(
       `/api/blind/${encodeURIComponent(blindState.token)}/tasks/${encodeURIComponent(task.token)}/vote`,
@@ -234,7 +240,7 @@ async function submitVote(event) {
         }),
       },
     );
-    event.currentTarget.reset();
+    voteForm.reset();
     renderPayload({
       ...blindState.payload,
       ...payload,
