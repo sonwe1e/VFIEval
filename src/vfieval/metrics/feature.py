@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from vfieval.config import WorkspaceConfig
+from vfieval.devices import resolve_torch_device
 from vfieval.metrics.base import MetricResult, MetricUnavailable
 from vfieval.metrics.health import metric_health
 
@@ -120,12 +121,13 @@ class ConvNextFeatureMetric:
 
 def _resolve_metric_device(device_name: str) -> torch.device:
     text = str(device_name or "cpu")
-    if text.startswith("npu"):
-        try:
-            import torch_npu  # noqa: F401
-        except Exception as exc:
-            raise MetricUnavailable(f"metric device {text} requires torch_npu: {exc}") from exc
-    return torch.device(text)
+    try:
+        # This resolves and binds NPU devices before any metric model is
+        # constructed.  It also keeps metric device handling aligned with the
+        # inference/preflight paths instead of relying on the process default.
+        return resolve_torch_device(text)
+    except Exception as exc:
+        raise MetricUnavailable(f"metric device {text} initialization failed: {exc}") from exc
 
 
 def _load_dino_model(health: dict[str, Any], device: torch.device):

@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import hashlib
+import sys
 import tempfile
 import urllib.request
 import zipfile
@@ -403,12 +404,29 @@ import sys
 from pathlib import Path
 
 
+def _prepare_device(device_name: str) -> None:
+    text = str(device_name or "cpu")
+    if not text.startswith("npu"):
+        return
+    import torch
+    import torch_npu  # noqa: F401
+
+    npu = getattr(torch, "npu", None)
+    set_device = getattr(npu, "set_device", None)
+    if not callable(set_device):
+        raise RuntimeError("torch.npu.set_device is unavailable")
+    index = int(text.split(":", 1)[1]) if ":" in text else 0
+    set_device(index)
+
+
 def main() -> int:
     payload = json.load(sys.stdin)
-    repo_dir = Path(payload["repo_dir"]).resolve()
-    sys.path.insert(0, str(repo_dir))
-    os.environ.setdefault("VFIEVAL_METRIC_DEVICE", str(payload.get("device") or "cpu"))
+    device = str(payload.get("device") or "cpu")
+    os.environ["VFIEVAL_METRIC_DEVICE"] = device
     try:
+        _prepare_device(device)
+        repo_dir = Path(payload["repo_dir"]).resolve()
+        sys.path.insert(0, str(repo_dir))
         module = importlib.import_module("cgvqm")
         value, details = _call_metric(module, payload)
         print(json.dumps({"status": "completed", "value": float(value), "details": details}))
@@ -598,6 +616,12 @@ def _vmaf_health(
             manifest_path=manifest_path,
             expected_paths=expected_paths,
         )
+    local_ffmpeg_candidates = [
+        manifest_path.parent / "ffmpeg.exe",
+        manifest_path.parent / "ffmpeg",
+    ]
+    expected_paths.extend(str(path.resolve()) for path in local_ffmpeg_candidates)
+
     if manifest is not None:
         validation_error = _validate_vmaf_manifest(metric_name, manifest)
         if validation_error:
@@ -618,19 +642,29 @@ def _vmaf_health(
     executable_source = "path"
     if ffmpeg_override:
         override_path = _resolve_manifest_file_path(manifest_path.parent, ffmpeg_override)
-        if override_path.exists():
+        if override_path.is_file():
             resolved_executable = str(override_path.resolve())
             executable_source = "manifest"
+
+    if resolved_executable is None:
+        for candidate in local_ffmpeg_candidates:
+            if candidate.is_file():
+                resolved_executable = str(candidate.resolve())
+                executable_source = "project_local"
+                break
 
     if resolved_executable is None:
         resolved_executable = shutil.which("ffmpeg")
         executable_source = "path"
 
     if not resolved_executable:
-        reason = "ffmpeg is not on PATH"
+        reason = "ffmpeg is not available from manifest, project-local set/metrics/vmaf, or PATH"
         if ffmpeg_override:
             override_path = _resolve_manifest_file_path(manifest_path.parent, ffmpeg_override)
-            reason = f"manifest ffmpeg_path does not exist and ffmpeg is not on PATH: {override_path.resolve()}"
+            reason = (
+                f"manifest ffmpeg_path does not exist, project-local ffmpeg is missing, "
+                f"and ffmpeg is not on PATH: {override_path.resolve()}"
+            )
         return _status(
             metric_name,
             STATUS_MISSING_EVALUATOR,
@@ -1219,6 +1253,10 @@ def _resolve_command_executable(base_dir: Path, token: str) -> tuple[str | None,
     relative = (base_dir / candidate).resolve()
     if relative.exists():
         return str(relative), "manifest", None
+    if candidate.name.lower() in {"python", "python.exe", "python3", "python3.exe"}:
+        current_python = Path(sys.executable).resolve()
+        if current_python.exists():
+            return str(current_python), "current_python", None
     resolved = shutil.which(token)
     if resolved:
         return resolved, "path", None
