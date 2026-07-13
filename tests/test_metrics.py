@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
+from vfieval.metrics.feature import _resolve_metric_device
 from vfieval.metrics import METRIC_NAMES, create_metric
 from vfieval.metrics.base import MetricResult, MetricUnavailable
 from vfieval.metrics.health import metric_cache_config, metric_health, prepare_metric_asset_manifest
@@ -41,6 +42,62 @@ class MetricTests(unittest.TestCase):
 
             with self.assertRaises(MetricUnavailable):
                 metric.evaluate(reference, distorted, tmp_path / "work")
+
+    def test_lpips_metric_device_uses_shared_npu_resolver(self) -> None:
+        import torch
+
+        original_device = torch.device
+        with patch("vfieval.devices.set_npu_device") as set_npu_device, patch(
+            "vfieval.devices.torch.device",
+            side_effect=lambda _name: original_device("cpu"),
+        ):
+            resolved = _resolve_metric_device("npu:1")
+
+        self.assertEqual(resolved, torch.device("cpu"))
+        set_npu_device.assert_called_once_with("npu:1")
+
+    def test_lpips_metric_device_failure_keeps_device_in_unavailable_reason(self) -> None:
+        with patch(
+            "vfieval.metrics.feature.resolve_torch_device",
+            side_effect=RuntimeError("torch_npu failed to bind device"),
+        ):
+            with self.assertRaisesRegex(MetricUnavailable, r"npu:1.*torch_npu failed"):
+                _resolve_metric_device("npu:1")
+
+    def test_vmaf_health_finds_project_local_ffmpeg(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            metric_dir = _metric_dir(workspace, "vmaf")
+            _write_vmaf_manifest(metric_dir, "")
+            local_ffmpeg = metric_dir / "ffmpeg.exe"
+            local_ffmpeg.write_bytes(b"project-local ffmpeg")
+
+            with patch(
+                "vfieval.metrics.health._inspect_ffmpeg_filters",
+                return_value={"available": True, "reason": None},
+            ):
+                health = metric_health(workspace, "vmaf")
+
+            self.assertEqual(health["status"], "available")
+            self.assertEqual(health["executable_source"], "project_local")
+            self.assertEqual(health["resolved_executable"], str(local_ffmpeg.resolve()))
+
+    def test_cgvqm_python_driver_uses_current_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            metric_dir = _metric_dir(workspace, "cgvqm")
+            _write_cgvqm_manifest(metric_dir, command=["python", "driver.py"])
+
+            with patch("vfieval.metrics.health.importlib.util.find_spec", return_value=object()):
+                health = metric_health(workspace, "cgvqm")
+
+            expected_python = str(Path(sys.executable).resolve())
+            self.assertEqual(health["status"], "available")
+            self.assertEqual(health["resolved_executable"], expected_python)
+            self.assertEqual(health["executable_source"], "current_python")
+            self.assertEqual(health["driver_command"][0], expected_python)
 
     def test_metric_cache_key_uses_file_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -159,6 +216,9 @@ class MetricTests(unittest.TestCase):
             self.assertFalse(result["errors"])
             metric_dir = workspace.root.parent / "set" / "metrics" / "cgvqm"
             wrapper = metric_dir / "run_cgvqm_vfieval.py"
+            wrapper_source = wrapper.read_text(encoding="utf-8")
+            self.assertIn("def _prepare_device", wrapper_source)
+            self.assertIn("set_device(index)", wrapper_source)
             payload = {
                 "metric_name": "cgvqm",
                 "reference": str((Path(tmp) / "ref.mp4").resolve()),

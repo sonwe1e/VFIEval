@@ -32,6 +32,7 @@ from vfieval.file_inputs import decode_cache_dir, list_checkpoints, list_model_f
 from vfieval.job_errors import describe_job_failure
 from vfieval.metrics.health import metric_assets_dir, metric_health, metrics_health
 from vfieval.models import load_flow_mask_model
+from vfieval.orchestration import _start_local_npu_worker_processes
 from vfieval.pipeline.inference import run_inference_job
 from vfieval.pipeline.postprocess import validate_model_outputs
 from vfieval.server import _make_handler, _partition_samples_by_video, _resolve_execution_devices, _run_metric_summary, _run_timeline, _worker_process_command
@@ -2676,6 +2677,28 @@ class Model:
         self.assertIn("--idle-timeout", command)
         self.assertIn("120.0", command)
         self.assertIn("--once", command)
+
+    def test_multi_npu_metric_worker_uses_first_metric_device(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            with patch("vfieval.orchestration._spawn_worker_process") as spawn:
+                _start_local_npu_worker_processes(
+                    workspace,
+                    run_id=7,
+                    devices=["npu:0", "npu:1"],
+                    start_metric_worker=True,
+                )
+
+            commands = [call.args[0] for call in spawn.call_args_list]
+            metric_command = next(
+                command for command in commands
+                if "--role" in command and command[command.index("--role") + 1] == "metric"
+            )
+            self.assertEqual(
+                metric_command[metric_command.index("--device-filter") + 1],
+                "npu:0",
+            )
 
 
 def _post(base_url: str, path: str, payload: dict) -> dict:

@@ -207,14 +207,14 @@ set/
 - `lpips_vit_patch`: `prepare-metrics` downloads the DINOv2 checkout and ViT-S/14 registers weights into `set/metrics/lpips_vit_patch/`.
 - `lpips_convnext`: `prepare-metrics` downloads the local ConvNeXt V2 tiny checkpoint into `set/metrics/lpips_convnext/`.
 - `cgvqm`: `prepare-metrics` downloads the IntelLabs CGVQM checkout and writes the VFIEval JSON wrapper into `set/metrics/cgvqm/`. This remains a video-level metric and does not synthesize per-frame points.
-- `vmaf`: this is the first metric that can run immediately in the current build. Install `ffmpeg` with the `libvmaf` filter on `PATH`, or set `set/metrics/vmaf/manifest.json -> ffmpeg_path` to a project-local portable ffmpeg binary.
+- `vmaf`: this is the first metric that can run immediately in the current build. VFIEval checks `manifest.json -> ffmpeg_path`, then `set/metrics/vmaf/ffmpeg.exe` (or `ffmpeg`), then `ffmpeg` on `PATH`; the selected binary must expose the `libvmaf` filter.
 
 Current remaining-metric adapters:
 
 - `lpips_vit_patch` is a sample-level DINOv2 feature-distance metric. Default backbone: `dinov2_vits14_reg`. Evaluation uses max edge `518`, preserves aspect ratio, and pads to a multiple of `14`.
 - `lpips_convnext` is a sample-level ConvNeXt V2 feature-distance metric. Default backbone: `convnextv2_tiny.fcmae_ft_in22k_in1k`. Evaluation uses max edge `288`, preserves aspect ratio, and pads to a multiple of `32`.
 - `cgvqm` is a video-level wrapper around a local IntelLabs CGVQM checkout. Evaluation videos are written under the metric work directory with long edge capped at `720`; original artifacts are not overwritten.
-- Metric jobs inherit the Run's inference device through `metric_device`. If CUDA/NPU metric warmup fails, VFIEval records `unavailable` with the device and reason instead of falling back to CPU.
+- Metric jobs inherit the Run's inference device through `metric_device`. LPIPS and CGVQM bind the requested `npu:<index>` before model construction; if CUDA/NPU metric warmup fails, VFIEval records `unavailable` with the device and reason instead of falling back to CPU.
 - `prepare-metrics --check-only` is read-only. `prepare-metrics --force` replaces only VFIEval-declared metric assets, not unrelated user files. Python packages such as `timm`, `safetensors`, `av`, and `scipy` are never installed automatically.
 
 Status interpretation:
@@ -224,7 +224,7 @@ Status interpretation:
 - `missing_dependency`: the Python package dependency for that metric is missing from the current environment.
 - `available`: the current build can attempt to execute that metric without substituting another score.
 
-Metric assets live under `set/metrics/` by default, or under `VFIEVAL_METRIC_ASSETS_DIR` when that environment variable is set. Missing dependencies, failed downloads, or unsupported evaluator devices are recorded as `unavailable`; VFIEval never substitutes a different metric score.
+Metric assets live under `set/metrics/` by default, or under `VFIEVAL_METRIC_ASSETS_DIR` when that environment variable is set. A migrated set can carry relative weights, model sources, wrappers, and a project-local VMAF ffmpeg binary; it cannot carry the Ascend runtime or Python wheels. CGVQM drivers use the same Python interpreter that started VFIEval, so compatible `torchvision`, `av`, and NPU packages must be installed in that environment. Missing dependencies, failed downloads, or unsupported evaluator devices are recorded as `unavailable`; VFIEval never substitutes a different metric score.
 
 ## 统一媒体资产与 External 上传
 
