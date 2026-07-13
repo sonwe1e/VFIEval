@@ -1,12 +1,42 @@
 function newEvaluatorId() {
-  return globalThis.crypto?.randomUUID?.()
-    || `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  try {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return window.crypto.randomUUID();
+    }
+  } catch (_error) {
+    // Some embedded/mobile browsers expose crypto but deny access to it.
+  }
+  return `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function readLocalValue(key) {
+  try {
+    return window.localStorage ? window.localStorage.getItem(key) || "" : "";
+  } catch (_error) {
+    return "";
+  }
+}
+
+function writeLocalValue(key, value) {
+  try {
+    if (window.localStorage) window.localStorage.setItem(key, value);
+  } catch (_error) {
+    // A usable in-memory session is better than aborting page initialization.
+  }
+}
+
+function removeLocalValue(key) {
+  try {
+    if (window.localStorage) window.localStorage.removeItem(key);
+  } catch (_error) {
+    // Ignore storage restrictions; the in-memory session is already cleared.
+  }
 }
 
 const blindState = {
   token: decodeURIComponent(location.pathname.split("/").filter(Boolean).pop() || ""),
-  evaluatorId: localStorage.getItem("vfieval-evaluator-id") || newEvaluatorId(),
-  evaluatorName: localStorage.getItem("vfieval-evaluator-name") || "",
+  evaluatorId: readLocalValue("vfieval-evaluator-id") || newEvaluatorId(),
+  evaluatorName: readLocalValue("vfieval-evaluator-name"),
   payload: null,
   taskStartedAt: 0,
   frameIndex: 0,
@@ -14,16 +44,27 @@ const blindState = {
   retryTimer: null,
 };
 
-localStorage.setItem("vfieval-evaluator-id", blindState.evaluatorId);
+writeLocalValue("vfieval-evaluator-id", blindState.evaluatorId);
 const byId = (id) => document.getElementById(id);
 
 async function blindApi(path, options = {}) {
-  const response = await fetch(path, {
+  if (typeof window.fetch !== "function") {
+    throw new Error("当前浏览器不支持盲评所需的网络功能，请升级浏览器后重试。");
+  }
+  const response = await window.fetch(path, {
     ...options,
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
   });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error?.message || response.statusText);
+  const contentType = response.headers.get("content-type") || "";
+  let data = {};
+  if (contentType.includes("application/json")) {
+    data = await response.json();
+  } else {
+    const message = (await response.text()).trim();
+    if (response.ok) throw new Error("服务器返回了无法识别的响应，请刷新后重试。");
+    data = { error: { message } };
+  }
+  if (!response.ok) throw new Error(data.error?.message || response.statusText || "请求失败");
   return data;
 }
 
@@ -197,7 +238,7 @@ async function loadBlindPayload() {
   } catch (error) {
     if (!String(error.message || "").toLowerCase().includes("session")) throw error;
     blindState.evaluatorName = "";
-    localStorage.removeItem("vfieval-evaluator-name");
+    removeLocalValue("vfieval-evaluator-name");
     setHidden("session-panel", false);
     byId("progress").textContent = "会话已失效，请重新加入";
   }
@@ -205,15 +246,31 @@ async function loadBlindPayload() {
 
 async function saveSession(event) {
   event.preventDefault();
-  const form = new FormData(event.currentTarget);
+  const sessionForm = event.currentTarget;
+  const submitButton = sessionForm.querySelector('button[type="submit"]');
+  const form = new FormData(sessionForm);
   const displayName = String(form.get("display_name") || "").trim();
-  const payload = await blindApi(`/api/blind/${encodeURIComponent(blindState.token)}/session`, {
-    method: "POST",
-    body: JSON.stringify({ evaluator_id: blindState.evaluatorId, display_name: displayName }),
-  });
-  blindState.evaluatorName = displayName;
-  localStorage.setItem("vfieval-evaluator-name", displayName);
-  renderPayload(payload);
+  if (!displayName) return;
+  const oldLabel = submitButton?.textContent || "进入盲评";
+  if (submitButton) {
+    submitButton.disabled = true;
+    submitButton.textContent = "正在进入…";
+  }
+  setHidden("message-panel", true);
+  try {
+    const payload = await blindApi(`/api/blind/${encodeURIComponent(blindState.token)}/session`, {
+      method: "POST",
+      body: JSON.stringify({ evaluator_id: blindState.evaluatorId, display_name: displayName }),
+    });
+    blindState.evaluatorName = displayName;
+    writeLocalValue("vfieval-evaluator-name", displayName);
+    renderPayload(payload);
+  } finally {
+    if (submitButton) {
+      submitButton.disabled = false;
+      submitButton.textContent = oldLabel;
+    }
+  }
 }
 
 async function submitVote(event) {
@@ -310,17 +367,24 @@ function startLeaseHeartbeat(task) {
   }, 60_000);
 }
 
-byId("session-form").addEventListener("submit", (event) => saveSession(event).catch(showError));
-byId("vote-form").addEventListener("submit", (event) => submitVote(event).catch(showError));
-byId("master-play").addEventListener("click", () => toggleMasterPlayback().catch(showError));
-byId("master-seek").addEventListener("input", (event) => seekVideos(event.currentTarget.value));
-byId("master-rate").addEventListener("change", (event) => activeVideos().forEach((video) => { video.playbackRate = Number(event.currentTarget.value); }));
-byId("master-loop").addEventListener("change", (event) => activeVideos().forEach((video) => { video.loop = event.currentTarget.checked; }));
-byId("frame-range").addEventListener("input", (event) => updateFrame(event.currentTarget.value));
-document.addEventListener("visibilitychange", () => {
-  if (document.hidden) return;
-  if (blindState.payload?.task) startLeaseHeartbeat(blindState.payload.task);
-  else if (blindState.evaluatorName && !blindState.payload?.progress?.complete) loadBlindPayload().catch(showError);
-});
+function initializeBlindPage() {
+  byId("session-form").addEventListener("submit", (event) => saveSession(event).catch(showError));
+  byId("vote-form").addEventListener("submit", (event) => submitVote(event).catch(showError));
+  byId("master-play").addEventListener("click", () => toggleMasterPlayback().catch(showError));
+  byId("master-seek").addEventListener("input", (event) => seekVideos(event.currentTarget.value));
+  byId("master-rate").addEventListener("change", (event) => activeVideos().forEach((video) => { video.playbackRate = Number(event.currentTarget.value); }));
+  byId("master-loop").addEventListener("change", (event) => activeVideos().forEach((video) => { video.loop = event.currentTarget.checked; }));
+  byId("frame-range").addEventListener("input", (event) => updateFrame(event.currentTarget.value));
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    if (blindState.payload?.task) startLeaseHeartbeat(blindState.payload.task);
+    else if (blindState.evaluatorName && !blindState.payload?.progress?.complete) loadBlindPayload().catch(showError);
+  });
+  loadBlindPayload().catch(showError);
+}
 
-loadBlindPayload().catch(showError);
+try {
+  initializeBlindPage();
+} catch (error) {
+  showError(error);
+}

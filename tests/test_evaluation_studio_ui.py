@@ -63,10 +63,28 @@ class EvaluationStudioUiTests(unittest.TestCase):
 
     def test_blind_page_generates_an_evaluator_id_without_secure_random_uuid(self) -> None:
         self.assertIn("function newEvaluatorId()", self.blind_js)
-        self.assertIn("globalThis.crypto?.randomUUID?.()", self.blind_js)
+        self.assertIn('typeof window.crypto.randomUUID === "function"', self.blind_js)
         self.assertIn("browser-${Date.now()}-${Math.random().toString(16).slice(2)}", self.blind_js)
-        self.assertIn('localStorage.getItem("vfieval-evaluator-id") || newEvaluatorId()', self.blind_js)
+        self.assertIn('readLocalValue("vfieval-evaluator-id") || newEvaluatorId()', self.blind_js)
         self.assertNotIn('|| crypto.randomUUID()', self.blind_js)
+
+    def test_blind_page_survives_restricted_storage_and_surfaces_startup_errors(self) -> None:
+        self.assertIn("function readLocalValue(key)", self.blind_js)
+        self.assertIn("function writeLocalValue(key, value)", self.blind_js)
+        self.assertIn("function removeLocalValue(key)", self.blind_js)
+        self.assertIn("function initializeBlindPage()", self.blind_js)
+        self.assertIn("initializeBlindPage();", self.blind_js)
+        self.assertRegex(self.blind_js, r"try \{\s+initializeBlindPage\(\);\s+\} catch \(error\) \{\s+showError\(error\);")
+
+    def test_blind_session_submit_has_visible_pending_and_failure_state(self) -> None:
+        start = self.blind_js.index("async function saveSession(event)")
+        end = self.blind_js.index("\nasync function submitVote", start)
+        handler = self.blind_js[start:end]
+        self.assertIn('submitButton.textContent = "正在进入…";', handler)
+        self.assertIn("submitButton.disabled = true;", handler)
+        self.assertIn("finally {", handler)
+        self.assertIn("submitButton.disabled = false;", handler)
+        self.assertIn('writeLocalValue("vfieval-evaluator-name", displayName);', handler)
 
     def test_blind_vote_captures_its_form_before_await(self) -> None:
         start = self.blind_js.index("async function submitVote(event)")
