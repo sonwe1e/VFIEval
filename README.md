@@ -285,6 +285,8 @@ python -m vfieval.cli --workspace .vfieval serve --host 0.0.0.0 --port 8765
 
 然后从 `http://<服务器内网 IP>:8765` 打开 Studio，并重新复制参与链接；该链接会使用当前页面的来源地址。不要把此服务直接暴露到公网。API 中的 `share_url` 保持相对 `/evaluate/{opaque_token}`，由 Studio 在显示和复制时补全当前来源，避免服务端猜测可访问的主机名。
 
+`0.0.0.0` 只是监听地址，不能作为发给参与者的主机地址。经另一台服务器做端口映射时，应使用参与者实际可访问的服务器 IP 或域名，并优先使用完整 TCP 端口转发。如果使用 HTTP 反向代理，必须同时转发 `/evaluate/`、`/blind.js`、`/blind.css` 和 `/api/blind/`；只转发参与页面会导致页面停在“准备中”。可先从参与者设备直接打开 `http://<映射地址>/blind.js` 和 `http://<映射地址>/api/blind/<token>`，两者都应返回 `200`。
+
 参与者完成个人全部可评任务后才看到当前实名实时结果；组织者可始终查看覆盖率和方法级分析。人类结果使用平局半胜、Bradley–Terry 和固定种子 bootstrap 区间；客观指标保持各自方向与 `completed/unavailable/failed/skipped` 语义，两者不合成总分。旧 schema v1 Campaign 保持只读，可导出和归档，不按标签猜测迁移。
 
 ## API

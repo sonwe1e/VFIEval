@@ -75,6 +75,26 @@
       <section id="message-panel" class="panel hidden" role="alert"></section>
     </main>
     <div id="toast" role="status"></div>
-    <script src="/blind.js"></script>
+    <script>
+      window.__vfievalBlindReady = false;
+      window.__vfievalBlindBootError = function (message) {
+        if (window.__vfievalBlindReady) return;
+        var panel = document.getElementById("message-panel");
+        if (!panel) return;
+        panel.textContent = "盲评页面脚本启动失败：" + (message || "请检查 /blind.js 是否能通过当前映射地址访问");
+        panel.classList.remove("hidden");
+      };
+      window.addEventListener("error", function (event) {
+        window.__vfievalBlindBootError(event.message);
+      });
+      window.setTimeout(function () {
+        if (window.__vfievalBlindReady) return;
+        var panel = document.getElementById("message-panel");
+        if (!panel) return;
+        panel.textContent = "盲评页面脚本未能加载，请刷新页面；若仍失败，请检查端口映射是否同时转发了 /blind.js 和 /api/blind/ 请求。";
+        panel.classList.remove("hidden");
+      }, 3000);
+    </script>
+    <script src="/blind.js" onerror="window.__vfievalBlindBootError('无法加载 /blind.js')"></script>
   </body>
 </html>

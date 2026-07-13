@@ -28,7 +28,7 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertEqual(blind_script_ids - blind_ids, set())
 
     def test_blind_page_is_independent_and_uses_only_opaque_task_urls(self) -> None:
-        self.assertIn('<script src="/blind.js"></script>', self.blind_html)
+        self.assertIn('<script src="/blind.js"', self.blind_html)
         self.assertNotIn('/app.js', self.blind_html)
         self.assertNotIn('class="nav-item', self.blind_html)
         self.assertIn('/api/blind/', self.blind_js)
@@ -74,7 +74,22 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn("function removeLocalValue(key)", self.blind_js)
         self.assertIn("function initializeBlindPage()", self.blind_js)
         self.assertIn("initializeBlindPage();", self.blind_js)
-        self.assertRegex(self.blind_js, r"try \{\s+initializeBlindPage\(\);\s+\} catch \(error\) \{\s+showError\(error\);")
+        self.assertRegex(
+            self.blind_js,
+            r"try \{\s+initializeBlindPage\(\);\s+window\.__vfievalBlindReady = true;\s+\} catch \(error\) \{\s+showError\(error\);",
+        )
+
+    def test_blind_page_avoids_newer_syntax_and_reports_script_boot_failures(self) -> None:
+        self.assertNotIn("?.", self.blind_js)
+        self.assertNotIn("??", self.blind_js)
+        self.assertNotIn("Promise.allSettled", self.blind_js)
+        self.assertIn("function replaceContent(element, ...nodes)", self.blind_js)
+        self.assertIn("window.__vfievalBlindReady = true;", self.blind_js)
+        self.assertIn("盲评页面脚本未能加载", self.blind_html)
+        self.assertIn("无法加载 /blind.js", self.blind_html)
+        self.assertIn("window.__vfievalBlindBootError", self.blind_html)
+        self.assertIn("连接盲评服务超时", self.blind_js)
+        self.assertIn("Promise.race", self.blind_js)
 
     def test_blind_session_submit_has_visible_pending_and_failure_state(self) -> None:
         start = self.blind_js.index("async function saveSession(event)")
@@ -99,10 +114,12 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertNotIn("event.currentTarget.reset()", handler)
 
     def test_blind_playback_and_lease_state_are_reset_between_tasks(self) -> None:
-        self.assertIn('video.playbackRate = Number(byId("master-rate")', self.blind_js)
-        self.assertIn('video.loop = Boolean(byId("master-loop")', self.blind_js)
+        self.assertIn('const rateControl = byId("master-rate");', self.blind_js)
+        self.assertIn("video.playbackRate = Number((rateControl && rateControl.value) || 1);", self.blind_js)
+        self.assertIn('const loopControl = byId("master-loop");', self.blind_js)
+        self.assertIn("video.loop = Boolean(loopControl && loopControl.checked);", self.blind_js)
         self.assertIn("function syncFromClockVideo(event)", self.blind_js)
-        self.assertIn('byId("media-grid").replaceChildren()', self.blind_js)
+        self.assertIn('replaceContent(byId("media-grid"))', self.blind_js)
         self.assertIn("clearInterval(blindState.leaseTimer)", self.blind_js)
 
     def test_v1_and_v2_actions_and_server_routes_stay_separate(self) -> None:

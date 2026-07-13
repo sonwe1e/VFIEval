@@ -51,10 +51,25 @@ async function blindApi(path, options = {}) {
   if (typeof window.fetch !== "function") {
     throw new Error("当前浏览器不支持盲评所需的网络功能，请升级浏览器后重试。");
   }
-  const response = await window.fetch(path, {
-    ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+  let timeoutId = null;
+  const timeout = new Promise((_resolve, reject) => {
+    timeoutId = window.setTimeout(
+      () => reject(new Error("连接盲评服务超时，请检查端口映射是否同时转发了 /api/blind/ 请求。")),
+      15_000,
+    );
   });
+  let response;
+  try {
+    response = await Promise.race([
+      window.fetch(path, {
+        ...options,
+        headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+      }),
+      timeout,
+    ]);
+  } finally {
+    if (timeoutId) window.clearTimeout(timeoutId);
+  }
   const contentType = response.headers.get("content-type") || "";
   let data = {};
   if (contentType.includes("application/json")) {
@@ -64,7 +79,7 @@ async function blindApi(path, options = {}) {
     if (response.ok) throw new Error("服务器返回了无法识别的响应，请刷新后重试。");
     data = { error: { message } };
   }
-  if (!response.ok) throw new Error(data.error?.message || response.statusText || "请求失败");
+  if (!response.ok) throw new Error((data.error && data.error.message) || response.statusText || "请求失败");
   return data;
 }
 
@@ -82,7 +97,17 @@ function showError(error) {
 }
 
 function setHidden(id, hidden) {
-  byId(id)?.classList.toggle("hidden", Boolean(hidden));
+  const element = byId(id);
+  if (element) element.classList.toggle("hidden", Boolean(hidden));
+}
+
+function replaceContent(element, ...nodes) {
+  if (typeof element.replaceChildren === "function") {
+    element.replaceChildren(...nodes);
+    return;
+  }
+  while (element.firstChild) element.removeChild(element.firstChild);
+  nodes.forEach((node) => element.appendChild(node));
 }
 
 function withFrame(url, frame) {
@@ -110,8 +135,10 @@ function mediaElement(task, side, label) {
     video.playsInline = true;
     video.preload = "metadata";
     video.dataset.mediaSide = side;
-    video.playbackRate = Number(byId("master-rate")?.value || 1);
-    video.loop = Boolean(byId("master-loop")?.checked);
+    const rateControl = byId("master-rate");
+    const loopControl = byId("master-loop");
+    video.playbackRate = Number((rateControl && rateControl.value) || 1);
+    video.loop = Boolean(loopControl && loopControl.checked);
     video.src = url;
     if (side === "reference") video.addEventListener("timeupdate", syncFromClockVideo);
     card.appendChild(video);
@@ -125,19 +152,20 @@ function renderTask(task) {
     if (blindState.leaseTimer) clearInterval(blindState.leaseTimer);
     blindState.leaseTimer = null;
     activeVideos().forEach((video) => video.pause());
-    byId("media-grid").replaceChildren();
+    replaceContent(byId("media-grid"));
     byId("master-play").textContent = "全部播放";
     return;
   }
   byId("task-video").textContent = task.video_name || "视频";
   const grid = byId("media-grid");
-  grid.replaceChildren(
+  replaceContent(
+    grid,
     mediaElement(task, "reference", "参考 GT"),
     mediaElement(task, "left", "候选 A"),
     mediaElement(task, "right", "候选 B"),
   );
   const reasons = byId("quality-reasons");
-  reasons.replaceChildren(...(task.quality_reasons || []).map((reason) => {
+  replaceContent(reasons, ...(task.quality_reasons || []).map((reason) => {
     const label = document.createElement("label");
     const input = document.createElement("input");
     input.type = "checkbox";
@@ -167,7 +195,9 @@ function renderTask(task) {
 
 function renderResults(results) {
   const host = byId("live-results");
-  const ranking = results?.human?.ranking || results?.ranking || [];
+  const ranking = (results && results.human && results.human.ranking)
+    || (results && results.ranking)
+    || [];
   if (!ranking.length) {
     host.textContent = "尚无足够投票生成结果。";
     return;
@@ -180,13 +210,14 @@ function renderResults(results) {
     const name = document.createElement("span");
     name.textContent = `#${index + 1} ${row.label || row.name || "候选"}`;
     const score = document.createElement("strong");
-    score.textContent = Number(row.score ?? row.win_rate ?? 0).toFixed(4);
+    const scoreValue = row.score != null ? row.score : (row.win_rate != null ? row.win_rate : 0);
+    score.textContent = Number(scoreValue).toFixed(4);
     const detail = document.createElement("small");
     detail.textContent = row.ci95 ? `95% CI ${row.ci95[0]}–${row.ci95[1]}` : `${Number(row.votes || 0)} 票`;
     card.append(name, score, detail);
     grid.appendChild(card);
   });
-  host.replaceChildren(grid);
+  replaceContent(host, grid);
 }
 
 function renderPayload(payload) {
@@ -251,7 +282,7 @@ async function saveSession(event) {
   const form = new FormData(sessionForm);
   const displayName = String(form.get("display_name") || "").trim();
   if (!displayName) return;
-  const oldLabel = submitButton?.textContent || "进入盲评";
+  const oldLabel = (submitButton && submitButton.textContent) || "进入盲评";
   if (submitButton) {
     submitButton.disabled = true;
     submitButton.textContent = "正在进入…";
@@ -276,9 +307,9 @@ async function saveSession(event) {
 async function submitVote(event) {
   event.preventDefault();
   const voteForm = event.currentTarget;
-  const submitter = event.submitter;
-  const task = blindState.payload?.task || blindState.payload?.next_task;
-  if (!task || !submitter?.value) return;
+  const submitter = event.submitter || document.activeElement;
+  const task = blindState.payload && (blindState.payload.task || blindState.payload.next_task);
+  if (!task || !submitter || !submitter.value) return;
   const buttons = voteForm.querySelectorAll("button");
   buttons.forEach((button) => { button.disabled = true; });
   const form = new FormData(voteForm);
@@ -301,7 +332,7 @@ async function submitVote(event) {
     renderPayload({
       ...blindState.payload,
       ...payload,
-      campaign: payload.campaign || blindState.payload?.campaign || {},
+      campaign: payload.campaign || (blindState.payload && blindState.payload.campaign) || {},
       task: payload.next_task || null,
     });
     showToast("投票已保存");
@@ -322,7 +353,10 @@ async function toggleMasterPlayback() {
     const clock = videos.find((video) => video.dataset.mediaSide === "reference") || videos[0];
     const anchor = Number(clock.currentTime || 0);
     videos.forEach((video) => { video.currentTime = anchor; });
-    await Promise.allSettled(videos.map((video) => video.play()));
+    await Promise.all(videos.map((video) => {
+      const attempt = video.play();
+      return attempt && typeof attempt.catch === "function" ? attempt.catch(() => {}) : Promise.resolve();
+    }));
   } else {
     videos.forEach((video) => video.pause());
   }
@@ -349,7 +383,7 @@ function seekVideos(value) {
 
 function updateFrame(value) {
   blindState.frameIndex = Number(value);
-  const task = blindState.payload?.task || blindState.payload?.next_task || {};
+  const task = (blindState.payload && (blindState.payload.task || blindState.payload.next_task)) || {};
   const total = Math.max(1, Number(task.frame_count || 1));
   byId("frame-label").textContent = `帧 ${blindState.frameIndex + 1}/${total}`;
   document.querySelectorAll("[data-frame-base]").forEach((image) => { image.src = withFrame(image.dataset.frameBase, blindState.frameIndex); });
@@ -357,7 +391,7 @@ function updateFrame(value) {
 
 function startLeaseHeartbeat(task) {
   if (blindState.leaseTimer) clearInterval(blindState.leaseTimer);
-  if (!task?.token) return;
+  if (!task || !task.token) return;
   blindState.leaseTimer = setInterval(() => {
     if (document.hidden) return;
     blindApi(`/api/blind/${encodeURIComponent(blindState.token)}/tasks/${encodeURIComponent(task.token)}/heartbeat`, {
@@ -377,14 +411,18 @@ function initializeBlindPage() {
   byId("frame-range").addEventListener("input", (event) => updateFrame(event.currentTarget.value));
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) return;
-    if (blindState.payload?.task) startLeaseHeartbeat(blindState.payload.task);
-    else if (blindState.evaluatorName && !blindState.payload?.progress?.complete) loadBlindPayload().catch(showError);
+    if (blindState.payload && blindState.payload.task) startLeaseHeartbeat(blindState.payload.task);
+    else if (
+      blindState.evaluatorName
+      && !(blindState.payload && blindState.payload.progress && blindState.payload.progress.complete)
+    ) loadBlindPayload().catch(showError);
   });
   loadBlindPayload().catch(showError);
 }
 
 try {
   initializeBlindPage();
+  window.__vfievalBlindReady = true;
 } catch (error) {
   showError(error);
 }

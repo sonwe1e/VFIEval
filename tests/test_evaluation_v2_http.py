@@ -339,6 +339,12 @@ class EvaluationCampaignV2HttpTests(unittest.TestCase):
                 self.assertNotIn('/app.js', html)
                 self.assertNotIn('media-view', html)
                 self.assertNotIn('evaluation-studio', html)
+
+                script_status, script_headers, script = _request(base_url, "/blind.js")
+                self.assertEqual(script_status, 200)
+                self.assertIn("javascript", script_headers.get("Content-Type", ""))
+                self.assertEqual(script_headers.get("Cache-Control"), "no-store")
+                self.assertIn(b"initializeBlindPage", script)
             finally:
                 stop_server(server, thread)
 
