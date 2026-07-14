@@ -646,6 +646,11 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
         }
         if run_id is not None:
             metric_payload["run_id"] = run_id
+            metric_batch_size = (
+                (((run or {}).get("metadata") or {}).get("request") or {}).get("metric_batch_size_per_device")
+            )
+            if metric_batch_size:
+                metric_payload["metric_batch_size_per_device"] = int(metric_batch_size)
         metric_job_id = db.create_job(
             "metric",
             metric_payload,
@@ -759,6 +764,11 @@ def _run_video_compare_job(
         }
         if run_id is not None:
             metric_payload["run_id"] = run_id
+            metric_batch_size = (
+                (((run or {}).get("metadata") or {}).get("request") or {}).get("metric_batch_size_per_device")
+            )
+            if metric_batch_size:
+                metric_payload["metric_batch_size_per_device"] = int(metric_batch_size)
         metric_job_id = db.create_job("metric", metric_payload)
         if run_id is not None:
             db.complete_run_inference(run_id, result.__dict__, artifact_summary, "metric_queued")
@@ -1406,6 +1416,8 @@ def _copy_ordered_frames(frame_paths: list[Path], output_dir: Path) -> list[Path
 
 
 def _write_mp4(frame_paths: list[Path], output_path: Path, fps: float) -> None:
+    if not frame_paths:
+        raise RuntimeError(f"cannot create video artifact without frames: {output_path}")
     if _write_mp4_ffmpeg_pipe(frame_paths, output_path, fps):
         return
     _write_mp4_cv2(frame_paths, output_path, fps)
@@ -1430,6 +1442,14 @@ def _write_mp4_ffmpeg_pipe(frame_paths: list[Path], output_path: Path, fps: floa
         "-i",
         "pipe:0",
         "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "18",
+        "-vf",
+        "pad=ceil(iw/2)*2:ceil(ih/2)*2",
         "-pix_fmt",
         "yuv420p",
         "-movflags",
@@ -1437,25 +1457,45 @@ def _write_mp4_ffmpeg_pipe(frame_paths: list[Path], output_path: Path, fps: floa
         str(output_path),
     ]
     process = None
+    stderr: bytes | str | None = b""
     try:
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         assert process.stdin is not None
+        stdin = process.stdin
         for path in frame_paths:
             with path.open("rb") as handle:
-                shutil.copyfileobj(handle, process.stdin, length=1024 * 1024)
-        process.stdin.close()
-        stderr = process.stderr.read() if process.stderr is not None else b""
-        return_code = process.wait(timeout=120)
-        return return_code == 0 and output_path.is_file() and output_path.stat().st_size > 0
-    except Exception:
+                shutil.copyfileobj(handle, stdin, length=1024 * 1024)
+        stdin.close()
+        process.stdin = None
+        _, stderr = process.communicate(timeout=600)
+        if process.returncode == 0 and output_path.is_file() and output_path.stat().st_size > 0:
+            return True
+    except subprocess.TimeoutExpired as exc:
         if process is not None:
             try:
                 process.kill()
-                process.wait(timeout=5)
+                process.communicate(timeout=5)
             except Exception:
                 pass
         output_path.unlink(missing_ok=True)
-        return False
+        raise RuntimeError("ffmpeg timed out while encoding browser-compatible H.264 video") from exc
+    except Exception as exc:
+        stderr = b""
+        if process is not None:
+            try:
+                if process.stdin is not None and not process.stdin.closed:
+                    process.stdin.close()
+                process.stdin = None
+                _, stderr = process.communicate(timeout=10)
+            except Exception:
+                try:
+                    process.kill()
+                    _, stderr = process.communicate(timeout=5)
+                except Exception:
+                    pass
+        output_path.unlink(missing_ok=True)
+        detail = _ffmpeg_error_detail(stderr) or str(exc)
+        raise RuntimeError(f"failed to encode browser-compatible H.264 video with ffmpeg/libx264: {detail}") from exc
     finally:
         if process is not None:
             for stream in (process.stdin, process.stderr):
@@ -1464,29 +1504,20 @@ def _write_mp4_ffmpeg_pipe(frame_paths: list[Path], output_path: Path, fps: floa
                         stream.close()
                     except Exception:
                         pass
+    output_path.unlink(missing_ok=True)
+    detail = _ffmpeg_error_detail(stderr)
+    raise RuntimeError(
+        "failed to encode browser-compatible H.264 video with ffmpeg/libx264"
+        + (f": {detail}" if detail else "")
+    )
 
 
-def _write_mp4_ffmpeg(frame_dir: Path, output_path: Path, fps: float) -> bool:
-    ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        return False
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    command = [
-        ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
-        "-framerate", str(fps),
-        "-i", str(frame_dir / "%06d.png"),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-        str(output_path),
-    ]
-    try:
-        result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=600)
-    except subprocess.TimeoutExpired:
-        return False
-    if result.returncode != 0:
-        return False
-    return output_path.exists()
+def _ffmpeg_error_detail(stderr: bytes | str | None) -> str:
+    if not stderr:
+        return ""
+    text = stderr.decode("utf-8", errors="replace") if isinstance(stderr, bytes) else str(stderr)
+    compact = " ".join(text.strip().split())
+    return compact[-1200:]
 
 
 def _write_mp4_cv2(frame_paths: list[Path], output_path: Path, fps: float) -> None:
@@ -1503,9 +1534,10 @@ def _write_mp4_cv2(frame_paths: list[Path], output_path: Path, fps: float) -> No
     encode_height = height if height % 2 == 0 else height + 1
     writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"avc1"), fps, (encode_width, encode_height))
     if not writer.isOpened():
-        writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (encode_width, encode_height))
-    if not writer.isOpened():
-        raise RuntimeError(f"failed to create video artifact: {output_path}")
+        raise RuntimeError(
+            "failed to create a browser-compatible H.264 video artifact; "
+            "install ffmpeg with the libx264 encoder or provide OpenCV with AVC support"
+        )
     try:
         writer.write(_fit_video_frame(first, encode_width, encode_height))
         for frame_path in frame_paths[1:]:

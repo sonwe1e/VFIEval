@@ -133,6 +133,27 @@ class CompareUiHookTests(unittest.TestCase):
         self.assertIn("asset.source_kind === \"upload\"", app_js)
         self.assertNotIn('name="path"', index_html)
 
+    def test_compare_submission_is_single_flight_and_immediately_visible(self) -> None:
+        web = ROOT / "src" / "vfieval" / "web"
+        app_js = (web / "app.js").read_text(encoding="utf-8")
+        index_html = (web / "index.html").read_text(encoding="utf-8")
+
+        self.assertIn('id="compare-submit-status"', index_html)
+        self.assertIn("if (state.compareSubmitting)", app_js)
+        self.assertIn('state.compareSubmitPhase = "preflight"', app_js)
+        self.assertIn('state.compareSubmitPhase = "creating"', app_js)
+        self.assertIn('state.compareSubmitPhase = "opening"', app_js)
+        self.assertIn('form.setAttribute("aria-busy"', app_js)
+        self.assertIn("请勿重复点击", app_js)
+
+    def test_video_player_keeps_a_diagnostic_link_on_media_error(self) -> None:
+        app_js = (ROOT / "src" / "vfieval" / "web" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("function handleVideoPlaybackError(video)", app_js)
+        self.assertIn("打开原始视频", app_js)
+        self.assertIn("视频产物可能损坏或编码不兼容", app_js)
+        self.assertNotIn("浏览器无法播放此视频格式", app_js)
+
 
 if __name__ == "__main__":
     unittest.main()

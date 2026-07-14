@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ from PIL import Image
 
 from vfieval.config import WorkspaceConfig
 from vfieval.devices import resolve_torch_device
-from vfieval.metrics.base import MetricResult, MetricUnavailable
+from vfieval.metrics.base import MetricBatchOutOfMemory, MetricResult, MetricUnavailable
 from vfieval.metrics.health import metric_health
 
 
@@ -25,48 +26,76 @@ class DinoPatchMetric:
     def __init__(self, workspace: WorkspaceConfig | None = None, device: str | None = None):
         self.workspace = workspace or WorkspaceConfig.from_root()
         self.device_name = device or "cpu"
+        self._health: dict[str, Any] | None = None
+        self._device: torch.device | None = None
+        self._model = None
+        self._warmed_shapes: set[tuple[int, int]] = set()
+        self._timings = {"model_load_seconds": 0.0, "warmup_seconds": 0.0, "preprocess_seconds": 0.0, "compute_seconds": 0.0}
+        self._model_load_count = 0
 
     def evaluate(self, reference: Path, distorted: Path, work_dir: Path) -> MetricResult:
-        health = metric_health(self.workspace, self.name)
-        if not health.get("available"):
-            raise MetricUnavailable(f"{self.name} metric is {health['status']}: {health['reason']}")
-        if reference.suffix.lower() not in IMAGE_SUFFIXES or distorted.suffix.lower() not in IMAGE_SUFFIXES:
-            raise MetricUnavailable(f"{self.name} requires reference and distorted image files.")
+        return self.evaluate_batch([(reference, distorted, work_dir)])[0]
 
-        device = _resolve_metric_device(self.device_name)
+    def evaluate_batch(self, pairs: list[tuple[Path, Path, Path]]) -> list[MetricResult]:
+        health, device, model = self._ensure_model()
+        prepared = _prepare_image_pairs(pairs, int(health.get("input_size") or 518), 14, self.name, self._timings)
+        results: list[MetricResult | None] = [None] * len(pairs)
         try:
-            model = _load_dino_model(health, device)
-            input_size = int(health.get("input_size") or 518)
-            ref = _load_image_tensor(reference, input_size, multiple=14).to(device)
-            dist = _load_image_tensor(distorted, input_size, multiple=14).to(device)
-            with torch.no_grad():
-                _warmup_model(model, ref)
-                ref_features = _dino_patch_features(model, ref)
-                dist_features = _dino_patch_features(model, dist)
-                value = _feature_distance(ref_features, dist_features)
+            for shape, rows in _group_prepared_pairs(prepared).items():
+                refs = torch.cat([row[1] for row in rows], dim=0).to(device)
+                dists = torch.cat([row[2] for row in rows], dim=0).to(device)
+                self._warmup(model, refs[:1], shape)
+                started = time.perf_counter()
+                with torch.inference_mode():
+                    features = _dino_patch_features(model, torch.cat([refs, dists], dim=0))
+                    values = _feature_distances(features[: len(rows)], features[len(rows) :])
+                self._timings["compute_seconds"] += time.perf_counter() - started
+                for (index, _ref, _dist), value in zip(rows, values):
+                    results[index] = MetricResult("completed", float(value), self._details(health))
         except MetricUnavailable:
             raise
         except Exception as exc:
+            if _is_out_of_memory(exc):
+                _clear_device_cache(self.device_name)
+                raise MetricBatchOutOfMemory(f"metric device {self.device_name} ran out of memory") from exc
             raise MetricUnavailable(
                 f"metric device {self.device_name} failed warmup or evaluation: {exc}"
             ) from exc
+        return [result for result in results if result is not None]
 
-        return MetricResult(
-            status="completed",
-            value=float(value),
-            details={
-                "metric_name": self.name,
-                "backbone": health.get("backbone"),
-                "input_size": input_size,
-                "eval_resolution": health.get("eval_resolution"),
-                "pad_multiple": health.get("pad_multiple"),
-                "normalize": health.get("normalize"),
-                "device": self.device_name,
-                "device_policy": health.get("device_policy"),
-                "manifest_path": health.get("manifest_path"),
-                "implementation_mode": health.get("implementation_mode"),
-            },
-        )
+    def _ensure_model(self):
+        if self._model is not None:
+            return self._health, self._device, self._model
+        health = metric_health(self.workspace, self.name)
+        if not health.get("available"):
+            raise MetricUnavailable(f"{self.name} metric is {health['status']}: {health['reason']}")
+        device = _resolve_metric_device(self.device_name)
+        started = time.perf_counter()
+        try:
+            self._model = _load_dino_model(health, device)
+        except MetricUnavailable:
+            raise
+        except Exception as exc:
+            raise MetricUnavailable(f"metric device {self.device_name} failed model load: {exc}") from exc
+        self._timings["model_load_seconds"] += time.perf_counter() - started
+        self._model_load_count += 1
+        self._health, self._device = health, device
+        return health, device, self._model
+
+    def _warmup(self, model, sample: torch.Tensor, shape: tuple[int, int]) -> None:
+        if shape in self._warmed_shapes:
+            return
+        started = time.perf_counter()
+        with torch.inference_mode():
+            _dino_patch_features(model, torch.zeros_like(sample))
+        self._timings["warmup_seconds"] += time.perf_counter() - started
+        self._warmed_shapes.add(shape)
+
+    def _details(self, health: dict[str, Any]) -> dict[str, Any]:
+        return _feature_details(self.name, self.device_name, health)
+
+    def performance(self) -> dict[str, Any]:
+        return {**self._timings, "model_load_count": self._model_load_count, "warmed_shape_count": len(self._warmed_shapes)}
 
 
 class ConvNextFeatureMetric:
@@ -75,48 +104,122 @@ class ConvNextFeatureMetric:
     def __init__(self, workspace: WorkspaceConfig | None = None, device: str | None = None):
         self.workspace = workspace or WorkspaceConfig.from_root()
         self.device_name = device or "cpu"
+        self._health: dict[str, Any] | None = None
+        self._device: torch.device | None = None
+        self._model = None
+        self._warmed_shapes: set[tuple[int, int]] = set()
+        self._timings = {"model_load_seconds": 0.0, "warmup_seconds": 0.0, "preprocess_seconds": 0.0, "compute_seconds": 0.0}
+        self._model_load_count = 0
 
     def evaluate(self, reference: Path, distorted: Path, work_dir: Path) -> MetricResult:
-        health = metric_health(self.workspace, self.name)
-        if not health.get("available"):
-            raise MetricUnavailable(f"{self.name} metric is {health['status']}: {health['reason']}")
-        if reference.suffix.lower() not in IMAGE_SUFFIXES or distorted.suffix.lower() not in IMAGE_SUFFIXES:
-            raise MetricUnavailable(f"{self.name} requires reference and distorted image files.")
+        return self.evaluate_batch([(reference, distorted, work_dir)])[0]
 
-        device = _resolve_metric_device(self.device_name)
+    def evaluate_batch(self, pairs: list[tuple[Path, Path, Path]]) -> list[MetricResult]:
+        health, device, model = self._ensure_model()
+        prepared = _prepare_image_pairs(pairs, int(health.get("input_size") or 288), 32, self.name, self._timings)
+        results: list[MetricResult | None] = [None] * len(pairs)
         try:
-            model = _load_convnext_model(health, device)
-            input_size = int(health.get("input_size") or 288)
-            ref = _load_image_tensor(reference, input_size, multiple=32).to(device)
-            dist = _load_image_tensor(distorted, input_size, multiple=32).to(device)
-            with torch.no_grad():
-                _warmup_model(model, ref)
-                ref_features = model(ref)
-                dist_features = model(dist)
-                value = _feature_distance_list(ref_features, dist_features)
+            for shape, rows in _group_prepared_pairs(prepared).items():
+                refs = torch.cat([row[1] for row in rows], dim=0).to(device)
+                dists = torch.cat([row[2] for row in rows], dim=0).to(device)
+                self._warmup(model, refs[:1], shape)
+                started = time.perf_counter()
+                with torch.inference_mode():
+                    features = model(torch.cat([refs, dists], dim=0))
+                    ref_features, dist_features = _split_feature_batch(features, len(rows))
+                    values = _feature_distances_list(ref_features, dist_features)
+                self._timings["compute_seconds"] += time.perf_counter() - started
+                for (index, _ref, _dist), value in zip(rows, values):
+                    results[index] = MetricResult("completed", float(value), self._details(health))
         except MetricUnavailable:
             raise
         except Exception as exc:
+            if _is_out_of_memory(exc):
+                _clear_device_cache(self.device_name)
+                raise MetricBatchOutOfMemory(f"metric device {self.device_name} ran out of memory") from exc
             raise MetricUnavailable(
                 f"metric device {self.device_name} failed warmup or evaluation: {exc}"
             ) from exc
+        return [result for result in results if result is not None]
 
-        return MetricResult(
-            status="completed",
-            value=float(value),
-            details={
-                "metric_name": self.name,
-                "backbone": health.get("backbone"),
-                "input_size": input_size,
-                "eval_resolution": health.get("eval_resolution"),
-                "pad_multiple": health.get("pad_multiple"),
-                "normalize": health.get("normalize"),
-                "device": self.device_name,
-                "device_policy": health.get("device_policy"),
-                "manifest_path": health.get("manifest_path"),
-                "implementation_mode": health.get("implementation_mode"),
-            },
-        )
+    def _ensure_model(self):
+        if self._model is not None:
+            return self._health, self._device, self._model
+        health = metric_health(self.workspace, self.name)
+        if not health.get("available"):
+            raise MetricUnavailable(f"{self.name} metric is {health['status']}: {health['reason']}")
+        device = _resolve_metric_device(self.device_name)
+        started = time.perf_counter()
+        try:
+            self._model = _load_convnext_model(health, device)
+        except MetricUnavailable:
+            raise
+        except Exception as exc:
+            raise MetricUnavailable(f"metric device {self.device_name} failed model load: {exc}") from exc
+        self._timings["model_load_seconds"] += time.perf_counter() - started
+        self._model_load_count += 1
+        self._health, self._device = health, device
+        return health, device, self._model
+
+    def _warmup(self, model, sample: torch.Tensor, shape: tuple[int, int]) -> None:
+        if shape in self._warmed_shapes:
+            return
+        started = time.perf_counter()
+        with torch.inference_mode():
+            model(torch.zeros_like(sample))
+        self._timings["warmup_seconds"] += time.perf_counter() - started
+        self._warmed_shapes.add(shape)
+
+    def _details(self, health: dict[str, Any]) -> dict[str, Any]:
+        return _feature_details(self.name, self.device_name, health)
+
+    def performance(self) -> dict[str, Any]:
+        return {**self._timings, "model_load_count": self._model_load_count, "warmed_shape_count": len(self._warmed_shapes)}
+
+
+def _feature_details(name: str, device_name: str, health: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "metric_name": name,
+        "backbone": health.get("backbone"),
+        "input_size": int(health.get("input_size") or (518 if name == "lpips_vit_patch" else 288)),
+        "eval_resolution": health.get("eval_resolution"),
+        "pad_multiple": health.get("pad_multiple"),
+        "normalize": health.get("normalize"),
+        "device": device_name,
+        "device_policy": health.get("device_policy"),
+        "manifest_path": health.get("manifest_path"),
+        "implementation_mode": health.get("implementation_mode"),
+    }
+
+
+def _prepare_image_pairs(
+    pairs: list[tuple[Path, Path, Path]],
+    input_size: int,
+    multiple: int,
+    metric_name: str,
+    timings: dict[str, float],
+) -> list[tuple[int, torch.Tensor, torch.Tensor]]:
+    started = time.perf_counter()
+    prepared = []
+    for index, (reference, distorted, _work_dir) in enumerate(pairs):
+        if reference.suffix.lower() not in IMAGE_SUFFIXES or distorted.suffix.lower() not in IMAGE_SUFFIXES:
+            raise MetricUnavailable(f"{metric_name} requires reference and distorted image files.")
+        ref = _load_image_tensor(reference, input_size, multiple=multiple)
+        dist = _load_image_tensor(distorted, input_size, multiple=multiple)
+        if ref.shape != dist.shape:
+            raise MetricUnavailable(f"{metric_name} requires spatially aligned image pairs.")
+        prepared.append((index, ref, dist))
+    timings["preprocess_seconds"] += time.perf_counter() - started
+    return prepared
+
+
+def _group_prepared_pairs(
+    prepared: list[tuple[int, torch.Tensor, torch.Tensor]],
+) -> dict[tuple[int, int], list[tuple[int, torch.Tensor, torch.Tensor]]]:
+    groups: dict[tuple[int, int], list[tuple[int, torch.Tensor, torch.Tensor]]] = {}
+    for row in prepared:
+        groups.setdefault((int(row[1].shape[-2]), int(row[1].shape[-1])), []).append(row)
+    return groups
 
 
 def _resolve_metric_device(device_name: str) -> torch.device:
@@ -212,16 +315,25 @@ def _dino_patch_features(model, tensor: torch.Tensor) -> torch.Tensor:
 
 
 def _feature_distance(reference: torch.Tensor, distorted: torch.Tensor) -> float:
+    return float(_feature_distances(reference, distorted)[0])
+
+
+def _feature_distances(reference: torch.Tensor, distorted: torch.Tensor) -> list[float]:
     count = min(reference.shape[1], distorted.shape[1]) if reference.ndim == 3 else None
     if count is not None:
         reference = reference[:, :count]
         distorted = distorted[:, :count]
     reference = F.normalize(reference.float(), dim=-1)
     distorted = F.normalize(distorted.float(), dim=-1)
-    return float((reference - distorted).pow(2).sum(dim=-1).mean().item())
+    values = (reference - distorted).pow(2).sum(dim=-1).flatten(1).mean(dim=1)
+    return [float(value) for value in values.detach().cpu().tolist()]
 
 
 def _feature_distance_list(reference: Any, distorted: Any) -> float:
+    return float(_feature_distances_list(reference, distorted)[0])
+
+
+def _feature_distances_list(reference: Any, distorted: Any) -> list[float]:
     if not isinstance(reference, (list, tuple)):
         reference = [reference]
     if not isinstance(distorted, (list, tuple)):
@@ -234,10 +346,44 @@ def _feature_distance_list(reference: Any, distorted: Any) -> float:
         dist_norm = F.normalize(dist.float(), dim=1)
         height = min(ref_norm.shape[-2], dist_norm.shape[-2])
         width = min(ref_norm.shape[-1], dist_norm.shape[-1])
-        values.append((ref_norm[..., :height, :width] - dist_norm[..., :height, :width]).pow(2).sum(dim=1).mean())
+        values.append(
+            (ref_norm[..., :height, :width] - dist_norm[..., :height, :width])
+            .pow(2)
+            .sum(dim=1)
+            .flatten(1)
+            .mean(dim=1)
+        )
     if not values:
         raise RuntimeError("ConvNeXt backbone did not return feature maps")
-    return float(torch.stack(values).mean().item())
+    combined = torch.stack(values).mean(dim=0)
+    return [float(value) for value in combined.detach().cpu().tolist()]
+
+
+def _split_feature_batch(features: Any, count: int) -> tuple[Any, Any]:
+    if isinstance(features, (list, tuple)):
+        return [value[:count] for value in features], [value[count:] for value in features]
+    return features[:count], features[count:]
+
+
+def _is_out_of_memory(exc: Exception) -> bool:
+    text = str(exc).lower()
+    oom_type = getattr(torch.cuda, "OutOfMemoryError", None)
+    return (
+        (oom_type is not None and isinstance(exc, oom_type))
+        or type(exc).__name__.lower().endswith("outofmemoryerror")
+        or "out of memory" in text
+        or ("alloc" in text and "memory" in text)
+    )
+
+
+def _clear_device_cache(device_name: str) -> None:
+    try:
+        if str(device_name).startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif str(device_name).startswith("npu") and hasattr(torch, "npu"):
+            torch.npu.empty_cache()
+    except Exception:
+        pass
 
 
 def feature_metric_details_json(health: dict[str, Any]) -> str:

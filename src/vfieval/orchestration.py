@@ -297,16 +297,17 @@ def _start_local_npu_worker_processes(
     )
     processes.append(_spawn_worker_process(finalize_command, logs_dir / "worker-finalize.log"))
     if start_metric_worker:
-        metric_device = devices[0] if devices else None
-        command = worker_process_command(
-            workspace,
-            role="metric",
-            device_filter=metric_device,
-            worker_id=f"local-metric-{run_id}",
-            once=False,
-            idle_timeout=86400.0,
-        )
-        processes.append(_spawn_worker_process(command, logs_dir / "worker-metric.log"))
+        for index, metric_device in enumerate(devices or [None]):
+            command = worker_process_command(
+                workspace,
+                role="metric",
+                device_filter=metric_device,
+                worker_id=f"local-metric-{run_id}-{index}",
+                once=False,
+                idle_timeout=86400.0,
+            )
+            suffix = str(metric_device or "default").replace(":", "-")
+            processes.append(_spawn_worker_process(command, logs_dir / f"worker-metric-{suffix}.log"))
     return processes
 
 

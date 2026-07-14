@@ -123,32 +123,10 @@ def run_finalize_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> d
     artifact_summary = db.summarize_run_artifacts(run_id)
     metrics = list(run.get("metrics") or [])
     if metrics:
-        inference_job_ids = [int(row["job_id"]) for row in inference_jobs]
-        run_devices = list((run.get("metadata") or {}).get("devices") or [])
-        metric_device = str(
-            run_devices[0]
-            if run_devices
-            else inference_jobs[0].get("device") or run.get("device") or "cpu"
-        )
-        metric_payload = {
-            "run_id": run_id,
-            "dataset_id": int(run["dataset_id"]),
-            "inference_job_ids": inference_job_ids,
-            "inference_job_id": inference_job_ids[0],
-            "metric_names": metrics,
-            "metric_device": metric_device,
-        }
-        metric_job_id = db.add_run_job(
-            run_id,
-            "metric",
-            metric_payload,
-            progress_total=0,
-            shard_index=0,
-            device=metric_device,
-            metadata={"source": "finalize"},
-        )
         db.complete_run_inference(run_id, result, artifact_summary, "metric_queued")
-        db.set_run_metric_job(run_id, metric_job_id)
+        from vfieval.pipeline.metric_jobs import create_metric_wave
+
+        create_metric_wave(db, run_id, metrics, source="finalize")
     else:
         db.complete_run_inference(run_id, result, artifact_summary, "completed")
     return result

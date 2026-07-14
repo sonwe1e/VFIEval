@@ -46,6 +46,24 @@ class RunResultFreshnessUiTests(unittest.TestCase):
         self.assertIn("artifact-pending", self.styles)
         self.assertIn("aria-busy=\"true\"", self.app_js)
 
+    def test_long_metric_timeline_uses_overview_and_bounded_detail_window(self) -> None:
+        self.assertIn("const TIMELINE_WINDOW_SIZE = 160", self.app_js)
+        self.assertIn("function renderMetricOverview", self.app_js)
+        self.assertIn("overview-envelope", self.app_js)
+        self.assertIn("overview-viewport", self.app_js)
+        self.assertIn("function metricLineSegments", self.app_js)
+        self.assertIn("function setGlobalSampleIndex", self.app_js)
+        self.assertIn("data-overview-video", self.app_js)
+        self.assertIn("chart-tooltip", self.styles)
+        detail_body = self.app_js.split("function renderMetricChart", 1)[1].split(
+            "function metricLineSegments", 1
+        )[0]
+        self.assertNotIn("renderMetricPoints", detail_body)
+
+    def test_metric_batch_override_is_optional_advanced_setting(self) -> None:
+        self.assertIn('name="metric_batch_size_per_device"', self.index_html)
+        self.assertIn("metric_batch_size_per_device: data.metric_batch_size_per_device", self.app_js)
+
 
 if __name__ == "__main__":
     unittest.main()

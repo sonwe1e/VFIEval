@@ -43,6 +43,7 @@ from vfieval.server import (
     _retry_run_metrics,
     _run_metric_summary,
     _run_timeline,
+    _timeline_buckets,
     _worker_process_command,
 )
 from vfieval.worker import WorkerOptions, detect_capabilities, run_worker
@@ -2419,15 +2420,26 @@ class Model:
             db.add_run_job(
                 run_id,
                 "inference",
-                {"run_id": run_id, "dataset_id": dataset_id},
+                {"run_id": run_id, "dataset_id": dataset_id, "sample_ids": [1]},
+                shard_index=0,
                 device="npu:0",
+            )
+            db.add_run_job(
+                run_id,
+                "inference",
+                {"run_id": run_id, "dataset_id": dataset_id, "sample_ids": [2]},
+                shard_index=1,
+                device="npu:1",
             )
 
             retry = _retry_run_metrics(db, run_id)
 
             metric_job = db.get_job(retry["metric_job_id"])
             self.assertEqual(metric_job["payload"]["metric_device"], "npu:0")
-            self.assertEqual(db.list_run_jobs(run_id, "metric")[0]["device"], "npu:0")
+            metric_jobs = db.list_run_jobs(run_id, "metric")
+            self.assertEqual([row["device"] for row in metric_jobs], ["npu:0", "npu:1"])
+            self.assertTrue(all(row["payload"]["retry"] for row in metric_jobs))
+            self.assertEqual(retry["metric_job_ids"], [row["job_id"] for row in metric_jobs])
 
     def test_multi_npu_worker_failure_preserves_shard_context_for_run_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2792,6 +2804,29 @@ class Model:
             self.assertFalse(cgvqm["available"])
             self.assertIn("driver executable", cgvqm["reason"])
 
+    def test_eight_hundred_frame_metric_overview_is_bounded_to_160_buckets(self) -> None:
+        samples = [
+            {
+                "sample_id": index + 1,
+                "frame_index": index,
+                "metrics": {
+                    "lpips_convnext": {
+                        "status": "completed",
+                        "value": float(index % 23) / 23.0,
+                    }
+                },
+            }
+            for index in range(800)
+        ]
+
+        overview = _timeline_buckets(samples, "lpips_convnext", 160)
+
+        self.assertEqual(len(overview), 160)
+        self.assertEqual(overview[0]["start_index"], 0)
+        self.assertEqual(overview[-1]["end_index"], 799)
+        self.assertTrue(all(row["count"] == 5 for row in overview))
+        self.assertTrue(all(row["min"] <= row["mean"] <= row["max"] for row in overview))
+
     def test_worker_process_command_includes_device_filter_and_timeout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
@@ -2809,7 +2844,7 @@ class Model:
         self.assertIn("120.0", command)
         self.assertIn("--once", command)
 
-    def test_multi_npu_metric_worker_uses_first_metric_device(self) -> None:
+    def test_multi_npu_metric_workers_cover_every_metric_device(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
             workspace.ensure()
@@ -2822,13 +2857,13 @@ class Model:
                 )
 
             commands = [call.args[0] for call in spawn.call_args_list]
-            metric_command = next(
+            metric_commands = [
                 command for command in commands
                 if "--role" in command and command[command.index("--role") + 1] == "metric"
-            )
+            ]
             self.assertEqual(
-                metric_command[metric_command.index("--device-filter") + 1],
-                "npu:0",
+                [command[command.index("--device-filter") + 1] for command in metric_commands],
+                ["npu:0", "npu:1"],
             )
 
 

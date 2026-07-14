@@ -16,6 +16,12 @@ class MetricUnavailable(RuntimeError):
     pass
 
 
+class MetricBatchOutOfMemory(MetricUnavailable):
+    """A same-device batch can be retried with fewer image pairs."""
+
+    pass
+
+
 class MetricAdapter(Protocol):
     name: str
 

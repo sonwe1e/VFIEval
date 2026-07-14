@@ -14,7 +14,7 @@ const STATUS_LABELS = {
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "canceled"]);
 const METRICS = ["lpips_vit_patch", "lpips_convnext", "vmaf", "cgvqm"];
-const TIMELINE_WINDOW_SIZE = 1000;
+const TIMELINE_WINDOW_SIZE = 160;
 const PREVIEW_GROUPS_MODEL = {
   images: { label: "图像", items: [["gt", "GT"], ["pred", "Pred"], ["difference", "Diff"]] },
   flow: { label: "Flow", items: [["flowt_0", "Flow t->0"], ["flowt_1", "Flow t->1"]] },
@@ -74,6 +74,9 @@ const state = {
   comparePreflightTimer: null,
   comparePreflightPayloadKey: "",
   comparePreflightAbortController: null,
+  compareSubmitting: false,
+  compareSubmitPhase: "",
+  compareSubmitError: "",
   sampleAbortControllers: {},
   timelineAbortController: null,
   timelineAbortRunId: null,
@@ -787,6 +790,7 @@ function payloadFromForm() {
     visualize_width: data.visualize_width ? Number(data.visualize_width) : null,
     batch_size: Number(data.batch_size || 1),
     batch_size_per_device: Number(data.batch_size_per_device || data.batch_size || 1),
+    metric_batch_size_per_device: data.metric_batch_size_per_device ? Number(data.metric_batch_size_per_device) : null,
     artifact_profile: data.artifact_profile || "evaluation",
     prefetch_workers: data.prefetch_workers ? Number(data.prefetch_workers) : null,
     save_workers: data.save_workers ? Number(data.save_workers) : null,
@@ -1245,6 +1249,10 @@ function renderCompareMetricOptions() {
 }
 
 function scheduleComparePreflight(delay = 600) {
+  if (!state.compareSubmitting && state.compareSubmitError) {
+    state.compareSubmitError = "";
+    renderCompareSubmissionState();
+  }
   clearTimeout(state.comparePreflightTimer);
   state.comparePreflightTimer = setTimeout(() => runComparePreflight().catch(renderComparePreflightError), delay);
 }
@@ -1362,6 +1370,7 @@ function renderComparePreflight() {
     $("compare-preflight").innerHTML = state.compareSourcesLoaded
       ? "<p class=\"muted\">选好一个 GT Media Item 和一至两份对应 Pred 后会自动预检查。</p>"
       : "<p class=\"muted\">先加载对比来源。</p>";
+    renderCompareSubmissionState();
     return;
   }
   start.disabled = !result.ok;
@@ -1389,28 +1398,79 @@ function renderComparePreflight() {
     ${renderAlignmentPlan(plan)}
     ${renderPortableMetricHealthTable(result.metrics?.health || {})}
   `;
+  renderCompareSubmissionState();
+}
+
+function renderCompareSubmissionState() {
+  const form = $("compare-form");
+  const start = $("start-compare");
+  const status = $("compare-submit-status");
+  if (!form || !start || !status) return;
+  const labels = {
+    preflight: "正在重新预检查…",
+    creating: "正在创建对比 Run…",
+    opening: "Run 已创建，正在打开…",
+  };
+  form.setAttribute("aria-busy", state.compareSubmitting ? "true" : "false");
+  start.disabled = state.compareSubmitting || !state.comparePreflight?.ok;
+  start.textContent = state.compareSubmitting ? (labels[state.compareSubmitPhase] || "正在创建…") : "开始对比";
+  if (state.compareSubmitting) {
+    status.hidden = false;
+    status.className = "compare-submit-status message";
+    status.textContent = `${labels[state.compareSubmitPhase] || "正在处理…"} 请勿重复点击。`;
+  } else if (state.compareSubmitError) {
+    status.hidden = false;
+    status.className = "compare-submit-status message error";
+    status.textContent = `对比任务创建失败：${state.compareSubmitError}`;
+  } else {
+    status.hidden = true;
+    status.className = "compare-submit-status";
+    status.textContent = "";
+  }
 }
 
 async function startCompareRun(event) {
   event.preventDefault();
+  if (state.compareSubmitting) {
+    toast("对比任务正在创建，请勿重复点击");
+    return;
+  }
   const payload = comparePayloadFromForm();
   if (!payload) {
     toast("请选择一个 GT Media Item 和一至两份对应 Pred");
     return;
   }
-  await runComparePreflight({ force: true });
-  if (!state.comparePreflight?.ok) {
-    toast("预检查未通过");
-    return;
+  state.compareSubmitting = true;
+  state.compareSubmitPhase = "preflight";
+  state.compareSubmitError = "";
+  clearTimeout(state.comparePreflightTimer);
+  renderCompareSubmissionState();
+  try {
+    await runComparePreflight({ force: true });
+    if (!state.comparePreflight?.ok) {
+      toast("预检查未通过");
+      return;
+    }
+    state.compareSubmitPhase = "creating";
+    renderCompareSubmissionState();
+    const created = await api("/api/runs", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    state.compareSubmitPhase = "opening";
+    renderCompareSubmissionState();
+    toast(`Run #${created.run_id} 已开始`);
+    switchView("runs");
+    await refreshRunsOnly();
+    await selectRun(created.run_id);
+  } catch (error) {
+    state.compareSubmitError = error.message || String(error);
+    throw error;
+  } finally {
+    state.compareSubmitting = false;
+    state.compareSubmitPhase = "";
+    renderCompareSubmissionState();
   }
-  const created = await api("/api/runs", {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
-  toast(`Run #${created.run_id} 已开始`);
-  switchView("runs");
-  await refreshRunsOnly();
-  await selectRun(created.run_id);
 }
 
 async function createAdhocEvaluation() {
@@ -2555,16 +2615,7 @@ function renderMetricChart(video, selectedIndex, metricName) {
   }
   const min = Math.min(...valid);
   const max = Math.max(...valid);
-  const points = values
-    .map((value, index) => {
-      if (value === null) return null;
-      const x = samples.length <= 1 ? 50 : 4 + (index / (samples.length - 1)) * 92;
-      const normalized = max === min ? 0.5 : (value - min) / (max - min);
-      const y = 42 - normalized * 30;
-      return `${x.toFixed(2)},${y.toFixed(2)}`;
-    })
-    .filter(Boolean)
-    .join(" ");
+  const segments = metricLineSegments(values, min, max);
   const markerX = samples.length <= 1 ? 50 : 4 + (selectedIndex / (samples.length - 1)) * 92;
   const selectedValue = values[selectedIndex];
   const selectedY = selectedValue === null || !Number.isFinite(selectedValue)
@@ -2588,13 +2639,14 @@ function renderMetricChart(video, selectedIndex, metricName) {
             <line x1="4" x2="96" y1="27" y2="27"></line>
             <line x1="4" x2="96" y1="42" y2="42"></line>
           </g>
-          <polyline class="metric-line" points="${points}" fill="none"></polyline>
+          ${segments.map((points) => `<polyline class="metric-line" points="${points}" fill="none"></polyline>`).join("")}
           <line class="current-marker" x1="${markerX.toFixed(2)}" x2="${markerX.toFixed(2)}" y1="8" y2="46"></line>
         </svg>
         <div class="chart-points">
           <span class="selected-metric-point" style="left: ${markerX.toFixed(2)}%; top: ${((selectedY / 56) * 100).toFixed(2)}%"></span>
-          ${renderMetricPoints(video.video_name, samples, metricName, min, max, selectedIndex)}
+          ${renderWorstMetricPoints(video, samples, metricName, min, max)}
         </div>
+        <div class="chart-tooltip" hidden></div>
       </div>
       <div class="chart-scale">
         <span>min ${formatNumber(min)}</span>
@@ -2604,18 +2656,67 @@ function renderMetricChart(video, selectedIndex, metricName) {
   `;
 }
 
-function renderMetricPoints(videoName, samples, metricName, min, max, selectedIndex) {
+function metricLineSegments(values, min, max) {
+  const segments = [];
+  let current = [];
+  values.forEach((value, index) => {
+    if (value === null || !Number.isFinite(value)) {
+      if (current.length) segments.push(current.join(" "));
+      current = [];
+      return;
+    }
+    const x = values.length <= 1 ? 50 : 4 + (index / (values.length - 1)) * 92;
+    const normalized = max === min ? 0.5 : (value - min) / (max - min);
+    current.push(`${x.toFixed(2)},${(42 - normalized * 30).toFixed(2)}`);
+  });
+  if (current.length) segments.push(current.join(" "));
+  return segments;
+}
+
+function renderWorstMetricPoints(video, samples, metricName, min, max) {
+  const worstFrames = new Set((video.worst_samples?.[metricName] || []).map((row) => Number(row.frame_index)));
   return samples.map((sample, index) => {
+    if (!worstFrames.has(Number(sample.frame_index))) return "";
     const metric = sample.metrics?.[metricName];
+    if (metric?.status !== "completed" || metric.value === null) return "";
     const x = samples.length <= 1 ? 50 : 4 + (index / (samples.length - 1)) * 92;
-    const status = metric?.status || "missing";
-    const value = metric?.value;
-    const normalized = status === "completed" && value !== null && max !== min ? (Number(value) - min) / (max - min) : 0.5;
-    const y = status === "completed" ? 42 - normalized * 30 : 46;
-    const top = (y / 56) * 100;
-    const selectedClass = index === selectedIndex ? " selected" : "";
-    return `<button class="metric-point ${escapeHtml(status)}${selectedClass}" data-chart-video="${escapeHtml(videoName)}" data-chart-sample="${index}" data-frame-index="${escapeHtml(sample.frame_index)}" style="left: ${x.toFixed(2)}%; top: ${top.toFixed(2)}%" type="button" title="${escapeHtml(status)} ${escapeHtml(value ?? metricReason(metric))}"></button>`;
+    const normalized = max === min ? 0.5 : (Number(metric.value) - min) / (max - min);
+    const top = ((42 - normalized * 30) / 56) * 100;
+    return `<button class="metric-point worst" data-chart-video="${escapeHtml(video.video_name)}" data-chart-sample="${index}" style="left:${x.toFixed(2)}%;top:${top.toFixed(2)}%" title="worst frame ${escapeHtml(sample.frame_index)}: ${formatNumber(metric.value)}" type="button"></button>`;
   }).join("");
+}
+
+function renderMetricOverview(video, metricName, selectedIndex) {
+  const buckets = video.overview || [];
+  const total = Number(video.sample_count || 0);
+  if (!metricName || total <= TIMELINE_WINDOW_SIZE || !buckets.length) return "";
+  const valid = buckets.filter((row) => row.mean !== null && Number.isFinite(Number(row.mean)));
+  if (!valid.length) return "";
+  const min = Math.min(...valid.map((row) => Number(row.min)));
+  const max = Math.max(...valid.map((row) => Number(row.max)));
+  const y = (value) => 24 - (max === min ? 0.5 : (Number(value) - min) / (max - min)) * 16;
+  const x = (index) => buckets.length <= 1 ? 50 : 2 + (index / (buckets.length - 1)) * 96;
+  const upper = valid.map((row) => `${x(row.bucket_index).toFixed(2)},${y(row.max).toFixed(2)}`);
+  const lower = [...valid].reverse().map((row) => `${x(row.bucket_index).toFixed(2)},${y(row.min).toFixed(2)}`);
+  const mean = valid.map((row) => `${x(row.bucket_index).toFixed(2)},${y(row.mean).toFixed(2)}`).join(" ");
+  const windowStart = Number(video.window_start || 0);
+  const windowEnd = Math.min(total, windowStart + Number(video.window_size || TIMELINE_WINDOW_SIZE));
+  const viewX = total <= 1 ? 0 : (windowStart / (total - 1)) * 100;
+  const viewWidth = total <= 1 ? 100 : Math.min(100 - viewX, Math.max(1, ((windowEnd - windowStart) / total) * 100));
+  const globalIndex = windowStart + selectedIndex;
+  const markerX = total <= 1 ? 50 : (globalIndex / (total - 1)) * 100;
+  return `
+    <div class="chart overview-chart" data-overview-video="${escapeHtml(video.video_name)}" title="点击总览加载对应细节窗口">
+      <div class="chart-head"><strong>全片总览</strong><span class="muted">${total} 帧 · 阴影为 min–max，曲线为均值</span></div>
+      <div class="overview-plot">
+        <svg viewBox="0 0 100 28" preserveAspectRatio="none" aria-label="${escapeHtml(metricName)} overview">
+          <polygon class="overview-envelope" points="${[...upper, ...lower].join(" ")}"></polygon>
+          <polyline class="overview-mean" points="${mean}" fill="none"></polyline>
+          <rect class="overview-viewport" x="${viewX.toFixed(2)}" y="2" width="${viewWidth.toFixed(2)}" height="24"></rect>
+          <line class="current-marker" x1="${markerX.toFixed(2)}" x2="${markerX.toFixed(2)}" y1="2" y2="26"></line>
+        </svg>
+      </div>
+    </div>`;
 }
 
 function renderStatusStrip(samples, metricName, selectedIndex) {
@@ -2658,9 +2759,24 @@ function renderVideoPlayer(label, artifactId) {
   return `
     <div class="video-artifact">
       <span>${escapeHtml(label)}</span>
-      <video controls playsinline preload="metadata" src="${escapeHtml(url)}" onerror="this.outerHTML='<p class=\\'muted\\'>浏览器无法播放此视频格式。</p>'"></video>
+      <video controls playsinline preload="metadata" src="${escapeHtml(url)}" onerror="handleVideoPlaybackError(this)"></video>
+      <div class="video-playback-error message error" hidden></div>
     </div>
   `;
+}
+
+function handleVideoPlaybackError(video) {
+  const host = video.closest(".video-artifact");
+  const status = host?.querySelector(".video-playback-error");
+  if (!status) return;
+  const code = Number(video.error?.code || 0);
+  const reason = code === 3
+    ? "浏览器解码失败，视频产物可能损坏或编码不兼容。"
+    : code === 2
+      ? "视频加载中断，请检查服务连接后重试。"
+      : "视频无法加载；文件可能尚未就绪、已被清理，或编码不受当前浏览器支持。";
+  status.hidden = false;
+  status.innerHTML = `${escapeHtml(reason)} <a href="${escapeHtml(video.currentSrc || video.src)}" target="_blank" rel="noreferrer">打开原始视频</a>`;
 }
 
 function renderVideoArtifacts(video) {
@@ -2729,12 +2845,13 @@ function renderFrameRegion(video, selectedIndex, metricName) {
     ${renderMetricToolbar(video, metricName)}
     ${renderTimelineWindowNav(video)}
     <div id="frame-chart">
+      ${renderMetricOverview(video, metricName, selectedIndex)}
       ${renderMetricChart(video, selectedIndex, metricName)}
       ${renderWorstSamples(video, metricName)}
     </div>
     <div class="sample-controls">
       <button class="secondary" data-sample-step="-1" type="button">上一帧</button>
-      <input data-sample-range="${escapeHtml(video.video_name)}" type="range" min="0" max="${Math.max(0, samples.length - 1)}" value="${selectedIndex}">
+      <input data-sample-range="${escapeHtml(video.video_name)}" type="range" min="0" max="${Math.max(0, total - 1)}" value="${globalIndex}">
       <button class="secondary" data-sample-step="1" type="button">下一帧</button>
       <span class="muted" id="frame-counter">${globalIndex + 1}/${total || 0}</span>
     </div>
@@ -2786,14 +2903,14 @@ function updateFrameRegion() {
   const counter = region.querySelector("#frame-counter");
   const slider = region.querySelector("[data-sample-range]");
   if (!chart || !preview) return false;
-  chart.innerHTML = `${renderMetricChart(video, selectedIndex, metricName)}${renderWorstSamples(video, metricName)}`;
+  chart.innerHTML = `${renderMetricOverview(video, metricName, selectedIndex)}${renderMetricChart(video, selectedIndex, metricName)}${renderWorstSamples(video, metricName)}`;
   preview.innerHTML = samples[selectedIndex] ? renderSamplePreview(samples[selectedIndex], video) : "<p class=\"muted\">没有样本。</p>";
   const windowStart = Number(video.window_start || 0);
   const total = Number(video.sample_count || samples.length);
   if (counter) counter.textContent = `${windowStart + selectedIndex + 1}/${total || 0}`;
   // Only sync the slider's value when the change did not originate from the
   // slider itself; overwriting it mid-drag would fight the pointer.
-  if (slider && Number(slider.value) !== selectedIndex) slider.value = String(selectedIndex);
+  if (slider && Number(slider.value) !== windowStart + selectedIndex) slider.value = String(windowStart + selectedIndex);
   return true;
 }
 
@@ -3148,6 +3265,30 @@ function setSampleIndex(videoName, index) {
   // Update only the frame-dependent region so the video players are not
   // recreated (which would reload and stutter). Fall back to a full render if
   // the region is not on the page (e.g. video not yet rendered).
+  if (!updateFrameRegion()) renderRunDetail();
+}
+
+async function setGlobalSampleIndex(videoName, globalIndex) {
+  if (!state.selectedRun) return;
+  const runId = Number(state.selectedRun.id);
+  const key = `${runId}:${videoName}`;
+  let video = state.runVideoTimelines[key];
+  if (!video) video = await loadRunVideoTimeline(runId, videoName);
+  if (!video || Number(state.selectedRun?.id) !== runId) return;
+  const total = Number(video.sample_count || 0);
+  const target = Math.max(0, Math.min(Math.max(0, total - 1), Number(globalIndex)));
+  let windowStart = Number(video.window_start || 0);
+  let localIndex = target - windowStart;
+  if (localIndex < 0 || localIndex >= (video.samples || []).length) {
+    const centeredStart = Math.max(0, Math.min(Math.max(0, total - TIMELINE_WINDOW_SIZE), target - Math.floor(TIMELINE_WINDOW_SIZE / 2)));
+    abortSampleRequestsForRun(runId);
+    video = await loadRunVideoTimeline(runId, videoName, { windowStart: centeredStart });
+    if (!video || Number(state.selectedRun?.id) !== runId) return;
+    windowStart = Number(video.window_start || 0);
+    localIndex = target - windowStart;
+  }
+  state.selectedVideoByRun[runId] = video.video_name;
+  state.selectedSampleByVideo[`${runId}:${video.video_name}`] = Math.max(0, Math.min((video.samples || []).length - 1, localIndex));
   if (!updateFrameRegion()) renderRunDetail();
 }
 
@@ -4369,7 +4510,7 @@ document.addEventListener("change", (event) => {
   }
   const range = event.target.closest("[data-sample-range]");
   if (range) {
-    setSampleIndex(range.dataset.sampleRange, Number(range.value));
+    setGlobalSampleIndex(range.dataset.sampleRange, Number(range.value)).catch((error) => toast(error.message));
   }
 });
 
@@ -4637,11 +4778,16 @@ document.addEventListener("click", async (event) => {
     if (isCompareRun(state.selectedRun)) {
       const video = state.runVideoTimelines[key];
       if (video) {
-        setSampleIndex(videoName, compareStepIndex(video, currentIndex, direction));
-        return;
+        const nextIndex = compareStepIndex(video, currentIndex, direction);
+        if (nextIndex !== currentIndex) {
+          setSampleIndex(videoName, nextIndex);
+          return;
+        }
       }
     }
-    setSampleIndex(videoName, currentIndex + direction);
+    const video = state.runVideoTimelines[key];
+    const globalIndex = Number(video?.window_start || 0) + currentIndex + direction;
+    await setGlobalSampleIndex(videoName, globalIndex);
     return;
   }
   const statusDot = event.target.closest("[data-sample-jump]");
@@ -4658,6 +4804,15 @@ document.addEventListener("click", async (event) => {
   const chartPoint = event.target.closest("[data-chart-sample]");
   if (chartPoint && state.selectedRun) {
     setSampleIndex(chartPoint.dataset.chartVideo, Number(chartPoint.dataset.chartSample));
+    return;
+  }
+  const overview = event.target.closest("[data-overview-video]");
+  if (overview && state.selectedRun) {
+    const video = state.runVideoTimelines[`${state.selectedRun.id}:${overview.dataset.overviewVideo}`];
+    if (!video) return;
+    const rect = overview.querySelector(".overview-plot")?.getBoundingClientRect() || overview.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(1, rect.width)));
+    await setGlobalSampleIndex(overview.dataset.overviewVideo, Math.round(ratio * Math.max(0, Number(video.sample_count || 1) - 1)));
     return;
   }
   const artifactGroup = event.target.closest("[data-artifact-group]");
@@ -4690,9 +4845,34 @@ document.addEventListener("mouseover", (event) => {
   }
 });
 
+document.addEventListener("mousemove", (event) => {
+  const chart = event.target.closest("[data-chart-video]");
+  if (!chart || !state.selectedRun) return;
+  const video = state.runVideoTimelines[`${state.selectedRun.id}:${chart.dataset.chartVideo}`];
+  const samples = video?.samples || [];
+  if (!samples.length) return;
+  const plot = chart.querySelector(".chart-plot");
+  const tooltip = chart.querySelector(".chart-tooltip");
+  if (!plot || !tooltip) return;
+  const rect = plot.getBoundingClientRect();
+  const ratio = Math.max(0, Math.min(1, (event.clientX - rect.left) / Math.max(1, rect.width)));
+  const index = Math.round(ratio * (samples.length - 1));
+  const sample = samples[index];
+  const metricName = selectedMetric(video);
+  const metric = sample?.metrics?.[metricName];
+  tooltip.hidden = false;
+  tooltip.style.left = `${ratio * 100}%`;
+  tooltip.textContent = `frame ${sample?.frame_index ?? "-"} · ${metric?.status || "missing"} · ${metric?.value === null || metric?.value === undefined ? metricReason(metric) : formatNumber(metric.value)}`;
+});
+
 document.addEventListener("mouseout", (event) => {
   if (event.target.closest("[data-layer-frame]")) {
     highlightTimelineFrame(null);
+  }
+  const chart = event.target.closest("[data-chart-video]");
+  if (chart && !chart.contains(event.relatedTarget)) {
+    const tooltip = chart.querySelector(".chart-tooltip");
+    if (tooltip) tooltip.hidden = true;
   }
 });
 

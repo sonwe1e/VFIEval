@@ -970,6 +970,22 @@ th {
   border-radius: 6px;
 }
 
+.video-playback-error {
+  margin: 0;
+  font-size: 12px;
+}
+
+.compare-submit-status {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.compare-submit-status.message:not(.error) {
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--line));
+  background: color-mix(in srgb, var(--accent) 8%, #fff);
+  color: var(--text);
+}
+
 .video-artifact-strip {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 260px));
@@ -1025,6 +1041,55 @@ th {
   position: relative;
 }
 
+.overview-chart {
+  padding-bottom: 6px;
+}
+
+.overview-plot {
+  position: relative;
+  height: 86px;
+  cursor: crosshair;
+}
+
+.overview-plot svg {
+  height: 86px;
+}
+
+.overview-envelope {
+  fill: color-mix(in srgb, var(--accent) 18%, transparent);
+  stroke: none;
+}
+
+.overview-mean {
+  stroke: var(--accent);
+  stroke-width: 1.4;
+  vector-effect: non-scaling-stroke;
+}
+
+.overview-viewport {
+  fill: color-mix(in srgb, var(--accent) 9%, transparent);
+  stroke: var(--accent);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.chart-tooltip {
+  position: absolute;
+  z-index: 2;
+  top: 6px;
+  max-width: 260px;
+  transform: translateX(-50%);
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.96);
+  color: var(--text);
+  font-size: 12px;
+  pointer-events: none;
+  white-space: nowrap;
+  box-shadow: var(--shadow);
+}
+
 .chart-points {
   position: absolute;
   inset: 0;
@@ -1078,6 +1143,14 @@ th {
 
 .metric-point.completed {
   background: var(--accent);
+}
+
+.metric-point.worst {
+  width: 9px;
+  height: 9px;
+  background: var(--warn);
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 1px var(--warn);
 }
 
 .metric-point.selected {

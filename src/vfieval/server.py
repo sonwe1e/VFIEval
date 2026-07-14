@@ -1786,6 +1786,9 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
     unsupported = [name for name in metrics if name not in METRIC_NAMES]
     if unsupported:
         raise ValueError(f"unsupported metrics: {', '.join(unsupported)}")
+    metric_batch_size = _optional_int(body.get("metric_batch_size_per_device"))
+    if metric_batch_size is not None and metric_batch_size <= 0:
+        raise ValueError("metric_batch_size_per_device must be a positive integer")
 
     model_path = resolve_model_file(workspace, str(body["model_file"]))
     selection = resolve_video_selection(workspace, body)
@@ -1904,6 +1907,7 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
             "visualize_width": visualize_width,
             "batch_size": int(body.get("batch_size") or 1),
             "batch_size_per_device": int(body.get("batch_size_per_device") or body.get("batch_size") or 1),
+            "metric_batch_size_per_device": metric_batch_size,
             "device": body.get("device") or "auto",
             "devices": devices,
             "execution_mode": execution_mode,
@@ -3790,11 +3794,10 @@ def _requested_video_metrics(run: dict[str, object]) -> list[str]:
 
 
 def _metric_job_status(db: Database, run: dict[str, object]) -> str | None:
-    metric_job_id = run.get("metric_job_id")
-    if metric_job_id is None:
-        return None
     try:
-        return str(db.get_job(int(metric_job_id)).get("status") or "")
+        from vfieval.pipeline.metric_jobs import metric_wave_status
+
+        return metric_wave_status(db, run)
     except Exception:
         return None
 
@@ -3911,30 +3914,9 @@ def _retry_run_metrics(db: Database, run_id: int) -> dict:
         failed_names = list(run.get("metrics") or [])
     if not failed_names:
         raise ValueError("Run has no metrics to retry")
-    inference_jobs = db.list_run_jobs(run_id, "inference")
-    run_devices = list((run.get("metadata") or {}).get("devices") or [])
-    metric_device = str(
-        run_devices[0]
-        if run_devices
-        else (inference_jobs[0].get("device") if inference_jobs else None) or run.get("device") or "cpu"
-    )
-    job_id = db.add_run_job(
-        run_id,
-        "metric",
-        {
-            "run_id": run_id,
-            "inference_job_id": int(inference_job_ids[0]),
-            "inference_job_ids": inference_job_ids,
-            "dataset_id": int(run["dataset_id"]),
-            "metric_names": failed_names,
-            "metric_device": metric_device,
-            "retry": True,
-        },
-        device=metric_device,
-        metadata={"source": "retry"},
-    )
-    db.set_run_metric_job(run_id, job_id)
-    return {"run_id": run_id, "metric_job_id": job_id, "metric_names": failed_names}
+    from vfieval.pipeline.metric_jobs import create_metric_wave
+
+    return create_metric_wave(db, run_id, failed_names, source="retry", retry=True)
 
 
 def _dashboard(db: Database) -> dict:

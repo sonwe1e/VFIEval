@@ -204,6 +204,15 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
             elif job["kind"] == "metric":
                 result = run_metric_job(db, workspace, int(job["id"]))
                 db.complete_job(int(job["id"]), result)
+                payload = job.get("payload") or {}
+                if payload.get("metric_wave_id") and payload.get("run_id") is not None:
+                    from vfieval.pipeline.metric_jobs import maybe_complete_metric_wave
+
+                    maybe_complete_metric_wave(
+                        db,
+                        int(payload["run_id"]),
+                        str(payload["metric_wave_id"]),
+                    )
             elif job["kind"] == "finalize":
                 result = run_finalize_job(db, workspace, int(job["id"]))
                 db.complete_job(int(job["id"]), result)

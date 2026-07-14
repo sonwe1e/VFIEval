@@ -1597,6 +1597,53 @@ class Database:
                 (_json(metric_summary), now, now, run_id),
             )
 
+    def complete_run_metric_wave(
+        self,
+        run_id: int,
+        leader_job_id: int,
+        metric_summary: dict[str, Any],
+        performance: list[dict[str, Any]],
+    ) -> bool:
+        """Publish a metric wave once even when shards finish concurrently."""
+        now = utc_ts()
+        with self.connection() as conn:
+            row = conn.execute("SELECT result_json FROM runs WHERE id = ?", (run_id,)).fetchone()
+            result = _loads(row["result_json"]) if row is not None else {}
+            result["metric_performance"] = performance
+            cur = conn.execute(
+                """
+                UPDATE runs
+                SET status = 'completed', metric_summary_json = ?, result_json = ?,
+                    content_revision = content_revision + 1, finished_at = ?, updated_at = ?
+                WHERE id = ? AND metric_job_id = ?
+                  AND status IN ('metric_queued', 'metric_running')
+                """,
+                (_json(metric_summary), _json(result), now, now, run_id, leader_job_id),
+            )
+            return bool(cur.rowcount)
+
+    def update_run_metric_wave_progress(
+        self,
+        run_id: int,
+        leader_job_id: int,
+        current: int,
+        total: int,
+    ) -> bool:
+        """Update active-wave progress without regressing a completed Run."""
+        now = utc_ts()
+        with self.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE runs
+                SET progress_current = ?, progress_total = ?,
+                    status = 'metric_running', updated_at = ?
+                WHERE id = ? AND metric_job_id = ?
+                  AND status IN ('metric_queued', 'metric_running')
+                """,
+                (int(current), int(total), now, run_id, leader_job_id),
+            )
+            return bool(cur.rowcount)
+
     def bump_run_content_revision(self, run_id: int) -> int:
         """Invalidate all client-side result caches for a Run.
 
@@ -2991,31 +3038,15 @@ class Database:
             return True
         metrics = list(run.get("metrics") or [])
         if metrics:
-            run_devices = list((run.get("metadata") or {}).get("devices") or [])
-            metric_device = str(
-                run_devices[0]
-                if run_devices
-                else jobs[0].get("device") or run.get("device") or "cpu"
-            )
-            metric_payload = {
-                "run_id": run_id,
-                "dataset_id": int(run["dataset_id"]),
-                "inference_job_ids": [int(job["job_id"]) for job in jobs],
-                "inference_job_id": int(jobs[0]["job_id"]),
-                "metric_names": metrics,
-                "metric_device": metric_device,
-            }
-            metric_job_id = self.add_run_job(
-                run_id,
-                "metric",
-                metric_payload,
-                progress_total=0,
-                shard_index=0,
-                device=metric_device,
-                metadata={"source": (run.get("metadata") or {}).get("execution_mode") or "multi"},
-            )
             self.complete_run_inference(run_id, result, artifact_summary, "metric_queued")
-            self.set_run_metric_job(run_id, metric_job_id)
+            from vfieval.pipeline.metric_jobs import create_metric_wave
+
+            create_metric_wave(
+                self,
+                run_id,
+                metrics,
+                source=str((run.get("metadata") or {}).get("execution_mode") or "multi"),
+            )
         else:
             self.complete_run_inference(run_id, result, artifact_summary, "completed")
         return True

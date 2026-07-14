@@ -34,7 +34,7 @@ raw grep, add `--glob '!*.backup.*'`.
 | Post-processing | `src/vfieval/pipeline/postprocess.py` | ~240 | warp/blend/pred, `compose_interpolated` |
 | Compare resolution | `src/vfieval/compare_inputs.py` | ~340 | descriptor → path, strict alignment |
 | Metric health/assets | `src/vfieval/metrics/health.py` | ~1460 | manifests, downloads, availability |
-| Metric execution | `src/vfieval/pipeline/metrics_runner.py` | ~280 | scores pred/gt after inference |
+| Metric execution | `src/vfieval/pipeline/metrics_runner.py`, `src/vfieval/pipeline/metric_jobs.py` | batched LPIPS scoring plus multi-device metric-wave queue/aggregation |
 | Media catalog | `src/vfieval/media_assets.py` | ~860 | collections/assets, backfill, resolver, provenance relations |
 | Uploads | `src/vfieval/uploads.py` | ~390 | resumable parts, hashes, ZIP validation, quotas/cleanup |
 | Run purge + cache GC | `src/vfieval/run_cleanup.py` | ~775 | persistent purge requests, cache refs/leases, preview/confirmed GC |
@@ -105,7 +105,7 @@ User rating (1–5, 0.25 step) + free-text issue per run; content-scoped (video/
 ### 8. Metrics (health, assets, execution)
 - **Names/registry:** `metrics/names.py`, `metrics/registry.py`
 - **Health/assets:** `metrics/health.py` (`metrics_health`, downloads via `prepare-metrics`)
-- **Execution:** `pipeline/metrics_runner.py`; per-metric `metrics/feature.py` (lpips_*), `metrics/vmaf.py`, `metrics/cgvqm.py`
+- **Execution:** `pipeline/metrics_runner.py` (batched scoring/cache), `pipeline/metric_jobs.py` (multi-device wave creation/progress/aggregation); per-metric `metrics/feature.py` (lpips_*), `metrics/vmaf.py`, `metrics/cgvqm.py`
 - **Routes:** `GET /api/metrics/health`
 - **Frontend:** `app.js` `renderMetricOptions` (L261), `renderMetricHealthTable` (L870), `renderMetricEnvironmentPanel` (L914)
 - **CLI:** `cli.py` `prepare-metrics [--check-only|--force]`

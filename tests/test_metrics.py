@@ -18,11 +18,12 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
-from vfieval.metrics.feature import _resolve_metric_device
+from vfieval.metrics.feature import ConvNextFeatureMetric, DinoPatchMetric, _resolve_metric_device
 from vfieval.metrics import METRIC_NAMES, create_metric
-from vfieval.metrics.base import MetricResult, MetricUnavailable
+from vfieval.metrics.base import MetricBatchOutOfMemory, MetricResult, MetricUnavailable
 from vfieval.metrics.health import metric_cache_config, metric_health, prepare_metric_asset_manifest
 from vfieval.pipeline.metrics_runner import _evaluate_with_cache, metric_cache_key, run_metric_job
+from vfieval.pipeline.metric_jobs import create_metric_wave, maybe_complete_metric_wave
 
 
 class MetricTests(unittest.TestCase):
@@ -63,6 +64,205 @@ class MetricTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(MetricUnavailable, r"npu:1.*torch_npu failed"):
                 _resolve_metric_device("npu:1")
+
+    def test_dino_batch_keeps_one_model_and_one_warmup_per_shape(self) -> None:
+        import torch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pairs = []
+            for index in range(2):
+                reference = root / f"ref-{index}.png"
+                distorted = root / f"dist-{index}.png"
+                Image.new("RGB", (8, 8), (index, 10, 20)).save(reference)
+                Image.new("RGB", (8, 8), (index + 1, 11, 21)).save(distorted)
+                pairs.append((reference, distorted, root / "work"))
+
+            class FakeDino:
+                def __init__(self):
+                    self.calls = 0
+
+                def forward_features(self, tensor):
+                    self.calls += 1
+                    return {"x_norm_patchtokens": tensor.flatten(2).transpose(1, 2)}
+
+            model = FakeDino()
+            health = {"available": True, "status": "available", "input_size": 14, "backbone": "fake"}
+            with patch("vfieval.metrics.feature.metric_health", return_value=health), patch(
+                "vfieval.metrics.feature._resolve_metric_device", return_value=torch.device("cpu")
+            ), patch("vfieval.metrics.feature._load_dino_model", return_value=model) as load:
+                metric = DinoPatchMetric(WorkspaceConfig.from_root(root / ".vfieval"), "cpu")
+                first = metric.evaluate_batch(pairs)
+                second = metric.evaluate_batch(pairs)
+
+            self.assertEqual(len(first), 2)
+            self.assertEqual(len(second), 2)
+            load.assert_called_once()
+            self.assertEqual(model.calls, 3, "one warmup plus one combined forward per batch")
+            self.assertEqual(metric.performance()["warmed_shape_count"], 1)
+
+    def test_convnext_batch_uses_one_combined_forward(self) -> None:
+        import torch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            reference = root / "ref.png"
+            distorted = root / "dist.png"
+            Image.new("RGB", (8, 8), (1, 2, 3)).save(reference)
+            Image.new("RGB", (8, 8), (4, 5, 6)).save(distorted)
+
+            class FakeConvNext:
+                def __init__(self):
+                    self.calls = 0
+
+                def __call__(self, tensor):
+                    self.calls += 1
+                    return [tensor, torch.nn.functional.avg_pool2d(tensor, 2)]
+
+            model = FakeConvNext()
+            health = {"available": True, "status": "available", "input_size": 32, "backbone": "fake"}
+            with patch("vfieval.metrics.feature.metric_health", return_value=health), patch(
+                "vfieval.metrics.feature._resolve_metric_device", return_value=torch.device("cpu")
+            ), patch("vfieval.metrics.feature._load_convnext_model", return_value=model) as load:
+                metric = ConvNextFeatureMetric(WorkspaceConfig.from_root(root / ".vfieval"), "cpu")
+                results = metric.evaluate_batch([(reference, distorted, root / "work")] * 3)
+
+            self.assertEqual(len(results), 3)
+            load.assert_called_once()
+            self.assertEqual(model.calls, 2, "one warmup plus one combined forward")
+
+    def test_metric_runner_halves_oom_batch_without_cpu_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = WorkspaceConfig.from_root(root / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("dummy", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("frames", str(root), True)
+            run_id = db.create_run(
+                name="metric-batch",
+                model_id=model_id,
+                dataset_id=dataset_id,
+                height=8,
+                width=8,
+                batch_size=1,
+                device="npu:0",
+                precision="fp32",
+                metrics=["lpips_convnext"],
+                create_inference_job=False,
+            )
+            inference_job_id = db.add_run_job(
+                run_id, "inference", {"run_id": run_id, "dataset_id": dataset_id}, device="npu:0"
+            )
+            for index in range(4):
+                reference = root / f"gt-{index}.png"
+                distorted = root / f"pred-{index}.png"
+                Image.new("RGB", (8, 8), (index, 0, 0)).save(reference)
+                Image.new("RGB", (8, 8), (index + 1, 0, 0)).save(distorted)
+                sample_id = db.add_sample(dataset_id, f"sample-{index}", str(reference), str(reference), str(reference), {})
+                db.add_artifact(inference_job_id, sample_id, "pred", str(distorted), "image/png", {})
+            metric_job_id = db.add_run_job(
+                run_id,
+                "metric",
+                {
+                    "run_id": run_id,
+                    "inference_job_id": inference_job_id,
+                    "dataset_id": dataset_id,
+                    "metric_names": ["lpips_convnext"],
+                    "metric_device": "npu:0",
+                    "metric_batch_size_per_device": 8,
+                },
+                device="npu:0",
+            )
+
+            class FakeMetric:
+                def __init__(self):
+                    self.calls = []
+
+                def evaluate_batch(self, pairs):
+                    self.calls.append(len(pairs))
+                    if len(pairs) > 2:
+                        raise MetricBatchOutOfMemory("npu:0 out of memory")
+                    return [MetricResult("completed", 0.25, {"device": "npu:0"}) for _ in pairs]
+
+            metric = FakeMetric()
+            with patch("vfieval.pipeline.metrics_runner.create_metric", return_value=metric) as create:
+                result = run_metric_job(db, workspace, metric_job_id)
+
+            create.assert_called_once_with("lpips_convnext", workspace, device="npu:0")
+            self.assertEqual(metric.calls, [4, 2, 2])
+            self.assertEqual(result["summary"]["lpips_convnext"]["completed"], 4)
+            self.assertEqual(result["performance"]["lpips_convnext"]["effective_batch_size"], 2)
+
+    def test_multi_device_metric_wave_partitions_frames_and_aggregates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("dummy", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("frames", str(Path(tmp)), True)
+            run_id = db.create_run(
+                name="metric-wave",
+                model_id=model_id,
+                dataset_id=dataset_id,
+                height=8,
+                width=8,
+                batch_size=1,
+                device="multi_npu",
+                precision="fp32",
+                metrics=["lpips_convnext", "vmaf"],
+                metadata={
+                    "devices": ["npu:0", "npu:1"],
+                    "request": {"metric_batch_size_per_device": 12},
+                },
+                create_inference_job=False,
+            )
+            for index, device in enumerate(("npu:0", "npu:1")):
+                db.add_run_job(
+                    run_id,
+                    "inference",
+                    {"run_id": run_id, "dataset_id": dataset_id, "sample_ids": [index + 1]},
+                    shard_index=index,
+                    device=device,
+                )
+
+            wave = create_metric_wave(db, run_id, ["lpips_convnext", "vmaf"], source="test")
+            jobs = db.list_run_jobs(run_id, "metric")
+            self.assertEqual([row["device"] for row in jobs], ["npu:0", "npu:1"])
+            self.assertEqual(jobs[0]["payload"]["metric_names"], ["lpips_convnext", "vmaf"])
+            self.assertEqual(jobs[1]["payload"]["metric_names"], ["lpips_convnext"])
+            self.assertEqual(jobs[0]["payload"]["sample_ids"], [1])
+            self.assertEqual(jobs[1]["payload"]["sample_ids"], [2])
+            self.assertTrue(all(row["payload"]["metric_batch_size_per_device"] == 12 for row in jobs))
+
+            db.complete_job(jobs[0]["job_id"], {"summary": {"lpips_convnext": {"completed": 1, "mean": 0.2, "value_sum": 0.2}, "vmaf": {"completed": 1, "mean": 90.0, "value_sum": 90.0}}})
+            self.assertFalse(maybe_complete_metric_wave(db, run_id, wave["metric_wave_id"]))
+            db.complete_job(jobs[1]["job_id"], {"summary": {"lpips_convnext": {"completed": 3, "mean": 0.4, "value_sum": 1.2}}})
+            self.assertTrue(maybe_complete_metric_wave(db, run_id, wave["metric_wave_id"]))
+            completed = db.get_run(run_id)
+            self.assertEqual(completed["status"], "completed")
+            self.assertAlmostEqual(completed["metric_summary"]["lpips_convnext"]["mean"], 0.35)
+            self.assertEqual(completed["metric_summary"]["vmaf"]["completed"], 1)
+            revision = completed["content_revision"]
+            self.assertFalse(maybe_complete_metric_wave(db, run_id, wave["metric_wave_id"]))
+            completed_again = db.get_run(run_id)
+            self.assertEqual(completed_again["status"], "completed")
+            self.assertEqual(completed_again["content_revision"], revision)
+
+            retry = create_metric_wave(db, run_id, ["lpips_convnext"], source="retry", retry=True)
+            retry_jobs = [
+                row
+                for row in db.list_run_jobs(run_id, "metric")
+                if row["payload"].get("metric_wave_id") == retry["metric_wave_id"]
+            ]
+            db.complete_job(retry_jobs[0]["job_id"], {"summary": {"lpips_convnext": {"completed": 1, "mean": 0.1, "value_sum": 0.1}}})
+            db.complete_job(retry_jobs[1]["job_id"], {"summary": {"lpips_convnext": {"completed": 1, "mean": 0.3, "value_sum": 0.3}}})
+            self.assertTrue(maybe_complete_metric_wave(db, run_id, retry["metric_wave_id"]))
+            retried = db.get_run(run_id)
+            self.assertAlmostEqual(retried["metric_summary"]["lpips_convnext"]["mean"], 0.2)
+            self.assertEqual(retried["metric_summary"]["vmaf"]["completed"], 1)
 
     def test_vmaf_health_finds_project_local_ffmpeg(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
