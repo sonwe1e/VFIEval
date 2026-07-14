@@ -2991,13 +2991,19 @@ class Database:
             return True
         metrics = list(run.get("metrics") or [])
         if metrics:
+            run_devices = list((run.get("metadata") or {}).get("devices") or [])
+            metric_device = str(
+                run_devices[0]
+                if run_devices
+                else jobs[0].get("device") or run.get("device") or "cpu"
+            )
             metric_payload = {
                 "run_id": run_id,
                 "dataset_id": int(run["dataset_id"]),
                 "inference_job_ids": [int(job["job_id"]) for job in jobs],
                 "inference_job_id": int(jobs[0]["job_id"]),
                 "metric_names": metrics,
-                "metric_device": str(run.get("device") or "cpu"),
+                "metric_device": metric_device,
             }
             metric_job_id = self.add_run_job(
                 run_id,
@@ -3005,7 +3011,7 @@ class Database:
                 metric_payload,
                 progress_total=0,
                 shard_index=0,
-                device=None,
+                device=metric_device,
                 metadata={"source": (run.get("metadata") or {}).get("execution_mode") or "multi"},
             )
             self.complete_run_inference(run_id, result, artifact_summary, "metric_queued")
@@ -3176,7 +3182,14 @@ class Database:
                     JOIN runs r ON r.id = rj.run_id
                     WHERE j.status = 'queued'
                       AND j.kind IN ({placeholders})
-                      AND rj.device = ?
+                      AND (
+                          rj.device = ?
+                          OR (
+                              rj.device IS NULL
+                              AND j.kind = 'metric'
+                              AND json_extract(j.payload_json, '$.metric_device') = ?
+                          )
+                      )
                       AND r.deleted_at IS NULL
                       AND r.artifact_cleaned_at IS NULL
                       AND r.status NOT IN ('completed', 'cancel_requested', 'canceled', 'failed')
@@ -3188,7 +3201,7 @@ class Database:
                     ORDER BY j.created_at, j.id
                     LIMIT 1
                     """,
-                    (*tuple(kinds), device_filter),
+                    (*tuple(kinds), device_filter, device_filter),
                 ).fetchone()
             else:
                 row = conn.execute(
@@ -3219,6 +3232,11 @@ class Database:
             if row is None:
                 conn.commit()
                 return None
+            if device_filter and str(row["kind"]) == "metric":
+                conn.execute(
+                    "UPDATE run_jobs SET device = COALESCE(device, ?) WHERE job_id = ? AND role = 'metric'",
+                    (device_filter, int(row["id"])),
+                )
             conn.execute(
                 """
                 UPDATE jobs

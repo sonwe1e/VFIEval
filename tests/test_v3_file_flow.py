@@ -33,9 +33,18 @@ from vfieval.job_errors import describe_job_failure
 from vfieval.metrics.health import metric_assets_dir, metric_health, metrics_health
 from vfieval.models import load_flow_mask_model
 from vfieval.orchestration import _start_local_npu_worker_processes
+from vfieval.pipeline.finalize_runner import run_finalize_job
 from vfieval.pipeline.inference import run_inference_job
 from vfieval.pipeline.postprocess import validate_model_outputs
-from vfieval.server import _make_handler, _partition_samples_by_video, _resolve_execution_devices, _run_metric_summary, _run_timeline, _worker_process_command
+from vfieval.server import (
+    _make_handler,
+    _partition_samples_by_video,
+    _resolve_execution_devices,
+    _retry_run_metrics,
+    _run_metric_summary,
+    _run_timeline,
+    _worker_process_command,
+)
 from vfieval.worker import WorkerOptions, detect_capabilities, run_worker
 
 
@@ -2297,6 +2306,128 @@ class Model:
             self.assertEqual(db.claim_next_job("worker-npu-0", ["inference"], device_filter="npu:0")["id"], job0)
             self.assertIsNone(db.claim_next_job("worker-npu-0-again", ["inference"], device_filter="npu:0"))
             self.assertEqual(db.claim_next_job("metric-worker", ["metric"])["id"], metric_job)
+
+    def test_multi_npu_finalize_binds_lpips_metric_job_to_first_device(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("dummy", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("frames", str(Path(tmp)), True)
+            run_id = db.create_run(
+                name="multi-npu-lpips",
+                model_id=model_id,
+                dataset_id=dataset_id,
+                height=8,
+                width=8,
+                batch_size=1,
+                device="multi_npu",
+                precision="fp32",
+                metrics=["lpips_vit_patch", "lpips_convnext"],
+                metadata={"execution_mode": "multi_npu", "devices": ["npu:0", "npu:1"]},
+                create_inference_job=False,
+            )
+            inference_job_ids = []
+            for shard_index, device in enumerate(("npu:0", "npu:1")):
+                inference_job_id = db.add_run_job(
+                    run_id,
+                    "inference",
+                    {"run_id": run_id, "dataset_id": dataset_id},
+                    progress_total=0,
+                    shard_index=shard_index,
+                    device=device,
+                )
+                db.complete_job(inference_job_id, {"samples": 0, "performance": {}})
+                inference_job_ids.append(inference_job_id)
+            finalize_job_id = db.add_run_job(
+                run_id,
+                "finalize",
+                {"run_id": run_id, "inference_job_ids": inference_job_ids},
+                progress_total=1,
+            )
+
+            run_finalize_job(db, workspace, finalize_job_id)
+
+            metric_job = db.list_run_jobs(run_id, "metric")[0]
+            self.assertEqual(metric_job["device"], "npu:0")
+            self.assertEqual(metric_job["payload"]["metric_device"], "npu:0")
+            claimed = db.claim_next_job("metric-npu-0", ["metric"], device_filter="npu:0")
+            self.assertIsNotNone(claimed)
+            self.assertEqual(claimed["id"], metric_job["job_id"])
+
+    def test_npu_metric_worker_recovers_legacy_unbound_metric_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("dummy", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("frames", str(Path(tmp)), True)
+            run_id = db.create_run(
+                name="legacy-multi-npu-metric",
+                model_id=model_id,
+                dataset_id=dataset_id,
+                height=8,
+                width=8,
+                batch_size=1,
+                device="multi_npu",
+                precision="fp32",
+                metrics=["lpips_vit_patch", "lpips_convnext"],
+                metadata={"execution_mode": "multi_npu", "devices": ["npu:0", "npu:1"]},
+                create_inference_job=False,
+            )
+            metric_job_id = db.add_run_job(
+                run_id,
+                "metric",
+                {
+                    "run_id": run_id,
+                    "metric_names": ["lpips_vit_patch", "lpips_convnext"],
+                    "metric_device": "npu:0",
+                },
+                device=None,
+            )
+            db.set_run_metric_job(run_id, metric_job_id)
+
+            claimed = db.claim_next_job("metric-npu-0", ["metric"], device_filter="npu:0")
+
+            self.assertIsNotNone(claimed)
+            self.assertEqual(claimed["id"], metric_job_id)
+            self.assertEqual(db.list_run_jobs(run_id, "metric")[0]["device"], "npu:0")
+
+    def test_multi_npu_metric_retry_inherits_first_device(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("dummy", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("frames", str(Path(tmp)), True)
+            run_id = db.create_run(
+                name="multi-npu-metric-retry",
+                model_id=model_id,
+                dataset_id=dataset_id,
+                height=8,
+                width=8,
+                batch_size=1,
+                device="multi_npu",
+                precision="fp32",
+                metrics=["lpips_vit_patch", "lpips_convnext"],
+                metadata={"execution_mode": "multi_npu", "devices": ["npu:0", "npu:1"]},
+                create_inference_job=False,
+            )
+            db.add_run_job(
+                run_id,
+                "inference",
+                {"run_id": run_id, "dataset_id": dataset_id},
+                device="npu:0",
+            )
+
+            retry = _retry_run_metrics(db, run_id)
+
+            metric_job = db.get_job(retry["metric_job_id"])
+            self.assertEqual(metric_job["payload"]["metric_device"], "npu:0")
+            self.assertEqual(db.list_run_jobs(run_id, "metric")[0]["device"], "npu:0")
 
     def test_multi_npu_worker_failure_preserves_shard_context_for_run_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

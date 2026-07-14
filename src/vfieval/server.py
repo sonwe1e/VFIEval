@@ -3911,7 +3911,15 @@ def _retry_run_metrics(db: Database, run_id: int) -> dict:
         failed_names = list(run.get("metrics") or [])
     if not failed_names:
         raise ValueError("Run has no metrics to retry")
-    job_id = db.create_job(
+    inference_jobs = db.list_run_jobs(run_id, "inference")
+    run_devices = list((run.get("metadata") or {}).get("devices") or [])
+    metric_device = str(
+        run_devices[0]
+        if run_devices
+        else (inference_jobs[0].get("device") if inference_jobs else None) or run.get("device") or "cpu"
+    )
+    job_id = db.add_run_job(
+        run_id,
         "metric",
         {
             "run_id": run_id,
@@ -3919,9 +3927,11 @@ def _retry_run_metrics(db: Database, run_id: int) -> dict:
             "inference_job_ids": inference_job_ids,
             "dataset_id": int(run["dataset_id"]),
             "metric_names": failed_names,
-            "metric_device": str(run.get("device") or "cpu"),
+            "metric_device": metric_device,
             "retry": True,
         },
+        device=metric_device,
+        metadata={"source": "retry"},
     )
     db.set_run_metric_job(run_id, job_id)
     return {"run_id": run_id, "metric_job_id": job_id, "metric_names": failed_names}

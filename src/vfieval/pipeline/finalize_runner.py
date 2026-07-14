@@ -124,13 +124,19 @@ def run_finalize_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> d
     metrics = list(run.get("metrics") or [])
     if metrics:
         inference_job_ids = [int(row["job_id"]) for row in inference_jobs]
+        run_devices = list((run.get("metadata") or {}).get("devices") or [])
+        metric_device = str(
+            run_devices[0]
+            if run_devices
+            else inference_jobs[0].get("device") or run.get("device") or "cpu"
+        )
         metric_payload = {
             "run_id": run_id,
             "dataset_id": int(run["dataset_id"]),
             "inference_job_ids": inference_job_ids,
             "inference_job_id": inference_job_ids[0],
             "metric_names": metrics,
-            "metric_device": str((run.get("metadata") or {}).get("devices", [run.get("device") or "cpu"])[0]),
+            "metric_device": metric_device,
         }
         metric_job_id = db.add_run_job(
             run_id,
@@ -138,7 +144,7 @@ def run_finalize_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> d
             metric_payload,
             progress_total=0,
             shard_index=0,
-            device=None,
+            device=metric_device,
             metadata={"source": "finalize"},
         )
         db.complete_run_inference(run_id, result, artifact_summary, "metric_queued")
