@@ -234,24 +234,13 @@ def materialize_aligned_frame(
     """Return an original frame or a rebuildable LANCZOS compare-cache frame."""
 
     normalized_plan = _validated_plan(plan)
-    source_report = normalized_plan["sources"].get(str(slot))
-    if not isinstance(source_report, Mapping):
-        raise KeyError(f"alignment plan has no source slot: {slot}")
     path = Path(source_path).resolve()
     if not path.is_file():
         raise FileNotFoundError(f"alignment source frame not found: {path}")
     with Image.open(path) as image:
-        actual_width, actual_height = image.size
-    original = source_report.get("original") or {}
-    expected_size = (int(original.get("width") or 0), int(original.get("height") or 0))
-    if (actual_width, actual_height) != expected_size:
-        raise ValueError(
-            f"alignment source {slot} dimensions changed: "
-            f"expected {expected_size[0]}x{expected_size[1]}, got {actual_width}x{actual_height}"
-        )
-    target = normalized_plan["target"]
-    target_size = (int(target["width"]), int(target["height"]))
-    if (actual_width, actual_height) == target_size:
+        actual_size = image.size
+    target_size = _aligned_source_target(normalized_plan, str(slot), actual_size)
+    if actual_size == target_size:
         return path
 
     cache_key = alignment_cache_key(normalized_plan, str(slot), path)
@@ -262,8 +251,11 @@ def materialize_aligned_frame(
         if not _valid_cached_image(output, target_size):
             temporary = cache_dir / f"{cache_key}.{uuid.uuid4().hex}.tmp.png"
             try:
-                with Image.open(path).convert("RGB") as image:
-                    image.resize(target_size, _lanczos()).save(temporary, format="PNG")
+                aligned = materialize_aligned_rgb(normalized_plan, str(slot), path)
+                try:
+                    aligned.save(temporary, format="PNG")
+                finally:
+                    aligned.close()
                 os.replace(temporary, output)
             finally:
                 try:
@@ -286,6 +278,53 @@ def materialize_aligned_frame(
             gc_after=time.time() + CACHE_GRACE_SECONDS,
         )
     return output
+
+
+def materialize_aligned_rgb(
+    plan: Mapping[str, Any],
+    slot: str,
+    source: str | Path | Image.Image,
+) -> Image.Image:
+    """Materialize one Alignment Plan source as an independent in-memory RGB image.
+
+    This is the non-caching counterpart to :func:`materialize_aligned_frame`.
+    Campaign freezing can therefore stream aligned pixels directly to encoders
+    without first publishing intermediate PNGs, while Compare keeps its existing
+    rebuildable on-disk cache behavior.  The source dimensions are always checked
+    before conversion or resize; a spatial transform can never hide a changed
+    input.
+    """
+
+    normalized_plan = _validated_plan(plan)
+    opened: Image.Image | None = None
+    try:
+        if isinstance(source, Image.Image):
+            image = source
+        else:
+            path = Path(source).resolve()
+            if not path.is_file():
+                raise FileNotFoundError(f"alignment source frame not found: {path}")
+            opened = Image.open(path)
+            image = opened
+        target_size = _aligned_source_target(normalized_plan, str(slot), image.size)
+        rgb = image.convert("RGB")
+        rgb.load()
+        if rgb.size != target_size:
+            resized = rgb.resize(target_size, _lanczos())
+            if rgb is not image:
+                rgb.close()
+            return resized
+        # ``convert`` may return ``self`` for an already-RGB image.  Return a
+        # detached copy so callers never depend on the lifetime of an input
+        # Image or its backing file handle.
+        if rgb is image:
+            detached = rgb.copy()
+            detached.load()
+            return detached
+        return rgb
+    finally:
+        if opened is not None:
+            opened.close()
 
 
 def materialize_frame_sets(
@@ -403,6 +442,29 @@ def _source_report(
         "filter": resize_filter,
         "spatial_origin": dict(source["spatial_origin"]),
     }
+
+
+def _aligned_source_target(
+    normalized_plan: Mapping[str, Any],
+    slot: str,
+    actual_size: tuple[int, int],
+) -> tuple[int, int]:
+    source_report = normalized_plan["sources"].get(str(slot))
+    if not isinstance(source_report, Mapping):
+        raise KeyError(f"alignment plan has no source slot: {slot}")
+    original = source_report.get("original") or {}
+    expected_size = (
+        int(original.get("width") or 0),
+        int(original.get("height") or 0),
+    )
+    if tuple(actual_size) != expected_size:
+        raise ValueError(
+            f"alignment source {slot} dimensions changed: "
+            f"expected {expected_size[0]}x{expected_size[1]}, "
+            f"got {actual_size[0]}x{actual_size[1]}"
+        )
+    target = normalized_plan["target"]
+    return int(target["width"]), int(target["height"])
 
 
 def _validated_plan(plan: Mapping[str, Any]) -> dict[str, Any]:

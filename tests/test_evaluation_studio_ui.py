@@ -14,6 +14,7 @@ class EvaluationStudioUiTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.index_html = (WEB / "index.html").read_text(encoding="utf-8")
         cls.studio_js = (WEB / "studio.js").read_text(encoding="utf-8")
+        cls.studio_css = (WEB / "studio.css").read_text(encoding="utf-8")
         cls.blind_html = (WEB / "blind.html").read_text(encoding="utf-8")
         cls.blind_js = (WEB / "blind.js").read_text(encoding="utf-8")
         cls.server_py = (ROOT / "src" / "vfieval" / "server.py").read_text(encoding="utf-8")
@@ -143,6 +144,34 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn("shareUrl && isLoopbackOrigin()", self.studio_js)
         self.assertIn("studio-share-warning", self.studio_js)
         self.assertIn("--host 0.0.0.0", self.studio_js)
+
+    def test_campaign_preparation_progress_keeps_legacy_summary_and_shows_fine_details(self) -> None:
+        start = self.studio_js.index("function preparationProgressMarkup(progress, campaign)")
+        end = self.studio_js.index("\n  function renderCampaignDetail", start)
+        renderer = self.studio_js[start:end]
+        self.assertIn("const legacyMarkup", renderer)
+        self.assertIn(
+            '<div class="studio-progress"><progress max="${total}" value="${current}"></progress><span>${current}/${total} · ${safe(phase)}</span></div>',
+            renderer,
+        )
+        self.assertIn("if (!hasFineProgress) return legacyMarkup;", renderer)
+        for field in (
+            "overall_fraction",
+            "stage",
+            "item_index",
+            "item_name",
+            "frame_current",
+            "frame_total",
+            "pipeline",
+            "timings",
+        ):
+            self.assertIn(field, renderer)
+        self.assertIn("...report, ...progress", renderer)
+        self.assertIn("Item ${Number(details.item_index)}/${total}", renderer)
+        self.assertIn("帧 ${frameCurrent}${frameTotal}", renderer)
+        self.assertIn("总进度 ${(fraction * 100).toFixed(1)}%", renderer)
+        self.assertIn("studio-progress-detailed", renderer)
+        self.assertIn(".studio-progress-detail", self.studio_css)
 
     def test_external_methods_are_advanced_and_require_explicit_item_bindings(self) -> None:
         for hook in (

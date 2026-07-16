@@ -386,6 +386,54 @@
     return host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === "::1" || host === "[::1]";
   }
 
+  function preparationProgressMarkup(progress, campaign) {
+    const report = progress.report && typeof progress.report === "object" ? progress.report : {};
+    const details = { ...report, ...progress };
+    const total = Number(progress.total || details.total || 0);
+    if (!total) return "";
+    const current = Number(progress.current || details.current || 0);
+    const phase = progress.phase || details.phase || campaignStatus(campaign);
+    const legacyMarkup = `<div class="studio-progress"><progress max="${total}" value="${current}"></progress><span>${current}/${total} · ${safe(phase)}</span></div>`;
+    const timingEntries = details.timings && typeof details.timings === "object" && !Array.isArray(details.timings)
+      ? Object.entries(details.timings).filter(([_name, value]) => Number.isFinite(Number(value)))
+      : [];
+    const fineValues = [
+      details.overall_fraction,
+      details.stage,
+      details.item_index,
+      details.frame_current,
+      details.frame_total,
+      details.pipeline,
+    ];
+    const hasFineProgress = fineValues.some((value) => value != null && value !== "") || timingEntries.length > 0;
+    if (!hasFineProgress) return legacyMarkup;
+
+    const hasOverallFraction = details.overall_fraction != null && details.overall_fraction !== "";
+    const fractionValue = hasOverallFraction ? Number(details.overall_fraction) : Number.NaN;
+    const fraction = Number.isFinite(fractionValue)
+      ? Math.min(1, Math.max(0, fractionValue))
+      : Math.min(1, Math.max(0, current / total));
+    const meta = [];
+    if (details.item_index != null && details.item_index !== "") {
+      const itemName = details.item_name == null || details.item_name === "" ? "" : ` · ${safe(details.item_name)}`;
+      meta.push(`<span>Item ${Number(details.item_index)}/${total}${itemName}</span>`);
+    }
+    if (details.stage != null && details.stage !== "") meta.push(`<span>阶段 ${safe(details.stage)}</span>`);
+    if (details.frame_current != null || details.frame_total != null) {
+      const frameCurrent = details.frame_current == null || details.frame_current === "" ? "–" : Number(details.frame_current);
+      const frameTotal = details.frame_total == null || details.frame_total === "" ? "" : `/${Number(details.frame_total)}`;
+      meta.push(`<span>帧 ${frameCurrent}${frameTotal}</span>`);
+    }
+    if (details.pipeline != null && details.pipeline !== "") meta.push(`<span>管线 ${safe(details.pipeline)}</span>`);
+    if (hasOverallFraction) {
+      meta.push(`<span>总进度 ${(fraction * 100).toFixed(1)}%</span>`);
+    }
+    if (timingEntries.length) {
+      meta.push(`<span>耗时 ${timingEntries.map(([name, value]) => `${safe(name)} ${Number(value).toFixed(2)}s`).join(" · ")}</span>`);
+    }
+    return `<div class="studio-progress studio-progress-detailed"><progress max="1" value="${fraction}"></progress><div class="studio-progress-detail"><span>${current}/${total} · ${safe(phase)}</span><small>${meta.join("")}</small></div></div>`;
+  }
+
   function renderCampaignDetail(payload) {
     const host = el("studio-campaign-detail");
     if (!host) return;
@@ -404,7 +452,7 @@
     host.innerHTML = `
       <div class="studio-detail-head"><div><p class="eyebrow">${legacy ? "历史 Campaign" : "Campaign V2"}</p><h3>${safe(campaign.name)}</h3><p class="muted">${safe(campaign.public_title || campaign.metadata?.public_title || "匿名视频质量评测")}</p></div><span class="studio-status">${safe(campaignStatus(campaign))}</span></div>
       ${legacy ? "<div class=\"message warn\"><p>旧 schema v1 Campaign 只读保留；可继续导出，不会按标签猜测迁移。</p></div>" : ""}
-      ${progress.total ? `<div class="studio-progress"><progress max="${Number(progress.total)}" value="${Number(progress.current || 0)}"></progress><span>${Number(progress.current || 0)}/${Number(progress.total)} · ${safe(progress.phase || campaignStatus(campaign))}</span></div>` : ""}
+      ${preparationProgressMarkup(progress, campaign)}
       ${progress.error?.message || campaign.preparation_error?.message ? `<div class="message error"><p>${safe(progress.error?.message || campaign.preparation_error?.message)}</p></div>` : ""}
       <div class="summary-grid"><div><span>视频</span><strong>${Number(coverage.items || campaign.item_count || 0)}</strong></div><div><span>任务</span><strong>${Number(coverage.tasks || campaign.task_count || 0)}</strong></div><div><span>投票</span><strong>${Number(coverage.votes || campaign.vote_count || 0)}</strong></div><div><span>目标票数/视频</span><strong>${Number(campaign.target_votes || 0)}</strong></div></div>
       ${shareUrl ? `<label class="studio-share"><span>参与链接</span><div><input readonly value="${safe(shareUrl)}"><button data-copy-share="${safe(shareUrl)}" type="button">复制</button></div></label>` : ""}

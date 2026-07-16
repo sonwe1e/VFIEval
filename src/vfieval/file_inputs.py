@@ -1102,13 +1102,20 @@ def _rotation_swaps_dimensions(rotation_degrees: float) -> bool:
     return abs(normalized - 90.0) <= 0.5 or abs(normalized - 270.0) <= 0.5
 
 
-def decode_cache_key(video_path: Path, decode_mode: str, frame_step: int, max_frames: int | None) -> str:
+def decode_cache_key(
+    video_path: Path,
+    decode_mode: str,
+    frame_step: int,
+    max_frames: int | None,
+    *,
+    content_sha256: str | None = None,
+) -> str:
     stat = video_path.stat()
     data = {
         "path": str(video_path.resolve()).replace("\\", "/"),
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
-        "sha256": file_sha256(video_path),
+        "sha256": str(content_sha256 or file_sha256(video_path)),
         "decode_mode": decode_mode,
         "frame_step": frame_step,
         "max_frames": max_frames,

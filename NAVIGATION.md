@@ -169,7 +169,7 @@ User rating (1–5, 0.25 step) + free-text issue per run; content-scoped (video/
 - **Tests:** `tests/test_artifact_profiles.py`, `tests/test_artifact_integrity.py`
 
 ### 16. Blind evaluation V2 + frozen Campaign packages
-- **Core:** `evaluations_v2.py` `list_run_outputs`, `preview_campaign_v2`, `create_campaign_v2`, `request_publish_campaign_v2`, `run_pending_preparations`, `publish_campaign_v2`, blind session/payload/media/heartbeat/vote functions, `campaign_analysis_v2`, `campaign_export_v2`
+- **Core:** `evaluations_v2.py` `list_run_outputs`, `preview_campaign_v2`, `create_campaign_v2`, `request_publish_campaign_v2`, `run_pending_preparations`, `publish_campaign_v2`, blind session/payload/media/heartbeat/vote functions, `campaign_analysis_v2`, `campaign_export_v2`; `pipeline/evaluation_freeze.py` owns bounded rawvideo/remux package materialization
 - **Lifecycle:** draft → preparing → published → closed/archived; failed preparation can be retried. Publish deep-validates every selected GT/A/B item, builds staging, freezes under `.vfieval/evaluations/{campaign_id}`, writes a SHA-256 manifest, registers evaluation-package assets, then creates tasks atomically.
 - **Tables:** `evaluation_campaigns_v2`, `evaluation_methods_v2`, `evaluation_items_v2`, `evaluation_bindings_v2`, `evaluation_preparations_v2`, `evaluation_tasks_v2`, `evaluation_assignments_v2`, `evaluation_votes_v2`, `evaluation_analysis_cache_v2`; shared identity table `evaluators`
 - **Admin routes:** `GET /api/evaluation-campaigns`, `POST /api/evaluation-campaigns/v2/preview`, `POST /api/evaluation-campaigns/v2`, `GET /api/evaluation-campaigns/v2/{id}[/{analysis,export}]`, `POST /api/evaluation-campaigns/v2/{id}/{publish,close,archive}`

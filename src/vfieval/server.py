@@ -4110,6 +4110,18 @@ def _evaluation_campaign_v2_payload(db: Database, campaign_id: int) -> dict[str,
             "updated_at": preparation_row.get("updated_at"),
             "completed_at": preparation_row.get("completed_at"),
         }
+        for optional_field in (
+            "stage",
+            "item_index",
+            "item_name",
+            "frame_current",
+            "frame_total",
+            "overall_fraction",
+            "pipeline",
+            "timings",
+        ):
+            if optional_field in report:
+                preparation[optional_field] = report[optional_field]
         campaign["preparation_status"] = state
         if error:
             campaign["preparation_error"] = error

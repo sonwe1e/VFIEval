@@ -26,7 +26,12 @@ from vfieval.compare_inputs import (
 )
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
-from vfieval.file_inputs import VIDEO_SUFFIXES, decode_cache_dir, decode_cache_key
+from vfieval.file_inputs import (
+    VIDEO_SUFFIXES,
+    decode_cache_dir,
+    decode_cache_key,
+    file_sha256,
+)
 from vfieval.run_cleanup import cache_lease, decode_cache_build_lock
 
 
@@ -815,8 +820,52 @@ def _load_compare_source_frames(
     source_path: Path,
     cache_prefix: str,
 ) -> tuple[list[Path], float | None, list[float | None]]:
+    frames, fps, timestamps, _cache = _load_compare_source_frames_with_cache(
+        db,
+        workspace,
+        source_path,
+        cache_prefix,
+    )
+    return frames, fps, timestamps
+
+
+def _load_compare_source_frames_with_cache(
+    db: Database,
+    workspace: WorkspaceConfig,
+    source_path: Path,
+    cache_prefix: str,
+) -> tuple[
+    list[Path],
+    float | None,
+    list[float | None],
+    dict[str, Any] | None,
+]:
+    """Load Compare frames and expose the already-computed decode cache identity.
+
+    Long-running consumers such as Campaign publication can retain a lease on
+    the returned cache directory without hashing the source video a second
+    time. Frame-directory inputs have no shared decode cache and return
+    ``None`` for the descriptor.
+    """
     if source_path.is_file() and source_path.suffix.lower() in VIDEO_SUFFIXES:
-        cache_key = decode_cache_key(source_path, cache_prefix, 1, None)
+        source_path = source_path.resolve()
+        stat_before = source_path.stat()
+        source_sha256 = file_sha256(source_path)
+        stat_after_hash = source_path.stat()
+        if (
+            int(stat_before.st_size) != int(stat_after_hash.st_size)
+            or int(stat_before.st_mtime_ns) != int(stat_after_hash.st_mtime_ns)
+        ):
+            raise ValueError(
+                "compare source video changed while its content signature was being read"
+            )
+        cache_key = decode_cache_key(
+            source_path,
+            cache_prefix,
+            1,
+            None,
+            content_sha256=source_sha256,
+        )
         frames, fps, timestamps, _decode_info = _decode_video_cached(
             db,
             workspace,
@@ -826,12 +875,31 @@ def _load_compare_source_frames(
             cache_prefix,
             1,
         )
-        return frames, fps, list(timestamps)
+        stat_after_decode = source_path.stat()
+        if (
+            int(stat_after_hash.st_size) != int(stat_after_decode.st_size)
+            or int(stat_after_hash.st_mtime_ns) != int(stat_after_decode.st_mtime_ns)
+        ):
+            raise ValueError("compare source video changed while it was being decoded")
+        return (
+            frames,
+            fps,
+            list(timestamps),
+            {
+                "cache_type": "decode_cache",
+                "cache_key": cache_key,
+                "path": decode_cache_dir(workspace, cache_key),
+                "source_path": source_path,
+                "source_sha256": source_sha256,
+                "source_size_bytes": int(stat_after_decode.st_size),
+                "source_mtime_ns": int(stat_after_decode.st_mtime_ns),
+            },
+        )
     if source_path.is_dir():
         frames = list_frame_images(source_path)
         if not frames:
             raise FileNotFoundError(f"frame directory has no supported images: {source_path}")
-        return frames, None, [None for _ in frames]
+        return frames, None, [None for _ in frames], None
     raise ValueError(f"unsupported compare source: {source_path}")
 
 

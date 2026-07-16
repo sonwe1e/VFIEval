@@ -4,6 +4,7 @@ import json
 import tempfile
 import sys
 import unittest
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -49,6 +50,37 @@ from vfieval.media_items import (
 from vfieval.run_cleanup import RunCleanupService
 
 from v13_test_utils import add_completed_pred_run, make_workspace, write_mp4
+
+
+class _FakeRawVideoSink:
+    instances = []
+
+    def __init__(self, path, **kwargs):
+        self.path = Path(path)
+        self.kwargs = dict(kwargs)
+        self.frames = []
+        self.aborted = False
+        type(self).instances.append(self)
+
+    def start(self):
+        return None
+
+    def write(self, frame):
+        self.frames.append(bytes(frame))
+
+    def close_input(self):
+        return None
+
+    def wait(self):
+        self.path.write_bytes(b"fake-campaign-mp4")
+
+    def finish(self):
+        self.close_input()
+        self.wait()
+
+    def abort(self):
+        self.aborted = True
+        self.path.unlink(missing_ok=True)
 
 
 class EvaluationCampaignV2Tests(unittest.TestCase):
@@ -193,6 +225,71 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
         }
         return item, body, (gt_path, pred_a, pred_b)
 
+    def _freeze_frame_fixture(
+        self,
+        root: Path,
+        *,
+        frame_count: int = 2,
+        gt_size: tuple[int, int] = (8, 8),
+        pred_a_size: tuple[int, int] = (8, 8),
+        pred_b_size: tuple[int, int] = (8, 8),
+    ):
+        from vfieval.alignment import plan_alignment
+
+        sizes = {"gt": gt_size, "pred_a": pred_a_size, "pred_b": pred_b_size}
+        colors = {"gt": (20, 0, 0), "pred_a": (0, 20, 0), "pred_b": (0, 0, 20)}
+        sources = {}
+        for slot in ("gt", "pred_a", "pred_b"):
+            directory = root / "source-frames" / slot
+            directory.mkdir(parents=True, exist_ok=True)
+            frames = []
+            for index in range(frame_count):
+                frame = directory / f"{index:06d}.png"
+                Image.new("RGB", sizes[slot], colors[slot]).save(frame)
+                frames.append(frame)
+            sources[slot] = frames
+        temporal = {
+            "mode": "exact",
+            "reference_frame_count": frame_count,
+            "frame_count": frame_count,
+            "prediction_frame_counts": [frame_count, frame_count],
+            "mapping_count": frame_count,
+            "mapping_first": 0,
+            "mapping_last": frame_count - 1,
+            "mapping_sha256": "fixture",
+            "fps": 5.0,
+            "timestamps_verified": True,
+            "timestamps_sha256": "fixture",
+            "timestamp_tolerance_seconds": 0.001,
+        }
+        plan = plan_alignment(
+            {
+                "slot": "gt",
+                "width": gt_size[0],
+                "height": gt_size[1],
+                "frame_count": frame_count,
+                "fps": 5.0,
+            },
+            [
+                {
+                    "slot": "pred_a",
+                    "width": pred_a_size[0],
+                    "height": pred_a_size[1],
+                    "frame_count": frame_count,
+                    "fps": 5.0,
+                },
+                {
+                    "slot": "pred_b",
+                    "width": pred_b_size[0],
+                    "height": pred_b_size[1],
+                    "frame_count": frame_count,
+                    "fps": 5.0,
+                },
+            ],
+            temporal_summary=temporal,
+        )
+        return plan, sources
+
     def test_item_mode_publish_materializes_alignment_diff_and_frozen_members(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace, db = make_workspace(tmp)
@@ -216,10 +313,28 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             self.assertEqual(manifest_item["media_item_id"], int(item["id"]))
             self.assertEqual(manifest_item["alignment_fingerprint"], plan["fingerprint"])
             self.assertEqual(manifest_item["alignment_plan"]["target"]["width"], 8)
+            freeze_report = manifest_item["freeze_pipeline"]
+            self.assertEqual(
+                set(freeze_report["outputs"]),
+                {"gt", "pred_a", "pred_b", "diff_a", "diff_b"},
+            )
+            self.assertTrue(
+                all(output["mode"] for output in freeze_report["outputs"].values())
+            )
+            self.assertIn("total", freeze_report["timings"])
+            self.assertFalse(list(package.rglob("*.png")))
             for method in manifest_item["methods"]:
                 self.assertTrue((package / method["path"]).is_file())
                 self.assertTrue((package / method["diff"]["path"]).is_file())
                 self.assertTrue(method["diff"]["sha256"])
+
+            preparation = get_preparation_v2(db, int(draft["id"]))
+            self.assertEqual(preparation["state"], "completed")
+            self.assertEqual(preparation["report"]["current"], 1)
+            self.assertEqual(preparation["report"]["total"], 1)
+            self.assertEqual(preparation["report"]["stage"], "completed")
+            self.assertEqual(preparation["report"]["overall_fraction"], 1.0)
+            self.assertEqual(preparation["report"]["pipeline"], "campaign-freeze-stream-v1")
 
             frozen_assets = db.query(
                 "SELECT * FROM media_assets WHERE source_kind = 'evaluation_package' ORDER BY id"
@@ -257,6 +372,260 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
                 source.unlink(missing_ok=True)
             for asset in frozen_assets:
                 self.assertTrue(Path(str(asset["storage_path"])).exists())
+
+    def test_video_freeze_streams_without_temporary_png_and_hashes_outputs_once(self) -> None:
+        from vfieval.pipeline import evaluation_freeze as freeze
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plan, sources = self._freeze_frame_fixture(root)
+            output_dir = root / "frozen"
+            eligibility = {
+                slot: {
+                    "eligible": False,
+                    "reasons": ["fixture forces streaming"],
+                    "probe": None,
+                }
+                for slot in ("gt", "pred_a", "pred_b")
+            }
+            _FakeRawVideoSink.instances = []
+            real_digest = freeze._digest_path
+            real_materialize = freeze.materialize_aligned_rgb
+            with patch.object(
+                freeze, "streaming_backend_available", return_value=True
+            ), patch.object(
+                freeze, "_collect_remux_eligibility", return_value=eligibility
+            ), patch.object(
+                freeze, "_RawVideoSink", _FakeRawVideoSink
+            ), patch.object(
+                freeze, "validate_frozen_video", return_value={}
+            ) as validate, patch.object(
+                freeze, "_digest_path", wraps=real_digest
+            ) as digest, patch.object(
+                freeze, "materialize_aligned_rgb", wraps=real_materialize
+            ) as materialize:
+                result = freeze.freeze_campaign_media(
+                    plan,
+                    sources,
+                    output_dir,
+                    media_kind="video",
+                    fps=5.0,
+                    ffmpeg=sys.executable,
+                    ffprobe=sys.executable,
+                )
+
+            self.assertEqual(result["pipeline"], "streaming")
+            self.assertEqual(set(result["artifacts"]), set(freeze.OUTPUT_SLOTS))
+            self.assertTrue(
+                all(artifact["mode"] == "stream" for artifact in result["artifacts"].values())
+            )
+            self.assertFalse(list(output_dir.rglob("*.png")))
+            self.assertEqual(materialize.call_count, 2 * len(freeze.SOURCE_SLOTS))
+            self.assertEqual(validate.call_count, len(freeze.OUTPUT_SLOTS))
+            self.assertEqual(len(_FakeRawVideoSink.instances), len(freeze.OUTPUT_SLOTS))
+            self.assertTrue(
+                all(len(sink.frames) == 2 for sink in _FakeRawVideoSink.instances)
+            )
+            self.assertTrue(
+                all(
+                    sink.kwargs["threads"] == result["encoder_threads"]
+                    for sink in _FakeRawVideoSink.instances
+                )
+            )
+
+            digest_counts = Counter(Path(call.args[0]).resolve() for call in digest.call_args_list)
+            artifact_paths = {
+                Path(artifact["path"]).resolve() for artifact in result["artifacts"].values()
+            }
+            self.assertEqual(set(digest_counts), artifact_paths)
+            self.assertTrue(all(digest_counts[path] == 1 for path in artifact_paths))
+
+    def test_rotation_and_resize_force_streaming_and_disable_paired_pred_remux(self) -> None:
+        from vfieval.pipeline import evaluation_freeze as freeze
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plan, sources = self._freeze_frame_fixture(root, pred_b_size=(10, 8))
+            source_media = {}
+            for slot in freeze.SOURCE_SLOTS:
+                path = root / f"{slot}.mp4"
+                path.write_bytes(f"source-{slot}".encode("utf-8"))
+                source_media[slot] = path
+            source_digests = {
+                slot: freeze._source_signature(path)["sha256"]
+                for slot, path in source_media.items()
+            }
+
+            def probe(path, **_kwargs):
+                slot = Path(path).stem
+                width, height = (10, 8) if slot == "pred_b" else (8, 8)
+                return {
+                    "codec": "h264",
+                    "pix_fmt": "yuv420p",
+                    "width": width,
+                    "height": height,
+                    "rotation_degrees": 90.0 if slot == "gt" else 0.0,
+                    "frame_count": 2,
+                    "fps": 5.0,
+                    "timestamps": [0.0, 0.2],
+                    "cfr": True,
+                    "audio_stream_count": 0,
+                }
+
+            _FakeRawVideoSink.instances = []
+            with patch.object(
+                freeze, "streaming_backend_available", return_value=True
+            ), patch.object(
+                freeze, "probe_video_for_freeze", side_effect=probe
+            ), patch.object(
+                freeze, "_RawVideoSink", _FakeRawVideoSink
+            ), patch.object(
+                freeze, "validate_frozen_video", return_value={}
+            ), patch.object(freeze, "remux_video") as remux:
+                result = freeze.freeze_campaign_media(
+                    plan,
+                    sources,
+                    root / "frozen",
+                    media_kind="video",
+                    fps=5.0,
+                    source_media=source_media,
+                    source_timestamps={slot: [0.0, 0.2] for slot in freeze.SOURCE_SLOTS},
+                    expected_source_sha256=source_digests,
+                    ffmpeg=sys.executable,
+                    ffprobe=sys.executable,
+                )
+
+            self.assertEqual(result["pipeline"], "streaming")
+            self.assertIn("rotation metadata is not zero", result["remux"]["gt"]["reasons"])
+            self.assertIn(
+                "source requires spatial normalization",
+                result["remux"]["pred_b"]["reasons"],
+            )
+            self.assertIn(
+                "paired prediction is not remux-eligible",
+                result["remux"]["pred_a"]["reasons"],
+            )
+            self.assertTrue(
+                all(artifact["mode"] == "stream" for artifact in result["artifacts"].values())
+            )
+            remux.assert_not_called()
+
+    def test_pred_remux_failure_reencodes_both_predictions(self) -> None:
+        from vfieval.pipeline import evaluation_freeze as freeze
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plan, sources = self._freeze_frame_fixture(root)
+            source_media = {}
+            for slot in freeze.SOURCE_SLOTS:
+                path = root / f"{slot}.mp4"
+                path.write_bytes(f"source-{slot}".encode("utf-8"))
+                source_media[slot] = path
+            eligibility = {
+                "gt": {"eligible": False, "reasons": ["stream GT"], "probe": None},
+                "pred_a": {"eligible": True, "reasons": [], "probe": {}},
+                "pred_b": {"eligible": True, "reasons": [], "probe": {}},
+            }
+
+            def flaky_remux(_source, target, **_kwargs):
+                target = Path(target)
+                target.write_bytes(b"remux-copy")
+                if target.name == "method-b.mp4":
+                    raise freeze.RemuxError("injected remux incompatibility")
+                return target
+
+            _FakeRawVideoSink.instances = []
+            with patch.object(
+                freeze, "streaming_backend_available", return_value=True
+            ), patch.object(
+                freeze, "_collect_remux_eligibility", return_value=eligibility
+            ), patch.object(
+                freeze, "remux_video", side_effect=flaky_remux
+            ) as remux, patch.object(
+                freeze, "_RawVideoSink", _FakeRawVideoSink
+            ), patch.object(
+                freeze, "validate_frozen_video", return_value={}
+            ):
+                result = freeze.freeze_campaign_media(
+                    plan,
+                    sources,
+                    root / "frozen",
+                    media_kind="video",
+                    fps=5.0,
+                    source_media=source_media,
+                    ffmpeg=sys.executable,
+                    ffprobe=sys.executable,
+                )
+
+            self.assertEqual(remux.call_count, 2)
+            self.assertEqual(result["artifacts"]["pred_a"]["mode"], "stream")
+            self.assertEqual(result["artifacts"]["pred_b"]["mode"], "stream")
+            self.assertEqual(
+                Path(result["artifacts"]["pred_a"]["path"]).read_bytes(),
+                b"fake-campaign-mp4",
+            )
+            self.assertEqual(
+                Path(result["artifacts"]["pred_b"]["path"]).read_bytes(),
+                b"fake-campaign-mp4",
+            )
+
+    def test_pred_remux_fast_path_commits_as_a_pair(self) -> None:
+        from vfieval.pipeline import evaluation_freeze as freeze
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plan, sources = self._freeze_frame_fixture(root)
+            source_media = {}
+            for slot in freeze.SOURCE_SLOTS:
+                path = root / f"{slot}.mp4"
+                path.write_bytes(f"source-{slot}".encode("utf-8"))
+                source_media[slot] = path
+            eligibility = {
+                "gt": {"eligible": False, "reasons": ["stream GT"], "probe": None},
+                "pred_a": {"eligible": True, "reasons": [], "probe": {}},
+                "pred_b": {"eligible": True, "reasons": [], "probe": {}},
+            }
+
+            def private_remux(_source, target, **_kwargs):
+                target = Path(target)
+                target.write_bytes(b"private-remux")
+                return target
+
+            _FakeRawVideoSink.instances = []
+            with patch.object(
+                freeze, "streaming_backend_available", return_value=True
+            ), patch.object(
+                freeze, "_collect_remux_eligibility", return_value=eligibility
+            ), patch.object(
+                freeze, "remux_video", side_effect=private_remux
+            ) as remux, patch.object(
+                freeze, "_RawVideoSink", _FakeRawVideoSink
+            ), patch.object(
+                freeze, "validate_frozen_video", return_value={}
+            ):
+                result = freeze.freeze_campaign_media(
+                    plan,
+                    sources,
+                    root / "frozen",
+                    media_kind="video",
+                    fps=5.0,
+                    source_media=source_media,
+                    ffmpeg=sys.executable,
+                    ffprobe=sys.executable,
+                )
+
+            self.assertEqual(result["pipeline"], "remux+stream")
+            self.assertEqual(remux.call_count, 2)
+            self.assertEqual(result["artifacts"]["pred_a"]["mode"], "remux")
+            self.assertEqual(result["artifacts"]["pred_b"]["mode"], "remux")
+            self.assertEqual(
+                {sink.path.name for sink in _FakeRawVideoSink.instances},
+                {"reference.mp4", "diff-a.mp4", "diff-b.mp4"},
+            )
+            for slot in ("pred_a", "pred_b"):
+                frozen_path = Path(result["artifacts"][slot]["path"])
+                self.assertEqual(frozen_path.read_bytes(), b"private-remux")
+                self.assertFalse(frozen_path.samefile(source_media[slot]))
 
     def test_item_mode_uses_decoded_dimensions_when_probe_dimensions_are_swapped(
         self,
@@ -813,6 +1182,54 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             self.assertEqual(get_campaign_v2(db, campaign["id"])["status"], "preparing")
             self.assertFalse((workspace.evaluations_dir / str(campaign["id"])).exists())
 
+    def test_preparation_progress_keeps_legacy_counters_with_frame_details(self) -> None:
+        from vfieval.evaluations_v2 import _PreparationProgressReporter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _workspace, db = make_workspace(tmp)
+            with patch("vfieval.evaluations_v2._update_preparation_progress") as update:
+                reporter = _PreparationProgressReporter(
+                    db,
+                    campaign_id=17,
+                    claim_token="owned-claim",
+                    item_total=2,
+                    min_interval_seconds=0,
+                )
+                reporter.start_item(1, "clip.mp4")
+                reporter.callback(
+                    {
+                        "stage": "streaming_frames",
+                        "frame_current": 2,
+                        "frame_total": 4,
+                        "pipeline": "stream",
+                    }
+                )
+                reporter.finish_item({"encode_seconds": 0.25})
+
+            reports = [call.args[3] for call in update.call_args_list]
+            self.assertGreaterEqual(len(reports), 3)
+            self.assertTrue(
+                all(
+                    report["phase"] == "validating_and_freezing"
+                    and "current" in report
+                    and report["total"] == 2
+                    for report in reports
+                )
+            )
+            frame_report = next(
+                report for report in reports if report["stage"] == "streaming_frames"
+            )
+            self.assertEqual(frame_report["item_index"], 1)
+            self.assertEqual(frame_report["item_name"], "clip.mp4")
+            self.assertEqual(frame_report["frame_current"], 2)
+            self.assertEqual(frame_report["frame_total"], 4)
+            self.assertEqual(frame_report["overall_fraction"], 0.25)
+            self.assertEqual(frame_report["current"], 0)
+            completed = reports[-1]
+            self.assertEqual(completed["current"], 1)
+            self.assertEqual(completed["overall_fraction"], 0.5)
+            self.assertEqual(completed["item_timings"], {"encode_seconds": 0.25})
+
     def test_persistent_preparation_request_can_be_resumed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace, db = make_workspace(tmp)
@@ -942,6 +1359,112 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             self.assertEqual(failed["tasks"], 0)
             self.assertFalse((workspace.root / "evaluations" / str(campaign["id"])).exists())
             self.assertFalse(any((workspace.root / "evaluations" / ".staging").iterdir()))
+
+    def test_encoder_failure_cleans_partial_freeze_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _item, body, _paths = self._item_campaign(workspace, db)
+            campaign = create_campaign_v2(db, workspace, body)
+
+            def fail_during_encode(_plan, _sources, output_dir, **kwargs):
+                output_dir = Path(output_dir)
+                (output_dir / "partial-encoder-output.mp4").write_bytes(b"partial")
+                kwargs["progress_callback"](
+                    {
+                        "stage": "materializing",
+                        "frame_current": 1,
+                        "frame_total": 3,
+                        "pipeline": "streaming",
+                        "force": True,
+                    }
+                )
+                raise RuntimeError("injected Campaign encoder failure")
+
+            with patch(
+                "vfieval.evaluations_v2.freeze_campaign_media",
+                side_effect=fail_during_encode,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected Campaign encoder failure"):
+                    publish_campaign_v2(db, workspace, int(campaign["id"]))
+
+            failed = get_campaign_v2(db, int(campaign["id"]))
+            preparation = get_preparation_v2(db, int(campaign["id"]))
+            self.assertEqual(failed["status"], "failed")
+            self.assertEqual(preparation["state"], "failed")
+            self.assertEqual(preparation["report"]["stage"], "materializing")
+            self.assertEqual(preparation["report"]["frame_current"], 1)
+            self.assertIn("encoder failure", preparation["error"]["message"])
+            self.assertEqual(
+                int(db.get("SELECT COUNT(*) AS count FROM evaluation_tasks_v2")["count"]),
+                0,
+            )
+            self.assertEqual(
+                int(
+                    db.get(
+                        "SELECT COUNT(*) AS count FROM media_assets "
+                        "WHERE source_kind = 'evaluation_package'"
+                    )["count"]
+                ),
+                0,
+            )
+            self.assertFalse((workspace.evaluations_dir / str(campaign["id"])).exists())
+            self.assertFalse(any((workspace.evaluations_dir / ".staging").iterdir()))
+
+    def test_claim_loss_during_freeze_cleans_staging_without_clearing_new_owner(self) -> None:
+        import threading
+        from contextlib import nullcontext
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _item, body, _paths = self._item_campaign(workspace, db)
+            campaign = create_campaign_v2(db, workspace, body)
+            ownership_lost = threading.Event()
+
+            def supersede_during_encode(_plan, _sources, output_dir, **kwargs):
+                output_dir = Path(output_dir)
+                (output_dir / "partial-old-owner.mp4").write_bytes(b"partial")
+                with db.connection() as conn:
+                    conn.execute(
+                        """
+                        UPDATE evaluation_preparations_v2
+                        SET state = 'running', claim_token = 'new-owner', updated_at = ?
+                        WHERE campaign_id = ?
+                        """,
+                        (10**12, int(campaign["id"])),
+                    )
+                ownership_lost.set()
+                kwargs["cancel_check"]()
+                self.fail("a superseded Campaign freeze must stop immediately")
+
+            with patch(
+                "vfieval.evaluations_v2._preparation_claim_heartbeat",
+                return_value=nullcontext(ownership_lost),
+            ), patch(
+                "vfieval.evaluations_v2.freeze_campaign_media",
+                side_effect=supersede_during_encode,
+            ):
+                with self.assertRaisesRegex(EvaluationConflict, "superseded"):
+                    publish_campaign_v2(db, workspace, int(campaign["id"]))
+
+            preparation = get_preparation_v2(db, int(campaign["id"]))
+            self.assertEqual(get_campaign_v2(db, int(campaign["id"]))["status"], "preparing")
+            self.assertEqual(preparation["state"], "running")
+            self.assertEqual(preparation["claim_token"], "new-owner")
+            self.assertEqual(
+                int(db.get("SELECT COUNT(*) AS count FROM evaluation_tasks_v2")["count"]),
+                0,
+            )
+            self.assertEqual(
+                int(
+                    db.get(
+                        "SELECT COUNT(*) AS count FROM media_assets "
+                        "WHERE source_kind = 'evaluation_package'"
+                    )["count"]
+                ),
+                0,
+            )
+            self.assertFalse((workspace.evaluations_dir / str(campaign["id"])).exists())
+            self.assertFalse(any((workspace.evaluations_dir / ".staging").iterdir()))
 
     def test_assignment_leases_limit_concurrent_votes_to_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

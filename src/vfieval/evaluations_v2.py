@@ -9,9 +9,10 @@ import secrets
 import shutil
 import statistics
 import threading
+import time
 import uuid
 from collections import Counter, defaultdict
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import quote
@@ -36,6 +37,13 @@ from vfieval.media_items import (
     resolve_item_member,
     resolve_item_reference,
 )
+from vfieval.pipeline.evaluation_freeze import (
+    FreezeBackendUnavailable,
+    FreezeCancelled,
+    SourceChanged,
+    freeze_campaign_media,
+)
+from vfieval.run_cleanup import cache_lease
 
 
 CAMPAIGN_V2_SCHEMA = """
@@ -802,7 +810,7 @@ def _campaign_item_alignment(
     predictions: list[dict[str, Any]],
     spatial_policy: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
-    from vfieval.datasets import _load_compare_source_frames
+    from vfieval.datasets import _load_compare_source_frames_with_cache
 
     def available_timestamps(values: list[float | None] | None) -> list[float] | None:
         if not values or any(value is None for value in values):
@@ -831,7 +839,12 @@ def _campaign_item_alignment(
         )
         for prediction in predictions
     ]
-    reference_frames, reference_fps, reference_timestamps = _load_compare_source_frames(
+    (
+        reference_frames,
+        reference_fps,
+        reference_timestamps,
+        reference_decode_cache,
+    ) = _load_compare_source_frames_with_cache(
         db,
         workspace,
         Path(str(reference["path"])),
@@ -847,11 +860,12 @@ def _campaign_item_alignment(
             "fps": reference_fps if reference_fps is not None else reference.get("fps"),
             "timestamps": available_timestamps(reference_timestamps),
             "frame_paths": reference_frames,
+            "decode_cache": reference_decode_cache,
         }
     )
     decoded: list[dict[str, Any]] = []
     for index, prediction in enumerate(resolved_predictions):
-        _frames, fps, timestamps = _load_compare_source_frames(
+        _frames, fps, timestamps, decode_cache = _load_compare_source_frames_with_cache(
             db,
             workspace,
             Path(str(prediction["path"])),
@@ -885,6 +899,7 @@ def _campaign_item_alignment(
                 ),
                 "source_frame_indices": mapping,
                 "frame_paths": _frames,
+                "decode_cache": decode_cache,
             }
         )
         decoded.append(source)
@@ -1576,6 +1591,109 @@ def _update_preparation_progress(
             raise EvaluationConflict("Campaign V2 preparation claim was superseded")
 
 
+class _PreparationProgressReporter:
+    """Throttle durable frame-level progress without changing Item counters."""
+
+    def __init__(
+        self,
+        db: Database,
+        campaign_id: int,
+        claim_token: str,
+        item_total: int,
+        *,
+        min_interval_seconds: float = 1.0,
+    ) -> None:
+        self.db = db
+        self.campaign_id = int(campaign_id)
+        self.claim_token = str(claim_token)
+        self.item_total = int(item_total)
+        self.min_interval_seconds = max(0.0, float(min_interval_seconds))
+        self.item_index = 0
+        self.item_name = ""
+        self._last_write = 0.0
+        self._last_stage = ""
+        self._lock = threading.Lock()
+
+    def start_item(self, item_index: int, item_name: str) -> None:
+        self.item_index = int(item_index)
+        self.item_name = str(item_name)
+        self.update(
+            {
+                "stage": "validating_sources",
+                "frame_current": 0,
+                "frame_total": 0,
+                "pipeline": "campaign-freeze-stream-v1",
+            },
+            force=True,
+        )
+
+    def callback(self, event: dict[str, Any]) -> None:
+        payload = dict(event or {})
+        force = bool(payload.pop("force", False))
+        self.update(payload, force=force)
+
+    def finish_item(self, timings: dict[str, Any] | None = None) -> None:
+        self.update(
+            {
+                "stage": "item_completed",
+                "frame_current": 0,
+                "frame_total": 0,
+                "pipeline": "campaign-freeze-stream-v1",
+                "item_timings": dict(timings or {}),
+                "timings": dict(timings or {}),
+                "current_override": self.item_index,
+                "overall_fraction": (
+                    float(self.item_index) / self.item_total if self.item_total > 0 else 1.0
+                ),
+            },
+            force=True,
+        )
+
+    def update(self, event: dict[str, Any], *, force: bool = False) -> None:
+        with self._lock:
+            payload = dict(event or {})
+            stage = str(payload.pop("stage", None) or self._last_stage or "validating_sources")
+            now = time.monotonic()
+            if stage != self._last_stage:
+                force = True
+            if not force and now - self._last_write < self.min_interval_seconds:
+                return
+
+            completed_items = max(0, self.item_index - 1)
+            frame_current = max(0, int(payload.pop("frame_current", 0) or 0))
+            frame_total = max(0, int(payload.pop("frame_total", 0) or 0))
+            if frame_total > 0:
+                fractional_items = completed_items + min(1.0, frame_current / frame_total)
+            else:
+                fractional_items = float(completed_items)
+            current = int(payload.pop("current_override", completed_items))
+            fractional = (
+                fractional_items / self.item_total if self.item_total > 0 else 1.0
+            )
+            fractional = float(payload.pop("overall_fraction", fractional))
+            report = {
+                "phase": "validating_and_freezing",
+                "current": current,
+                "total": self.item_total,
+                "item_index": self.item_index,
+                "item_name": self.item_name,
+                "stage": stage,
+                "frame_current": frame_current,
+                "frame_total": frame_total,
+                "overall_fraction": max(0.0, min(1.0, fractional)),
+                "pipeline": str(payload.pop("pipeline", "campaign-freeze-stream-v1")),
+                **payload,
+            }
+            _update_preparation_progress(
+                self.db,
+                self.campaign_id,
+                self.claim_token,
+                report,
+            )
+            self._last_write = now
+            self._last_stage = stage
+
+
 @contextmanager
 def _preparation_claim_heartbeat(
     db: Database,
@@ -1957,6 +2075,99 @@ def _normalized_asset_snapshot(
     return snapshot
 
 
+@contextmanager
+def _hold_campaign_decode_caches(
+    db: Database,
+    workspace: WorkspaceConfig,
+    sources: Iterable[dict[str, Any]],
+) -> Iterable[None]:
+    """Keep decoded frame directories alive for the complete Item freeze."""
+
+    seen: set[tuple[str, str]] = set()
+    with ExitStack() as stack:
+        for source in sources:
+            descriptor = source.get("decode_cache")
+            if not isinstance(descriptor, dict):
+                continue
+            cache_type = str(descriptor.get("cache_type") or "")
+            cache_key = str(descriptor.get("cache_key") or "")
+            cache_path = descriptor.get("path")
+            identity = (cache_type, cache_key)
+            if cache_type != "decode_cache" or not cache_key or cache_path is None:
+                raise ValueError("Campaign V2 received an invalid decode-cache descriptor")
+            if identity in seen:
+                continue
+            seen.add(identity)
+            stack.enter_context(
+                cache_lease(
+                    db,
+                    workspace,
+                    cache_type,
+                    cache_key,
+                    Path(str(cache_path)),
+                )
+            )
+        yield
+
+
+def _validate_campaign_decoded_source(
+    source: dict[str, Any],
+    source_asset: dict[str, Any],
+    label: str,
+    *,
+    verify_content: bool,
+    cancel_check: Any = None,
+) -> None:
+    """Validate the video backing an Item's leased decode-cache snapshot."""
+
+    if cancel_check is not None and cancel_check():
+        raise FreezeCancelled("Campaign preparation was cancelled")
+    descriptor = source.get("decode_cache")
+    if not isinstance(descriptor, dict):
+        return
+    source_path_value = descriptor.get("source_path")
+    source_digest = str(descriptor.get("source_sha256") or "").lower()
+    if source_path_value is None or not source_digest:
+        raise SourceChanged(f"Campaign {label} decode-cache source signature is unavailable")
+    expected_digest = str(source_asset.get("content_sha256") or "").lower()
+    if expected_digest and source_digest != expected_digest:
+        raise SourceChanged(
+            f"Campaign {label} source content changed after the draft was created; "
+            "create a new Campaign from a fresh preview"
+        )
+
+    source_path = Path(str(source_path_value))
+    try:
+        stat_before = source_path.stat()
+    except OSError as exc:
+        raise SourceChanged(f"Campaign {label} source is no longer available") from exc
+    if (
+        int(stat_before.st_size) != int(descriptor.get("source_size_bytes") or -1)
+        or int(stat_before.st_mtime_ns) != int(descriptor.get("source_mtime_ns") or -1)
+    ):
+        raise SourceChanged(f"Campaign {label} source changed while the package was freezing")
+    if not verify_content:
+        return
+
+    digest = hashlib.sha256()
+    with source_path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+            if cancel_check is not None and cancel_check():
+                raise FreezeCancelled("Campaign preparation was cancelled")
+            digest.update(chunk)
+    current_digest = digest.hexdigest().lower()
+    try:
+        stat_after = source_path.stat()
+    except OSError as exc:
+        raise SourceChanged(f"Campaign {label} source is no longer available") from exc
+    if (
+        int(stat_before.st_size) != int(stat_after.st_size)
+        or int(stat_before.st_mtime_ns) != int(stat_after.st_mtime_ns)
+        or current_digest != source_digest
+    ):
+        raise SourceChanged(f"Campaign {label} source changed while the package was freezing")
+
+
 def _stage_item_campaign_media(
     db: Database,
     workspace: WorkspaceConfig,
@@ -1964,12 +2175,15 @@ def _stage_item_campaign_media(
     item: dict[str, Any],
     video_dir: Path,
     staging: Path,
+    *,
+    cancel_check: Any = None,
+    progress_callback: Any = None,
 ) -> tuple[dict[tuple[int, str], dict[str, Any]], dict[str, Any]]:
     """Materialize one Media Item GT/A/B package from its immutable AlignmentPlan."""
     media_item_id = int(item.get("media_item_id") or 0)
     if media_item_id <= 0:
         raise ValueError("Campaign V2 item-mode row is missing media_item_id")
-    semantic_item, reference_member, reference_asset, _reference_path = resolve_item_reference(
+    semantic_item, reference_member, reference_asset, reference_path = resolve_item_reference(
         db, workspace, media_item_id
     )
     if int(reference_asset["id"]) != int(item["reference_source_asset_id"]):
@@ -1980,12 +2194,13 @@ def _stage_item_campaign_media(
         raise ValueError("Campaign V2 item-mode publishing requires exactly Method A and B")
     members: dict[str, dict[str, Any]] = {}
     source_assets: dict[str, dict[str, Any]] = {}
+    source_paths: dict[str, Path] = {}
     for slot in ("a", "b"):
         binding = by_slot[slot]
         source_member_id = int(binding.get("source_member_id") or 0)
         if source_member_id <= 0:
             raise ValueError(f"Campaign V2 Method {slot.upper()} is missing source_member_id")
-        member_item, member, asset, _path = resolve_item_member(
+        member_item, member, asset, member_path = resolve_item_member(
             db,
             workspace,
             source_member_id,
@@ -1997,6 +2212,7 @@ def _stage_item_campaign_media(
             raise ValueError("Campaign V2 source prediction changed after the draft was created")
         members[slot] = member
         source_assets[slot] = asset
+        source_paths[slot] = member_path
 
     spatial_policy = dict((campaign.get("config") or {}).get("spatial_policy") or {})
     recomputed_plan, reference, decoded_predictions = _campaign_item_alignment(
@@ -2035,7 +2251,6 @@ def _stage_item_campaign_media(
         "pred_a": prediction_frames["a"],
         "pred_b": prediction_frames["b"],
     }
-    aligned = materialize_frame_sets(db, workspace, stored_plan, sources)
     target = stored_plan["target"]
     target_width = int(target["width"])
     target_height = int(target["height"])
@@ -2047,36 +2262,164 @@ def _stage_item_campaign_media(
     media_kind = str(semantic_item.get("media_kind") or "video")
     suffix = ".mp4" if media_kind == "video" else ""
     video_dir.mkdir(parents=True, exist_ok=False)
-    output_paths: dict[str, Path] = {}
-    for slot, role in (("gt", "reference"), ("pred_a", "method-a"), ("pred_b", "method-b")):
-        output_paths[slot] = _write_package_media(
-            workspace,
-            aligned[slot],
-            video_dir / f"{role}{suffix}",
-            media_kind=media_kind,
-            fps=fps,
-            expected_width=target_width,
-            expected_height=target_height,
-        )
-    diff_paths: dict[str, Path] = {}
-    for slot in ("a", "b"):
-        temporary_diff = video_dir / f".diff-{slot}-{uuid.uuid4().hex}-frames"
-        try:
-            diff_frames = _write_difference_sequence(
-                aligned["gt"], aligned[f"pred_{slot}"], temporary_diff
+
+    def legacy_freeze() -> dict[str, Any]:
+        """Compatibility path used only when the streaming backend is unavailable."""
+
+        legacy_started = time.monotonic()
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": "legacy_materializing",
+                    "frame_current": 0,
+                    "frame_total": frame_count,
+                    "pipeline": "legacy_png",
+                    "force": True,
+                }
             )
-            diff_paths[slot] = _write_package_media(
+        aligned = materialize_frame_sets(db, workspace, stored_plan, sources)
+        output_paths: dict[str, Path] = {}
+        for slot, role in (
+            ("gt", "reference"),
+            ("pred_a", "method-a"),
+            ("pred_b", "method-b"),
+        ):
+            output_paths[slot] = _write_package_media(
                 workspace,
-                diff_frames,
-                video_dir / f"diff-{slot}{suffix}",
+                aligned[slot],
+                video_dir / f"{role}{suffix}",
                 media_kind=media_kind,
                 fps=fps,
                 expected_width=target_width,
                 expected_height=target_height,
             )
-        finally:
-            if temporary_diff.exists():
-                shutil.rmtree(temporary_diff)
+        for slot in ("a", "b"):
+            temporary_diff = video_dir / f".diff-{slot}-{uuid.uuid4().hex}-frames"
+            try:
+                diff_frames = _write_difference_sequence(
+                    aligned["gt"], aligned[f"pred_{slot}"], temporary_diff
+                )
+                output_paths[f"diff_{slot}"] = _write_package_media(
+                    workspace,
+                    diff_frames,
+                    video_dir / f"diff-{slot}{suffix}",
+                    media_kind=media_kind,
+                    fps=fps,
+                    expected_width=target_width,
+                    expected_height=target_height,
+                )
+            finally:
+                if temporary_diff.exists():
+                    shutil.rmtree(temporary_diff)
+        artifacts: dict[str, dict[str, Any]] = {}
+        for slot, path in output_paths.items():
+            artifacts[slot] = {
+                "path": path,
+                "sha256": _path_sha256(path),
+                "size_bytes": _path_size(path),
+                "mode": "legacy_png",
+            }
+        return {
+            "pipeline": "legacy_png",
+            "frame_count": frame_count,
+            "width": target_width,
+            "height": target_height,
+            "fps": float(fps or 24.0),
+            "encoder_threads": 0,
+            "artifacts": artifacts,
+            "timings": {"total": time.monotonic() - legacy_started},
+            "remux": {},
+        }
+
+    guarded_sources = {
+        "gt": (reference, reference_asset, "GT"),
+        "pred_a": (decoded_predictions[0], source_assets["a"], "Method A"),
+        "pred_b": (decoded_predictions[1], source_assets["b"], "Method B"),
+    }
+    source_signatures: dict[str, dict[str, Any]] = {}
+    for slot, (guarded_source, _guarded_asset, _guarded_label) in guarded_sources.items():
+        descriptor = guarded_source.get("decode_cache")
+        if not isinstance(descriptor, dict):
+            continue
+        source_signatures[slot] = {
+            "path": descriptor.get("source_path"),
+            "sha256": descriptor.get("source_sha256"),
+            "size_bytes": descriptor.get("source_size_bytes"),
+            "mtime_ns": descriptor.get("source_mtime_ns"),
+        }
+    with _hold_campaign_decode_caches(db, workspace, [reference, *decoded_predictions]):
+        for guarded_source, guarded_asset, guarded_label in guarded_sources.values():
+            _validate_campaign_decoded_source(
+                guarded_source,
+                guarded_asset,
+                guarded_label,
+                verify_content=False,
+                cancel_check=cancel_check,
+            )
+        try:
+            freeze_result = freeze_campaign_media(
+                stored_plan,
+                sources,
+                video_dir,
+                media_kind=media_kind,
+                fps=fps,
+                source_media={
+                    "gt": reference_path,
+                    "pred_a": source_paths["a"],
+                    "pred_b": source_paths["b"],
+                },
+                source_timestamps={
+                    "gt": reference.get("timestamps"),
+                    "pred_a": decoded_predictions[0].get("timestamps"),
+                    "pred_b": decoded_predictions[1].get("timestamps"),
+                },
+                expected_source_sha256={
+                    "gt": reference_asset.get("content_sha256"),
+                    "pred_a": source_assets["a"].get("content_sha256"),
+                    "pred_b": source_assets["b"].get("content_sha256"),
+                },
+                source_signatures=source_signatures,
+                cancel_check=cancel_check,
+                progress_callback=progress_callback,
+            )
+        except FreezeBackendUnavailable:
+            freeze_result = legacy_freeze()
+        frozen_artifacts = dict(freeze_result.get("artifacts") or {})
+        source_validation_started = time.monotonic()
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": "validating_sources",
+                    "frame_current": frame_count,
+                    "frame_total": frame_count,
+                    "pipeline": str(freeze_result.get("pipeline") or "unknown"),
+                    "timings": dict(freeze_result.get("timings") or {}),
+                    "force": True,
+                }
+            )
+        for slot, (guarded_source, guarded_asset, guarded_label) in guarded_sources.items():
+            artifact_mode = str((frozen_artifacts.get(slot) or {}).get("mode") or "")
+            if artifact_mode == "remux":
+                continue
+            _validate_campaign_decoded_source(
+                guarded_source,
+                guarded_asset,
+                guarded_label,
+                verify_content=True,
+                cancel_check=cancel_check,
+            )
+        freeze_result.setdefault("timings", {})["source_stability"] = (
+            time.monotonic() - source_validation_started
+        )
+
+    artifacts = dict(freeze_result["artifacts"])
+    output_paths = {
+        slot: Path(str(artifacts[slot]["path"]))
+        for slot in ("gt", "pred_a", "pred_b")
+    }
+    diff_paths = {
+        slot: Path(str(artifacts[f"diff_{slot}"]["path"])) for slot in ("a", "b")
+    }
 
     evaluation_item_id = int(item["id"])
     normalized_reference = _normalized_asset_snapshot(
@@ -2091,7 +2434,8 @@ def _stage_item_campaign_media(
         (evaluation_item_id, "reference"): {
             "asset": normalized_reference,
             "path": output_paths["gt"],
-            "digest": _path_sha256(output_paths["gt"]),
+            "digest": str(artifacts["gt"]["sha256"]),
+            "size_bytes": int(artifacts["gt"]["size_bytes"]),
             "alignment": stored_plan,
             "source_member": reference_member,
             "media_item_id": media_item_id,
@@ -2113,7 +2457,8 @@ def _stage_item_campaign_media(
         frozen[(evaluation_item_id, slot)] = {
             "asset": normalized_asset,
             "path": path,
-            "digest": _path_sha256(path),
+            "digest": str(artifacts[f"pred_{slot}"]["sha256"]),
+            "size_bytes": int(artifacts[f"pred_{slot}"]["size_bytes"]),
             "alignment": stored_plan,
             "source_member": members[slot],
             "binding_id": int(binding["id"]),
@@ -2125,12 +2470,14 @@ def _stage_item_campaign_media(
                 "slot": slot,
                 "source_member_id": int(members[slot]["id"]),
                 "path": path.relative_to(staging).as_posix(),
-                "sha256": _path_sha256(path),
-                "size_bytes": _path_size(path),
+                "sha256": str(artifacts[f"pred_{slot}"]["sha256"]),
+                "size_bytes": int(artifacts[f"pred_{slot}"]["size_bytes"]),
+                "mode": str(artifacts[f"pred_{slot}"].get("mode") or "stream"),
                 "diff": {
                     "path": diff_path.relative_to(staging).as_posix(),
-                    "sha256": _path_sha256(diff_path),
-                    "size_bytes": _path_size(diff_path),
+                    "sha256": str(artifacts[f"diff_{slot}"]["sha256"]),
+                    "size_bytes": int(artifacts[f"diff_{slot}"]["size_bytes"]),
+                    "mode": str(artifacts[f"diff_{slot}"].get("mode") or "stream"),
                 },
                 "temporal_mapping": dict(members[slot].get("temporal_mapping") or {}),
                 "transform": dict((stored_plan.get("sources") or {}).get(f"pred_{slot}") or {}),
@@ -2152,11 +2499,34 @@ def _stage_item_campaign_media(
         "reference": {
             "source_member_id": int(reference_member["id"]),
             "path": reference_path.relative_to(staging).as_posix(),
-            "sha256": _path_sha256(reference_path),
-            "size_bytes": _path_size(reference_path),
+            "sha256": str(artifacts["gt"]["sha256"]),
+            "size_bytes": int(artifacts["gt"]["size_bytes"]),
+            "mode": str(artifacts["gt"].get("mode") or "stream"),
             "transform": dict((stored_plan.get("sources") or {}).get("gt") or {}),
         },
         "methods": methods_manifest,
+        "freeze_pipeline": {
+            "version": "campaign-freeze-stream-v1",
+            "pipeline": str(freeze_result.get("pipeline") or "unknown"),
+            "encoder_threads": int(freeze_result.get("encoder_threads") or 0),
+            "timings": {
+                str(name): float(value)
+                for name, value in dict(freeze_result.get("timings") or {}).items()
+            },
+            "outputs": {
+                slot: {"mode": str(payload.get("mode") or "unknown")}
+                for slot, payload in artifacts.items()
+            },
+            "remux": {
+                slot: {
+                    "eligible": bool(payload.get("eligible")),
+                    "reasons": [str(reason) for reason in payload.get("reasons") or []],
+                    "fallback_reason": str(payload.get("fallback_reason") or ""),
+                }
+                for slot, payload in dict(freeze_result.get("remux") or {}).items()
+                if isinstance(payload, dict)
+            },
+        },
     }
     return frozen, manifest_item
 
@@ -2242,6 +2612,7 @@ def _register_frozen_asset(
     source_asset: dict[str, Any],
     path: Path,
     digest: str,
+    size_bytes: int | None = None,
     display_name: str,
 ) -> int:
     source_key = f"evaluation_package:{campaign_id}:{item_id}:{slot}"
@@ -2257,7 +2628,7 @@ def _register_frozen_asset(
         path.name,
         "ready",
         digest,
-        _path_size(path),
+        int(size_bytes) if size_bytes is not None else _path_size(path),
         str(path.resolve()),
         str(source_asset.get("mime_type") or "application/octet-stream"),
         int(source_asset.get("frame_count") or 0),
@@ -2456,8 +2827,18 @@ def publish_campaign_v2(
         if cursor.rowcount != 1:
             raise EvaluationConflict("Campaign V2 preparation claim was superseded")
 
+    progress_reporter = _PreparationProgressReporter(
+        db,
+        int(campaign_id),
+        claim_token,
+        item_total,
+    )
+    preparation_started_monotonic = time.monotonic()
+    item_timing_reports: list[dict[str, Any]] = []
+
     manifest: dict[str, Any] = {
         "schema_version": 2,
+        "freeze_pipeline": "campaign-freeze-stream-v1",
         "campaign_id": int(campaign_id),
         "created_at": started,
         "items": [],
@@ -2468,12 +2849,19 @@ def publish_campaign_v2(
             _require_preparation_claim(
                 db, int(campaign_id), claim_token, ownership_lost=ownership_lost
             )
+
+            def check_preparation_cancelled() -> bool:
+                if ownership_lost.is_set():
+                    raise EvaluationConflict("Campaign V2 preparation claim was superseded")
+                return False
+
             staging.mkdir(parents=True, exist_ok=False)
             frozen: dict[tuple[int, str], dict[str, Any]] = {}
             for item_index, item in enumerate(campaign["items"], start=1):
                 _require_preparation_claim(
                     db, int(campaign_id), claim_token, ownership_lost=ownership_lost
                 )
+                progress_reporter.start_item(item_index, str(item["video_name"]))
                 video_dir = staging / f"{int(item['id'])}-{slugify(str(item['video_name']))}"
                 if item.get("media_item_id") is not None:
                     item_frozen, manifest_item = _stage_item_campaign_media(
@@ -2483,6 +2871,8 @@ def publish_campaign_v2(
                         item,
                         video_dir,
                         staging,
+                        cancel_check=check_preparation_cancelled,
+                        progress_callback=progress_reporter.callback,
                     )
                 else:
                     item_frozen, manifest_item = _stage_legacy_campaign_media(
@@ -2495,16 +2885,17 @@ def publish_campaign_v2(
                     )
                 frozen.update(item_frozen)
                 manifest["items"].append(manifest_item)
-                _update_preparation_progress(
-                    db,
-                    int(campaign_id),
-                    claim_token,
-                    {
-                        "phase": "validating_and_freezing",
-                        "current": item_index,
-                        "total": item_total,
-                    },
-                )
+                freeze_report = dict(manifest_item.get("freeze_pipeline") or {})
+                item_timings = dict(freeze_report.get("timings") or {})
+                if item_timings:
+                    item_timing_reports.append(
+                        {
+                            "item_index": item_index,
+                            "video_name": str(item["video_name"]),
+                            **item_timings,
+                        }
+                    )
+                progress_reporter.finish_item(item_timings)
 
             _require_preparation_claim(
                 db, int(campaign_id), claim_token, ownership_lost=ownership_lost
@@ -2575,6 +2966,7 @@ def publish_campaign_v2(
                         source_asset=reference["asset"],
                         path=reference_path,
                         digest=reference["digest"],
+                        size_bytes=reference.get("size_bytes"),
                         display_name=f"{item['video_name']} / GT",
                     )
                     if item_mode:
@@ -2615,6 +3007,7 @@ def publish_campaign_v2(
                             source_asset=payload["asset"],
                             path=frozen_path,
                             digest=payload["digest"],
+                            size_bytes=payload.get("size_bytes"),
                             display_name=f"{item['video_name']} / Method {slot.upper()}",
                         )
                         if item_mode:
@@ -2699,6 +3092,16 @@ def publish_campaign_v2(
                                 "manifest_path": str(final_root / "manifest.json"),
                                 "items": len(manifest["items"]),
                                 "size_bytes": _path_size(final_root),
+                                "stage": "completed",
+                                "overall_fraction": 1.0,
+                                "pipeline": "campaign-freeze-stream-v1",
+                                "timings": {
+                                    "elapsed_seconds": round(
+                                        time.monotonic() - preparation_started_monotonic,
+                                        6,
+                                    ),
+                                    "items": item_timing_reports,
+                                },
                             }
                         ),
                         completed,
