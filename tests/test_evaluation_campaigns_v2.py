@@ -106,7 +106,15 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
         }
         return run_a, run_b, body, (gt_path, pred_a, pred_b)
 
-    def _item_campaign(self, workspace, db):
+    def _item_campaign(
+        self,
+        workspace,
+        db,
+        *,
+        gt_size=(12, 8),
+        pred_a_size=(8, 8),
+        pred_b_size=(16, 8),
+    ):
         collection = ensure_collection(
             db,
             "videos/test4k",
@@ -116,7 +124,7 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
         gt_path = write_mp4(
             workspace.root.parent / "videos" / "test4k" / "clip.mp4",
             [(0, 0, 0), (10, 0, 0), (20, 0, 0), (30, 0, 0), (40, 0, 0)],
-            size=(12, 8),
+            size=gt_size,
             fps=5,
         )
         gt_asset = upsert_asset(
@@ -130,21 +138,21 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             original_name="clip.mp4",
             storage_path=gt_path,
             frame_count=5,
-            width=12,
-            height=8,
+            width=gt_size[0],
+            height=gt_size[1],
             fps=5,
         )
         item = ensure_canonical_gt_item(db, int(gt_asset["id"]))
         pred_a = write_mp4(
             workspace.runs_dir / "item-method-a" / "pred.mp4",
             [(0, 1, 0), (20, 1, 0), (40, 1, 0)],
-            size=(8, 8),
+            size=pred_a_size,
             fps=5,
         )
         pred_b = write_mp4(
             workspace.runs_dir / "item-method-b" / "pred.mp4",
             [(0, 0, 1), (20, 0, 1), (40, 0, 1)],
-            size=(16, 8),
+            size=pred_b_size,
             fps=5,
         )
         mapping = [0, 2, 4]
@@ -154,7 +162,7 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             "item-method-a",
             pred_a,
             video_name="clip",
-            size=(8, 8),
+            size=pred_a_size,
             source_frame_indices=mapping,
         )
         run_b = add_completed_pred_run(
@@ -163,7 +171,7 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             "item-method-b",
             pred_b,
             video_name="clip",
-            size=(16, 8),
+            size=pred_b_size,
             source_frame_indices=mapping,
         )
         for run_id in (run_a, run_b):
@@ -250,25 +258,115 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             for asset in frozen_assets:
                 self.assertTrue(Path(str(asset["storage_path"])).exists())
 
+    def test_item_mode_uses_decoded_dimensions_when_probe_dimensions_are_swapped(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _item, body, _source_paths = self._item_campaign(
+                workspace,
+                db,
+                gt_size=(12, 8),
+                pred_a_size=(10, 6),
+                pred_b_size=(16, 8),
+            )
+            from vfieval.compare_inputs import inspect_compare_path as real_inspect
+
+            def swapped_inspect(workspace_arg, path):
+                observed = real_inspect(workspace_arg, path)
+                observed["width"], observed["height"] = (
+                    int(observed["height"]),
+                    int(observed["width"]),
+                )
+                return observed
+
+            with patch(
+                "vfieval.compare_inputs.inspect_compare_path",
+                side_effect=swapped_inspect,
+            ):
+                preview = preview_campaign_v2(db, workspace, body)
+                row = preview["items"][0]
+                self.assertEqual(
+                    (row["reference"]["width"], row["reference"]["height"]),
+                    (12, 8),
+                )
+                self.assertEqual(
+                    (row["methods"]["a"]["width"], row["methods"]["a"]["height"]),
+                    (10, 6),
+                )
+                self.assertEqual(
+                    (row["methods"]["b"]["width"], row["methods"]["b"]["height"]),
+                    (16, 8),
+                )
+                plan = row["alignment_plan"]
+                self.assertEqual(
+                    plan["sources"]["gt"]["original"],
+                    {"width": 12, "height": 8},
+                )
+                self.assertEqual(
+                    plan["sources"]["pred_a"]["original"],
+                    {"width": 10, "height": 6},
+                )
+                self.assertEqual(
+                    plan["sources"]["pred_b"]["original"],
+                    {"width": 16, "height": 8},
+                )
+                self.assertEqual(
+                    (plan["target"]["width"], plan["target"]["height"]),
+                    (10, 6),
+                )
+
+                draft = create_campaign_v2(db, workspace, body)
+                published = publish_campaign_v2(db, workspace, int(draft["id"]))
+
+            self.assertEqual(published["status"], "published")
+            self.assertEqual(published["tasks"], 1)
+            frozen_assets = db.query(
+                "SELECT width, height, storage_path FROM media_assets "
+                "WHERE source_kind = 'evaluation_package' ORDER BY id"
+            )
+            self.assertEqual(len(frozen_assets), 3)
+            self.assertTrue(
+                all(
+                    (int(asset["width"]), int(asset["height"])) == (10, 6)
+                    for asset in frozen_assets
+                )
+            )
+            for asset in frozen_assets:
+                observed = real_inspect(workspace, Path(str(asset["storage_path"])))
+                self.assertEqual((int(observed["width"]), int(observed["height"])), (10, 6))
+            manifest = json.loads(
+                (workspace.evaluations_dir / str(draft["id"]) / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["items"][0]["alignment_fingerprint"], plan["fingerprint"])
+
     def test_item_mode_publish_revalidates_strict_frame_mapping_atomically(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace, db = make_workspace(tmp)
             _item, body, _source_paths = self._item_campaign(workspace, db)
             draft = create_campaign_v2(db, workspace, body)
-            binding = db.get(
+            bindings = db.query(
                 """
                 SELECT source_member_id FROM evaluation_bindings_v2 b
                 JOIN evaluation_methods_v2 m ON m.id = b.method_id
-                WHERE m.campaign_id = ? AND m.slot = 'b'
+                WHERE m.campaign_id = ? ORDER BY m.slot
                 """,
                 (int(draft["id"]),),
             )
             with db.connection() as conn:
-                conn.execute(
+                conn.executemany(
                     "UPDATE media_item_members SET temporal_mapping_json = ? WHERE id = ?",
-                    (json.dumps({"source_frame_indices": [0, 1, 2]}), int(binding["source_member_id"])),
+                    [
+                        (
+                            json.dumps({"source_frame_indices": [0, 1, 2]}),
+                            int(binding["source_member_id"]),
+                        )
+                        for binding in bindings
+                    ],
                 )
-            with self.assertRaisesRegex(ValueError, "source_frame_indices|AlignmentPlan"):
+            with self.assertRaisesRegex(ValueError, "new Campaign from a fresh preview"):
                 publish_campaign_v2(db, workspace, int(draft["id"]))
             self.assertEqual(get_campaign_v2(db, int(draft["id"]))["status"], "failed")
             self.assertEqual(

@@ -131,6 +131,25 @@ class AlignmentPlanTests(unittest.TestCase):
             )
             self.assertEqual(sets["pred_a"], [pred_path.resolve()])
 
+    def test_materializer_still_rejects_a_real_source_dimension_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            source_path = Path(tmp) / "changed.png"
+            Image.new("RGB", (6, 8), (255, 0, 0)).save(source_path)
+            plan = plan_alignment(
+                _source(8, 6, frames=1, slot="gt"),
+                [_source(4, 3, frames=1, slot="pred_a")],
+            )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                r"alignment source gt dimensions changed: expected 8x6, got 6x8",
+            ):
+                materialize_aligned_frame(db, workspace, plan, "gt", source_path)
+
     def test_compare_video_writer_can_omit_reusable_pred_video(self) -> None:
         class RecordingDatabase:
             def __init__(self) -> None:

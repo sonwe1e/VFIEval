@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -21,7 +22,7 @@ from vfieval.pipeline.postprocess import compose_interpolated, validate_model_ou
 VIDEO_SUFFIXES = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 CHECKPOINT_SUFFIXES = {".bin", ".ckpt", ".pth", ".pt", ".safetensors"}
 DECODE_STRATEGY_VERSION = "opencv-rgb-v1"
-VIDEO_INSPECT_VERSION = "ffprobe-opencv-v3"
+VIDEO_INSPECT_VERSION = "ffprobe-opencv-v4"
 _DRY_RUN_CACHE: dict[str, dict[str, Any]] = {}
 DRY_RUN_INPUT_SHAPE = (1, 3, 128, 128)
 
@@ -351,7 +352,7 @@ def _preflight_media_item_compare(
     """Preflight an Item-bound Compare with strict time and explicit resize."""
     from vfieval.alignment import plan_alignment, validate_temporal_alignment
     from vfieval.compare_inputs import resolve_compare_descriptor
-    from vfieval.datasets import _load_compare_source_frames
+    from vfieval.datasets import _frame_size, _load_compare_source_frames
 
     health = metrics_health(workspace)
     selected_metrics = [str(name) for name in (payload.get("metrics") or [])]
@@ -402,12 +403,15 @@ def _preflight_media_item_compare(
             Path(str(reference["path"])),
             "compare_item_reference",
         )
+        reference_width, reference_height = _frame_size(reference_frames[0])
         reference.update(
             {
                 "slot": "gt",
                 "frame_count": len(reference_frames),
                 "fps": reference_fps if reference_fps is not None else reference.get("fps"),
                 "timestamps": reference_timestamps,
+                "width": reference_width,
+                "height": reference_height,
             }
         )
         decoded_predictions: list[dict[str, Any]] = []
@@ -418,6 +422,7 @@ def _preflight_media_item_compare(
                 Path(str(prediction["path"])),
                 f"compare_item_pred_{index}",
             )
+            decoded_width, decoded_height = _frame_size(frames[0])
             temporal_mapping = prediction.get("temporal_mapping") or {}
             mapping = prediction.get("source_frame_indices")
             if (mapping is None or mapping == "") and isinstance(temporal_mapping, dict):
@@ -441,6 +446,8 @@ def _preflight_media_item_compare(
                     ),
                     "frame_count": len(frames),
                     "fps": fps if fps is not None else prediction.get("fps"),
+                    "width": decoded_width,
+                    "height": decoded_height,
                     # A re-encoded Pred video normally starts at PTS=0 even
                     # when it represents nonzero source indices.  In indexed
                     # mode only preserved source timestamps are meaningful;
@@ -1005,7 +1012,10 @@ def _inspect_video_ffprobe(path: Path) -> dict[str, Any] | None:
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "stream=width,height,codec_name,pix_fmt,avg_frame_rate,r_frame_rate,nb_frames,duration:format=duration",
+                (
+                    "stream=width,height,codec_name,pix_fmt,avg_frame_rate,r_frame_rate,nb_frames,duration:"
+                    "stream_tags=rotate:stream_side_data=side_data_type,displaymatrix,rotation:format=duration"
+                ),
                 "-of",
                 "json",
                 str(path),
@@ -1030,6 +1040,12 @@ def _inspect_video_ffprobe(path: Path) -> dict[str, Any] | None:
     nb_frames = _optional_positive_int(stream.get("nb_frames"))
     frame_count = nb_frames or (round(duration * fps) if duration > 0 and fps > 0 else 0)
     source = "ffprobe_nb_frames" if nb_frames else "ffprobe_duration"
+    coded_width = int(stream.get("width") or 0)
+    coded_height = int(stream.get("height") or 0)
+    rotation_degrees = _stream_rotation_degrees(stream)
+    width, height = coded_width, coded_height
+    if _rotation_swaps_dimensions(rotation_degrees):
+        width, height = coded_height, coded_width
     return {
         "frame_count": int(frame_count),
         "container_frame_count": int(frame_count),
@@ -1037,12 +1053,53 @@ def _inspect_video_ffprobe(path: Path) -> dict[str, Any] | None:
         "frame_count_warning": None if nb_frames else "ffprobe 未提供 nb_frames，已按 duration * fps 估算",
         "duration_seconds": float(duration),
         "fps": float(fps),
-        "width": int(stream.get("width") or 0),
-        "height": int(stream.get("height") or 0),
+        "width": width,
+        "height": height,
+        "coded_width": coded_width,
+        "coded_height": coded_height,
+        "rotation_degrees": rotation_degrees,
         "codec": stream.get("codec_name"),
         "pix_fmt": stream.get("pix_fmt"),
         "metadata_source": "ffprobe",
     }
+
+
+def _stream_rotation_degrees(stream: dict[str, Any]) -> float:
+    side_data_list = stream.get("side_data_list") or []
+    if isinstance(side_data_list, list):
+        display_matrices = [
+            item
+            for item in side_data_list
+            if isinstance(item, dict)
+            and "display matrix" in str(item.get("side_data_type") or "").lower()
+        ]
+        for item in [*display_matrices, *side_data_list]:
+            if not isinstance(item, dict):
+                continue
+            parsed = _rotation_number(item.get("rotation"))
+            if parsed is not None:
+                return parsed
+    tags = stream.get("tags") or {}
+    if isinstance(tags, dict):
+        parsed = _rotation_number(tags.get("rotate"))
+        if parsed is not None:
+            return parsed
+    return 0.0
+
+
+def _rotation_number(value: Any) -> float | None:
+    if value in {None, ""}:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
+
+
+def _rotation_swaps_dimensions(rotation_degrees: float) -> bool:
+    normalized = float(rotation_degrees) % 360.0
+    return abs(normalized - 90.0) <= 0.5 or abs(normalized - 270.0) <= 0.5
 
 
 def decode_cache_key(video_path: Path, decode_mode: str, frame_step: int, max_frames: int | None) -> str:

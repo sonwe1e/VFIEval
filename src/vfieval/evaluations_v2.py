@@ -809,6 +809,13 @@ def _campaign_item_alignment(
             return None
         return [float(value) for value in values if value is not None]
 
+    def decoded_dimensions(frame_paths: list[Path], label: str) -> tuple[int, int]:
+        if not frame_paths:
+            raise ValueError(f"Campaign V2 {label} has no decoded frames")
+        with Image.open(frame_paths[0]) as image:
+            width, height = image.size
+        return int(width), int(height)
+
     reference = resolve_compare_descriptor(
         workspace,
         db,
@@ -830,10 +837,13 @@ def _campaign_item_alignment(
         Path(str(reference["path"])),
         f"campaign_item_{item_id}_gt",
     )
+    reference_width, reference_height = decoded_dimensions(reference_frames, "GT")
     reference.update(
         {
             "slot": "gt",
             "frame_count": len(reference_frames),
+            "width": reference_width,
+            "height": reference_height,
             "fps": reference_fps if reference_fps is not None else reference.get("fps"),
             "timestamps": available_timestamps(reference_timestamps),
             "frame_paths": reference_frames,
@@ -846,6 +856,10 @@ def _campaign_item_alignment(
             workspace,
             Path(str(prediction["path"])),
             f"campaign_item_{item_id}_pred_{index}",
+        )
+        decoded_width, decoded_height = decoded_dimensions(
+            _frames,
+            f"Pred {chr(ord('A') + index)}",
         )
         temporal_mapping = prediction.get("temporal_mapping") or {}
         mapping = prediction.get("source_frame_indices")
@@ -861,6 +875,8 @@ def _campaign_item_alignment(
             {
                 "slot": f"pred_{chr(ord('a') + index)}",
                 "frame_count": len(_frames),
+                "width": decoded_width,
+                "height": decoded_height,
                 "fps": fps if fps is not None else prediction.get("fps"),
                 "timestamps": (
                     preserved_timestamps
@@ -934,6 +950,8 @@ def _preview_item_campaign_v2(
         method_payload: dict[str, Any] = {}
         for method, prediction in zip(methods, selected_predictions):
             slot = str(method["slot"])
+            alignment = (plan.get("sources") or {}).get(f"pred_{slot}") or {}
+            original = alignment.get("original") or {}
             method_payload[slot] = {
                 "label": str(
                     method.get("label")
@@ -945,11 +963,13 @@ def _preview_item_campaign_v2(
                 "asset_id": int(prediction["asset_id"]) if prediction else None,
                 "run_id": prediction.get("producer_run_id") if prediction else method.get("run_id"),
                 "frame_count": int((prediction or {}).get("frame_count") or 0),
-                "width": int((prediction or {}).get("width") or 0),
-                "height": int((prediction or {}).get("height") or 0),
+                "width": int(original.get("width") or (prediction or {}).get("width") or 0),
+                "height": int(original.get("height") or (prediction or {}).get("height") or 0),
                 "fps": (prediction or {}).get("fps"),
-                "alignment": (plan.get("sources") or {}).get(f"pred_{slot}") or {},
+                "alignment": alignment,
             }
+        reference_alignment = (plan.get("sources") or {}).get("gt") or {}
+        reference_original = reference_alignment.get("original") or {}
         row = {
             "media_item_id": item_id,
             "item_id": item_id,
@@ -965,11 +985,11 @@ def _preview_item_campaign_v2(
                 "asset_id": int(item["canonical_gt_asset_id"]),
                 "display_name": str(item["display_name"]),
                 "frame_count": int(item.get("frame_count") or 0),
-                "width": int(item.get("width") or 0),
-                "height": int(item.get("height") or 0),
+                "width": int(reference_original.get("width") or item.get("width") or 0),
+                "height": int(reference_original.get("height") or item.get("height") or 0),
                 "fps": item.get("fps"),
                 "media_kind": str(item.get("media_kind") or "video"),
-                "alignment": (plan.get("sources") or {}).get("gt") or {},
+                "alignment": reference_alignment,
             },
             "methods": method_payload,
             "alignment_plan": plan,
@@ -1990,7 +2010,10 @@ def _stage_item_campaign_media(
     if not stored_plan.get("fingerprint"):
         raise ValueError("Campaign V2 item-mode draft has no AlignmentPlan fingerprint")
     if str(recomputed_plan["fingerprint"]) != str(stored_plan["fingerprint"]):
-        raise ValueError("Campaign V2 AlignmentPlan changed after the draft was created")
+        raise ValueError(
+            "Campaign V2 AlignmentPlan changed after the draft was created; "
+            "create a new Campaign from a fresh preview"
+        )
     for slot in ("a", "b"):
         binding_plan = dict(by_slot[slot].get("alignment") or {})
         if str(binding_plan.get("fingerprint") or "") != str(stored_plan["fingerprint"]):

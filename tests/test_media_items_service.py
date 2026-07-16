@@ -52,7 +52,16 @@ def _post_error(base_url: str, path: str, payload: dict) -> tuple[int, dict]:
 
 
 class MediaItemServiceTests(unittest.TestCase):
-    def _canonical_gt(self, db, workspace, collection_name: str, source_key: str, file_name: str):
+    def _canonical_gt(
+        self,
+        db,
+        workspace,
+        collection_name: str,
+        source_key: str,
+        file_name: str,
+        *,
+        size: tuple[int, int] = (8, 8),
+    ):
         collection = ensure_collection(
             db,
             f"videos/{collection_name}",
@@ -61,7 +70,7 @@ class MediaItemServiceTests(unittest.TestCase):
         )
         path = workspace.root.parent / "videos" / collection_name / file_name
         path.parent.mkdir(parents=True, exist_ok=True)
-        write_mp4(path, [(0, 0, 0), (20, 0, 0), (40, 0, 0)], size=(8, 8), fps=5)
+        write_mp4(path, [(0, 0, 0), (20, 0, 0), (40, 0, 0)], size=size, fps=5)
         asset = upsert_asset(
             db,
             collection_id=collection["id"],
@@ -73,8 +82,8 @@ class MediaItemServiceTests(unittest.TestCase):
             original_name=file_name,
             storage_path=path,
             frame_count=3,
-            width=8,
-            height=8,
+            width=size[0],
+            height=size[1],
             fps=5,
         )
         return collection, asset, ensure_canonical_gt_item(db, asset["id"])
@@ -180,9 +189,22 @@ class MediaItemServiceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "same media item"):
                 resolve_media_item_compare(db, workspace, other_item["id"], [member["id"]])
 
-    def _item_with_model_prediction(self, db, workspace, *, group: str, pred_size: tuple[int, int]):
+    def _item_with_model_prediction(
+        self,
+        db,
+        workspace,
+        *,
+        group: str,
+        pred_size: tuple[int, int],
+        gt_size: tuple[int, int] = (8, 8),
+    ):
         collection, _gt, item = self._canonical_gt(
-            db, workspace, group, f"folder:{group}/clip.mp4", "clip.mp4"
+            db,
+            workspace,
+            group,
+            f"folder:{group}/clip.mp4",
+            "clip.mp4",
+            size=gt_size,
         )
         run_collection = ensure_collection(
             db,
@@ -515,6 +537,66 @@ class MediaItemServiceTests(unittest.TestCase):
                 )
                 self.assertEqual(status, 400)
                 self.assertIn("same media item", error["error"]["message"])
+            finally:
+                stop_server(server, thread)
+
+    def test_item_compare_plan_uses_decoded_dimensions_when_probe_is_stale(self) -> None:
+        """Alignment geometry follows decoded frames, not stale/coded probe dimensions."""
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _collection, item, member, _run_id, _pred_path = self._item_with_model_prediction(
+                db,
+                workspace,
+                group="rotated-geometry",
+                gt_size=(12, 8),
+                pred_size=(8, 6),
+            )
+            compare_payload = {
+                "run_type": "video_compare",
+                "media_item_id": item["id"],
+                "pred_member_ids": [member["id"]],
+                "spatial_policy": {
+                    "mode": "smallest_pred",
+                    "filter": "lanczos",
+                    "allow_known_aspect_stretch": True,
+                },
+                "metrics": [],
+            }
+
+            from vfieval import compare_inputs
+
+            inspect_compare_path = compare_inputs.inspect_compare_path
+
+            def stale_probe(*args, **kwargs):
+                info = inspect_compare_path(*args, **kwargs)
+                info["width"], info["height"] = info["height"], info["width"]
+                return info
+
+            server, thread, base_url = start_server(db, workspace)
+            try:
+                with patch(
+                    "vfieval.compare_inputs.inspect_compare_path",
+                    side_effect=stale_probe,
+                ):
+                    preflight = post_json(base_url, "/api/preflight", compare_payload)
+                    self.assertTrue(preflight["ok"], preflight)
+                    plan = preflight["alignment_plan"]
+                    self.assertEqual(plan["sources"]["gt"]["original"], {"width": 12, "height": 8})
+                    self.assertEqual(
+                        plan["sources"]["pred_a"]["original"],
+                        {"width": 8, "height": 6},
+                    )
+                    self.assertEqual(
+                        plan["target"],
+                        {"width": 8, "height": 6, "source_slot": "pred_a"},
+                    )
+                    with patch("vfieval.server._start_local_inference_worker", return_value=None):
+                        created = post_json(base_url, "/api/runs", compare_payload)
+
+                compare_run = db.get_run(int(created["run_id"]))
+                samples = db.list_samples(int(compare_run["dataset_id"]))
+                self.assertEqual(len(samples), 3)
+                self.assertTrue(all(sample["metadata"]["alignment_fingerprint"] for sample in samples))
             finally:
                 stop_server(server, thread)
 
