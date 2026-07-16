@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -9,10 +10,10 @@ import subprocess
 import threading
 import time
 from collections import OrderedDict, defaultdict
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 import torch
@@ -22,6 +23,14 @@ from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
 from vfieval.devices import autocast_context, resolve_torch_device, tune_for_inference
 from vfieval.models import load_flow_mask_model
+from vfieval.pipeline.artifact_integrity import (
+    ArtifactIntegrityError,
+    merge_integrity_reports,
+    require_job_artifact_integrity,
+    validate_job_artifact_integrity,
+    validate_video_artifact_integrity,
+    write_integrity_report,
+)
 from vfieval.pipeline.io import batch_tensors, load_rgb_tensor, resize_batch
 from vfieval.pipeline.postprocess import (
     compose_interpolated,
@@ -34,16 +43,35 @@ VALID_PRECISIONS = {"fp32", "fp16", "bf16"}
 ARTIFACT_PROFILES = {"evaluation", "diagnostic", "benchmark"}
 DEFAULT_VISUALIZE_HEIGHT = 832
 DEFAULT_VISUALIZE_WIDTH = 1792
-# Above this max edge a downscaled preview thumbnail is worth its extra encode;
-# at or below it the saved artifact is already small enough to display directly,
-# so skipping the preview removes redundant save-pool work on long videos.
-PREVIEW_SKIP_MAX_EDGE = 1024
+ARTIFACT_CONTRACT = "canonical-v1"
+POSTPROCESS_MAX_PIXELS = 8_388_608
 CORE_OUTPUTS = {"flowt_0", "flowt_1", "mask0", "mask1"}
-BUNDLE_KEYS = ("pred", "warp0", "warp1", "blend", "mask0", "mask1", "flowt_0", "flowt_1")
 
 
 class RunCanceled(RuntimeError):
     pass
+
+
+class CoreArtifactSaveError(RuntimeError):
+    """A required per-sample artifact could not be written or registered."""
+
+    def __init__(self, sample_id: int, sample_name: str, cause: BaseException):
+        self.sample_id = int(sample_id)
+        self.sample_name = str(sample_name)
+        self.cause = cause
+        super().__init__(f"failed to publish core artifacts for sample {sample_name} ({sample_id}): {cause}")
+
+
+class ArtifactSaveAggregateError(RuntimeError):
+    """All bounded async save work drained, with one or more failures."""
+
+    def __init__(self, failures: list[BaseException]):
+        self.failures = tuple(failures)
+        first = failures[0]
+        super().__init__(
+            f"{len(failures)} artifact save operation(s) failed; first error: "
+            f"{type(first).__name__}: {first}"
+        )
 
 
 @dataclass(frozen=True)
@@ -59,6 +87,7 @@ class InferenceJobResult:
     prefetch_wait_seconds: float = 0.0
     save_backlog_seconds: float = 0.0
     performance: dict[str, Any] | None = None
+    artifact_integrity: dict[str, Any] | None = None
 
 
 class _DeviceEventTimings:
@@ -333,6 +362,39 @@ def sanitize_name(name: str) -> str:
     return clean or "sample"
 
 
+def _unique_sanitized_tokens(entries: list[tuple[str, str]]) -> dict[str, str]:
+    """Return stable path components without changing non-colliding names."""
+
+    normalized = [(str(identity), sanitize_name(str(label))) for identity, label in entries]
+    counts = defaultdict(int)
+    for _identity, base in normalized:
+        counts[base] += 1
+
+    resolved = {
+        identity: base
+        for identity, base in normalized
+        if counts[base] == 1
+    }
+    used = set(resolved.values())
+    for identity, base in sorted(normalized, key=lambda item: (item[1], item[0])):
+        if counts[base] == 1:
+            continue
+        digest = hashlib.sha256(f"{identity}\0{base}".encode("utf-8")).hexdigest()
+        digest_length = 12
+        candidate = f"{base}__{digest[:digest_length]}"
+        while candidate in used and digest_length < len(digest):
+            digest_length += 4
+            candidate = f"{base}__{digest[:digest_length]}"
+        suffix = 2
+        unique_candidate = candidate
+        while unique_candidate in used:
+            unique_candidate = f"{candidate}_{suffix}"
+            suffix += 1
+        resolved[identity] = unique_candidate
+        used.add(unique_candidate)
+    return resolved
+
+
 def resolve_device(device_name: str) -> torch.device:
     return resolve_torch_device(device_name)
 
@@ -411,13 +473,19 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
     run_dir.mkdir(parents=True, exist_ok=True)
     _write_run_metadata(run_dir, job, model_row, db.get_dataset(dataset_id) if dataset_id else None)
 
-    db.update_job_progress(job_id, 0, len(samples))
+    _require_progress_cas(db, run_id, job_id, db.update_job_progress(job_id, 0, len(samples)), "Job")
     if run_id is not None:
-        db.mark_run_started(run_id, "running")
+        if not db.mark_run_started(run_id, "running"):
+            _raise_if_canceled(db, run_id, job_id)
+            raise RuntimeError(f"run {run_id} rejected inference start from status {db.get_run(run_id)['status']}")
         if is_shard:
-            db.update_run_progress_from_jobs(run_id, "running")
+            _require_progress_cas(
+                db, run_id, job_id, db.update_run_progress_from_jobs(run_id), "Run"
+            )
         else:
-            db.update_run_progress(run_id, 0, len(samples), "running")
+            _require_progress_cas(
+                db, run_id, job_id, db.update_run_progress(run_id, 0, len(samples)), "Run"
+            )
     model = load_flow_mask_model(
         adapter=model_row["adapter"],
         checkpoint_path=model_row.get("checkpoint_path"),
@@ -456,6 +524,8 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
         save_workers=save_workers,
         max_inflight=max_save_inflight,
         artifact_batch_size=int(payload.get("artifact_db_batch_size") or 128),
+        preview_height=visualize_height,
+        preview_width=visualize_width,
     )
 
     timing = {"decode": 0.0, "model": 0.0, "post": 0.0, "save": 0.0}
@@ -463,6 +533,7 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
     direct_processed = 0
     steady_start = time.perf_counter()
     benchmark_warmed = False
+    postprocess_chunk_size = _postprocess_chunk_size(batch_size, height, width)
 
     try:
         for batch_rows, img0_cpu, img1_cpu, gt_cpu_list, prefetch_wait in _iter_prefetched_batches(
@@ -474,6 +545,7 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
             workers=prefetch_workers,
         ):
             _raise_if_canceled(db, run_id, job_id)
+            pipeline.raise_if_failed()
             timing["decode"] += prefetch_wait
 
             t1 = time.perf_counter()
@@ -485,9 +557,13 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
                 with torch.no_grad(), _autocast_context(device, precision):
                     for _ in range(warmup_batches):
                         warm_outputs = model.predict(img0, img1, 0.5)
-                        warm_img0 = _resize_to_device(img0, visualize_height, visualize_width)
-                        warm_img1 = _resize_to_device(img1, visualize_height, visualize_width)
-                        compose_interpolated(warm_img0, warm_img1, warm_outputs)
+                        for _start, _end, _chunk_outputs, warm_composed in _compose_canonical_chunks(
+                            img0,
+                            img1,
+                            warm_outputs,
+                            initial_chunk_size=postprocess_chunk_size,
+                        ):
+                            del warm_composed
                 module = _device_module(device)
                 if module is not None:
                     try:
@@ -507,91 +583,141 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
 
             t2 = time.perf_counter()
             post_event = device_events.start()
-            # Compose pred at the visualization resolution: downscale the (near
-            # full-res) source frames to viz size, upsample the model's low-res
-            # flow/mask to match, then warp. Warping sharp sources keeps pred
-            # crisp (warping the model's native 208x448 pixels would blur it),
-            # while composing at viz res instead of full inference res keeps the
-            # on-device work and the PNG payload small.
-            img0_viz = _resize_to_device(img0, visualize_height, visualize_width)
-            img1_viz = _resize_to_device(img1, visualize_height, visualize_width)
-            composed_viz = compose_interpolated(img0_viz, img1_viz, outputs)
-            device_events.stop("postprocess", post_event)
             if artifact_profile == "benchmark":
+                for _start, _end, _chunk_outputs, composed in _compose_canonical_chunks(
+                    img0,
+                    img1,
+                    outputs,
+                    initial_chunk_size=postprocess_chunk_size,
+                ):
+                    del composed
+                device_events.stop("postprocess", post_event)
                 direct_processed += len(batch_rows)
                 timing["post"] += time.perf_counter() - t2
-                db.update_job_progress(job_id, direct_processed)
+                _require_progress_cas(
+                    db, run_id, job_id, db.update_job_progress(job_id, direct_processed), "Job"
+                )
                 if run_id is not None:
                     if is_shard:
-                        db.update_run_progress_from_jobs(run_id, "running")
+                        _require_progress_cas(
+                            db, run_id, job_id, db.update_run_progress_from_jobs(run_id), "Run"
+                        )
                     else:
-                        db.update_run_progress(run_id, direct_processed)
+                        _require_progress_cas(
+                            db, run_id, job_id, db.update_run_progress(run_id, direct_processed), "Run"
+                        )
                 continue
-            # pred is the evaluation artifact and is always saved at viz res.
-            # flow/mask are stored at the model's *native* output resolution —
-            # they are upsampled anyway before warping, so persisting the small
-            # native tensors and letting the UI upscale for display saves disk
-            # proportional to (viz / native) squared. warp/blend are diagnostic
-            # only and are materialized to CPU (and saved) solely on request.
-            device_bundle: dict[str, torch.Tensor] = {
-                "pred": composed_viz["pred"],
-                "mask0": torch.sigmoid(outputs["mask0"]),
-                "mask1": torch.sigmoid(outputs["mask1"]),
-                "flowt_0": outputs["flowt_0"],
-                "flowt_1": outputs["flowt_1"],
-            }
-            if save_warp_blend:
-                device_bundle.update({name: composed_viz[name] for name in ("warp0", "warp1", "blend")})
-            device_extra: dict[str, torch.Tensor] = {}
-            if artifact_profile == "diagnostic":
-                for name, tensor in outputs.items():
-                    if name in CORE_OUTPUTS or not isinstance(tensor, torch.Tensor):
-                        continue
-                    device_extra[name] = tensor
-            transferred = _detach_tensors_to_cpu({**device_bundle, **{f"extra::{name}": tensor for name, tensor in device_extra.items()}})
-            health_bundle = {name: transferred[name] for name in ("pred", "mask0", "mask1", "flowt_0", "flowt_1")}
-            output_health.update(health_bundle)
-            bundle_cpu = {"pred": transferred["pred"]}
-            if artifact_profile == "diagnostic":
-                bundle_cpu.update({name: transferred[name] for name in ("mask0", "mask1", "flowt_0", "flowt_1")})
-            if save_warp_blend:
-                bundle_cpu.update({name: transferred[name] for name in ("warp0", "warp1", "blend")})
-            extra_cpu = {name: transferred[f"extra::{name}"] for name in device_extra}
-            timing["post"] += time.perf_counter() - t2
+            # Pred/warp/blend are canonical output-resolution artifacts.
+            # Native flow/mask stay compact; visualize_* only controls previews.
+            for start, end, chunk_outputs, composed in _compose_canonical_chunks(
+                img0,
+                img1,
+                outputs,
+                initial_chunk_size=postprocess_chunk_size,
+            ):
+                pipeline.raise_if_failed()
+                device_bundle: dict[str, torch.Tensor] = {
+                    "pred": composed["pred"],
+                    "mask0": torch.sigmoid(chunk_outputs["mask0"]),
+                    "mask1": torch.sigmoid(chunk_outputs["mask1"]),
+                    "flowt_0": chunk_outputs["flowt_0"],
+                    "flowt_1": chunk_outputs["flowt_1"],
+                }
+                if save_warp_blend:
+                    device_bundle.update({name: composed[name] for name in ("warp0", "warp1", "blend")})
+                device_extra: dict[str, torch.Tensor] = {}
+                if artifact_profile == "diagnostic":
+                    for name, tensor in chunk_outputs.items():
+                        if name in CORE_OUTPUTS or not isinstance(tensor, torch.Tensor):
+                            continue
+                        if tensor.ndim > 0 and int(tensor.shape[0]) == end - start:
+                            device_extra[name] = tensor
+                transferred = _detach_tensors_to_cpu(
+                    {**device_bundle, **{f"extra::{name}": tensor for name, tensor in device_extra.items()}}
+                )
+                health_bundle = {
+                    name: transferred[name]
+                    for name in ("pred", "mask0", "mask1", "flowt_0", "flowt_1")
+                }
+                output_health.update(health_bundle)
+                bundle_cpu = {"pred": transferred["pred"]}
+                if artifact_profile == "diagnostic":
+                    bundle_cpu.update(
+                        {name: transferred[name] for name in ("mask0", "mask1", "flowt_0", "flowt_1")}
+                    )
+                if save_warp_blend:
+                    bundle_cpu.update({name: transferred[name] for name in ("warp0", "warp1", "blend")})
+                extra_cpu = {name: transferred[f"extra::{name}"] for name in device_extra}
 
-            t3 = time.perf_counter()
-            pipeline.submit_batch(
-                batch_rows=batch_rows,
-                bundle_cpu=bundle_cpu,
-                extra_cpu=extra_cpu,
-                gt_cpu_list=gt_cpu_list,
-            )
-            timing["save"] += time.perf_counter() - t3
+                t3 = time.perf_counter()
+                pipeline.submit_batch(
+                    batch_rows=batch_rows[start:end],
+                    bundle_cpu=bundle_cpu,
+                    extra_cpu=extra_cpu,
+                    gt_cpu_list=gt_cpu_list[start:end],
+                )
+                timing["save"] += time.perf_counter() - t3
+                del composed, transferred
+            device_events.stop("postprocess", post_event)
+            timing["post"] += time.perf_counter() - t2
 
         backlog_start = time.perf_counter()
         pipeline.wait_for_all()
         save_backlog_seconds = time.perf_counter() - backlog_start
-    except BaseException:
         pipeline.shutdown()
+    except BaseException as exc:
+        pipeline.shutdown(suppress_errors=True)
         npu_smi.stop()
+        try:
+            _log_failed_job_integrity(
+                db,
+                run_dir,
+                job_id,
+                [int(sample["id"]) for sample in samples],
+                exc,
+                phase="core_artifact_pipeline",
+            )
+        except Exception:
+            pass
         raise
-
     processed = pipeline.processed_count + direct_processed
     video_groups = pipeline.video_groups
-    pipeline.shutdown()
     npu_smi.stop()
+
+    expected_sample_ids = [int(sample["id"]) for sample in samples]
+    integrity_report = _require_and_log_job_integrity(db, run_dir, job_id, expected_sample_ids)
 
     if video_groups:
         if is_shard and bool(payload.get("defer_video_finalize")):
-            _write_shard_video_manifest(run_dir, job_id, video_groups)
+            _write_shard_video_manifest(
+                run_dir,
+                run_id,
+                job_id,
+                video_groups,
+                expected_sample_ids=expected_sample_ids,
+                successful_sample_ids=[int(value) for value in integrity_report["successful_sample_ids"]],
+                core_artifact_counts=dict(integrity_report["core_artifact_counts"]),
+            )
         else:
-            _write_video_artifacts(db, job_id, run_dir, video_groups)
+            _raise_if_canceled(db, run_id, job_id)
+            integrity_report = _encode_and_validate_video_artifacts(
+                db,
+                job_id,
+                run_dir,
+                video_groups,
+                integrity_report,
+                expected_sample_ids=expected_sample_ids,
+                preview_height=visualize_height,
+                preview_width=visualize_width,
+            )
+            _raise_if_canceled(db, run_id, job_id)
 
     device_timing = device_events.result()
     steady_seconds = time.perf_counter() - steady_start
     total_wall_seconds = time.perf_counter() - total_wall_start
     performance = {
         "artifact_profile": artifact_profile,
+        "artifact_contract": ARTIFACT_CONTRACT,
         "startup_seconds": startup_seconds,
         "steady_state_seconds": steady_seconds,
         "total_wall_seconds": total_wall_seconds,
@@ -609,6 +735,7 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
         "batch_size": batch_size,
         "prefetch_workers": prefetch_workers,
         "save_workers": save_workers,
+        "postprocess_chunk_size": postprocess_chunk_size,
     }
 
     output_health_report = None if artifact_profile == "benchmark" else output_health.to_dict()
@@ -627,6 +754,7 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
         prefetch_wait_seconds=timing["decode"],
         save_backlog_seconds=save_backlog_seconds,
         performance=performance,
+        artifact_integrity=integrity_report,
     )
 
     result_dict = dict(result.__dict__)
@@ -637,29 +765,57 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
     if is_shard:
         return result
 
-    if metric_names:
-        metric_payload = {
-            "inference_job_id": job_id,
-            "dataset_id": dataset_id,
-            "metric_names": metric_names,
-            "metric_device": str(device),
-        }
-        if run_id is not None:
-            metric_payload["run_id"] = run_id
-            metric_batch_size = (
-                (((run or {}).get("metadata") or {}).get("request") or {}).get("metric_batch_size_per_device")
-            )
-            if metric_batch_size:
-                metric_payload["metric_batch_size_per_device"] = int(metric_batch_size)
-        metric_job_id = db.create_job(
-            "metric",
-            metric_payload,
+    if run_id is not None:
+        _publish_run_media_strict(
+            db,
+            workspace,
+            run_id,
+            job_id,
+            run_dir,
+            integrity_report,
         )
+
+    if metric_names:
         if run_id is not None:
-            db.complete_run_inference(run_id, result_dict, artifact_summary, "metric_queued")
-            db.set_run_metric_job(run_id, metric_job_id)
+            from vfieval.pipeline.metric_jobs import create_metric_wave
+
+            try:
+                create_metric_wave(
+                    db,
+                    run_id,
+                    metric_names,
+                    source="inference",
+                    result=result_dict,
+                    artifact_summary=artifact_summary,
+                    source_job_id=job_id,
+                    source_job_result=result_dict,
+                )
+            except ValueError:
+                db.invalidate_run_media_assets(run_id)
+                _raise_if_canceled(db, run_id, job_id)
+                raise
+        else:
+            db.create_job(
+                "metric",
+                {
+                    "inference_job_id": job_id,
+                    "dataset_id": dataset_id,
+                    "metric_names": metric_names,
+                    "metric_device": str(device),
+                },
+            )
     elif run_id is not None:
-        db.complete_run_inference(run_id, result_dict, artifact_summary, "completed")
+        if not db.complete_run_inference(
+            run_id,
+            result_dict,
+            artifact_summary,
+            "completed",
+            source_job_id=job_id,
+            source_job_result=result_dict,
+        ):
+            db.invalidate_run_media_assets(run_id)
+            _raise_if_canceled(db, run_id, job_id)
+            raise RuntimeError(f"run {run_id} rejected completion from status {db.get_run(run_id)['status']}")
 
     return result
 
@@ -686,6 +842,13 @@ def _run_video_compare_job(
 
     run_metadata = (run or {}).get("metadata") or {}
     request_metadata = run_metadata.get("request") or {}
+    canonical_height = int((run or {}).get("height") or 0)
+    canonical_width = int((run or {}).get("width") or 0)
+    preview_height, preview_width = _resolve_visualize_size(
+        request_metadata,
+        canonical_height,
+        canonical_width,
+    )
     publish_pred_video = bool(
         run_metadata.get(
             "publish_compare_pred_video",
@@ -693,13 +856,19 @@ def _run_video_compare_job(
         )
     )
 
-    db.update_job_progress(job_id, 0, len(samples))
+    _require_progress_cas(db, run_id, job_id, db.update_job_progress(job_id, 0, len(samples)), "Job")
     if run_id is not None:
-        db.mark_run_started(run_id, "running")
+        if not db.mark_run_started(run_id, "running"):
+            _raise_if_canceled(db, run_id, job_id)
+            raise RuntimeError(f"run {run_id} rejected Compare start from status {db.get_run(run_id)['status']}")
         if is_shard:
-            db.update_run_progress_from_jobs(run_id, "running")
+            _require_progress_cas(
+                db, run_id, job_id, db.update_run_progress_from_jobs(run_id), "Run"
+            )
         else:
-            db.update_run_progress(run_id, 0, len(samples), "running")
+            _require_progress_cas(
+                db, run_id, job_id, db.update_run_progress(run_id, 0, len(samples)), "Run"
+            )
 
     processed = 0
     video_groups: dict[str, dict[str, Any]] = {}
@@ -708,7 +877,7 @@ def _run_video_compare_job(
         _raise_if_canceled(db, run_id, job_id)
         t0 = time.perf_counter()
         try:
-            sample_dir = run_dir / sanitize_name(row["name"])
+            sample_dir = run_dir / f"{int(row['id']):08d}_{sanitize_name(row['name'])}"
             sample_dir.mkdir(parents=True, exist_ok=True)
             gt_output_path = _copy_compare_image(Path(row["gt_path"]), sample_dir / "gt.png")
             pred_output_path = _copy_compare_image(Path(row["img1_path"]), sample_dir / "pred.png")
@@ -716,33 +885,88 @@ def _run_video_compare_job(
             with Image.open(gt_output_path).convert("RGB") as gt_image, Image.open(pred_output_path).convert("RGB") as pred_image:
                 ImageChops.difference(pred_image, gt_image).save(diff_output_path)
 
-            artifact_metadata = {"sample": row["name"], **_compare_track_metadata(row)}
-            _add_image_artifact_with_preview(db, job_id, int(row["id"]), "gt", gt_output_path, artifact_metadata)
-            _add_image_artifact_with_preview(db, job_id, int(row["id"]), "pred", pred_output_path, artifact_metadata)
-            _add_image_artifact_with_preview(db, job_id, int(row["id"]), "difference", diff_output_path, artifact_metadata)
+            with Image.open(pred_output_path) as canonical_image:
+                canonical_width, canonical_height = canonical_image.size
+            artifact_metadata = {
+                "sample": row["name"],
+                "artifact_contract": ARTIFACT_CONTRACT,
+                "canonical_height": int(canonical_height),
+                "canonical_width": int(canonical_width),
+                **_compare_track_metadata(row),
+            }
+            make_preview = (canonical_height, canonical_width) != (preview_height, preview_width)
+            db.add_artifacts_bulk(
+                job_id,
+                [
+                    _image_artifact_record(
+                        int(row["id"]),
+                        kind,
+                        path,
+                        artifact_metadata,
+                        make_preview=make_preview,
+                        preview_height=preview_height,
+                        preview_width=preview_width,
+                    )
+                    for kind, path in (
+                        ("gt", gt_output_path),
+                        ("pred", pred_output_path),
+                        ("difference", diff_output_path),
+                    )
+                ],
+            )
             _collect_compare_frame(video_groups, row, gt_output_path, pred_output_path, diff_output_path)
         except RunCanceled:
             raise
         except Exception as exc:
-            _record_sample_error(db, job_id, int(row["id"]), row["name"], exc)
+            try:
+                _record_sample_error(db, job_id, int(row["id"]), row["name"], exc)
+            except Exception:
+                pass
+            wrapped = CoreArtifactSaveError(int(row["id"]), str(row["name"]), exc)
+            try:
+                _log_failed_job_integrity(
+                    db,
+                    run_dir,
+                    job_id,
+                    [int(sample["id"]) for sample in samples],
+                    wrapped,
+                    phase="core_artifact_pipeline",
+                )
+            except Exception:
+                pass
+            raise wrapped from exc
 
         processed += 1
-        db.update_job_progress(job_id, processed)
+        _require_progress_cas(
+            db, run_id, job_id, db.update_job_progress(job_id, processed), "Job"
+        )
         if run_id is not None:
             if is_shard:
-                db.update_run_progress_from_jobs(run_id, "running")
+                _require_progress_cas(
+                    db, run_id, job_id, db.update_run_progress_from_jobs(run_id), "Run"
+                )
             else:
-                db.update_run_progress(run_id, processed)
+                _require_progress_cas(
+                    db, run_id, job_id, db.update_run_progress(run_id, processed), "Run"
+                )
         save_seconds += time.perf_counter() - t0
 
+    expected_sample_ids = [int(sample["id"]) for sample in samples]
+    integrity_report = _require_and_log_job_integrity(db, run_dir, job_id, expected_sample_ids)
     if video_groups:
-        _write_video_artifacts(
+        _raise_if_canceled(db, run_id, job_id)
+        integrity_report = _encode_and_validate_video_artifacts(
             db,
             job_id,
             run_dir,
             video_groups,
+            integrity_report,
             publish_pred_video=publish_pred_video,
+            expected_sample_ids=expected_sample_ids,
+            preview_height=preview_height,
+            preview_width=preview_width,
         )
+        _raise_if_canceled(db, run_id, job_id)
 
     result = InferenceJobResult(
         samples=processed,
@@ -751,49 +975,78 @@ def _run_video_compare_job(
         model_fps=0.0,
         postprocess_fps=0.0,
         save_fps=_fps(processed, save_seconds),
+        artifact_integrity=integrity_report,
     )
     artifact_summary = db.summarize_artifacts(job_id)
     if is_shard:
         return result
+    if run_id is not None:
+        _publish_run_media_strict(
+            db,
+            workspace,
+            run_id,
+            job_id,
+            run_dir,
+            integrity_report,
+        )
     if metric_names:
-        metric_payload = {
-            "inference_job_id": job_id,
-            "dataset_id": dataset_id,
-            "metric_names": metric_names,
-            "metric_device": str((run or {}).get("device") or job.get("payload", {}).get("device") or "cpu"),
-        }
         if run_id is not None:
-            metric_payload["run_id"] = run_id
-            metric_batch_size = (
-                (((run or {}).get("metadata") or {}).get("request") or {}).get("metric_batch_size_per_device")
+            from vfieval.pipeline.metric_jobs import create_metric_wave
+
+            try:
+                create_metric_wave(
+                    db,
+                    run_id,
+                    metric_names,
+                    source="compare",
+                    result=result.__dict__,
+                    artifact_summary=artifact_summary,
+                    source_job_id=job_id,
+                    source_job_result=result.__dict__,
+                )
+            except ValueError:
+                db.invalidate_run_media_assets(run_id)
+                _raise_if_canceled(db, run_id, job_id)
+                raise
+        else:
+            db.create_job(
+                "metric",
+                {
+                    "inference_job_id": job_id,
+                    "dataset_id": dataset_id,
+                    "metric_names": metric_names,
+                    "metric_device": str(job.get("payload", {}).get("device") or "cpu"),
+                },
             )
-            if metric_batch_size:
-                metric_payload["metric_batch_size_per_device"] = int(metric_batch_size)
-        metric_job_id = db.create_job("metric", metric_payload)
-        if run_id is not None:
-            db.complete_run_inference(run_id, result.__dict__, artifact_summary, "metric_queued")
-            db.set_run_metric_job(run_id, metric_job_id)
     elif run_id is not None:
-        db.complete_run_inference(run_id, result.__dict__, artifact_summary, "completed")
+        if not db.complete_run_inference(
+            run_id,
+            result.__dict__,
+            artifact_summary,
+            "completed",
+            source_job_id=job_id,
+            source_job_result=result.__dict__,
+        ):
+            db.invalidate_run_media_assets(run_id)
+            _raise_if_canceled(db, run_id, job_id)
+            raise RuntimeError(f"run {run_id} rejected completion from status {db.get_run(run_id)['status']}")
     return result
 
 
 def _resolve_visualize_size(payload: dict[str, Any], height: int, width: int) -> tuple[int, int]:
-    """Resolution at which visual artifacts (PNGs) are saved.
+    """Resolution of optional preview derivatives.
 
-    Defaults to 832x1792 (H x W) so display artifacts keep full detail. The
-    visualization size is clamped to never exceed the inference resolution
-    (upscaling artifacts for display wastes disk and CPU without adding
-    information).
+    Canonical artifacts always use the inference resolution. Explicit preview
+    dimensions are exact; defaults avoid gratuitously upscaling small Runs.
     """
     raw_h = payload.get("visualize_height")
     raw_w = payload.get("visualize_width")
-    vis_h = int(raw_h) if raw_h else DEFAULT_VISUALIZE_HEIGHT
-    vis_w = int(raw_w) if raw_w else DEFAULT_VISUALIZE_WIDTH
-    if vis_h <= 0 or vis_w <= 0:
-        vis_h, vis_w = DEFAULT_VISUALIZE_HEIGHT, DEFAULT_VISUALIZE_WIDTH
-    vis_h = min(vis_h, height)
-    vis_w = min(vis_w, width)
+    vis_h = int(raw_h) if raw_h else min(DEFAULT_VISUALIZE_HEIGHT, height)
+    vis_w = int(raw_w) if raw_w else min(DEFAULT_VISUALIZE_WIDTH, width)
+    if vis_h <= 0:
+        vis_h = min(DEFAULT_VISUALIZE_HEIGHT, height)
+    if vis_w <= 0:
+        vis_w = min(DEFAULT_VISUALIZE_WIDTH, width)
     return vis_h, vis_w
 
 
@@ -821,13 +1074,69 @@ def _resolve_pool_size(override: Any, per_shard: int, *, lo: int, hi: int) -> in
     return max(lo, min(hi, int(per_shard)))
 
 
-def _resize_to_device(tensor: torch.Tensor, height: int, width: int) -> torch.Tensor:
-    """Resize a BCHW tensor in place on its current device (no host copy)."""
-    if tuple(tensor.shape[-2:]) == (height, width):
-        return tensor
-    return torch.nn.functional.interpolate(
-        tensor, size=(height, width), mode="bilinear", align_corners=False
-    )
+def _postprocess_chunk_size(batch_size: int, height: int, width: int) -> int:
+    pixels_per_sample = max(1, int(height) * int(width))
+    return max(1, min(int(batch_size), POSTPROCESS_MAX_PIXELS // pixels_per_sample))
+
+
+def _slice_model_outputs(
+    outputs: dict[str, Any],
+    start: int,
+    end: int,
+    batch_size: int,
+) -> dict[str, Any]:
+    sliced: dict[str, Any] = {}
+    for name, value in outputs.items():
+        if isinstance(value, torch.Tensor) and value.ndim > 0 and int(value.shape[0]) == int(batch_size):
+            sliced[name] = value[start:end]
+        else:
+            sliced[name] = value
+    return sliced
+
+
+def _is_device_oom(exc: BaseException) -> bool:
+    oom_type = getattr(torch, "OutOfMemoryError", None)
+    return (oom_type is not None and isinstance(exc, oom_type)) or "out of memory" in str(exc).lower()
+
+
+def _release_device_cache(device: torch.device) -> None:
+    module = _device_module(device)
+    empty_cache = getattr(module, "empty_cache", None) if module is not None else None
+    if callable(empty_cache):
+        try:
+            empty_cache()
+        except Exception:
+            pass
+
+
+def _compose_canonical_chunks(
+    img0: torch.Tensor,
+    img1: torch.Tensor,
+    outputs: dict[str, Any],
+    *,
+    initial_chunk_size: int,
+) -> Iterator[tuple[int, int, dict[str, Any], dict[str, torch.Tensor]]]:
+    """Compose output-resolution artifacts with bounded accelerator memory.
+
+    The model batch remains intact. Only warp/blend/pred post-processing is
+    sliced, and OOM retries reduce the slice without changing model precision.
+    """
+    batch_size = int(img0.shape[0])
+    chunk_size = max(1, min(batch_size, int(initial_chunk_size)))
+    cursor = 0
+    while cursor < batch_size:
+        end = min(batch_size, cursor + chunk_size)
+        chunk_outputs = _slice_model_outputs(outputs, cursor, end, batch_size)
+        try:
+            composed = compose_interpolated(img0[cursor:end], img1[cursor:end], chunk_outputs)
+        except RuntimeError as exc:
+            if not _is_device_oom(exc) or chunk_size <= 1:
+                raise
+            _release_device_cache(img0.device)
+            chunk_size = max(1, chunk_size // 2)
+            continue
+        yield cursor, end, chunk_outputs, composed
+        cursor = end
 
 
 def _detach_tensors_to_cpu(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -928,19 +1237,6 @@ def _load_resized_batch(paths: list[str], device: torch.device, height: int, wid
     return batch_tensors(tensors)
 
 
-def _add_image_artifact_with_preview(
-    db: Database,
-    job_id: int,
-    sample_id: int,
-    kind: str,
-    path: Path,
-    metadata: dict[str, Any],
-    make_preview: bool = True,
-) -> int:
-    record = _image_artifact_record(sample_id, kind, path, metadata, make_preview=make_preview)
-    return db.add_artifacts_bulk(job_id, [record])[0]
-
-
 def _image_artifact_record(
     sample_id: int,
     kind: str,
@@ -948,20 +1244,36 @@ def _image_artifact_record(
     metadata: dict[str, Any],
     *,
     make_preview: bool,
+    preview_height: int | None = None,
+    preview_width: int | None = None,
 ) -> dict[str, Any]:
-    # Previews exist so the UI can render a small thumbnail without fetching a
-    # multi-megapixel original. When the artifact itself is already small (the
-    # visualization resolution defaults to 832x384, at or below the 512px
-    # preview edge), the extra thumbnail encode is pure overhead on the save
-    # pool and the UI falls back to the original URL when no preview exists.
     preview_metadata = dict(metadata)
+    if preview_height is not None and preview_width is not None:
+        preview_metadata.update(
+            {
+                "preview_height": int(preview_height),
+                "preview_width": int(preview_width),
+                "preview_resize": "lanczos",
+                "preview_uses_canonical": not bool(make_preview),
+            }
+        )
     if make_preview:
         preview_path = path.parent / "preview" / path.name
         try:
-            preview = save_preview_image(path, preview_path)
-            preview_metadata.update({"preview_path": str(preview), "preview_max_edge": 512})
-        except Exception:
-            pass
+            preview = save_preview_image(
+                path,
+                preview_path,
+                height=preview_height,
+                width=preview_width,
+            )
+            preview_metadata.update({"preview_path": str(preview), "preview_resize": "lanczos"})
+            if preview_height is None or preview_width is None:
+                preview_metadata["preview_max_edge"] = 512
+        except Exception as exc:
+            preview_metadata["preview_warning"] = {
+                "type": type(exc).__name__,
+                "message": str(exc)[:500],
+            }
     return {
         "sample_id": int(sample_id),
         "kind": str(kind),
@@ -1003,16 +1315,209 @@ def _write_run_metadata(run_dir: Path, job: dict[str, Any], model: dict[str, Any
         (run_dir / "video_group_info.json").write_text(json.dumps(dataset, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
 
 
-def _write_shard_video_manifest(
+def _require_and_log_job_integrity(
+    db: Database,
     run_dir: Path,
     job_id: int,
+    expected_sample_ids: list[int],
+) -> dict[str, Any]:
+    path = run_dir / "logs" / "artifact_integrity" / f"{int(job_id)}.json"
+    try:
+        report = require_job_artifact_integrity(
+            db,
+            int(job_id),
+            expected_sample_ids=expected_sample_ids,
+        )
+    except ArtifactIntegrityError as exc:
+        write_integrity_report(path, exc.report)
+        _persist_job_integrity_failure(db, int(job_id), exc.report)
+        raise
+    write_integrity_report(path, report)
+    return report
+
+
+def _persist_job_integrity_failure(
+    db: Database,
+    job_id: int,
+    report: dict[str, Any],
+) -> None:
+    try:
+        job = db.get_job(int(job_id))
+        result = dict(job.get("result") or {})
+        result["artifact_integrity"] = report
+        db.update_job_progress(
+            int(job_id),
+            int(job.get("progress_current") or 0),
+            result=result,
+        )
+        run_id = (job.get("payload") or {}).get("run_id")
+        if run_id is not None:
+            db.merge_run_result(int(run_id), {"artifact_integrity": report})
+    except Exception:
+        pass
+
+
+def _log_failed_job_integrity(
+    db: Database,
+    run_dir: Path,
+    job_id: int,
+    expected_sample_ids: list[int],
+    exc: BaseException,
+    *,
+    phase: str,
+) -> dict[str, Any]:
+    report = validate_job_artifact_integrity(
+        db,
+        int(job_id),
+        expected_sample_ids=expected_sample_ids,
+    )
+    report["errors"].append(
+        {
+            "code": f"{phase}_failed",
+            "message": str(exc) or type(exc).__name__,
+            "error_type": type(exc).__name__,
+        }
+    )
+    report["error_count"] = len(report["errors"])
+    report["valid"] = False
+    write_integrity_report(
+        run_dir / "logs" / "artifact_integrity" / f"{int(job_id)}.json",
+        report,
+    )
+    _persist_job_integrity_failure(db, int(job_id), report)
+    return report
+
+
+def _encode_and_validate_video_artifacts(
+    db: Database,
+    job_id: int,
+    run_dir: Path,
     video_groups: dict[str, dict[str, Any]],
+    job_integrity: dict[str, Any],
+    *,
+    expected_sample_ids: list[int],
+    publish_pred_video: bool = True,
+    preview_height: int | None = None,
+    preview_width: int | None = None,
+) -> dict[str, Any]:
+    integrity_path = run_dir / "logs" / "artifact_integrity" / f"{int(job_id)}.json"
+    try:
+        _write_video_artifacts(
+            db,
+            job_id,
+            run_dir,
+            video_groups,
+            publish_pred_video=publish_pred_video,
+            preview_height=preview_height,
+            preview_width=preview_width,
+        )
+    except Exception as exc:
+        report = merge_integrity_reports(
+            "job_artifacts",
+            [job_integrity],
+            job_id=int(job_id),
+            phase="video_encoding",
+        )
+        report["errors"].append(
+            {
+                "code": "video_encoding_failed",
+                "message": str(exc) or type(exc).__name__,
+                "error_type": type(exc).__name__,
+            }
+        )
+        report["error_count"] = len(report["errors"])
+        report["valid"] = False
+        write_integrity_report(integrity_path, report)
+        _persist_job_integrity_failure(db, int(job_id), report)
+        raise ArtifactIntegrityError(report) from exc
+
+    video_report = validate_video_artifact_integrity(
+        db,
+        job_id,
+        video_groups,
+        publish_pred_video=publish_pred_video,
+        expected_sample_ids=expected_sample_ids,
+    )
+    report = merge_integrity_reports(
+        "job_artifacts",
+        [job_integrity, video_report],
+        job_id=int(job_id),
+        phase="video_validation",
+    )
+    write_integrity_report(integrity_path, report)
+    if not report["valid"]:
+        _persist_job_integrity_failure(db, int(job_id), report)
+        raise ArtifactIntegrityError(report)
+    return report
+
+
+def _publish_run_media_strict(
+    db: Database,
+    workspace: WorkspaceConfig,
+    run_id: int,
+    job_id: int,
+    run_dir: Path,
+    integrity_report: dict[str, Any],
+) -> None:
+    from vfieval.media_assets import sync_run_assets
+
+    try:
+        sync_run_assets(db, workspace, int(run_id), allow_running=True)
+    except Exception as exc:
+        db.invalidate_run_media_assets(int(run_id))
+        report = merge_integrity_reports(
+            "job_artifacts",
+            [integrity_report],
+            job_id=int(job_id),
+            run_id=int(run_id),
+            phase="media_publication",
+        )
+        report["errors"].append(
+            {
+                "code": "media_publication_failed",
+                "message": str(exc) or type(exc).__name__,
+                "error_type": type(exc).__name__,
+            }
+        )
+        report["error_count"] = len(report["errors"])
+        report["valid"] = False
+        write_integrity_report(
+            run_dir / "logs" / "artifact_integrity" / f"{int(job_id)}.json",
+            report,
+        )
+        _persist_job_integrity_failure(db, int(job_id), report)
+        raise ArtifactIntegrityError(report) from exc
+    _raise_if_canceled(db, int(run_id), int(job_id))
+
+
+def _write_shard_video_manifest(
+    run_dir: Path,
+    run_id: int | None,
+    job_id: int,
+    video_groups: dict[str, dict[str, Any]],
+    *,
+    expected_sample_ids: list[int],
+    successful_sample_ids: list[int],
+    core_artifact_counts: dict[str, int],
 ) -> Path:
     manifest_dir = run_dir / "logs" / "shards"
     manifest_dir.mkdir(parents=True, exist_ok=True)
     path = manifest_dir / f"{int(job_id)}.json"
     path.write_text(
-        json.dumps({"job_id": int(job_id), "video_groups": video_groups}, indent=2, ensure_ascii=False, default=str),
+        json.dumps(
+            {
+                "version": "artifact-shard-v1",
+                "run_id": int(run_id) if run_id is not None else None,
+                "job_id": int(job_id),
+                "expected_sample_ids": [int(value) for value in expected_sample_ids],
+                "successful_sample_ids": [int(value) for value in successful_sample_ids],
+                "core_artifact_counts": {str(key): int(value) for key, value in core_artifact_counts.items()},
+                "video_groups": video_groups,
+            },
+            indent=2,
+            ensure_ascii=False,
+            default=str,
+        ),
         encoding="utf-8",
     )
     return path
@@ -1046,21 +1551,31 @@ def _record_sample_error(db: Database, job_id: int, sample_id: int, sample_name:
     )
 
 
+def _require_progress_cas(
+    db: Database,
+    run_id: int | None,
+    job_id: int,
+    accepted: bool,
+    target: str,
+) -> None:
+    if accepted:
+        return
+    _raise_if_canceled(db, run_id, job_id)
+    raise RuntimeError(f"{target} rejected inference progress CAS")
+
+
 def _raise_if_canceled(db: Database, run_id: int | None, job_id: int) -> None:
     if run_id is None:
         return
     run = db.get_run(run_id)
     if run["status"] in {"cancel_requested", "canceled"}:
-        error = {"message": "用户取消了 Run", "type": "RunCanceled"}
-        db.cancel_job(job_id, error)
-        db.cancel_run(run_id, error)
         raise RunCanceled("用户取消了 Run")
     if run["status"] == "failed":
         # A sibling shard already failed the run (multi_cuda/multi_npu). Stop
         # this shard instead of burning device time toward a run that is
         # already terminal.
-        error = {"message": "sibling shard failed the run", "type": "RunCanceled"}
-        db.cancel_job(job_id, error)
+        # Keep the Job running until the worker has unwound save pools and
+        # other file users; the worker owns the terminal cancellation CAS.
         raise RunCanceled("sibling shard failed the run")
 
 
@@ -1088,14 +1603,20 @@ def _collect_video_frame(
             "source_video_file": metadata.get("video_file"),
         },
     )
-    frame_order = int(metadata.get("frame_index") or metadata.get("sample_index") or len(group["frames"]))
-    # Prefer the visualization-resolution GT written alongside pred so pred/gt
-    # video frames share dimensions (VMAF requires matched sizes). Fall back to
-    # the original decoded GT when no resized copy was produced.
+    frame_order_value = metadata.get("frame_index")
+    if frame_order_value is None:
+        frame_order_value = metadata.get("sample_index")
+    if frame_order_value is None:
+        frame_order_value = len(group["frames"])
+    frame_order = int(frame_order_value)
+    # Prefer the canonical GT materialized alongside Pred so both video streams
+    # have the exact Run output dimensions. Legacy callers may still fall back
+    # to the decoded source when no paired artifact was produced.
     resolved_gt = Path(gt_path) if gt_path is not None else (Path(sample["gt_path"]) if sample.get("gt_path") else None)
     group["frames"].append(
         {
             "order": frame_order,
+            "sample_id": int(sample["id"]),
             "sample_name": sample["name"],
             "pred_path": Path(pred_path),
             "gt_path": resolved_gt,
@@ -1130,10 +1651,16 @@ def _collect_compare_frame(
             "frames": [],
         },
     )
-    frame_order = int(metadata.get("frame_index") or metadata.get("sample_index") or len(group["frames"]))
+    frame_order_value = metadata.get("frame_index")
+    if frame_order_value is None:
+        frame_order_value = metadata.get("sample_index")
+    if frame_order_value is None:
+        frame_order_value = len(group["frames"])
+    frame_order = int(frame_order_value)
     group["frames"].append(
         {
             "order": frame_order,
+            "sample_id": int(sample["id"]),
             "sample_name": sample["name"],
             "pred_path": Path(pred_path),
             "gt_path": Path(gt_path),
@@ -1146,6 +1673,59 @@ def _collect_compare_frame(
     )
 
 
+def _attach_optional_video_preview(
+    frame_paths: list[Path],
+    canonical_path: Path,
+    metadata: dict[str, Any],
+    fps: float,
+    *,
+    preview_height: int | None,
+    preview_width: int | None,
+) -> None:
+    metadata.update({"artifact_contract": ARTIFACT_CONTRACT})
+    if preview_height is None or preview_width is None or not frame_paths:
+        return
+    try:
+        with Image.open(frame_paths[0]) as image:
+            canonical_width, canonical_height = image.size
+        resolved_preview_height = int(preview_height)
+        resolved_preview_width = int(preview_width)
+        metadata.update(
+            {
+                "canonical_height": int(canonical_height),
+                "canonical_width": int(canonical_width),
+                "preview_height": int(resolved_preview_height),
+                "preview_width": int(resolved_preview_width),
+                "preview_resize": "lanczos",
+                "preview_uses_canonical": (canonical_height, canonical_width)
+                == (resolved_preview_height, resolved_preview_width),
+            }
+        )
+        if (canonical_height, canonical_width) == (resolved_preview_height, resolved_preview_width):
+            return
+        preview_path = canonical_path.parent / "preview" / canonical_path.name
+        _write_mp4(
+            frame_paths,
+            preview_path,
+            fps,
+            target_height=resolved_preview_height,
+            target_width=resolved_preview_width,
+        )
+        metadata.update(
+            {
+                "preview_path": str(preview_path),
+                "preview_height": resolved_preview_height,
+                "preview_width": resolved_preview_width,
+                "preview_resize": "lanczos",
+            }
+        )
+    except Exception as exc:
+        metadata["preview_warning"] = {
+            "type": type(exc).__name__,
+            "message": str(exc)[:500],
+        }
+
+
 def _write_video_artifacts(
     db: Database,
     job_id: int,
@@ -1153,12 +1733,20 @@ def _write_video_artifacts(
     video_groups: dict[str, dict[str, Any]],
     *,
     publish_pred_video: bool = True,
+    preview_height: int | None = None,
+    preview_width: int | None = None,
 ) -> None:
-    for group in video_groups.values():
+    directory_names = _unique_sanitized_tokens(
+        [
+            (str(group_key), str(group.get("video_name") or group_key))
+            for group_key, group in video_groups.items()
+        ]
+    )
+    for group_key, group in video_groups.items():
         frames = sorted(group["frames"], key=lambda item: item["order"])
         if not frames:
             continue
-        video_name = sanitize_name(str(group["video_name"]))
+        video_name = directory_names[str(group_key)]
         fps = float(group["fps"] or 24.0)
         if any(frame.get("track_label") for frame in frames):
             _write_multitrack_compare_video_artifacts(
@@ -1170,6 +1758,8 @@ def _write_video_artifacts(
                 video_name,
                 fps,
                 publish_pred_video=publish_pred_video,
+                preview_height=preview_height,
+                preview_width=preview_width,
             )
             continue
         video_dir = run_dir / "videos" / video_name
@@ -1181,6 +1771,14 @@ def _write_video_artifacts(
             _write_mp4(pred_frame_paths, pred_video_path, fps)
             pred_metadata = _video_artifact_metadata(group["video_name"], frames, pred_frame_paths, fps)
             pred_metadata.update(_source_mapping_metadata(group, frames))
+            _attach_optional_video_preview(
+                pred_frame_paths,
+                pred_video_path,
+                pred_metadata,
+                fps,
+                preview_height=preview_height,
+                preview_width=preview_width,
+            )
             db.add_artifact(
                 job_id,
                 None,
@@ -1196,6 +1794,14 @@ def _write_video_artifacts(
             gt_video_path = video_dir / "gt.mp4"
             _write_mp4(gt_frame_paths, gt_video_path, fps)
             gt_metadata = _video_artifact_metadata(group["video_name"], frames, gt_frame_paths, fps)
+            _attach_optional_video_preview(
+                gt_frame_paths,
+                gt_video_path,
+                gt_metadata,
+                fps,
+                preview_height=preview_height,
+                preview_width=preview_width,
+            )
             db.add_artifact(
                 job_id,
                 None,
@@ -1211,6 +1817,14 @@ def _write_video_artifacts(
             diff_video_path = video_dir / "diff.mp4"
             _write_mp4(diff_frame_paths, diff_video_path, fps)
             diff_metadata = _video_artifact_metadata(group["video_name"], frames, diff_frame_paths, fps)
+            _attach_optional_video_preview(
+                diff_frame_paths,
+                diff_video_path,
+                diff_metadata,
+                fps,
+                preview_height=preview_height,
+                preview_width=preview_width,
+            )
             db.add_artifact(
                 job_id,
                 None,
@@ -1241,6 +1855,8 @@ def _write_multitrack_compare_video_artifacts(
     fps: float,
     *,
     publish_pred_video: bool = True,
+    preview_height: int | None = None,
+    preview_width: int | None = None,
 ) -> None:
     video_dir = run_dir / "videos" / video_name
     tracks: dict[str, list[dict[str, Any]]] = {}
@@ -1252,19 +1868,39 @@ def _write_multitrack_compare_video_artifacts(
         if frame.get("gt_path") is not None:
             gt_by_order.setdefault(int(frame["order"]), Path(frame["gt_path"]))
 
+    track_directory_names = _unique_sanitized_tokens(
+        [
+            (
+                track_key,
+                str(sorted(track_frames, key=lambda item: item["order"])[0].get("track_label") or track_key),
+            )
+            for track_key, track_frames in tracks.items()
+            if track_frames
+        ]
+    )
+
     gt_video_path = None
     ordered_gt = [gt_by_order[index] for index in sorted(gt_by_order)]
     if ordered_gt:
         gt_frame_paths = ordered_gt
         gt_video_path = video_dir / "gt.mp4"
         _write_mp4(gt_frame_paths, gt_video_path, fps)
+        gt_metadata = _video_artifact_metadata(group["video_name"], frames, gt_frame_paths, fps)
+        _attach_optional_video_preview(
+            gt_frame_paths,
+            gt_video_path,
+            gt_metadata,
+            fps,
+            preview_height=preview_height,
+            preview_width=preview_width,
+        )
         db.add_artifact(
             job_id,
             None,
             "gt_video",
             str(gt_video_path),
             "video/mp4",
-            _video_artifact_metadata(group["video_name"], frames, gt_frame_paths, fps),
+            gt_metadata,
         )
 
     manifest_tracks = []
@@ -1273,7 +1909,7 @@ def _write_multitrack_compare_video_artifacts(
         if not ordered:
             continue
         track_label = str(ordered[0].get("track_label") or track_key)
-        track_dir = video_dir / sanitize_name(track_label)
+        track_dir = video_dir / track_directory_names[track_key]
         track_dir.mkdir(parents=True, exist_ok=True)
         pred_frame_paths = [Path(frame["pred_path"]) for frame in ordered]
         pred_video_path = None
@@ -1290,21 +1926,45 @@ def _write_multitrack_compare_video_artifacts(
             "compare_track_artifact_id": ordered[0].get("track_artifact_id"),
         }
         if pred_video_path is not None:
+            pred_metadata = {
+                **_video_artifact_metadata(group["video_name"], ordered, pred_frame_paths, fps),
+                **track_metadata,
+            }
+            _attach_optional_video_preview(
+                pred_frame_paths,
+                pred_video_path,
+                pred_metadata,
+                fps,
+                preview_height=preview_height,
+                preview_width=preview_width,
+            )
             db.add_artifact(
                 job_id,
                 None,
                 "pred_video",
                 str(pred_video_path),
                 "video/mp4",
-                {**_video_artifact_metadata(group["video_name"], ordered, pred_frame_paths, fps), **track_metadata},
+                pred_metadata,
             )
+        diff_metadata = {
+            **_video_artifact_metadata(group["video_name"], ordered, diff_frame_paths, fps),
+            **track_metadata,
+        }
+        _attach_optional_video_preview(
+            diff_frame_paths,
+            diff_video_path,
+            diff_metadata,
+            fps,
+            preview_height=preview_height,
+            preview_width=preview_width,
+        )
         db.add_artifact(
             job_id,
             None,
             "diff_video",
             str(diff_video_path),
             "video/mp4",
-            {**_video_artifact_metadata(group["video_name"], ordered, diff_frame_paths, fps), **track_metadata},
+            diff_metadata,
         )
 
         manifest_tracks.append(
@@ -1415,19 +2075,92 @@ def _copy_ordered_frames(frame_paths: list[Path], output_dir: Path) -> list[Path
     return copied
 
 
-def _write_mp4(frame_paths: list[Path], output_path: Path, fps: float) -> None:
+def _write_mp4(
+    frame_paths: list[Path],
+    output_path: Path,
+    fps: float,
+    *,
+    target_height: int | None = None,
+    target_width: int | None = None,
+) -> None:
     if not frame_paths:
         raise RuntimeError(f"cannot create video artifact without frames: {output_path}")
-    if _write_mp4_ffmpeg_pipe(frame_paths, output_path, fps):
+    _validate_video_encode_dimensions(
+        frame_paths,
+        target_height=target_height,
+        target_width=target_width,
+    )
+    if _write_mp4_ffmpeg_pipe(
+        frame_paths,
+        output_path,
+        fps,
+        target_height=target_height,
+        target_width=target_width,
+    ):
         return
-    _write_mp4_cv2(frame_paths, output_path, fps)
+    _write_mp4_cv2(
+        frame_paths,
+        output_path,
+        fps,
+        target_height=target_height,
+        target_width=target_width,
+    )
 
 
-def _write_mp4_ffmpeg_pipe(frame_paths: list[Path], output_path: Path, fps: float) -> bool:
+def _validate_video_encode_dimensions(
+    frame_paths: list[Path],
+    *,
+    target_height: int | None,
+    target_width: int | None,
+) -> tuple[int, int]:
+    if (target_height is None) != (target_width is None):
+        raise ValueError("video target height and width must be provided together")
+    if target_height is not None and target_width is not None:
+        height, width = int(target_height), int(target_width)
+        if height <= 0 or width <= 0:
+            raise ValueError("video target height and width must both be positive")
+    else:
+        try:
+            with Image.open(frame_paths[0]) as image:
+                width, height = image.size
+        except Exception as exc:
+            raise RuntimeError(f"failed to inspect video frame dimensions: {frame_paths[0]}") from exc
+        for frame_path in frame_paths[1:]:
+            try:
+                with Image.open(frame_path) as image:
+                    frame_size = image.size
+            except Exception as exc:
+                raise RuntimeError(f"failed to inspect video frame dimensions: {frame_path}") from exc
+            if frame_size != (width, height):
+                raise ValueError(
+                    "canonical video frames must all have identical dimensions; "
+                    f"expected {width}x{height}, found {frame_size[0]}x{frame_size[1]} in {frame_path}"
+                )
+    if width % 2 or height % 2:
+        raise ValueError(
+            "browser-compatible H.264/yuv420p requires even dimensions; "
+            f"requested {width}x{height}. Canonical video dimensions are exact and will not be padded."
+        )
+    return int(height), int(width)
+
+
+def _write_mp4_ffmpeg_pipe(
+    frame_paths: list[Path],
+    output_path: Path,
+    fps: float,
+    *,
+    target_height: int | None = None,
+    target_width: int | None = None,
+) -> bool:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg or not frame_paths or any(path.suffix.lower() != ".png" for path in frame_paths):
         return False
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    filters = []
+    if target_height is not None or target_width is not None:
+        if target_height is None or target_width is None or int(target_height) <= 0 or int(target_width) <= 0:
+            raise ValueError("video preview height and width must both be positive")
+        filters.append(f"scale={int(target_width)}:{int(target_height)}:flags=lanczos")
     command = [
         ffmpeg,
         "-y",
@@ -1448,14 +2181,15 @@ def _write_mp4_ffmpeg_pipe(frame_paths: list[Path], output_path: Path, fps: floa
         "veryfast",
         "-crf",
         "18",
-        "-vf",
-        "pad=ceil(iw/2)*2:ceil(ih/2)*2",
         "-pix_fmt",
         "yuv420p",
         "-movflags",
         "+faststart",
         str(output_path),
     ]
+    if filters:
+        pixel_format_index = command.index("-pix_fmt")
+        command[pixel_format_index:pixel_format_index] = ["-vf", ",".join(filters)]
     process = None
     stderr: bytes | str | None = b""
     try:
@@ -1520,7 +2254,14 @@ def _ffmpeg_error_detail(stderr: bytes | str | None) -> str:
     return compact[-1200:]
 
 
-def _write_mp4_cv2(frame_paths: list[Path], output_path: Path, fps: float) -> None:
+def _write_mp4_cv2(
+    frame_paths: list[Path],
+    output_path: Path,
+    fps: float,
+    *,
+    target_height: int | None = None,
+    target_width: int | None = None,
+) -> None:
     try:
         import cv2
     except ImportError as exc:
@@ -1529,36 +2270,42 @@ def _write_mp4_cv2(frame_paths: list[Path], output_path: Path, fps: float) -> No
     first = cv2.imread(str(frame_paths[0]), cv2.IMREAD_COLOR)
     if first is None:
         raise RuntimeError(f"failed to read video frame: {frame_paths[0]}")
-    height, width = first.shape[:2]
-    encode_width = width if width % 2 == 0 else width + 1
-    encode_height = height if height % 2 == 0 else height + 1
-    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"avc1"), fps, (encode_width, encode_height))
+    source_height, source_width = first.shape[:2]
+    height = int(target_height) if target_height is not None else source_height
+    width = int(target_width) if target_width is not None else source_width
+    if height <= 0 or width <= 0:
+        raise ValueError("video preview height and width must both be positive")
+    if width % 2 or height % 2:
+        raise ValueError(
+            "browser-compatible H.264/yuv420p requires even dimensions; "
+            f"requested {width}x{height}. Canonical video dimensions are exact and will not be padded."
+        )
+    writer = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*"avc1"), fps, (width, height))
     if not writer.isOpened():
         raise RuntimeError(
             "failed to create a browser-compatible H.264 video artifact; "
             "install ffmpeg with the libx264 encoder or provide OpenCV with AVC support"
         )
     try:
-        writer.write(_fit_video_frame(first, encode_width, encode_height))
+        writer.write(_resize_video_frame(first, width, height))
         for frame_path in frame_paths[1:]:
             frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
             if frame is None:
                 raise RuntimeError(f"failed to read video frame: {frame_path}")
-            if frame.shape[:2] != (height, width):
-                frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
-            writer.write(_fit_video_frame(frame, encode_width, encode_height))
+            frame = _resize_video_frame(frame, width, height)
+            writer.write(frame)
     finally:
         writer.release()
 
 
-def _fit_video_frame(frame, width: int, height: int):
+def _resize_video_frame(frame, width: int, height: int):
     if frame.shape[1] == width and frame.shape[0] == height:
         return frame
     try:
         import cv2
     except ImportError as exc:
         raise RuntimeError("resizing video frames requires opencv-python (cv2)") from exc
-    return cv2.copyMakeBorder(frame, 0, height - frame.shape[0], 0, width - frame.shape[1], cv2.BORDER_REPLICATE)
+    return cv2.resize(frame, (int(width), int(height)), interpolation=cv2.INTER_LANCZOS4)
 
 
 def _load_rgb_cpu(path: str, height: int, width: int) -> torch.Tensor:
@@ -1707,6 +2454,8 @@ class _AsyncSavePipeline:
         save_workers: int,
         max_inflight: int,
         artifact_batch_size: int,
+        preview_height: int,
+        preview_width: int,
     ) -> None:
         self._db = db
         self._job_id = job_id
@@ -1726,6 +2475,10 @@ class _AsyncSavePipeline:
         self._artifact_batch_size = max(1, int(artifact_batch_size))
         self._artifact_buffer: list[dict[str, Any]] = []
         self._artifact_db_batches = 0
+        self._preview_height = int(preview_height)
+        self._preview_width = int(preview_width)
+        self._failure_event = threading.Event()
+        self._failures: list[BaseException] = []
 
     @property
     def processed_count(self) -> int:
@@ -1755,11 +2508,16 @@ class _AsyncSavePipeline:
         extra_cpu: dict[str, torch.Tensor],
         gt_cpu_list: list[torch.Tensor | None],
     ) -> None:
+        self.raise_if_failed()
         self._total += len(batch_rows)
         for idx, row in enumerate(batch_rows):
             wait_start = time.perf_counter()
             self._slots.acquire()
             waited = time.perf_counter() - wait_start
+            if self._failure_event.is_set():
+                self._slots.release()
+                self._cancel_not_started()
+                self.raise_if_failed()
             per_sample_bundle = {name: bundle_cpu[name][idx] for name in bundle_cpu}
             per_sample_extra = {name: extra_cpu[name][idx] for name in extra_cpu}
             gt_tensor = gt_cpu_list[idx] if idx < len(gt_cpu_list) else None
@@ -1776,6 +2534,20 @@ class _AsyncSavePipeline:
                 self._max_observed_inflight = max(self._max_observed_inflight, len(self._pending))
             future.add_done_callback(self._on_sample_done)
 
+    def raise_if_failed(self) -> None:
+        if not self._failure_event.is_set():
+            return
+        self._cancel_not_started()
+        with self._lock:
+            failure = self._failures[0] if self._failures else RuntimeError("artifact save pipeline failed")
+        raise failure
+
+    def _cancel_not_started(self) -> None:
+        with self._lock:
+            pending = list(self._pending)
+        for future in pending:
+            future.cancel()
+
     def wait_for_all(self) -> None:
         while True:
             with self._lock:
@@ -1784,19 +2556,50 @@ class _AsyncSavePipeline:
             if not pending:
                 break
             for future in pending:
-                # _save_sample already catches its own exceptions and records
-                # them via _record_sample_error, so a future.exception() here
-                # means the save task itself crashed outside that try/except
-                # (e.g. a bug in _on_sample_done). Surface those, since they
-                # are not otherwise recorded anywhere.
-                exc = future.exception()
-                if exc is not None:
-                    raise exc
-        self._flush_artifact_records()
+                try:
+                    future.result()
+                except CancelledError:
+                    continue
+                except BaseException as exc:
+                    # The callback records the first actionable exception. Keep
+                    # draining so already-running, bounded save work finishes.
+                    self._record_failure(exc)
+                    continue
+        try:
+            self._flush_artifact_records()
+        except BaseException as exc:
+            self._record_failure(exc)
+        self._raise_collected_failures()
 
-    def shutdown(self) -> None:
+    def shutdown(self, *, suppress_errors: bool = False) -> None:
         self._pool.shutdown(wait=True)
-        self._flush_artifact_records()
+        try:
+            self._flush_artifact_records()
+        except BaseException as exc:
+            self._record_failure(exc)
+            if not suppress_errors:
+                raise
+        if not suppress_errors:
+            self._raise_collected_failures()
+
+    def _raise_collected_failures(self) -> None:
+        if not self._failure_event.is_set():
+            return
+        with self._lock:
+            failures = list(self._failures)
+        if not failures:
+            raise RuntimeError("artifact save pipeline failed")
+        if len(failures) == 1:
+            raise failures[0]
+        raise ArtifactSaveAggregateError(failures) from failures[0]
+
+    def _record_failure(self, exc: BaseException) -> None:
+        if isinstance(exc, CancelledError):
+            return
+        with self._lock:
+            if all(existing is not exc for existing in self._failures):
+                self._failures.append(exc)
+            self._failure_event.set()
 
     def _save_sample(
         self,
@@ -1809,31 +2612,54 @@ class _AsyncSavePipeline:
         sample_id = int(row["id"])
         sample_name = row["name"]
         try:
-            sample_dir = self._run_dir / sanitize_name(sample_name)
+            sample_dir = self._run_dir / f"{sample_id:08d}_{sanitize_name(sample_name)}"
             paths = _save_visual_bundle_from_cpu(bundle, sample_dir)
             artifact_records: list[dict[str, Any]] = []
-            # Previews are only worth their extra encode when the artifact is
-            # genuinely large. At the default visualization resolution the saved
-            # image is already small, so skip the redundant thumbnail — the
-            # biggest save-pool cost on long videos. The UI falls back to the
-            # original URL when no preview exists.
             pred_h, pred_w = int(bundle["pred"].shape[-2]), int(bundle["pred"].shape[-1])
-            make_preview = max(pred_h, pred_w) > PREVIEW_SKIP_MAX_EDGE
-            for kind, path in paths.items():
-                artifact_records.append(
-                    _image_artifact_record(
-                        sample_id, kind, path, {"sample": sample_name}, make_preview=make_preview
-                    )
-                )
+            base_artifact_metadata = {
+                "sample": sample_name,
+                "artifact_contract": ARTIFACT_CONTRACT,
+            }
             extra_paths: dict[str, Path] = {}
+            optional_warnings: list[dict[str, str]] = []
             for name, tensor in extra.items():
                 try:
                     safe_name = sanitize_name(name)
                     path = sample_dir / f"extra_{safe_name}.png"
                     save_extra_tensor(tensor, path, index=0)
                     extra_paths[f"extra_{safe_name}"] = path
-                except Exception:
+                except Exception as exc:
+                    optional_warnings.append(
+                        {
+                            "kind": f"extra_{sanitize_name(name)}",
+                            "type": type(exc).__name__,
+                            "message": str(exc)[:500],
+                        }
+                    )
                     continue
+            if optional_warnings:
+                base_artifact_metadata["optional_warnings"] = optional_warnings
+            for kind, path in paths.items():
+                tensor = bundle[kind]
+                artifact_h = int(tensor.shape[-2])
+                artifact_w = int(tensor.shape[-1])
+                artifact_metadata = {
+                    **base_artifact_metadata,
+                    "canonical_height": artifact_h,
+                    "canonical_width": artifact_w,
+                }
+                artifact_records.append(
+                    _image_artifact_record(
+                        sample_id,
+                        kind,
+                        path,
+                        artifact_metadata,
+                        make_preview=(artifact_h, artifact_w)
+                        != (self._preview_height, self._preview_width),
+                        preview_height=self._preview_height,
+                        preview_width=self._preview_width,
+                    )
+                )
             for kind, path in extra_paths.items():
                 artifact_records.append(
                     _image_artifact_record(
@@ -1844,31 +2670,53 @@ class _AsyncSavePipeline:
             diff_path = None
             gt_path = None
             if gt_tensor is not None and row.get("gt_path"):
-                # pred is saved at the visualization resolution; match GT to it
-                # so the difference map and the pred/gt video pair (VMAF input)
-                # share dimensions.
                 pred_h, pred_w = int(bundle["pred"].shape[-2]), int(bundle["pred"].shape[-1])
                 if tuple(gt_tensor.shape[-2:]) != (pred_h, pred_w):
                     gt_tensor = _resize_chw(gt_tensor, pred_h, pred_w)
                 gt_path = sample_dir / "gt.png"
                 save_rgb_tensor(gt_tensor, gt_path)
+                canonical_metadata = {
+                    **base_artifact_metadata,
+                    "canonical_height": pred_h,
+                    "canonical_width": pred_w,
+                }
+                make_canonical_preview = (pred_h, pred_w) != (
+                    self._preview_height,
+                    self._preview_width,
+                )
                 artifact_records.append(
                     _image_artifact_record(
-                        sample_id, "gt", gt_path, {"sample": sample_name}, make_preview=False
+                        sample_id,
+                        "gt",
+                        gt_path,
+                        canonical_metadata,
+                        make_preview=make_canonical_preview,
+                        preview_height=self._preview_height,
+                        preview_width=self._preview_width,
                     )
                 )
                 diff_path = sample_dir / "difference.png"
                 save_difference(bundle["pred"], gt_tensor, diff_path)
                 artifact_records.append(
                     _image_artifact_record(
-                        sample_id, "difference", diff_path, {"sample": sample_name}, make_preview=False
+                        sample_id,
+                        "difference",
+                        diff_path,
+                        canonical_metadata,
+                        make_preview=make_canonical_preview,
+                        preview_height=self._preview_height,
+                        preview_width=self._preview_width,
                     )
                 )
             self._queue_artifact_records(artifact_records)
             with self._lock:
                 _collect_video_frame(self._video_groups, row, paths["pred"], diff_path, gt_path)
         except Exception as exc:
-            _record_sample_error(self._db, job_id, sample_id, sample_name, exc)
+            try:
+                _record_sample_error(self._db, job_id, sample_id, sample_name, exc)
+            except Exception:
+                pass
+            raise CoreArtifactSaveError(sample_id, sample_name, exc) from exc
 
     def _queue_artifact_records(self, records: list[dict[str, Any]]) -> None:
         if not records:
@@ -1900,9 +2748,21 @@ class _AsyncSavePipeline:
             self._artifact_db_batches += 1
 
     def _on_sample_done(self, future: Future) -> None:
+        report_now = False
+        processed = 0
+        total = 0
         try:
+            try:
+                exc = future.exception()
+            except CancelledError:
+                exc = None
             with self._lock:
-                self._processed += 1
+                if exc is None and not future.cancelled():
+                    self._processed += 1
+                elif exc is not None:
+                    if all(existing is not exc for existing in self._failures):
+                        self._failures.append(exc)
+                    self._failure_event.set()
                 processed = self._processed
                 total = self._total
                 try:
@@ -1910,7 +2770,9 @@ class _AsyncSavePipeline:
                 except ValueError:
                     pass
                 step = max(1, total // 200)
-                report_now = processed == total or processed - self._last_progress_report >= step
+                report_now = exc is None and (
+                    processed == total or processed - self._last_progress_report >= step
+                )
                 if report_now:
                     self._last_progress_report = processed
         finally:
@@ -1921,7 +2783,7 @@ class _AsyncSavePipeline:
             self._db.update_job_progress(self._job_id, processed)
             if self._run_id is not None:
                 if self._is_shard:
-                    self._db.update_run_progress_from_jobs(self._run_id, "running")
+                    self._db.update_run_progress_from_jobs(self._run_id)
                 else:
                     self._db.update_run_progress(self._run_id, processed)
         except Exception:

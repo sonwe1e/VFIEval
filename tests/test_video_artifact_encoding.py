@@ -9,8 +9,14 @@ import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
+from PIL import Image
 
-from vfieval.pipeline.inference import _write_mp4, _write_mp4_cv2, _write_mp4_ffmpeg_pipe
+from vfieval.pipeline.inference import (
+    _write_mp4,
+    _write_mp4_cv2,
+    _write_mp4_ffmpeg_pipe,
+    _write_video_artifacts,
+)
 
 
 class VideoArtifactEncodingTests(unittest.TestCase):
@@ -41,7 +47,8 @@ class VideoArtifactEncodingTests(unittest.TestCase):
             self.assertEqual(command[command.index("-c:v") + 1], "libx264")
             self.assertEqual(command[command.index("-pix_fmt") + 1], "yuv420p")
             self.assertEqual(command[command.index("-movflags") + 1], "+faststart")
-            self.assertIn("pad=ceil(iw/2)*2:ceil(ih/2)*2", command)
+            self.assertFalse(any("pad=" in value for value in command))
+            self.assertNotIn("-vf", command)
 
     def test_ffmpeg_failure_is_actionable_and_removes_partial_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -96,6 +103,71 @@ class VideoArtifactEncodingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(RuntimeError, "without frames"):
                 _write_mp4([], Path(tmp) / "video.mp4", 24.0)
+
+    def test_canonical_video_rejects_odd_dimensions_instead_of_padding(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frame = root / "frame.png"
+            Image.new("RGB", (7, 8)).save(frame)
+            with patch("vfieval.pipeline.inference._write_mp4_ffmpeg_pipe") as ffmpeg:
+                with self.assertRaisesRegex(ValueError, "will not be padded"):
+                    _write_mp4([frame], root / "video.mp4", 24.0)
+            ffmpeg.assert_not_called()
+
+    def test_canonical_video_rejects_mixed_frame_dimensions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "first.png"
+            second = root / "second.png"
+            Image.new("RGB", (8, 8)).save(first)
+            Image.new("RGB", (10, 8)).save(second)
+            with self.assertRaisesRegex(ValueError, "identical dimensions"):
+                _write_mp4([first, second], root / "video.mp4", 24.0)
+
+    def test_colliding_sanitized_video_names_get_distinct_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frames = []
+            for index in range(3):
+                path = root / f"frame-{index}.png"
+                Image.new("RGB", (8, 8), (index, 0, 0)).save(path)
+                frames.append(path)
+            groups = {
+                "identity-a": {
+                    "video_name": "clip/a",
+                    "fps": 24.0,
+                    "frames": [{"order": 0, "sample_id": 1, "pred_path": frames[0], "gt_path": None, "diff_path": None}],
+                },
+                "identity-b": {
+                    "video_name": "clip:a",
+                    "fps": 24.0,
+                    "frames": [{"order": 0, "sample_id": 2, "pred_path": frames[1], "gt_path": None, "diff_path": None}],
+                },
+                "safe-identity": {
+                    "video_name": "safe",
+                    "fps": 24.0,
+                    "frames": [{"order": 0, "sample_id": 3, "pred_path": frames[2], "gt_path": None, "diff_path": None}],
+                },
+            }
+            db = Mock()
+
+            def encode(_frames, output_path: Path, _fps: float, **_kwargs) -> None:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(b"video")
+
+            with patch("vfieval.pipeline.inference._write_mp4", side_effect=encode):
+                _write_video_artifacts(db, 1, root, groups)
+
+            pred_paths = [Path(call.args[3]) for call in db.add_artifact.call_args_list]
+            self.assertEqual(len(pred_paths), 3)
+            self.assertEqual(len({path.resolve() for path in pred_paths}), 3)
+            colliding_dirs = {
+                path.parent.name
+                for path in pred_paths
+                if path.parent.name.startswith("clip_a")
+            }
+            self.assertEqual(len(colliding_dirs), 2)
+            self.assertIn(root / "videos" / "safe" / "pred.mp4", pred_paths)
 
 
 if __name__ == "__main__":

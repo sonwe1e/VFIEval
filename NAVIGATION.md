@@ -161,11 +161,12 @@ User rating (1–5, 0.25 step) + free-text issue per run; content-scoped (video/
 ### 15. Artifact profiles, benchmark, segments + finalize
 - **Inference:** `pipeline/inference.py` `ARTIFACT_PROFILES`, `run_inference_job`, `_detach_tensors_to_cpu`, `_AsyncSavePipeline`, `_DeviceEventTimings`, `_NpuSmiSampler`
 - **Sharding:** `orchestration.py` `partition_samples_by_video`, `_create_inference_shards`; continuous segments when videos are insufficient/skewed
-- **Finalize:** `pipeline/finalize_runner.py` `run_finalize_job`; only finalize encodes shared videos and queues metrics
+- **Integrity:** `pipeline/artifact_integrity.py` validates required per-sample artifacts, shard manifest coverage, file existence, and canonical video counts before publication
+- **Finalize:** `pipeline/finalize_runner.py` `run_finalize_job`; only finalize encodes shared videos and queues metrics, after strict pre/post integrity checks
 - **Profiles:** `performance.py` `execution_profile_identity`, `record_execution_profile`, `recommend_execution_profile`; table `execution_profiles`
 - **CLI:** `cli.py benchmark` (warmup/samples/repeats)
 - **Frontend:** artifact profile and pool overrides in infer form; `renderPerformanceReport`, `renderExecutionProfileRecommendation`
-- **Tests:** `tests/test_artifact_profiles.py`
+- **Tests:** `tests/test_artifact_profiles.py`, `tests/test_artifact_integrity.py`
 
 ### 16. Blind evaluation V2 + frozen Campaign packages
 - **Core:** `evaluations_v2.py` `list_run_outputs`, `preview_campaign_v2`, `create_campaign_v2`, `request_publish_campaign_v2`, `run_pending_preparations`, `publish_campaign_v2`, blind session/payload/media/heartbeat/vote functions, `campaign_analysis_v2`, `campaign_export_v2`

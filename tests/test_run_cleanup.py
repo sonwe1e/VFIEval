@@ -380,8 +380,11 @@ class RunCleanupTests(unittest.TestCase):
             workspace, db = _workspace(tmp)
             run_id = _run(db, workspace, "running")
             job_id = db.add_run_job(run_id, "inference", {"run_id": run_id})
-            db.mark_run_started(run_id)
             with db.connection() as conn:
+                conn.execute(
+                    "UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?",
+                    (run_id,),
+                )
                 conn.execute("UPDATE jobs SET status = 'running' WHERE id = ?", (job_id,))
             service = RunCleanupService(db, workspace)
 
@@ -577,11 +580,25 @@ class RunCleanupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             workspace, db = _workspace(tmp)
             run_id = _run(db, workspace, "revision")
+            with db.connection() as conn:
+                conn.execute(
+                    "UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?",
+                    (run_id,),
+                )
             self.assertEqual(db.get_run(run_id)["content_revision"], 0)
-            db.fail_run(run_id, {"message": "failed"})
+            self.assertTrue(db.fail_run(run_id, {"message": "failed"}))
             self.assertEqual(db.get_run(run_id)["content_revision"], 1)
-            db.cancel_run(run_id, {"message": "canceled"})
-            self.assertEqual(db.get_run(run_id)["content_revision"], 2)
+            self.assertFalse(db.cancel_run(run_id, {"message": "canceled"}))
+            self.assertEqual(db.get_run(run_id)["content_revision"], 1)
+
+            canceled_id = _run(db, workspace, "canceled-revision")
+            with db.connection() as conn:
+                conn.execute(
+                    "UPDATE runs SET status = 'running', finished_at = NULL WHERE id = ?",
+                    (canceled_id,),
+                )
+            self.assertTrue(db.cancel_run(canceled_id, {"message": "canceled"}))
+            self.assertEqual(db.get_run(canceled_id)["content_revision"], 1)
 
     def test_queued_cancel_and_artifact_publication_invalidate_result_revision(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

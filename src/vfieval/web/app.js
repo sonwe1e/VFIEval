@@ -2753,13 +2753,17 @@ function renderWorstSamples(video, metricName) {
   `;
 }
 
-function renderVideoPlayer(label, artifactId) {
-  if (!artifactId) return "";
-  const url = `/api/files/${artifactId}`;
+function renderVideoPlayer(label, artifact) {
+  if (!artifact) return "";
+  const item = typeof artifact === "object" ? artifact : { id: artifact };
+  if (!item.id && !item.preview_url && !item.original_url) return "";
+  const previewUrl = item.preview_url || item.url || `/api/files/${item.id}?variant=preview`;
+  const originalUrl = item.original_url || `/api/files/${item.id}`;
   return `
     <div class="video-artifact">
       <span>${escapeHtml(label)}</span>
-      <video controls playsinline preload="metadata" src="${escapeHtml(url)}" onerror="handleVideoPlaybackError(this)"></video>
+      <video controls playsinline preload="metadata" src="${escapeHtml(previewUrl)}" data-original-url="${escapeHtml(originalUrl)}" onerror="handleVideoPlaybackError(this)"></video>
+      <a class="muted" href="${escapeHtml(originalUrl)}" target="_blank" rel="noreferrer">打开原始视频</a>
       <div class="video-playback-error message error" hidden></div>
     </div>
   `;
@@ -2776,7 +2780,7 @@ function handleVideoPlaybackError(video) {
       ? "视频加载中断，请检查服务连接后重试。"
       : "视频无法加载；文件可能尚未就绪、已被清理，或编码不受当前浏览器支持。";
   status.hidden = false;
-  status.innerHTML = `${escapeHtml(reason)} <a href="${escapeHtml(video.currentSrc || video.src)}" target="_blank" rel="noreferrer">打开原始视频</a>`;
+  status.innerHTML = `${escapeHtml(reason)} <a href="${escapeHtml(video.dataset.originalUrl || video.currentSrc || video.src)}" target="_blank" rel="noreferrer">打开原始视频</a>`;
 }
 
 function renderVideoArtifacts(video) {
@@ -2784,7 +2788,7 @@ function renderVideoArtifacts(video) {
   let items = "";
   if (tracks.length) {
     items = tracks
-      .map((item) => renderVideoPlayer(`${item.track_label || "shared"} / ${item.kind}`, item.id))
+      .map((item) => renderVideoPlayer(`${item.track_label || "shared"} / ${item.kind}`, item))
       .join("");
   } else {
     items = `
@@ -3074,9 +3078,9 @@ function renderBigSlot(sample, options, slot, selectedKind) {
   if (!artifact) {
     body = "<p class=\"muted\">暂无</p>";
   } else {
-    const url = artifact.original_url || artifact.preview_url;
+    const url = artifact.preview_url || artifact.original_url;
     const href = artifact.original_url || url;
-    body = `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(url)}" alt="${escapeHtml(label)}" loading="lazy"></a>`;
+    body = `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(url)}" alt="${escapeHtml(label)}" loading="lazy"></a><a class="muted" href="${escapeHtml(href)}" target="_blank" rel="noreferrer">打开原图</a>`;
   }
   return `
     <div class="big-slot">
@@ -3120,9 +3124,9 @@ function renderCompareTrackSlot(payload) {
     if (!artifact) {
       body = "<p class=\"muted\">暂无</p>";
     } else {
-      const url = artifact.original_url || artifact.preview_url;
+      const url = artifact.preview_url || artifact.original_url;
       const href = artifact.original_url || url;
-      body = `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(url)}" alt="${escapeHtml(label)}" loading="lazy"></a>`;
+      body = `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(url)}" alt="${escapeHtml(label)}" loading="lazy"></a><a class="muted" href="${escapeHtml(href)}" target="_blank" rel="noreferrer">打开原图</a>`;
     }
   }
   return `
@@ -3134,13 +3138,22 @@ function renderCompareTrackSlot(payload) {
 }
 
 function renderCompareGtSlot(sample) {
-  // GT is shared across tracks; use the img0/gt sample file so it renders even
-  // before any track's detail has loaded (compare gt == reference frame).
-  const url = sample.sample_files?.gt || `/api/sample-files/${sample.sample_id}/gt`;
+  const artifact = sample.artifacts?.gt;
+  let body;
+  if (sample._loading) {
+    body = "<div class=\"sample-loading skeleton-card\" aria-busy=\"true\"><span></span><span></span></div>";
+  } else if (artifact) {
+    const url = artifact.preview_url || artifact.original_url;
+    const href = artifact.original_url || url;
+    body = `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(url)}" alt="GT" loading="lazy"></a><a class="muted" href="${escapeHtml(href)}" target="_blank" rel="noreferrer">打开原图</a>`;
+  } else {
+    const href = sample.sample_files?.gt || `/api/sample-files/${sample.sample_id}/gt`;
+    body = `<a class="muted" href="${escapeHtml(href)}" target="_blank" rel="noreferrer">打开原图</a>`;
+  }
   return `
     <div class="big-slot compare-gt-slot">
       <div class="big-slot-head"><strong class="compare-track-title">GT</strong></div>
-      <div class="big-slot-body"><a href="${escapeHtml(url)}" target="_blank" rel="noreferrer"><img src="${escapeHtml(url)}" alt="GT" loading="lazy"></a></div>
+      <div class="big-slot-body">${body}</div>
     </div>
   `;
 }

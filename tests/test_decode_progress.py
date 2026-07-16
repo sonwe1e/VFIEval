@@ -80,6 +80,9 @@ class DecodeProgressTests(unittest.TestCase):
                 {"run_id": run_id, "dataset_id": dataset_id, "total_frames": 4, "decode_backend": "ffmpeg"},
                 progress_total=4,
             )
+            claimed = db.claim_next_job("decode-test", ["decode"])
+            self.assertIsNotNone(claimed)
+            self.assertEqual(int(claimed["id"]), job_id)
 
             def fake_scan(_db, _workspace, _dataset_id, progress_callback=None, decode_backend="auto"):
                 self.assertEqual(decode_backend, "ffmpeg")
@@ -222,6 +225,9 @@ class DecodeProgressTests(unittest.TestCase):
                 {"run_id": first_run, "dataset_id": dataset_id, "total_frames": 5},
                 progress_total=5,
             )
+            claimed = db.claim_next_job("decode-first", ["decode"])
+            self.assertIsNotNone(claimed)
+            self.assertEqual(int(claimed["id"]), first_job)
             with patch("vfieval.datasets._decode_video", side_effect=fake_decode) as decode_video:
                 first_result = run_decode_job(db, workspace, first_job)
             self.assertEqual(first_result["samples"], 4)  # N - frame_step = 5 - 1 = 4
@@ -234,6 +240,9 @@ class DecodeProgressTests(unittest.TestCase):
                 {"run_id": second_run, "dataset_id": dataset_id, "total_frames": 5},
                 progress_total=5,
             )
+            claimed = db.claim_next_job("decode-second", ["decode"])
+            self.assertIsNotNone(claimed)
+            self.assertEqual(int(claimed["id"]), second_job)
             with (
                 patch("vfieval.datasets._decode_video_ffmpeg") as ffmpeg_decode,
                 patch("vfieval.datasets._decode_video_opencv") as opencv_decode,

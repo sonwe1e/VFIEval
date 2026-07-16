@@ -15,9 +15,59 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from v13_test_utils import get_json, make_workspace, start_server, stop_server
+from vfieval.server import _compare_layer_payloads
 
 
 class SampleApiScopeTests(unittest.TestCase):
+    def test_compare_layers_only_use_source_run_inference_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            model_id = db.upsert_model("layer-scope", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("layer-scope", tmp, False)
+            sample_id = db.add_sample(
+                dataset_id,
+                "clip_000000",
+                str(Path(tmp) / "img0.png"),
+                str(Path(tmp) / "img1.png"),
+                None,
+                {"source_type": "video", "video_name": "clip", "frame_index": 0},
+            )
+            run_a = db.create_run("layer-a", model_id, dataset_id, 8, 8, 1, "cpu", "fp32", [])
+            run_b = db.create_run("layer-b", model_id, dataset_id, 8, 8, 1, "cpu", "fp32", [])
+            job_a = int(db.get_run(run_a)["inference_job_id"])
+            job_b = int(db.get_run(run_b)["inference_job_id"])
+            path_a = Path(tmp) / "flow-a.png"
+            path_b = Path(tmp) / "flow-b.png"
+            Image.new("RGB", (8, 8), (10, 0, 0)).save(path_a)
+            Image.new("RGB", (8, 8), (20, 0, 0)).save(path_b)
+            artifact_a = db.add_artifact(job_a, sample_id, "flowt_0", str(path_a), "image/png", {})
+            db.add_artifact(job_b, sample_id, "flowt_0", str(path_b), "image/png", {})
+
+            layers = _compare_layer_payloads(
+                db,
+                {
+                    "metadata": {
+                        "distorted_tracks": [{"track_run_id": run_a, "track_label": "A"}],
+                        "request": {
+                            "extra_layers": [
+                                {"source": "run_artifact", "run_id": run_a, "kinds": ["flowt_0"]}
+                            ]
+                        },
+                    }
+                },
+                {
+                    "metadata": {
+                        "source_type": "compare",
+                        "video_name": "clip",
+                        "frame_index": 0,
+                    }
+                },
+            )
+
+            self.assertEqual(len(layers), 1)
+            self.assertEqual(int(layers[0]["artifact"]["id"]), artifact_a)
+            self.assertEqual(int(layers[0]["track_run_id"]), run_a)
+
     def test_sample_and_video_timeline_endpoints_do_not_materialize_full_timeline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace, db = make_workspace(tmp)
@@ -47,7 +97,17 @@ class SampleApiScopeTests(unittest.TestCase):
             Image.new("RGB", (8, 8), (20, 0, 0)).save(pred_path)
             for sample_id in sample_ids:
                 db.add_artifact(job_id, sample_id, "pred", str(pred_path), "image/png", {"sample": f"sample-{sample_id}"})
-            db.complete_run_inference(run_id, {"output_dir": str(workspace.runs_dir / str(run_id))}, db.summarize_artifacts(job_id), "completed")
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertEqual(int(db.claim_next_job("scope-inference", ["inference"])["id"]), job_id)
+            self.assertTrue(
+                db.complete_run_inference(
+                    run_id,
+                    {"output_dir": str(workspace.runs_dir / str(run_id))},
+                    db.summarize_artifacts(job_id),
+                    "completed",
+                )
+            )
+            self.assertTrue(db.complete_job(job_id, {"samples": len(sample_ids)}))
 
             server, thread, base_url = start_server(db, workspace)
             try:
@@ -91,7 +151,17 @@ class SampleApiScopeTests(unittest.TestCase):
             for index, sample_id in enumerate(sample_ids):
                 db.add_artifact(inference_job_id, sample_id, "pred", str(pred_path), "image/png", {"sample": f"sample-{sample_id}"})
                 db.add_metric_result(metric_job_id, inference_job_id, sample_id, "lpips_vit_patch", "completed", float(index), {})
-            db.complete_run_inference(run_id, {"output_dir": str(workspace.runs_dir / str(run_id))}, db.summarize_artifacts(inference_job_id), "completed")
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertEqual(int(db.claim_next_job("scope-window", ["inference"])["id"]), inference_job_id)
+            self.assertTrue(
+                db.complete_run_inference(
+                    run_id,
+                    {"output_dir": str(workspace.runs_dir / str(run_id))},
+                    db.summarize_artifacts(inference_job_id),
+                    "completed",
+                )
+            )
+            self.assertTrue(db.complete_job(inference_job_id, {"samples": len(sample_ids)}))
 
             queries: list[str] = []
             original_connect = db.connect

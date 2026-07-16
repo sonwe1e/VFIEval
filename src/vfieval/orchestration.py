@@ -11,9 +11,15 @@ from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
 
 
-def create_inference_jobs_for_run(db: Database, run_id: int) -> list[int]:
+def create_inference_jobs_for_run(
+    db: Database,
+    run_id: int,
+    *,
+    source_job_id: int | None = None,
+    source_job_result: dict[str, Any] | None = None,
+) -> list[int]:
     existing = db.list_run_jobs(run_id, "inference")
-    if existing:
+    if existing and source_job_id is None:
         return [int(row["job_id"]) for row in existing]
 
     run = db.get_run(run_id)
@@ -58,6 +64,8 @@ def create_inference_jobs_for_run(db: Database, run_id: int) -> list[int]:
             sample_npu_smi=request.get("sample_npu_smi", True),
             benchmark_warmup_batches=request.get("benchmark_warmup_batches"),
             benchmark_samples=request.get("benchmark_samples"),
+            source_job_id=source_job_id,
+            source_job_result=source_job_result,
         )
     else:
         payload = {
@@ -81,17 +89,19 @@ def create_inference_jobs_for_run(db: Database, run_id: int) -> list[int]:
             "benchmark_warmup_batches": request.get("benchmark_warmup_batches"),
             "benchmark_samples": request.get("benchmark_samples"),
         }
-        job_ids = [
-            db.add_run_job(
-                run_id,
-                "inference",
-                payload,
-                progress_total=len(samples),
-                shard_index=0,
-                device=str(run.get("device") or "cpu"),
-            )
-        ]
-    db.update_run_progress_from_jobs(run_id, "queued")
+        job_ids = db.publish_inference_jobs(
+            run_id,
+            [
+                {
+                    "payload": payload,
+                    "progress_total": len(samples),
+                    "shard_index": 0,
+                    "device": str(run.get("device") or "cpu"),
+                }
+            ],
+            source_job_id=source_job_id,
+            source_job_result=source_job_result,
+        )
     return job_ids
 
 
@@ -206,9 +216,11 @@ def _create_inference_shards(
     sample_npu_smi: bool = True,
     benchmark_warmup_batches: int | None = None,
     benchmark_samples: int | None = None,
+    source_job_id: int | None = None,
+    source_job_result: dict[str, Any] | None = None,
 ) -> list[int]:
     partitions = partition_samples_by_video(samples, devices)
-    job_ids: list[int] = []
+    job_specs: list[dict[str, Any]] = []
     for shard_index, device in enumerate(devices):
         sample_ids = partitions[shard_index]
         if not sample_ids:
@@ -236,22 +248,28 @@ def _create_inference_shards(
             "sample_npu_smi": bool(sample_npu_smi),
             "benchmark_warmup_batches": benchmark_warmup_batches,
             "benchmark_samples": benchmark_samples,
-            "defer_video_finalize": True,
+            # Benchmark performs canonical post-processing but deliberately
+            # publishes no artifacts. It therefore has no shard video
+            # manifests for a finalize job to merge.
+            "defer_video_finalize": artifact_profile != "benchmark",
         }
-        job_ids.append(
-            db.add_run_job(
-                run_id,
-                "inference",
-                payload,
-                progress_total=len(sample_ids),
-                shard_index=shard_index,
-                device=device,
-                metadata={"metrics_after_all_shards": metrics},
-            )
+        job_specs.append(
+            {
+                "payload": payload,
+                "progress_total": len(sample_ids),
+                "shard_index": shard_index,
+                "device": device,
+                "metadata": {"metrics_after_all_shards": metrics},
+            }
         )
-    if not job_ids:
+    if not job_specs:
         raise ValueError("decoded dataset did not produce any non-empty inference shards")
-    return job_ids
+    return db.publish_inference_jobs(
+        run_id,
+        job_specs,
+        source_job_id=source_job_id,
+        source_job_result=source_job_result,
+    )
 
 
 def _start_local_worker(db: Database, workspace: WorkspaceConfig, role: str, count: int = 1) -> None:

@@ -151,6 +151,10 @@ class CompareUiHookTests(unittest.TestCase):
 
         self.assertIn("function handleVideoPlaybackError(video)", app_js)
         self.assertIn("打开原始视频", app_js)
+        self.assertIn("?variant=preview", app_js)
+        self.assertIn("data-original-url", app_js)
+        self.assertIn("video.dataset.originalUrl", app_js)
+        self.assertIn("renderVideoPlayer(`${item.track_label || \"shared\"} / ${item.kind}`, item)", app_js)
         self.assertIn("视频产物可能损坏或编码不兼容", app_js)
         self.assertNotIn("浏览器无法播放此视频格式", app_js)
 

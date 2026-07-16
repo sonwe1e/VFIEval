@@ -139,7 +139,20 @@ def add_completed_pred_run(
     Image.new("RGB", size, (30, 20, 10)).save(mask_path)
     db.add_artifact(job_id, sample_id, "flowt_0", str(flow_path), "image/png", {"sample": f"{video_name}_000000"})
     db.add_artifact(job_id, sample_id, "mask0", str(mask_path), "image/png", {"sample": f"{video_name}_000000"})
-    db.complete_run_inference(run_id, {"output_dir": str(workspace.runs_dir / name)}, db.summarize_artifacts(job_id), "completed")
+    if not db.mark_run_started(run_id, "running"):
+        raise RuntimeError("test Run rejected inference start")
+    claimed = db.claim_next_job(f"fixture-{name}", ["inference"])
+    if claimed is None or int(claimed["id"]) != job_id:
+        raise RuntimeError("test inference Job could not be claimed")
+    if not db.complete_run_inference(
+        run_id,
+        {"output_dir": str(workspace.runs_dir / name)},
+        db.summarize_artifacts(job_id),
+        "completed",
+    ):
+        raise RuntimeError("test Run rejected inference completion")
+    if not db.complete_job(job_id, {"samples": sample_count}):
+        raise RuntimeError("test inference Job rejected completion")
     sync_run_assets(db, workspace, run_id)
     return run_id
 

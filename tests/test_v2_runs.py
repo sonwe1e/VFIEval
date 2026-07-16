@@ -22,6 +22,499 @@ from vfieval.worker import WorkerOptions, run_worker
 
 
 class V2RunTests(unittest.TestCase):
+    def test_decode_handoff_completes_source_and_publishes_inference_atomically(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "vfieval.sqlite")
+            db.init()
+            model_id = db.register_model("atomic-decode", "dummy", None, 4, 4, {})
+            dataset_id = db.create_dataset("atomic-decode", tmp, False)
+            source = Path(tmp) / "sample.png"
+            Image.new("RGB", (4, 4)).save(source)
+            db.add_sample(dataset_id, "sample", str(source), str(source), None, {})
+            run_id = db.create_run(
+                "atomic-decode", model_id, dataset_id, 4, 4, 1, "cpu", "fp32", [],
+                create_inference_job=False,
+            )
+            decode_job_id = db.add_run_job(
+                run_id,
+                "decode",
+                {"run_id": run_id, "dataset_id": dataset_id},
+                progress_total=1,
+            )
+            self.assertEqual(int(db.claim_next_job("atomic-decode", ["decode"])["id"]), decode_job_id)
+            result = {"samples": 1, "status": "completed"}
+
+            job_ids = db.publish_inference_jobs(
+                run_id,
+                [{"payload": {"dataset_id": dataset_id}, "progress_total": 1, "device": "cpu"}],
+                source_job_id=decode_job_id,
+                source_job_result=result,
+            )
+
+            self.assertEqual(len(job_ids), 1)
+            self.assertEqual(db.get_job(decode_job_id)["status"], "completed")
+            self.assertEqual(db.get_job(decode_job_id)["result"], result)
+            self.assertEqual(db.get_run(run_id)["status"], "queued")
+            self.assertEqual(db.get_job(job_ids[0])["status"], "queued")
+
+    def test_last_inference_shard_completion_and_finalize_handoff_are_atomic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "vfieval.sqlite")
+            db.init()
+            model_id = db.register_model("atomic-shards", "dummy", None, 4, 4, {})
+            dataset_id = db.create_dataset("atomic-shards", tmp, False)
+            run_id = db.create_run(
+                "atomic-shards", model_id, dataset_id, 4, 4, 1, "cpu", "fp32", [],
+                create_inference_job=False,
+            )
+            job_ids = db.publish_inference_jobs(
+                run_id,
+                [
+                    {
+                        "payload": {
+                            "run_id": run_id,
+                            "dataset_id": dataset_id,
+                            "shard_count": 2,
+                            "defer_video_finalize": True,
+                        },
+                        "shard_index": index,
+                    }
+                    for index in range(2)
+                ],
+            )
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            first = db.claim_next_job("atomic-shard-0", ["inference"])
+            second = db.claim_next_job("atomic-shard-1", ["inference"])
+            self.assertEqual([int(first["id"]), int(second["id"])], job_ids)
+
+            self.assertFalse(
+                db.maybe_complete_multi_run_inference(
+                    run_id,
+                    source_job_id=job_ids[0],
+                    source_job_result={"samples": 1, "performance": {}},
+                )
+            )
+            self.assertEqual(db.get_job(job_ids[0])["status"], "completed")
+            self.assertEqual(db.get_run(run_id)["status"], "running")
+
+            self.assertTrue(
+                db.maybe_complete_multi_run_inference(
+                    run_id,
+                    source_job_id=job_ids[1],
+                    source_job_result={"samples": 1, "performance": {}},
+                )
+            )
+            self.assertEqual(db.get_job(job_ids[1])["status"], "completed")
+            self.assertEqual(db.get_run(run_id)["status"], "finalize_queued")
+            finalize_jobs = db.list_run_jobs(run_id, "finalize")
+            self.assertEqual(len(finalize_jobs), 1)
+            self.assertEqual(finalize_jobs[0]["status"], "queued")
+
+    def test_payload_only_job_callbacks_are_fenced_after_cancel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "vfieval.sqlite")
+            db.init()
+            model_id = db.register_model("payload-cas", "dummy", None, 4, 4, {})
+            dataset_id = db.create_dataset("payload-cas", tmp, False)
+            run_id = db.create_run(
+                "payload-cas", model_id, dataset_id, 4, 4, 1, "cpu", "fp32", [],
+                create_inference_job=False,
+            )
+            job_id = db.create_job("inference", {"run_id": run_id})
+            with db.connection() as conn:
+                conn.execute("DELETE FROM run_jobs WHERE job_id = ?", (job_id,))
+                conn.execute("UPDATE runs SET inference_job_id = NULL WHERE id = ?", (run_id,))
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertEqual(int(db.claim_next_job("payload-cas", ["inference"])["id"]), job_id)
+
+            self.assertTrue(db.request_run_cancel(run_id))
+            self.assertEqual(db.get_run(run_id)["status"], "cancel_requested")
+            self.assertFalse(db.update_job_progress(job_id, 1, 1))
+            self.assertFalse(db.complete_job(job_id, {"late": True}))
+            self.assertFalse(db.fail_job(job_id, {"message": "late"}))
+            self.assertTrue(db.converge_run_cancellation(run_id, job_id))
+            self.assertEqual(db.get_job(job_id)["status"], "canceled")
+            self.assertEqual(db.get_run(run_id)["status"], "canceled")
+
+    def test_legacy_direct_inference_link_is_backfilled_without_duplication(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "vfieval.sqlite")
+            db.init()
+            model_id = db.register_model("direct-publish", "dummy", None, 4, 4, {})
+            dataset_id = db.create_dataset("direct-publish", tmp, False)
+            run_id = db.create_run(
+                "direct-publish", model_id, dataset_id, 4, 4, 1, "cpu", "fp32", [],
+                create_inference_job=False,
+            )
+            direct_job_id = db.create_job("inference", {"legacy": True})
+            with db.connection() as conn:
+                conn.execute(
+                    "UPDATE runs SET inference_job_id = ? WHERE id = ?",
+                    (direct_job_id, run_id),
+                )
+
+            published = db.publish_inference_jobs(
+                run_id,
+                [{"payload": {"dataset_id": dataset_id}, "progress_total": 1}],
+            )
+
+            self.assertEqual(published, [direct_job_id])
+            self.assertEqual(
+                [int(row["job_id"]) for row in db.list_run_jobs(run_id, "inference")],
+                [direct_job_id],
+            )
+            self.assertEqual(
+                int(db.get("SELECT COUNT(*) AS count FROM jobs WHERE kind = 'inference'")["count"]),
+                1,
+            )
+
+    def test_legacy_direct_metric_link_blocks_duplicate_wave(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "vfieval.sqlite")
+            db.init()
+            model_id = db.register_model("direct-metric", "dummy", None, 4, 4, {})
+            dataset_id = db.create_dataset("direct-metric", tmp, False)
+            run_id = db.create_run(
+                "direct-metric", model_id, dataset_id, 4, 4, 1, "cpu", "fp32", [],
+                create_inference_job=False,
+            )
+            metric_job_id = db.create_job("metric", {"legacy": True})
+            with db.connection() as conn:
+                conn.execute(
+                    "UPDATE runs SET metric_job_id = ?, status = 'running' WHERE id = ?",
+                    (metric_job_id, run_id),
+                )
+
+            with self.assertRaisesRegex(ValueError, "active metric"):
+                db.publish_metric_wave(
+                    run_id,
+                    [{"payload": {"metric_names": ["lpips_convnext"]}}],
+                    retry=False,
+                )
+
+            self.assertEqual(
+                int(db.get("SELECT COUNT(*) AS count FROM jobs WHERE kind = 'metric'")["count"]),
+                1,
+            )
+            self.assertEqual(db.get_job(metric_job_id)["status"], "queued")
+
+    def test_cancel_converges_only_workers_that_reached_their_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "vfieval.sqlite")
+            db.init()
+            model_id = db.register_model("cancel-boundary", "dummy", None, 4, 4, {})
+            dataset_id = db.create_dataset("cancel-boundary", tmp, False)
+            run_id = db.create_run(
+                "cancel-boundary",
+                model_id,
+                dataset_id,
+                4,
+                4,
+                1,
+                "cpu",
+                "fp32",
+                [],
+                create_inference_job=False,
+            )
+            job_ids = db.publish_inference_jobs(
+                run_id,
+                [
+                    {
+                        "payload": {"run_id": run_id, "dataset_id": dataset_id},
+                        "shard_index": index,
+                    }
+                    for index in range(3)
+                ],
+            )
+            self.assertEqual(len(job_ids), 3)
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            first = db.claim_next_job("cancel-boundary-0", ["inference"])
+            second = db.claim_next_job("cancel-boundary-1", ["inference"])
+            self.assertEqual([int(first["id"]), int(second["id"])], job_ids[:2])
+
+            self.assertTrue(db.request_run_cancel(run_id))
+            self.assertEqual(db.get_run(run_id)["status"], "cancel_requested")
+            self.assertEqual(db.get_job(job_ids[2])["status"], "canceled")
+
+            self.assertFalse(db.converge_run_cancellation(run_id, job_ids[0]))
+            self.assertEqual(db.get_job(job_ids[0])["status"], "canceled")
+            self.assertEqual(db.get_job(job_ids[1])["status"], "running")
+            self.assertEqual(db.get_run(run_id)["status"], "cancel_requested")
+
+            self.assertTrue(db.converge_run_cancellation(run_id, job_ids[1]))
+            self.assertEqual(db.get_job(job_ids[1])["status"], "canceled")
+            self.assertEqual(db.get_run(run_id)["status"], "canceled")
+
+    def test_non_device_claim_fences_legacy_links_payload_phase_and_purge(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "vfieval.sqlite")
+            db.init()
+            model_id = db.register_model("claim-fence", "dummy", None, 4, 4, {})
+            dataset_id = db.create_dataset("claim-fence", tmp, False)
+
+            phase_run_id = db.create_run(
+                "phase-fence",
+                model_id,
+                dataset_id,
+                4,
+                4,
+                1,
+                "cpu",
+                "fp32",
+                [],
+                create_inference_job=False,
+            )
+            phase_job_id = db.create_job("inference", {"legacy": "direct-inference"})
+
+            terminal_run_id = db.create_run(
+                "terminal-fence",
+                model_id,
+                dataset_id,
+                4,
+                4,
+                1,
+                "cpu",
+                "fp32",
+                [],
+                create_inference_job=False,
+            )
+            terminal_job_id = db.create_job("metric", {"legacy": "direct-metric"})
+
+            purge_run_id = db.create_run(
+                "payload-purge-fence",
+                model_id,
+                dataset_id,
+                4,
+                4,
+                1,
+                "cpu",
+                "fp32",
+                [],
+                create_inference_job=False,
+            )
+            payload_job_id = db.create_job("inference", {"run_id": purge_run_id})
+
+            with db.connection() as conn:
+                conn.execute(
+                    "UPDATE runs SET inference_job_id = ?, status = 'metric_queued' WHERE id = ?",
+                    (phase_job_id, phase_run_id),
+                )
+                conn.execute(
+                    "UPDATE runs SET metric_job_id = ?, status = 'completed' WHERE id = ?",
+                    (terminal_job_id, terminal_run_id),
+                )
+                # Leave the payload as the only association for this legacy Job.
+                conn.execute("DELETE FROM run_jobs WHERE job_id = ?", (payload_job_id,))
+                conn.execute(
+                    "UPDATE runs SET inference_job_id = NULL WHERE id = ?",
+                    (purge_run_id,),
+                )
+            db.request_run_purge(purge_run_id, "cleanup_artifacts")
+
+            standalone_job_id = db.create_job("inference", {"standalone": True})
+            claimed = db.claim_next_job("legacy-fence", ["inference", "metric"])
+            self.assertIsNotNone(claimed)
+            self.assertEqual(int(claimed["id"]), standalone_job_id)
+            self.assertIsNone(db.claim_next_job("legacy-fence-empty", ["inference", "metric"]))
+            for job_id in (phase_job_id, terminal_job_id, payload_job_id):
+                self.assertEqual(db.get_job(job_id)["status"], "queued")
+
+    def test_publish_inference_jobs_fast_path_only_returns_active_jobs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "vfieval.sqlite")
+            db.init()
+            model_id = db.register_model("publish-fence", "dummy", None, 4, 4, {})
+            dataset_id = db.create_dataset("publish-fence", tmp, False)
+            run_id = db.create_run(
+                "publish-fence",
+                model_id,
+                dataset_id,
+                4,
+                4,
+                1,
+                "cpu",
+                "fp32",
+                [],
+                create_inference_job=False,
+            )
+            specs = [
+                {
+                    "payload": {"dataset_id": dataset_id},
+                    "progress_total": 1,
+                    "shard_index": 0,
+                    "device": "cpu",
+                }
+            ]
+
+            job_ids = db.publish_inference_jobs(run_id, specs)
+            self.assertEqual(len(job_ids), 1)
+            self.assertEqual(db.publish_inference_jobs(run_id, specs), job_ids)
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            claimed = db.claim_next_job("publish-fence-worker", ["inference"])
+            self.assertEqual(int(claimed["id"]), job_ids[0])
+            self.assertEqual(db.publish_inference_jobs(run_id, specs), job_ids)
+            self.assertTrue(db.complete_job(job_ids[0], {}))
+            self.assertEqual(db.publish_inference_jobs(run_id, specs), [])
+
+            terminal_run_id = db.create_run(
+                "publish-terminal",
+                model_id,
+                dataset_id,
+                4,
+                4,
+                1,
+                "cpu",
+                "fp32",
+                [],
+                create_inference_job=False,
+            )
+            terminal_job_ids = db.publish_inference_jobs(terminal_run_id, specs)
+            self.assertTrue(db.mark_run_started(terminal_run_id, "running"))
+            self.assertTrue(db.complete_run_inference(terminal_run_id, {}, {}, "completed"))
+            self.assertEqual(db.get_job(terminal_job_ids[0])["status"], "queued")
+            self.assertEqual(db.publish_inference_jobs(terminal_run_id, specs), [])
+
+            canceled_run_id = db.create_run(
+                "publish-canceled",
+                model_id,
+                dataset_id,
+                4,
+                4,
+                1,
+                "cpu",
+                "fp32",
+                [],
+                create_inference_job=False,
+            )
+            canceled_job_ids = db.publish_inference_jobs(canceled_run_id, specs)
+            self.assertTrue(db.request_run_cancel(canceled_run_id))
+            self.assertEqual(db.get_run(canceled_run_id)["status"], "canceled")
+            self.assertEqual(db.get_job(canceled_job_ids[0])["status"], "canceled")
+            self.assertEqual(db.publish_inference_jobs(canceled_run_id, specs), [])
+            self.assertEqual(
+                [row["job_id"] for row in db.list_run_jobs(canceled_run_id, "inference")],
+                canceled_job_ids,
+            )
+
+    def test_queue_finalize_fast_path_only_accepts_coherent_active_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "vfieval.sqlite")
+            db.init()
+            model_id = db.register_model("finalize-fence", "dummy", None, 4, 4, {})
+            dataset_id = db.create_dataset("finalize-fence", tmp, False)
+            run_id = db.create_run(
+                "finalize-fence", model_id, dataset_id, 4, 4, 1, "cpu", "fp32", []
+            )
+            inference_job_id = int(db.get_run(run_id)["inference_job_id"])
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            claimed_inference = db.claim_next_job("finalize-source", ["inference"])
+            self.assertEqual(int(claimed_inference["id"]), inference_job_id)
+            self.assertTrue(db.complete_job(inference_job_id, {"samples": 1}))
+
+            args = (run_id, {"samples": 1}, {}, [inference_job_id])
+            self.assertTrue(db.queue_run_finalize(*args))
+            finalize_jobs = db.list_run_jobs(run_id, "finalize")
+            self.assertEqual(len(finalize_jobs), 1)
+            finalize_job_id = int(finalize_jobs[0]["job_id"])
+            self.assertTrue(db.queue_run_finalize(*args))
+
+            claimed_finalize = db.claim_next_job("finalize-worker", ["finalize"])
+            self.assertEqual(int(claimed_finalize["id"]), finalize_job_id)
+            # Claim and Run-phase CAS are separate calls, so this active pair is
+            # valid both immediately before and after the phase transition.
+            self.assertTrue(db.queue_run_finalize(*args))
+            self.assertTrue(db.mark_run_started(run_id, "finalizing"))
+            self.assertTrue(db.queue_run_finalize(*args))
+
+            self.assertTrue(db.complete_job(finalize_job_id, {}))
+            self.assertFalse(db.queue_run_finalize(*args))
+            self.assertTrue(db.cancel_run(run_id))
+            self.assertEqual(db.get_run(run_id)["status"], "canceled")
+            self.assertFalse(db.queue_run_finalize(*args))
+
+            terminal_run_id = db.create_run(
+                "finalize-terminal",
+                model_id,
+                dataset_id,
+                4,
+                4,
+                1,
+                "cpu",
+                "fp32",
+                [],
+            )
+            terminal_inference_job_id = int(
+                db.get_run(terminal_run_id)["inference_job_id"]
+            )
+            self.assertTrue(db.mark_run_started(terminal_run_id, "running"))
+            terminal_source = db.claim_next_job("finalize-terminal-source", ["inference"])
+            self.assertEqual(int(terminal_source["id"]), terminal_inference_job_id)
+            self.assertTrue(db.complete_job(terminal_inference_job_id, {}))
+            terminal_args = (terminal_run_id, {}, {}, [terminal_inference_job_id])
+            self.assertTrue(db.queue_run_finalize(*terminal_args))
+            terminal_finalize_job_id = int(
+                db.list_run_jobs(terminal_run_id, "finalize")[0]["job_id"]
+            )
+            self.assertTrue(db.cancel_run(terminal_run_id))
+            self.assertEqual(db.get_job(terminal_finalize_job_id)["status"], "queued")
+            self.assertFalse(db.queue_run_finalize(*terminal_args))
+
+    def test_cancel_first_is_absorbing_for_late_job_callbacks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "vfieval.sqlite")
+            db.init()
+            model_id = db.register_model("cas-cancel", "dummy", None, 4, 4, {})
+            dataset_id = db.create_dataset("cas-cancel", tmp, False)
+            run_id = db.create_run(
+                "cas-cancel", model_id, dataset_id, 4, 4, 1, "cpu", "fp32", []
+            )
+            job_id = int(db.get_run(run_id)["inference_job_id"])
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            claimed = db.claim_next_job("cas-cancel-worker", ["inference"])
+            self.assertEqual(int(claimed["id"]), job_id)
+
+            self.assertTrue(db.request_run_cancel(run_id))
+            self.assertEqual(db.get_run(run_id)["status"], "cancel_requested")
+            self.assertFalse(db.update_job_progress(job_id, 1, 1))
+            self.assertFalse(db.complete_job(job_id, {"late": True}))
+            self.assertFalse(db.fail_job(job_id, {"message": "late"}))
+            self.assertTrue(db.converge_run_cancellation(run_id, job_id))
+
+            self.assertEqual(db.get_job(job_id)["status"], "canceled")
+            self.assertEqual(db.get_run(run_id)["status"], "canceled")
+            self.assertFalse(db.mark_run_started(run_id, "running"))
+            self.assertFalse(db.complete_run_inference(run_id, {}, {}, "completed"))
+            self.assertFalse(db.update_run_progress(run_id, 99, 100))
+
+    def test_completion_or_failure_committed_first_blocks_late_cancel(self) -> None:
+        for terminal in ("completed", "failed"):
+            with self.subTest(terminal=terminal), tempfile.TemporaryDirectory() as tmp:
+                db = Database(Path(tmp) / "vfieval.sqlite")
+                db.init()
+                model_id = db.register_model(f"cas-{terminal}", "dummy", None, 4, 4, {})
+                dataset_id = db.create_dataset(f"cas-{terminal}", tmp, False)
+                run_id = db.create_run(
+                    f"cas-{terminal}", model_id, dataset_id, 4, 4, 1, "cpu", "fp32", []
+                )
+                job_id = int(db.get_run(run_id)["inference_job_id"])
+                self.assertTrue(db.mark_run_started(run_id, "running"))
+                self.assertEqual(
+                    int(db.claim_next_job(f"cas-{terminal}-worker", ["inference"])["id"]),
+                    job_id,
+                )
+                if terminal == "completed":
+                    self.assertTrue(db.complete_run_inference(run_id, {}, {}, "completed"))
+                    self.assertTrue(db.complete_job(job_id, {}))
+                else:
+                    error = {"message": "failure committed first", "type": "RuntimeError"}
+                    self.assertTrue(db.fail_run(run_id, error))
+                    self.assertFalse(db.complete_job(job_id, {"late": True}))
+                    self.assertTrue(db.fail_job(job_id, error))
+
+                self.assertFalse(db.request_run_cancel(run_id))
+                self.assertEqual(db.get_run(run_id)["status"], terminal)
+                self.assertEqual(db.get_job(job_id)["status"], terminal)
+
     def test_v1_database_init_adds_v2_tables_without_losing_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "vfieval.sqlite"
@@ -282,8 +775,9 @@ class V2RunTests(unittest.TestCase):
                     "metric_names": ["cgvqm"],
                 },
             )
-            db.set_run_metric_job(run_id, metric_job_id)
-            db.mark_run_started(run_id, "metric_running")
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertTrue(db.set_run_metric_job(run_id, metric_job_id))
+            self.assertTrue(db.mark_run_started(run_id, "metric_running"))
             db.request_run_cancel(run_id)
 
             run_worker(db, workspace, WorkerOptions(role="metric", once=True, worker_id="v2-metric"))

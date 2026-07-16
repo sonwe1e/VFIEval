@@ -10,6 +10,9 @@ from vfieval.db import Database, utc_ts
 from vfieval.file_inputs import resolve_checkpoint, resolve_model_file
 
 
+EXECUTION_PROFILE_CONTRACT = "canonical-v1"
+
+
 def _json(data: Any) -> str:
     return json.dumps(data if data is not None else {}, sort_keys=True, ensure_ascii=False)
 
@@ -57,6 +60,10 @@ def execution_profile_identity(workspace: WorkspaceConfig, payload: dict[str, An
     else:
         device_kind = "cpu"
     identity = {
+        # Post-processing and artifact publication are part of the measured
+        # workload.  Including the contract version keeps recommendations
+        # recorded before canonical/preview separation from being reused.
+        "execution_profile_contract": EXECUTION_PROFILE_CONTRACT,
         "model_name": model_path.name,
         "model_sha256": _sha256(model_path),
         "checkpoint": str(checkpoint_path) if checkpoint_path else "",

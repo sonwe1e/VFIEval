@@ -126,12 +126,15 @@ Contract：
       pred.mp4
       gt.mp4
       diff.mp4
-      pred_frames/
-      gt_frames/
-      diff_frames/
+      preview/
+        pred.mp4
+        gt.mp4
+        diff.mp4
 ```
 
-Run Detail 默认不会一次性加载所有视频和所有图片。页面先读取 Run 的视频摘要，再按当前视频加载最多 160 帧的细节 `timeline`；长视频同时显示固定桶数的全片 min–max/均值总览，点击总览或拖动全局滑条时再加载目标细节窗口。只有选中某个样本时，才调用 `GET /api/runs/{id}/samples/{sample_id}` 加载对应的 `GT / Pred / Diff / Flow / Mask / Warp / Blend`。
+`Pred / GT / Difference` PNG 和 `pred / gt / diff` 视频是 `canonical-v1` 核心制品，尺寸由 Run 的输出分辨率决定。高级设置中的 `visualize_height / visualize_width` 只控制 LANCZOS 预览，不改变推理合成、指标、Compare/Campaign 输入或媒体目录；预览尺寸与 canonical 相同时不会重复写文件。`GET /api/files/{artifact_id}` 始终返回 canonical，`?variant=preview` 返回预览（没有独立预览时回到同一 canonical 文件）。4K Run 会保留完整分辨率 PNG 和视频，因此磁盘占用与编码耗时会明显高于低分辨率 Run。
+
+Run Detail 默认不会一次性加载所有视频和所有图片。页面先读取 Run 的视频摘要并播放预览视频，再按当前视频加载最多 160 帧的细节 `timeline`；长视频同时显示固定桶数的全片 min–max/均值总览，点击总览或拖动全局滑条时再加载目标细节窗口。只有选中某个样本时，才调用 `GET /api/runs/{id}/samples/{sample_id}` 加载对应的预览 `GT / Pred / Diff / Flow / Mask / Warp / Blend`；原图和原视频只在点击“打开原图/原视频”后加载，原视频继续支持 HTTP Range。
 
 Run 的产物、指标或清理状态发生变化时，服务端会递增 `content_revision`。前端检测到 revision 变化后会中止旧请求、失效当前 Run 的结果缓存，并原位恢复当前视频、帧位置、时间线窗口和指标选择；推理完成后不再需要整页刷新。详情页的 `刷新结果` 可强制执行同样的局部刷新。运行中尚未发布产物时显示“产物生成中”，只有终态重新查询后仍为空才显示无产物。
 

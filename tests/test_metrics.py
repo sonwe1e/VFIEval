@@ -21,12 +21,186 @@ from vfieval.db import Database
 from vfieval.metrics.feature import ConvNextFeatureMetric, DinoPatchMetric, _resolve_metric_device
 from vfieval.metrics import METRIC_NAMES, create_metric
 from vfieval.metrics.base import MetricBatchOutOfMemory, MetricResult, MetricUnavailable
+from vfieval.metrics.cgvqm import _bounded_aligned_size
 from vfieval.metrics.health import metric_cache_config, metric_health, prepare_metric_asset_manifest
-from vfieval.pipeline.metrics_runner import _evaluate_with_cache, metric_cache_key, run_metric_job
+from vfieval.pipeline.metrics_runner import (
+    _evaluate_with_cache,
+    _published_video_metric_inputs,
+    _resolve_frame_reference,
+    metric_cache_key,
+    run_metric_job,
+)
 from vfieval.pipeline.metric_jobs import create_metric_wave, maybe_complete_metric_wave
+from vfieval.pipeline.artifact_integrity import ArtifactIntegrityError
 
 
 class MetricTests(unittest.TestCase):
+    def test_legacy_invalid_paired_gt_uses_only_exact_source_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pred_path = root / "pred.png"
+            source_gt = root / "source-gt.png"
+            Image.new("RGB", (8, 8), (1, 2, 3)).save(pred_path)
+            Image.new("RGB", (8, 8), (4, 5, 6)).save(source_gt)
+            pred = {
+                "id": 1,
+                "job_id": 7,
+                "sample_id": 11,
+                "path": str(pred_path),
+                "metadata": {},
+            }
+            paired = [{"id": 2, "path": str(root / "missing.png"), "metadata": {}}]
+
+            status, reference, details = _resolve_frame_reference(
+                pred,
+                {"id": 11, "gt_path": str(source_gt)},
+                paired,
+            )
+
+            self.assertIsNone(status)
+            self.assertEqual(reference, source_gt)
+            self.assertTrue(details["legacy_fallback"])
+            self.assertIn("paired GT artifact is unusable", details["paired_gt_rejected_reason"])
+
+            canonical_pred = {**pred, "metadata": {"artifact_contract": "canonical-v1"}}
+            status, reference, details = _resolve_frame_reference(
+                canonical_pred,
+                {"id": 11, "gt_path": str(source_gt)},
+                paired,
+            )
+            self.assertEqual(status, "unavailable")
+            self.assertIsNone(reference)
+            self.assertEqual(details["reference_source"], "paired_gt_artifact")
+
+            status, reference, details = _resolve_frame_reference(
+                pred,
+                {"id": 11, "gt_path": None},
+                [{"id": 3, "path": str(source_gt), "metadata": {}}],
+            )
+            self.assertEqual(status, "skipped")
+            self.assertIsNone(reference)
+            self.assertEqual(details["reason"], "sample has no ground-truth reference")
+            self.assertEqual(details["ignored_unexpected_gt_artifact_ids"], [3])
+
+    def test_no_gt_video_ignores_stray_paired_gt_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = Database(root / "vfieval.sqlite")
+            db.init()
+            model_id = db.register_model("stray-video-gt", "dummy", None, 4, 4, {})
+            dataset_id = db.create_dataset("stray-video-gt", str(root), False)
+            frame = root / "frame.png"
+            Image.new("RGB", (4, 4), (1, 2, 3)).save(frame)
+            sample_id = db.add_sample(
+                dataset_id,
+                "clip-0001",
+                str(frame),
+                str(frame),
+                None,
+                {"source_type": "video", "video_name": "clip"},
+            )
+            job_id = db.create_job("inference", {"dataset_id": dataset_id})
+            pred_path = root / "pred.mp4"
+            gt_path = root / "stray-gt.mp4"
+            pred_path.write_bytes(b"pred")
+            gt_path.write_bytes(b"gt")
+            pred_id = db.add_artifact(
+                job_id,
+                None,
+                "pred_video",
+                str(pred_path),
+                "video/mp4",
+                {"video_name": "clip", "artifact_contract": "canonical-v1"},
+            )
+            gt_id = db.add_artifact(
+                job_id,
+                None,
+                "gt_video",
+                str(gt_path),
+                "video/mp4",
+                {"video_name": "clip", "artifact_contract": "canonical-v1"},
+            )
+            pred = next(row for row in db.list_artifacts(job_id=job_id) if int(row["id"]) == pred_id)
+
+            inputs = _published_video_metric_inputs(
+                db,
+                db.get_dataset(dataset_id),
+                {sample_id: db.get_sample(sample_id)},
+                [job_id],
+                [pred],
+            )
+
+            self.assertEqual(len(inputs), 1)
+            self.assertIsNone(inputs[0]["reference_path"])
+            self.assertNotIn("error", inputs[0])
+            self.assertEqual(
+                inputs[0]["input_details"]["ignored_unexpected_gt_artifact_ids"],
+                [gt_id],
+            )
+
+    def test_published_video_metric_rejects_nonidentical_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = Database(root / "vfieval.sqlite")
+            db.init()
+            model_id = db.register_model("strict-video", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("strict-video", str(root), True)
+            frame = root / "frame.png"
+            Image.new("RGB", (8, 8)).save(frame)
+            sample_id = db.add_sample(
+                dataset_id,
+                "clip-0001",
+                str(frame),
+                str(frame),
+                str(frame),
+                {"source_type": "video", "video_name": "clip"},
+            )
+            job_id = db.create_job("inference", {"dataset_id": dataset_id})
+            pred_path = root / "pred.mp4"
+            gt_path = root / "gt.mp4"
+            pred_path.write_bytes(b"pred")
+            gt_path.write_bytes(b"gt")
+            pred_id = db.add_artifact(
+                job_id,
+                None,
+                "pred_video",
+                str(pred_path),
+                "video/mp4",
+                {"video_name": "clip", "frames": 2, "width": 8, "height": 8, "fps": 24.0},
+            )
+            db.add_artifact(
+                job_id,
+                None,
+                "gt_video",
+                str(gt_path),
+                "video/mp4",
+                {"video_name": "clip", "frames": 1, "width": 8, "height": 8, "fps": 24.0},
+            )
+            pred = next(row for row in db.list_artifacts(job_id=job_id) if int(row["id"]) == pred_id)
+
+            def inspect(path, exact=True):
+                return {
+                    "decodable": True,
+                    "frame_count": 2 if Path(path) == pred_path else 1,
+                    "width": 8,
+                    "height": 8,
+                    "fps": 24.0,
+                }
+
+            with patch("vfieval.file_inputs.inspect_video", side_effect=inspect):
+                inputs = _published_video_metric_inputs(
+                    db,
+                    db.get_dataset(dataset_id),
+                    {sample_id: db.get_sample(sample_id)},
+                    [job_id],
+                    [pred],
+                )
+
+            self.assertEqual(inputs[0]["input_status"], "unavailable")
+            self.assertIn("strict temporal and spatial identity", inputs[0]["error"])
+            mismatch = inputs[0]["input_details"]["video_pair_integrity"]["mismatches"]
+            self.assertEqual(mismatch["observed_frame_count"], {"pred": 2, "gt": 1})
+
     def test_registry_excludes_psnr(self) -> None:
         self.assertNotIn("psnr", METRIC_NAMES)
         with self.assertRaisesRegex(ValueError, "unsupported metric"):
@@ -175,6 +349,10 @@ class MetricTests(unittest.TestCase):
                 },
                 device="npu:0",
             )
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertTrue(db.set_run_metric_job(run_id, metric_job_id))
+            claimed = db.claim_next_job("metric-batch", ["metric"], device_filter="npu:0")
+            self.assertEqual(int(claimed["id"]), metric_job_id)
 
             class FakeMetric:
                 def __init__(self):
@@ -189,11 +367,241 @@ class MetricTests(unittest.TestCase):
             metric = FakeMetric()
             with patch("vfieval.pipeline.metrics_runner.create_metric", return_value=metric) as create:
                 result = run_metric_job(db, workspace, metric_job_id)
+            self.assertTrue(db.complete_job(metric_job_id, result))
 
             create.assert_called_once_with("lpips_convnext", workspace, device="npu:0")
             self.assertEqual(metric.calls, [4, 2, 2])
             self.assertEqual(result["summary"]["lpips_convnext"]["completed"], 4)
             self.assertEqual(result["performance"]["lpips_convnext"]["effective_batch_size"], 2)
+
+    def test_frame_metric_uses_same_job_materialized_gt_not_sample_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = WorkspaceConfig.from_root(root / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("paired", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("paired", str(root), True)
+            source_gt = root / "source-gt.png"
+            canonical_gt = root / "canonical-gt.png"
+            pred = root / "pred.png"
+            Image.new("RGB", (8, 8), (1, 2, 3)).save(source_gt)
+            Image.new("RGB", (8, 8), (20, 30, 40)).save(canonical_gt)
+            Image.new("RGB", (8, 8), (50, 60, 70)).save(pred)
+            sample_id = db.add_sample(
+                dataset_id, "sample", str(source_gt), str(source_gt), str(source_gt), {}
+            )
+            run_id = db.create_run(
+                "paired", model_id, dataset_id, 8, 8, 1, "cpu", "fp32", ["lpips_convnext"],
+                create_inference_job=False,
+            )
+            inference_job_id = db.add_run_job(
+                run_id, "inference", {"run_id": run_id, "dataset_id": dataset_id}
+            )
+            pred_id = db.add_artifact(
+                inference_job_id,
+                sample_id,
+                "pred",
+                str(pred),
+                "image/png",
+                {"artifact_contract": "canonical-v1"},
+            )
+            gt_id = db.add_artifact(
+                inference_job_id,
+                sample_id,
+                "gt",
+                str(canonical_gt),
+                "image/png",
+                {"artifact_contract": "canonical-v1"},
+            )
+            metric_job_id = db.add_run_job(
+                run_id,
+                "metric",
+                {
+                    "run_id": run_id,
+                    "inference_job_id": inference_job_id,
+                    "dataset_id": dataset_id,
+                    "metric_names": ["lpips_convnext"],
+                    "metric_device": "cpu",
+                },
+            )
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertTrue(db.set_run_metric_job(run_id, metric_job_id))
+            self.assertEqual(int(db.claim_next_job("paired-metric", ["metric"])["id"]), metric_job_id)
+
+            seen: list[tuple[Path, Path]] = []
+
+            class FakeMetric:
+                def evaluate_batch(self, pairs):
+                    seen.extend((Path(reference), Path(distorted)) for reference, distorted, _work in pairs)
+                    return [MetricResult("completed", 0.5, {}) for _ in pairs]
+
+            with patch("vfieval.pipeline.metrics_runner.create_metric", return_value=FakeMetric()):
+                result = run_metric_job(db, workspace, metric_job_id)
+
+            self.assertEqual(seen, [(canonical_gt, pred)])
+            metric_result = db.list_metric_results(inference_job_id)[0]
+            self.assertEqual(metric_result["details"]["reference_source"], "paired_gt_artifact")
+            self.assertEqual(metric_result["details"]["reference_artifact_id"], gt_id)
+            self.assertNotEqual(pred_id, gt_id)
+            self.assertTrue(db.complete_job(metric_job_id, result))
+
+    def test_canonical_frame_metric_never_falls_back_to_raw_sample_gt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = WorkspaceConfig.from_root(root / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("missing-pair", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("missing-pair", str(root), True)
+            source_gt = root / "source-gt.png"
+            pred = root / "pred.png"
+            Image.new("RGB", (8, 8), (1, 2, 3)).save(source_gt)
+            Image.new("RGB", (8, 8), (4, 5, 6)).save(pred)
+            sample_id = db.add_sample(
+                dataset_id, "sample", str(source_gt), str(source_gt), str(source_gt), {}
+            )
+            run_id = db.create_run(
+                "missing-pair", model_id, dataset_id, 8, 8, 1, "cpu", "fp32", ["lpips_convnext"],
+                create_inference_job=False,
+            )
+            inference_job_id = db.add_run_job(
+                run_id, "inference", {"run_id": run_id, "dataset_id": dataset_id}
+            )
+            db.add_artifact(
+                inference_job_id,
+                sample_id,
+                "pred",
+                str(pred),
+                "image/png",
+                {"artifact_contract": "canonical-v1"},
+            )
+            metric_job_id = db.add_run_job(
+                run_id,
+                "metric",
+                {
+                    "run_id": run_id,
+                    "inference_job_id": inference_job_id,
+                    "dataset_id": dataset_id,
+                    "metric_names": ["lpips_convnext"],
+                    "metric_device": "cpu",
+                },
+            )
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertTrue(db.set_run_metric_job(run_id, metric_job_id))
+            self.assertEqual(int(db.claim_next_job("missing-pair", ["metric"])["id"]), metric_job_id)
+
+            with patch("vfieval.pipeline.metrics_runner.create_metric") as create:
+                result = run_metric_job(db, workspace, metric_job_id)
+
+            create.assert_not_called()
+            self.assertEqual(result["summary"]["lpips_convnext"]["unavailable"], 1)
+            metric_result = db.list_metric_results(inference_job_id)[0]
+            self.assertIn("no unique materialized GT", metric_result["details"]["reason"])
+            self.assertTrue(db.complete_job(metric_job_id, result))
+
+    def test_canonical_video_metric_gt_coverage_is_scoped_to_video_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = WorkspaceConfig.from_root(root / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("video-pairs", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("video-pairs", str(root), True)
+            source_frame = root / "source.png"
+            source_gt = root / "source-gt.png"
+            Image.new("RGB", (8, 8), (1, 2, 3)).save(source_frame)
+            Image.new("RGB", (8, 8), (4, 5, 6)).save(source_gt)
+            db.add_sample(
+                dataset_id,
+                "with-gt",
+                str(source_frame),
+                str(source_frame),
+                str(source_gt),
+                {"source_type": "video", "video_name": "with-gt", "frame_index": 0},
+            )
+            db.add_sample(
+                dataset_id,
+                "without-gt",
+                str(source_frame),
+                str(source_frame),
+                None,
+                {"source_type": "video", "video_name": "without-gt", "frame_index": 0},
+            )
+            run_id = db.create_run(
+                "video-pairs",
+                model_id,
+                dataset_id,
+                8,
+                8,
+                1,
+                "cpu",
+                "fp32",
+                ["vmaf"],
+                create_inference_job=False,
+            )
+            inference_job_id = db.add_run_job(
+                run_id, "inference", {"run_id": run_id, "dataset_id": dataset_id}
+            )
+            for video_name in ("with-gt", "without-gt"):
+                pred_video = root / f"{video_name}-pred.mp4"
+                pred_video.write_bytes(b"canonical-pred-video")
+                db.add_artifact(
+                    inference_job_id,
+                    None,
+                    "pred_video",
+                    str(pred_video),
+                    "video/mp4",
+                    {
+                        "artifact_contract": "canonical-v1",
+                        "video_name": video_name,
+                        "frames": 1,
+                        "width": 8,
+                        "height": 8,
+                        "fps": 24.0,
+                    },
+                )
+            metric_job_id = db.add_run_job(
+                run_id,
+                "metric",
+                {
+                    "run_id": run_id,
+                    "inference_job_id": inference_job_id,
+                    "dataset_id": dataset_id,
+                    "metric_names": ["vmaf"],
+                    "metric_device": "cpu",
+                },
+            )
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertTrue(db.set_run_metric_job(run_id, metric_job_id))
+            self.assertEqual(
+                int(db.claim_next_job("video-pairs-metric", ["metric"])["id"]),
+                metric_job_id,
+            )
+
+            with patch("vfieval.pipeline.metrics_runner.sync_run_assets"), patch(
+                "vfieval.pipeline.metrics_runner.create_metric"
+            ) as create:
+                result = run_metric_job(db, workspace, metric_job_id)
+
+            create.assert_not_called()
+            self.assertEqual(result["summary"]["vmaf"]["unavailable"], 1)
+            self.assertEqual(result["summary"]["vmaf"]["skipped"], 1)
+            results = {
+                str(row["details"].get("video_name")): row
+                for row in db.list_metric_results(inference_job_id)
+            }
+            self.assertEqual(results["with-gt"]["status"], "unavailable")
+            self.assertIn("no canonical gt_video", results["with-gt"]["details"]["reason"])
+            self.assertEqual(results["without-gt"]["status"], "skipped")
+            self.assertEqual(
+                results["without-gt"]["details"]["reason"],
+                "video has no ground-truth reference",
+            )
+            self.assertTrue(db.complete_job(metric_job_id, result))
 
     def test_multi_device_metric_wave_partitions_frames_and_aggregates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -203,6 +611,20 @@ class MetricTests(unittest.TestCase):
             db.init()
             model_id = db.register_model("dummy", "dummy", None, 8, 8, {})
             dataset_id = db.create_dataset("frames", str(Path(tmp)), True)
+            sample_ids = []
+            for index in range(2):
+                source = Path(tmp) / f"sample-{index}.png"
+                source.write_bytes(b"source")
+                sample_ids.append(
+                    db.add_sample(
+                        dataset_id,
+                        f"sample-{index}",
+                        str(source),
+                        str(source),
+                        str(source),
+                        {"source_type": "frames"},
+                    )
+                )
             run_id = db.create_run(
                 name="metric-wave",
                 model_id=model_id,
@@ -219,28 +641,65 @@ class MetricTests(unittest.TestCase):
                 },
                 create_inference_job=False,
             )
+            inference_job_ids = []
             for index, device in enumerate(("npu:0", "npu:1")):
-                db.add_run_job(
+                inference_job_ids.append(db.add_run_job(
                     run_id,
                     "inference",
-                    {"run_id": run_id, "dataset_id": dataset_id, "sample_ids": [index + 1]},
+                    {
+                        "run_id": run_id,
+                        "dataset_id": dataset_id,
+                        "sample_ids": [sample_ids[index]],
+                        "artifact_profile": "evaluation",
+                    },
                     shard_index=index,
                     device=device,
-                )
+                ))
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            for index, (job_id, sample_id) in enumerate(zip(inference_job_ids, sample_ids)):
+                claimed = db.claim_next_job(f"inference-{index}", ["inference"])
+                self.assertEqual(int(claimed["id"]), job_id)
+                for kind in ("pred", "gt", "difference"):
+                    path = Path(tmp) / f"{sample_id}-{kind}.png"
+                    path.write_bytes(kind.encode("ascii"))
+                    db.add_artifact(job_id, sample_id, kind, str(path), "image/png", {})
+                self.assertTrue(db.complete_job(job_id, {"samples": 1}))
 
             wave = create_metric_wave(db, run_id, ["lpips_convnext", "vmaf"], source="test")
             jobs = db.list_run_jobs(run_id, "metric")
             self.assertEqual([row["device"] for row in jobs], ["npu:0", "npu:1"])
             self.assertEqual(jobs[0]["payload"]["metric_names"], ["lpips_convnext", "vmaf"])
             self.assertEqual(jobs[1]["payload"]["metric_names"], ["lpips_convnext"])
-            self.assertEqual(jobs[0]["payload"]["sample_ids"], [1])
-            self.assertEqual(jobs[1]["payload"]["sample_ids"], [2])
+            self.assertEqual(jobs[0]["payload"]["sample_ids"], [sample_ids[0]])
+            self.assertEqual(jobs[1]["payload"]["sample_ids"], [sample_ids[1]])
             self.assertTrue(all(row["payload"]["metric_batch_size_per_device"] == 12 for row in jobs))
 
-            db.complete_job(jobs[0]["job_id"], {"summary": {"lpips_convnext": {"completed": 1, "mean": 0.2, "value_sum": 0.2}, "vmaf": {"completed": 1, "mean": 90.0, "value_sum": 90.0}}})
-            self.assertFalse(maybe_complete_metric_wave(db, run_id, wave["metric_wave_id"]))
-            db.complete_job(jobs[1]["job_id"], {"summary": {"lpips_convnext": {"completed": 3, "mean": 0.4, "value_sum": 1.2}}})
-            self.assertTrue(maybe_complete_metric_wave(db, run_id, wave["metric_wave_id"]))
+            self.assertTrue(db.mark_run_started(run_id, "metric_running"))
+            for index, job in enumerate(jobs):
+                claimed = db.claim_next_job(f"metric-{index}", ["metric"])
+                self.assertEqual(int(claimed["id"]), int(job["job_id"]))
+            first_result = {"summary": {"lpips_convnext": {"completed": 1, "mean": 0.2, "value_sum": 0.2}, "vmaf": {"completed": 1, "mean": 90.0, "value_sum": 90.0}}}
+            self.assertFalse(
+                maybe_complete_metric_wave(
+                    db,
+                    run_id,
+                    wave["metric_wave_id"],
+                    source_job_id=int(jobs[0]["job_id"]),
+                    source_job_result=first_result,
+                )
+            )
+            self.assertEqual(db.get_job(int(jobs[0]["job_id"]))["status"], "completed")
+            second_result = {"summary": {"lpips_convnext": {"completed": 3, "mean": 0.4, "value_sum": 1.2}}}
+            self.assertTrue(
+                maybe_complete_metric_wave(
+                    db,
+                    run_id,
+                    wave["metric_wave_id"],
+                    source_job_id=int(jobs[1]["job_id"]),
+                    source_job_result=second_result,
+                )
+            )
+            self.assertEqual(db.get_job(int(jobs[1]["job_id"]))["status"], "completed")
             completed = db.get_run(run_id)
             self.assertEqual(completed["status"], "completed")
             self.assertAlmostEqual(completed["metric_summary"]["lpips_convnext"]["mean"], 0.35)
@@ -257,12 +716,92 @@ class MetricTests(unittest.TestCase):
                 for row in db.list_run_jobs(run_id, "metric")
                 if row["payload"].get("metric_wave_id") == retry["metric_wave_id"]
             ]
-            db.complete_job(retry_jobs[0]["job_id"], {"summary": {"lpips_convnext": {"completed": 1, "mean": 0.1, "value_sum": 0.1}}})
-            db.complete_job(retry_jobs[1]["job_id"], {"summary": {"lpips_convnext": {"completed": 1, "mean": 0.3, "value_sum": 0.3}}})
+            self.assertTrue(db.mark_run_started(run_id, "metric_running"))
+            for index, job in enumerate(retry_jobs):
+                claimed = db.claim_next_job(f"retry-metric-{index}", ["metric"])
+                self.assertEqual(int(claimed["id"]), int(job["job_id"]))
+            self.assertTrue(db.complete_job(retry_jobs[0]["job_id"], {"summary": {"lpips_convnext": {"completed": 1, "mean": 0.1, "value_sum": 0.1}}}))
+            self.assertTrue(db.complete_job(retry_jobs[1]["job_id"], {"summary": {"lpips_convnext": {"completed": 1, "mean": 0.3, "value_sum": 0.3}}}))
             self.assertTrue(maybe_complete_metric_wave(db, run_id, retry["metric_wave_id"]))
             retried = db.get_run(run_id)
             self.assertAlmostEqual(retried["metric_summary"]["lpips_convnext"]["mean"], 0.2)
             self.assertEqual(retried["metric_summary"]["vmaf"]["completed"], 1)
+
+    def test_metric_wave_publication_rolls_back_as_one_transaction(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("dummy", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("frames", str(Path(tmp)), False)
+            run_id = db.create_run(
+                "atomic-wave", model_id, dataset_id, 8, 8, 1, "cpu", "fp32", [], create_inference_job=False
+            )
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+
+            with self.assertRaises(TypeError):
+                db.publish_metric_wave(
+                    run_id,
+                    [
+                        {"payload": {"run_id": run_id, "metric_names": ["lpips_convnext"]}},
+                        {
+                            "payload": {"run_id": run_id, "metric_names": ["lpips_convnext"]},
+                            "metadata": {"not_json": object()},
+                        },
+                    ],
+                    retry=False,
+                )
+
+            self.assertEqual(db.list_run_jobs(run_id, "metric"), [])
+            self.assertEqual(db.get_run(run_id)["status"], "running")
+
+    def test_metric_retry_rejects_failed_partial_inference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("dummy", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("frames", str(Path(tmp)), True)
+            source = Path(tmp) / "sample.png"
+            source.write_bytes(b"source")
+            sample_id = db.add_sample(
+                dataset_id,
+                "sample",
+                str(source),
+                str(source),
+                str(source),
+                {"source_type": "frames"},
+            )
+            run_id = db.create_run(
+                "partial", model_id, dataset_id, 8, 8, 1, "cpu", "fp32", ["lpips_convnext"], create_inference_job=False
+            )
+            job_id = db.add_run_job(
+                run_id,
+                "inference",
+                {
+                    "run_id": run_id,
+                    "dataset_id": dataset_id,
+                    "sample_ids": [sample_id],
+                    "artifact_profile": "evaluation",
+                },
+                progress_total=1,
+            )
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertEqual(int(db.claim_next_job("partial", ["inference"])["id"]), job_id)
+            pred = Path(tmp) / "pred.png"
+            pred.write_bytes(b"pred")
+            db.add_artifact(job_id, sample_id, "pred", str(pred), "image/png", {})
+            error = {"message": "GT save failed", "type": "OSError"}
+            self.assertTrue(db.fail_job(job_id, error))
+            self.assertTrue(db.fail_run(run_id, error))
+
+            with self.assertRaises(ArtifactIntegrityError):
+                create_metric_wave(db, run_id, ["lpips_convnext"], source="retry", retry=True)
+
+            self.assertEqual(db.get_run(run_id)["status"], "failed")
+            self.assertEqual(db.list_run_jobs(run_id, "metric"), [])
 
     def test_vmaf_health_finds_project_local_ffmpeg(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -298,6 +837,15 @@ class MetricTests(unittest.TestCase):
             self.assertEqual(health["resolved_executable"], expected_python)
             self.assertEqual(health["executable_source"], "current_python")
             self.assertEqual(health["driver_command"][0], expected_python)
+
+    def test_cgvqm_eval_size_is_patch_aligned(self) -> None:
+        width, height = _bounded_aligned_size(1792, 832, 720, 4)
+        self.assertEqual((width, height), (720, 332))
+        self.assertEqual(width % 4, 0)
+        self.assertEqual(height % 4, 0)
+
+        width, height = _bounded_aligned_size(96, 64, 720, 4)
+        self.assertEqual((width, height), (96, 64))
 
     def test_metric_cache_key_uses_file_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -417,6 +965,8 @@ class MetricTests(unittest.TestCase):
             metric_dir = workspace.root.parent / "set" / "metrics" / "cgvqm"
             wrapper = metric_dir / "run_cgvqm_vfieval.py"
             wrapper_source = wrapper.read_text(encoding="utf-8")
+            checked_in_wrapper = ROOT / "set" / "metrics" / "cgvqm" / "run_cgvqm_vfieval.py"
+            self.assertEqual(wrapper_source, checked_in_wrapper.read_text(encoding="utf-8"))
             self.assertIn("def _prepare_device", wrapper_source)
             self.assertIn("set_device(index)", wrapper_source)
             payload = {
@@ -442,6 +992,8 @@ class MetricTests(unittest.TestCase):
             self.assertEqual(output["details"]["entrypoint"], "run_cgvqm")
             self.assertEqual(output["details"]["patch_pool"], "max")
             self.assertEqual(output["details"]["patch_scale"], 4)
+            self.assertEqual(output["details"]["driver_stdout"], "WARNING: fake third-party stdout")
+            self.assertFalse(output["details"]["driver_stdout_truncated"])
 
     def test_prepare_metrics_check_only_does_not_create_metric_assets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -491,6 +1043,7 @@ class MetricTests(unittest.TestCase):
             self.assertEqual(result.value, 0.42)
             self.assertEqual(result.details["manifest_path"], str((metric_dir / "manifest.json").resolve()))
             self.assertEqual(result.details["metric_name"], "cgvqm")
+            self.assertEqual(result.details["patch_scale"], 4)
 
     def test_cgvqm_wrapper_metric_maps_unavailable_stdout_status(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -847,6 +1400,10 @@ class MetricTests(unittest.TestCase):
                 },
                 progress_total=4,
             )
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertTrue(db.set_run_metric_job(run_id, metric_job_id))
+            claimed = db.claim_next_job("item-compare-metric", ["metric"])
+            self.assertEqual(int(claimed["id"]), metric_job_id)
             encoded: list[tuple[list[Path], Path, float]] = []
             evaluated: list[tuple[Path, Path]] = []
 
@@ -864,6 +1421,7 @@ class MetricTests(unittest.TestCase):
                 "vfieval.pipeline.metrics_runner.create_metric", return_value=FakeVideoMetric()
             ):
                 result = run_metric_job(db, workspace, metric_job_id)
+            self.assertTrue(db.complete_job(metric_job_id, result))
 
             self.assertEqual(result["summary"]["vmaf"]["completed"], 2)
             self.assertEqual(result["summary"]["cgvqm"]["completed"], 2)
@@ -1079,6 +1637,7 @@ def _write_fake_driver(metric_dir: Path, *, mode: str = "completed", value: floa
                 "details": {{
                     "metric_name": payload["metric_name"],
                     "manifest_path": payload["manifest_path"],
+                    "patch_scale": payload.get("patch_scale"),
                     "reason": "driver reported {mode}" if {mode!r} != "completed" else "",
                 }},
             }}
@@ -1156,6 +1715,7 @@ def _fake_cgvqm_module() -> str:
                 return 0.5
 
         def run_cgvqm(test_vid_path, ref_vid_path, cgvqm_type=None, device='cpu', patch_pool='max', patch_scale=4):
+            print('WARNING: fake third-party stdout')
             if patch_pool != 'max' or patch_scale != 4:
                 raise RuntimeError('bad wrapper defaults')
             if cgvqm_type != CGVQM_TYPE.CGVQM_2:

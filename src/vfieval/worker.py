@@ -156,54 +156,60 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
         try:
             if job["kind"] == "decode":
                 result = run_decode_job(db, workspace, int(job["id"]))
-                if db.get_job(int(job["id"]))["status"] != "canceled":
-                    db.complete_job(int(job["id"]), result)
-                    run_id = job.get("payload", {}).get("run_id")
-                    if run_id is not None:
-                        create_inference_jobs_for_run(db, int(run_id))
-                        start_workers_for_run(db, workspace, int(run_id))
+                run_id = job.get("payload", {}).get("run_id")
+                if run_id is not None:
+                    inference_job_ids = create_inference_jobs_for_run(
+                        db,
+                        int(run_id),
+                        source_job_id=int(job["id"]),
+                        source_job_result=result,
+                    )
+                    if not inference_job_ids:
+                        _raise_rejected_handoff(db, int(run_id), int(job["id"]), "inference")
+                    _complete_claimed_job(db, job, result)
+                    start_workers_for_run(db, workspace, int(run_id))
+                else:
+                    _complete_claimed_job(db, job, result)
             elif job["kind"] == "inference":
                 result = run_inference_job(db, workspace, int(job["id"]))
-                if db.get_job(int(job["id"]))["status"] != "canceled":
-                    db.complete_job(int(job["id"]), result.__dict__)
-                    run_id = job.get("payload", {}).get("run_id")
-                    if run_id is not None:
-                        from vfieval.media_assets import sync_run_assets
+                run_id = job.get("payload", {}).get("run_id")
+                if run_id is not None and int(job.get("payload", {}).get("shard_count") or 1) > 1:
+                    db.maybe_complete_multi_run_inference(
+                        int(run_id),
+                        source_job_id=int(job["id"]),
+                        source_job_result=result.__dict__,
+                    )
+                _complete_claimed_job(db, job, result.__dict__)
+                if run_id is not None and result.performance:
+                    from vfieval.performance import execution_profile_identity, record_execution_profile
 
-                        sync_run_assets(db, workspace, int(run_id))
-                        if result.performance:
-                            from vfieval.performance import execution_profile_identity, record_execution_profile
-
-                            run = db.get_run(int(run_id))
-                            request = dict((run.get("metadata") or {}).get("request") or {})
-                            request.update(
-                                {
-                                    "height": int(run.get("height") or 0),
-                                    "width": int(run.get("width") or 0),
-                                    "artifact_profile": result.performance.get("artifact_profile") or request.get("artifact_profile"),
-                                    "device_model": result.performance.get("device_name") or "",
-                                }
-                            )
-                            try:
-                                identity = execution_profile_identity(workspace, request)
-                                record_execution_profile(
-                                    db,
-                                    identity,
-                                    {
-                                        "batch_size": int(job.get("payload", {}).get("batch_size") or 1),
-                                        "prefetch_workers": result.performance.get("prefetch_workers"),
-                                        "save_workers": result.performance.get("save_workers"),
-                                        "max_save_inflight": job.get("payload", {}).get("max_save_inflight"),
-                                    },
-                                    result.performance,
-                                )
-                            except Exception:
-                                pass
-                    if run_id is not None and int(job.get("payload", {}).get("shard_count") or 1) > 1:
-                        db.maybe_complete_multi_run_inference(int(run_id))
+                    run = db.get_run(int(run_id))
+                    request = dict((run.get("metadata") or {}).get("request") or {})
+                    request.update(
+                        {
+                            "height": int(run.get("height") or 0),
+                            "width": int(run.get("width") or 0),
+                            "artifact_profile": result.performance.get("artifact_profile") or request.get("artifact_profile"),
+                            "device_model": result.performance.get("device_name") or "",
+                        }
+                    )
+                    try:
+                        identity = execution_profile_identity(workspace, request)
+                        record_execution_profile(
+                            db,
+                            identity,
+                            {
+                                "batch_size": int(job.get("payload", {}).get("batch_size") or 1),
+                                "prefetch_workers": result.performance.get("prefetch_workers"),
+                                "save_workers": result.performance.get("save_workers"),
+                                "max_save_inflight": job.get("payload", {}).get("max_save_inflight"),
+                            },
+                            result.performance,
+                        )
+                    except Exception:
+                        pass
             elif job["kind"] == "metric":
                 result = run_metric_job(db, workspace, int(job["id"]))
-                db.complete_job(int(job["id"]), result)
                 payload = job.get("payload") or {}
                 if payload.get("metric_wave_id") and payload.get("run_id") is not None:
                     from vfieval.pipeline.metric_jobs import maybe_complete_metric_wave
@@ -212,13 +218,27 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
                         db,
                         int(payload["run_id"]),
                         str(payload["metric_wave_id"]),
+                        source_job_id=int(job["id"]),
+                        source_job_result=result,
                     )
+                _complete_claimed_job(db, job, result)
             elif job["kind"] == "finalize":
                 result = run_finalize_job(db, workspace, int(job["id"]))
-                db.complete_job(int(job["id"]), result)
+                _complete_claimed_job(db, job, result)
             else:
                 raise ValueError(f"unsupported job kind {job['kind']}")
         except RunCanceled:
+            payload = job.get("payload") or {}
+            if payload.get("run_id") is not None:
+                canceled_run_id = int(payload["run_id"])
+                run_status = str(db.get_run(canceled_run_id).get("status") or "")
+                if run_status in {"cancel_requested", "canceled"}:
+                    db.converge_run_cancellation(canceled_run_id, int(job["id"]))
+                elif run_status == "failed":
+                    db.cancel_job(
+                        int(job["id"]),
+                        {"message": "Run already failed", "type": "RunCanceled"},
+                    )
             if options.once:
                 return
         except Exception as exc:
@@ -232,12 +252,24 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
                     "traceback": traceback.format_exc(),
                 },
             )
-            db.fail_job(
-                int(job["id"]),
-                error,
-            )
             if run_id is not None:
-                db.fail_run(int(run_id), error)
+                if not db.fail_claimed_job_and_run(int(job["id"]), int(run_id), error):
+                    run = db.get_run(int(run_id))
+                    if run["status"] in {"cancel_requested", "canceled"}:
+                        db.converge_run_cancellation(int(run_id), int(job["id"]))
+                    elif run["status"] == "failed":
+                        db.cancel_job(
+                            int(job["id"]),
+                            {"message": "Run already failed", "type": "RunCanceled"},
+                        )
+                    elif run["status"] not in {"completed"}:
+                        # The source Job may already have completed atomically
+                        # with a phase handoff. A later local failure (for
+                        # example spawning the next worker) must still fail the
+                        # active Run instead of leaving it queued forever.
+                        db.fail_run(int(run_id), error)
+            else:
+                db.fail_job(int(job["id"]), error)
             if options.once:
                 return
         finally:
@@ -248,3 +280,32 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
                 RunCleanupService(db, workspace).process_pending(limit=20)
             except Exception as exc:
                 print(f"run cleanup coordinator failed: {type(exc).__name__}: {exc}")
+
+
+def _complete_claimed_job(db: Database, job: dict[str, object], result: dict[str, object]) -> None:
+    job_id = int(job["id"])
+    if db.complete_job(job_id, result):
+        return
+    # A phase handoff may atomically complete this source Job together with the
+    # Run transition and child Job publication. ``complete_job`` accepts that
+    # acknowledgement only when its result is identical; a conflicting replay
+    # must enter the regular failure path instead of being silently accepted.
+    payload = job.get("payload") or {}
+    run_id = payload.get("run_id") if isinstance(payload, dict) else None
+    if run_id is not None:
+        run = db.get_run(int(run_id))
+        if run["status"] in {"cancel_requested", "canceled"}:
+            db.converge_run_cancellation(int(run_id), job_id)
+            raise RunCanceled(f"Run {run_id} canceled before Job {job_id} completion")
+        if run["status"] == "failed":
+            db.cancel_job(job_id, {"message": "Run already failed", "type": "RunCanceled"})
+            raise RunCanceled(f"Run {run_id} failed before Job {job_id} completion")
+    raise RuntimeError(f"Job {job_id} rejected completion CAS")
+
+
+def _raise_rejected_handoff(db: Database, run_id: int, job_id: int, phase: str) -> None:
+    run = db.get_run(run_id)
+    if run["status"] in {"cancel_requested", "canceled"}:
+        db.converge_run_cancellation(run_id, job_id)
+        raise RunCanceled(f"Run {run_id} canceled before {phase} publication")
+    raise RuntimeError(f"Run {run_id} rejected {phase} publication")

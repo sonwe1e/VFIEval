@@ -28,6 +28,26 @@ def _loads(text: str | None) -> Any:
 LATEST_SCHEMA_VERSION = "2026-07-media-items-v2-cache-build-locks"
 
 
+RUN_TERMINAL_STATUSES = {"completed", "failed", "canceled"}
+RUN_NON_PROGRESS_STATUSES = RUN_TERMINAL_STATUSES | {"cancel_requested"}
+JOB_TERMINAL_STATUSES = {"completed", "failed", "canceled"}
+
+# State changes are intentionally centralized here. Runs and Jobs follow the
+# guarded lifecycle contract; progress publication never changes lifecycle
+# state and terminal states are absorbing.
+RUN_START_SOURCES: dict[str, tuple[str, ...]] = {
+    "decoding": ("queued", "decoding"),
+    "running": ("queued", "running"),
+    "finalizing": ("finalize_queued", "finalizing"),
+    "metric_running": ("metric_queued", "metric_running"),
+}
+RUN_INFERENCE_COMPLETION_SOURCES: dict[str, tuple[str, ...]] = {
+    "completed": ("running", "finalizing"),
+    "finalize_queued": ("running",),
+    "metric_queued": ("running", "finalizing"),
+}
+
+
 def _rating_key(score: float) -> str:
     """Canonical 0.25-step histogram key, e.g. 3.0 -> "3.00", 3.25 -> "3.25"."""
     return f"{round(float(score) * 4) / 4:.2f}"
@@ -1378,16 +1398,286 @@ class Database:
                     """,
                     (job_id, now, run_id),
                 )
-            elif role == "metric":
+            elif role == "decode":
                 conn.execute(
                     """
                     UPDATE runs
-                    SET metric_job_id = ?, updated_at = ?
-                    WHERE id = ?
+                    SET status = 'decoding', updated_at = ?
+                    WHERE id = ? AND status = 'queued'
                     """,
-                    (job_id, now, run_id),
+                    (now, run_id),
                 )
             return job_id
+
+    @staticmethod
+    def _source_job_status(
+        conn: sqlite3.Connection,
+        run_id: int,
+        source_job_id: int | None,
+        allowed_kinds: Iterable[str],
+    ) -> str | None:
+        """Validate that an optional phase-producing Job belongs to this Run."""
+        if source_job_id is None:
+            return None
+        kinds = tuple(str(kind) for kind in allowed_kinds)
+        if not kinds:
+            raise ValueError("source Job validation requires at least one kind")
+        placeholders = ",".join("?" for _ in kinds)
+        row = conn.execute(
+            f"""
+            SELECT j.status
+            FROM jobs j
+            WHERE j.id = ? AND j.kind IN ({placeholders})
+              AND (
+                    CAST(json_extract(j.payload_json, '$.run_id') AS INTEGER) = ?
+                    OR EXISTS (
+                        SELECT 1 FROM run_jobs rj
+                        WHERE rj.run_id = ? AND rj.job_id = j.id
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM runs r
+                        WHERE r.id = ?
+                          AND (r.inference_job_id = j.id OR r.metric_job_id = j.id)
+                    )
+              )
+            """,
+            (int(source_job_id), *kinds, int(run_id), int(run_id), int(run_id)),
+        ).fetchone()
+        if row is None:
+            return ""
+        return str(row["status"] or "")
+
+    @staticmethod
+    def _complete_source_job_in_transaction(
+        conn: sqlite3.Connection,
+        source_job_id: int | None,
+        source_status: str | None,
+        source_job_result: dict[str, Any] | None,
+        now: float,
+    ) -> bool:
+        if source_job_id is None:
+            return True
+        if source_status == "completed":
+            row = conn.execute(
+                "SELECT result_json FROM jobs WHERE id = ?",
+                (int(source_job_id),),
+            ).fetchone()
+            return bool(
+                row is not None
+                and _loads(row["result_json"]) == _loads(_json(source_job_result))
+            )
+        if source_status != "running":
+            return False
+        cur = conn.execute(
+            """
+            UPDATE jobs
+            SET status = 'completed', result_json = ?, finished_at = ?
+            WHERE id = ? AND status = 'running'
+            """,
+            (_json(source_job_result), now, int(source_job_id)),
+        )
+        return bool(cur.rowcount)
+
+    def publish_inference_jobs(
+        self,
+        run_id: int,
+        job_specs: Iterable[dict[str, Any]],
+        *,
+        source_job_id: int | None = None,
+        source_job_result: dict[str, Any] | None = None,
+    ) -> list[int]:
+        """Atomically publish the decode -> inference handoff.
+
+        A cancellation that commits first prevents every new inference job;
+        publication that commits first exposes the complete job set and the
+        queued Run state together. Repeated calls return the original set.
+        """
+        specs = list(job_specs)
+        if not specs:
+            raise ValueError("inference handoff requires at least one job")
+        now = utc_ts()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                """
+                SELECT status, inference_job_id, device,
+                       deleted_at, artifact_cleaned_at
+                FROM runs
+                WHERE id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"run {run_id} not found")
+            source_status = self._source_job_status(
+                conn,
+                run_id,
+                source_job_id,
+                ("decode",),
+            )
+            if source_job_id is not None and source_status not in {"running", "completed"}:
+                return []
+            purge_pending = conn.execute(
+                """
+                SELECT 1
+                FROM run_purge_requests
+                WHERE run_id = ?
+                  AND status IN ('requested', 'canceling', 'purging')
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            existing = conn.execute(
+                """
+                SELECT rj.job_id, j.kind, j.status
+                FROM run_jobs rj
+                JOIN jobs j ON j.id = rj.job_id
+                WHERE rj.run_id = ? AND rj.role = 'inference'
+                ORDER BY rj.shard_index, rj.job_id
+                """,
+                (run_id,),
+            ).fetchall()
+            if existing:
+                if (
+                    str(run["status"]) not in {"queued", "decoding", "running"}
+                    or run["deleted_at"] is not None
+                    or run["artifact_cleaned_at"] is not None
+                    or purge_pending is not None
+                    or any(
+                        str(row["kind"]) != "inference"
+                        or str(row["status"]) not in {"queued", "running"}
+                        for row in existing
+                    )
+                ):
+                    return []
+                if not self._complete_source_job_in_transaction(
+                    conn,
+                    source_job_id,
+                    source_status,
+                    source_job_result,
+                    now,
+                ):
+                    raise RuntimeError(f"decode Job {source_job_id} rejected inference handoff completion")
+                conn.execute(
+                    "UPDATE runs SET status = 'queued', updated_at = ? WHERE id = ? AND status = 'decoding'",
+                    (now, run_id),
+                )
+                return [int(row["job_id"]) for row in existing]
+
+            # Historical Runs may point directly at their inference Job
+            # without a corresponding ``run_jobs`` row. Treat a coherent,
+            # active direct link as the already-published handoff instead of
+            # creating a second inference Job. Backfill the binding so device
+            # claims and all newer lifecycle checks see the same association.
+            direct_job = None
+            if run["inference_job_id"] is not None:
+                direct_job = conn.execute(
+                    "SELECT id, kind, status FROM jobs WHERE id = ?",
+                    (int(run["inference_job_id"]),),
+                ).fetchone()
+            if direct_job is not None and (
+                str(direct_job["kind"]) == "inference"
+                and str(direct_job["status"]) in {"queued", "running"}
+            ):
+                if (
+                    str(run["status"]) not in {"queued", "decoding", "running"}
+                    or run["deleted_at"] is not None
+                    or run["artifact_cleaned_at"] is not None
+                    or purge_pending is not None
+                ):
+                    return []
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO run_jobs(
+                        run_id, job_id, role, shard_index, device,
+                        metadata_json, created_at
+                    )
+                    VALUES (?, ?, 'inference', 0, ?, '{}', ?)
+                    """,
+                    (run_id, int(direct_job["id"]), run["device"], now),
+                )
+                if not self._complete_source_job_in_transaction(
+                    conn,
+                    source_job_id,
+                    source_status,
+                    source_job_result,
+                    now,
+                ):
+                    raise RuntimeError(f"decode Job {source_job_id} rejected inference handoff completion")
+                conn.execute(
+                    "UPDATE runs SET status = 'queued', updated_at = ? WHERE id = ? AND status = 'decoding'",
+                    (now, run_id),
+                )
+                return [int(direct_job["id"])]
+
+            if run["inference_job_id"] is not None:
+                # A historical direct link is authoritative even when its Job
+                # is no longer active. Never create a second inference Job for
+                # the same Run from a partially migrated state.
+                return []
+
+            if (
+                str(run["status"]) not in {"queued", "decoding"}
+                or run["deleted_at"] is not None
+                or run["artifact_cleaned_at"] is not None
+                or purge_pending is not None
+            ):
+                return []
+
+            job_ids: list[int] = []
+            progress_total = 0
+            for spec in specs:
+                payload = dict(spec.get("payload") or {})
+                payload.setdefault("run_id", run_id)
+                total = int(spec.get("progress_total") or 0)
+                cur = conn.execute(
+                    """
+                    INSERT INTO jobs(kind, status, payload_json, progress_total, created_at)
+                    VALUES ('inference', 'queued', ?, ?, ?)
+                    """,
+                    (_json(payload), total, now),
+                )
+                job_id = int(cur.lastrowid)
+                job_ids.append(job_id)
+                progress_total += total
+                conn.execute(
+                    """
+                    INSERT INTO run_jobs(
+                        run_id, job_id, role, shard_index, device, metadata_json, created_at
+                    )
+                    VALUES (?, ?, 'inference', ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        job_id,
+                        int(spec.get("shard_index") or 0),
+                        spec.get("device"),
+                        _json(spec.get("metadata") or {}),
+                        now,
+                    ),
+                )
+
+            cur = conn.execute(
+                """
+                UPDATE runs
+                SET inference_job_id = COALESCE(inference_job_id, ?),
+                    status = 'queued', progress_current = 0,
+                    progress_total = ?, updated_at = ?
+                WHERE id = ? AND status IN ('queued', 'decoding')
+                """,
+                (job_ids[0], progress_total, now, run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError(f"run {run_id} rejected inference job publication")
+            if not self._complete_source_job_in_transaction(
+                conn,
+                source_job_id,
+                source_status,
+                source_job_result,
+                now,
+            ):
+                raise RuntimeError(f"decode Job {source_job_id} rejected inference handoff completion")
+            return job_ids
 
     def list_run_jobs(self, run_id: int, role: str | None = None) -> list[dict[str, Any]]:
         params: list[Any] = [run_id]
@@ -1446,6 +1736,48 @@ class Database:
             row["purge_request"] = self.get_run_purge_request(int(row["id"]))
         return rows
 
+    def list_run_associated_jobs(
+        self,
+        run_id: int,
+        statuses: Iterable[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """List Jobs linked through current bindings or legacy Run identity.
+
+        Historical databases may lack ``run_jobs`` rows while still linking a
+        Job through ``runs.inference_job_id``, ``runs.metric_job_id``, or the
+        Job payload's ``run_id``.  Lifecycle and cleanup decisions must see
+        the same complete association set as cancellation and Job CAS fences.
+        """
+        requested = tuple(sorted({str(status) for status in (statuses or [])}))
+        status_clause = ""
+        params: list[Any] = [int(run_id), int(run_id), int(run_id)]
+        if requested:
+            placeholders = ",".join("?" for _ in requested)
+            status_clause = f" AND j.status IN ({placeholders})"
+            params.extend(requested)
+        rows = self.query(
+            f"""
+            SELECT DISTINCT j.*, j.id AS job_id
+            FROM jobs j
+            JOIN runs r ON r.id = ?
+            WHERE (
+                    EXISTS (
+                        SELECT 1 FROM run_jobs rj
+                        WHERE rj.run_id = ? AND rj.job_id = j.id
+                    )
+                    OR j.id = r.inference_job_id
+                    OR j.id = r.metric_job_id
+                    OR CAST(json_extract(j.payload_json, '$.run_id') AS INTEGER) = ?
+                  )
+                  {status_clause}
+            ORDER BY j.created_at, j.id
+            """,
+            params,
+        )
+        for row in rows:
+            self._decode_job(row)
+        return rows
+
     def get_run(self, run_id: int) -> dict[str, Any]:
         row = self.get(
             """
@@ -1498,49 +1830,169 @@ class Database:
         current: int,
         total: int | None = None,
         status: str | None = None,
-    ) -> None:
+    ) -> bool:
+        """Publish progress without changing the Run lifecycle state.
+
+        ``status`` remains accepted for source compatibility, but lifecycle
+        changes must use one of the guarded transition methods.  This prevents
+        late save/metric callbacks from reviving a canceled or terminal Run.
+        """
+        del status
         now = utc_ts()
         with self.connection() as conn:
-            if total is None and status is None:
-                conn.execute(
-                    "UPDATE runs SET progress_current = ?, updated_at = ? WHERE id = ?",
-                    (current, now, run_id),
-                )
-            elif total is None:
-                conn.execute(
-                    "UPDATE runs SET progress_current = ?, status = ?, updated_at = ? WHERE id = ?",
-                    (current, status, now, run_id),
-                )
-            elif status is None:
-                conn.execute(
-                    "UPDATE runs SET progress_current = ?, progress_total = ?, updated_at = ? WHERE id = ?",
-                    (current, total, now, run_id),
-                )
-            else:
-                conn.execute(
+            if total is None:
+                cur = conn.execute(
                     """
                     UPDATE runs
-                    SET progress_current = ?, progress_total = ?, status = ?, updated_at = ?
+                    SET progress_current = ?, updated_at = ?
                     WHERE id = ?
+                      AND status NOT IN ('completed', 'failed', 'cancel_requested', 'canceled')
                     """,
-                    (current, total, status, now, run_id),
+                    (int(current), now, run_id),
                 )
+            else:
+                cur = conn.execute(
+                    """
+                    UPDATE runs
+                    SET progress_current = ?, progress_total = ?, updated_at = ?
+                    WHERE id = ?
+                      AND status NOT IN ('completed', 'failed', 'cancel_requested', 'canceled')
+                    """,
+                    (int(current), int(total), now, run_id),
+                )
+            return bool(cur.rowcount)
 
-    def mark_run_started(self, run_id: int, status: str = "running") -> None:
+    def merge_run_result(self, run_id: int, patch: dict[str, Any]) -> bool:
+        """Merge diagnostic result details without changing lifecycle state."""
         now = utc_ts()
         with self.connection() as conn:
-            conn.execute(
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, result_json FROM runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"run {run_id} not found")
+            if str(row["status"]) in RUN_NON_PROGRESS_STATUSES:
+                return False
+            result = dict(_loads(row["result_json"]) or {})
+            result.update(dict(patch or {}))
+            cur = conn.execute(
                 """
                 UPDATE runs
-                SET status = ?, started_at = COALESCE(started_at, ?), updated_at = ?
+                SET result_json = ?, content_revision = content_revision + 1,
+                    updated_at = ?
                 WHERE id = ?
+                  AND status NOT IN ('completed', 'failed', 'cancel_requested', 'canceled')
                 """,
-                (status, now, now, run_id),
+                (_json(result), now, run_id),
             )
+            return bool(cur.rowcount)
 
-    def set_run_metric_job(self, run_id: int, metric_job_id: int) -> None:
+    def mark_run_started(self, run_id: int, status: str = "running") -> bool:
+        sources = RUN_START_SOURCES.get(status)
+        if sources is None:
+            raise ValueError(f"unsupported active Run status: {status}")
+        placeholders = ",".join("?" for _ in sources)
         now = utc_ts()
         with self.connection() as conn:
+            cur = conn.execute(
+                f"""
+                UPDATE runs
+                SET status = ?, started_at = COALESCE(started_at, ?), updated_at = ?
+                WHERE id = ? AND status IN ({placeholders})
+                """,
+                (status, now, now, run_id, *sources),
+            )
+            return bool(cur.rowcount)
+
+    def set_run_metric_job(self, run_id: int, metric_job_id: int) -> bool:
+        now = utc_ts()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                """
+                SELECT status, deleted_at, artifact_cleaned_at
+                FROM runs
+                WHERE id = ?
+                """,
+                (int(run_id),),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"run {run_id} not found")
+            if (
+                str(run["status"] or "") not in {"running", "finalizing"}
+                or run["deleted_at"] is not None
+                or run["artifact_cleaned_at"] is not None
+            ):
+                return False
+            purge_pending = conn.execute(
+                """
+                SELECT 1
+                FROM run_purge_requests
+                WHERE run_id = ?
+                  AND status IN ('requested', 'canceling', 'purging')
+                LIMIT 1
+                """,
+                (int(run_id),),
+            ).fetchone()
+            if purge_pending is not None:
+                return False
+            job = conn.execute(
+                "SELECT kind, status, payload_json FROM jobs WHERE id = ?",
+                (metric_job_id,),
+            ).fetchone()
+            if job is None:
+                raise KeyError(f"job {metric_job_id} not found")
+            if str(job["kind"]) != "metric":
+                raise ValueError(f"job {metric_job_id} is not a metric job")
+            if str(job["status"] or "") != "queued":
+                return False
+            payload = _loads(job["payload_json"])
+            payload_run_id = payload.get("run_id") if isinstance(payload, dict) else None
+            if payload_run_id is not None and int(payload_run_id) != int(run_id):
+                return False
+            foreign_owner = conn.execute(
+                """
+                SELECT 1
+                FROM runs owner
+                WHERE owner.id != ?
+                  AND (
+                      owner.inference_job_id = ?
+                      OR owner.metric_job_id = ?
+                      OR EXISTS (
+                          SELECT 1 FROM run_jobs rj
+                          WHERE rj.job_id = ? AND rj.run_id = owner.id
+                      )
+                  )
+                LIMIT 1
+                """,
+                (int(run_id), int(metric_job_id), int(metric_job_id), int(metric_job_id)),
+            ).fetchone()
+            if foreign_owner is not None:
+                return False
+            other_active_metric = conn.execute(
+                """
+                SELECT 1
+                FROM jobs active
+                JOIN runs owner ON owner.id = ?
+                WHERE active.id != ?
+                  AND active.kind = 'metric'
+                  AND active.status IN ('queued', 'running')
+                  AND (
+                      active.id = owner.metric_job_id
+                      OR EXISTS (
+                          SELECT 1 FROM run_jobs rj
+                          WHERE rj.run_id = owner.id AND rj.job_id = active.id
+                      )
+                      OR CAST(json_extract(active.payload_json, '$.run_id') AS INTEGER) = owner.id
+                  )
+                LIMIT 1
+                """,
+                (int(run_id), int(metric_job_id)),
+            ).fetchone()
+            if other_active_metric is not None:
+                return False
             conn.execute(
                 """
                 INSERT OR IGNORE INTO run_jobs(run_id, job_id, role, shard_index, device, metadata_json, created_at)
@@ -1548,14 +2000,236 @@ class Database:
                 """,
                 (run_id, metric_job_id, now),
             )
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE runs
                 SET metric_job_id = ?, status = 'metric_queued', updated_at = ?
                 WHERE id = ?
+                  AND status IN ('running', 'finalizing')
                 """,
                 (metric_job_id, now, run_id),
             )
+            if cur.rowcount:
+                return True
+
+            # A cancellation can win after metric jobs are constructed but
+            # before the leader is published. Fence every queued job in that
+            # wave so it cannot remain as an orphaned claimable job.
+            wave_id = str(payload.get("metric_wave_id") or "")
+            if wave_id:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'canceled', error_json = ?, finished_at = ?
+                    WHERE status = 'queued'
+                      AND id IN (
+                          SELECT rj.job_id
+                          FROM run_jobs rj
+                          JOIN jobs j ON j.id = rj.job_id
+                          WHERE rj.run_id = ? AND rj.role = 'metric'
+                            AND json_extract(j.payload_json, '$.metric_wave_id') = ?
+                      )
+                    """,
+                    (
+                        _json({"message": "Run state rejected metric publication", "type": "RunCanceled"}),
+                        now,
+                        run_id,
+                        wave_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'canceled', error_json = ?, finished_at = ?
+                    WHERE id = ? AND status = 'queued'
+                    """,
+                    (
+                        _json({"message": "Run state rejected metric publication", "type": "RunCanceled"}),
+                        now,
+                        metric_job_id,
+                    ),
+                )
+            return False
+
+    def publish_metric_wave(
+        self,
+        run_id: int,
+        job_specs: Iterable[dict[str, Any]],
+        *,
+        retry: bool,
+        result: dict[str, Any] | None = None,
+        artifact_summary: dict[str, Any] | None = None,
+        expected_content_revision: int | None = None,
+        source_job_id: int | None = None,
+        source_job_result: dict[str, Any] | None = None,
+    ) -> list[int]:
+        """Atomically publish a complete metric wave and its Run phase.
+
+        Jobs are not visible to workers until every shard, its Run binding,
+        the leader id, and ``metric_queued`` commit together. A cancellation
+        that commits first therefore leaves no orphaned claimable jobs.
+        """
+        specs = list(job_specs)
+        if not specs:
+            raise ValueError("metric wave requires at least one job")
+        now = utc_ts()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                """
+                SELECT status, metric_job_id, result_json,
+                       artifact_summary_json, content_revision,
+                       deleted_at, artifact_cleaned_at
+                FROM runs WHERE id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"run {run_id} not found")
+            source_job_status = self._source_job_status(
+                conn,
+                run_id,
+                source_job_id,
+                ("inference", "finalize"),
+            )
+            if source_job_id is not None and source_job_status not in {"running", "completed"}:
+                return []
+            allowed = {"completed", "failed"} if retry else {"running", "finalizing"}
+            source_status = str(run["status"])
+            if source_status not in allowed:
+                return []
+            if retry:
+                if (
+                    expected_content_revision is None
+                    or int(run["content_revision"] or 0) != int(expected_content_revision)
+                    or run["deleted_at"] is not None
+                    or run["artifact_cleaned_at"] is not None
+                ):
+                    return []
+                purge = conn.execute(
+                    """
+                    SELECT 1 FROM run_purge_requests
+                    WHERE run_id = ? AND status IN ('requested', 'canceling', 'purging')
+                    LIMIT 1
+                    """,
+                    (run_id,),
+                ).fetchone()
+                if purge is not None:
+                    return []
+                incomplete = conn.execute(
+                    """
+                    SELECT 1
+                    FROM run_jobs rj
+                    JOIN jobs j ON j.id = rj.job_id
+                    WHERE rj.run_id = ?
+                      AND rj.role IN ('inference', 'finalize')
+                      AND j.status != 'completed'
+                    LIMIT 1
+                    """,
+                    (run_id,),
+                ).fetchone()
+                if incomplete is not None:
+                    return []
+            active = conn.execute(
+                """
+                SELECT 1
+                FROM run_jobs rj
+                JOIN jobs j ON j.id = rj.job_id
+                WHERE rj.run_id = ? AND rj.role = 'metric'
+                  AND j.status IN ('queued', 'running')
+                LIMIT 1
+                """,
+                (run_id,),
+            ).fetchone()
+            if active is None and run["metric_job_id"] is not None:
+                active = conn.execute(
+                    """
+                    SELECT 1
+                    FROM jobs
+                    WHERE id = ? AND kind = 'metric'
+                      AND status IN ('queued', 'running')
+                    LIMIT 1
+                    """,
+                    (int(run["metric_job_id"]),),
+                ).fetchone()
+            if active is not None:
+                raise ValueError("Run already has an active metric evaluation")
+
+            job_ids: list[int] = []
+            progress_total = 0
+            for spec in specs:
+                payload = dict(spec.get("payload") or {})
+                payload.setdefault("run_id", int(run_id))
+                payload["retry"] = bool(retry)
+                total = int(spec.get("progress_total") or 0)
+                cur = conn.execute(
+                    """
+                    INSERT INTO jobs(kind, status, payload_json, progress_total, created_at)
+                    VALUES ('metric', 'queued', ?, ?, ?)
+                    """,
+                    (_json(payload), total, now),
+                )
+                job_id = int(cur.lastrowid)
+                job_ids.append(job_id)
+                progress_total += total
+                conn.execute(
+                    """
+                    INSERT INTO run_jobs(
+                        run_id, job_id, role, shard_index, device, metadata_json, created_at
+                    )
+                    VALUES (?, ?, 'metric', ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        job_id,
+                        int(spec.get("shard_index") or 0),
+                        spec.get("device"),
+                        _json(spec.get("metadata") or {}),
+                        now,
+                    ),
+                )
+
+            result_json = _json(result) if result is not None else str(run["result_json"] or "{}")
+            artifact_json = (
+                _json(artifact_summary)
+                if artifact_summary is not None
+                else str(run["artifact_summary_json"] or "{}")
+            )
+            cur = conn.execute(
+                """
+                UPDATE runs
+                SET metric_job_id = ?, status = 'metric_queued',
+                    result_json = ?, artifact_summary_json = ?,
+                    progress_current = 0, progress_total = ?,
+                    error_json = CASE WHEN ? THEN '{}' ELSE error_json END,
+                    finished_at = NULL,
+                    content_revision = content_revision + 1,
+                    updated_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    job_ids[0],
+                    result_json,
+                    artifact_json,
+                    progress_total,
+                    1 if retry else 0,
+                    now,
+                    run_id,
+                    source_status,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError(f"run {run_id} rejected metric wave publication")
+            if not self._complete_source_job_in_transaction(
+                conn,
+                source_job_id,
+                source_job_status,
+                source_job_result,
+                now,
+            ):
+                raise RuntimeError(f"source Job {source_job_id} rejected metric wave completion")
+            return job_ids
 
     def complete_run_inference(
         self,
@@ -1563,12 +2237,28 @@ class Database:
         result: dict[str, Any],
         artifact_summary: dict[str, Any],
         status: str,
-    ) -> None:
+        *,
+        source_job_id: int | None = None,
+        source_job_result: dict[str, Any] | None = None,
+    ) -> bool:
+        sources = RUN_INFERENCE_COMPLETION_SOURCES.get(status)
+        if sources is None:
+            raise ValueError(f"unsupported inference completion status: {status}")
+        placeholders = ",".join("?" for _ in sources)
         now = utc_ts()
         finished_at = now if status == "completed" else None
         with self.connection() as conn:
-            conn.execute(
-                """
+            conn.execute("BEGIN IMMEDIATE")
+            source_job_status = self._source_job_status(
+                conn,
+                run_id,
+                source_job_id,
+                ("inference", "finalize"),
+            )
+            if source_job_id is not None and source_job_status not in {"running", "completed"}:
+                return False
+            cur = conn.execute(
+                f"""
                 UPDATE runs
                 SET status = ?,
                     result_json = ?,
@@ -1576,15 +2266,43 @@ class Database:
                     content_revision = content_revision + 1,
                     finished_at = COALESCE(?, finished_at),
                     updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND status IN ({placeholders})
                 """,
-                (status, _json(result), _json(artifact_summary), finished_at, now, run_id),
+                (status, _json(result), _json(artifact_summary), finished_at, now, run_id, *sources),
             )
+            if not cur.rowcount:
+                return False
+            if not self._complete_source_job_in_transaction(
+                conn,
+                source_job_id,
+                source_job_status,
+                source_job_result,
+                now,
+            ):
+                conn.rollback()
+                return False
+            return True
 
-    def complete_run_metrics(self, run_id: int, metric_summary: dict[str, Any]) -> None:
+    def complete_run_metrics(
+        self,
+        run_id: int,
+        metric_summary: dict[str, Any],
+        *,
+        source_job_id: int | None = None,
+        source_job_result: dict[str, Any] | None = None,
+    ) -> bool:
         now = utc_ts()
         with self.connection() as conn:
-            conn.execute(
+            conn.execute("BEGIN IMMEDIATE")
+            source_job_status = self._source_job_status(
+                conn,
+                run_id,
+                source_job_id,
+                ("metric",),
+            )
+            if source_job_id is not None and source_job_status not in {"running", "completed"}:
+                return False
+            cur = conn.execute(
                 """
                 UPDATE runs
                 SET status = 'completed',
@@ -1592,10 +2310,22 @@ class Database:
                     content_revision = content_revision + 1,
                     finished_at = ?,
                     updated_at = ?
-                WHERE id = ?
+                WHERE id = ? AND status = 'metric_running'
                 """,
                 (_json(metric_summary), now, now, run_id),
             )
+            if not cur.rowcount:
+                return False
+            if not self._complete_source_job_in_transaction(
+                conn,
+                source_job_id,
+                source_job_status,
+                source_job_result,
+                now,
+            ):
+                conn.rollback()
+                return False
+            return True
 
     def complete_run_metric_wave(
         self,
@@ -1603,10 +2333,58 @@ class Database:
         leader_job_id: int,
         metric_summary: dict[str, Any],
         performance: list[dict[str, Any]],
+        *,
+        source_job_id: int | None = None,
+        source_job_result: dict[str, Any] | None = None,
     ) -> bool:
         """Publish a metric wave once even when shards finish concurrently."""
         now = utc_ts()
         with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            source_job_status = self._source_job_status(
+                conn,
+                run_id,
+                source_job_id,
+                ("metric",),
+            )
+            if source_job_id is not None and source_job_status not in {"running", "completed"}:
+                return False
+            leader = conn.execute(
+                "SELECT kind, payload_json FROM jobs WHERE id = ?",
+                (int(leader_job_id),),
+            ).fetchone()
+            if leader is None or str(leader["kind"] or "") != "metric":
+                return False
+            leader_payload = _loads(leader["payload_json"])
+            wave_id = str(leader_payload.get("metric_wave_id") or "")
+            if not wave_id:
+                return False
+            if source_job_id is not None:
+                source = conn.execute(
+                    "SELECT payload_json FROM jobs WHERE id = ?",
+                    (int(source_job_id),),
+                ).fetchone()
+                source_wave_id = str(
+                    (_loads(source["payload_json"]) if source is not None else {}).get("metric_wave_id")
+                    or ""
+                )
+                if source_wave_id != wave_id:
+                    return False
+            if source_job_id is not None and source_job_status == "running":
+                other_incomplete = conn.execute(
+                    """
+                    SELECT 1
+                    FROM run_jobs rj
+                    JOIN jobs j ON j.id = rj.job_id
+                    WHERE rj.run_id = ? AND rj.role = 'metric'
+                      AND json_extract(j.payload_json, '$.metric_wave_id') = ?
+                      AND j.id != ? AND j.status != 'completed'
+                    LIMIT 1
+                    """,
+                    (run_id, wave_id, int(source_job_id)),
+                ).fetchone()
+                if other_incomplete is not None:
+                    return False
             row = conn.execute("SELECT result_json FROM runs WHERE id = ?", (run_id,)).fetchone()
             result = _loads(row["result_json"]) if row is not None else {}
             result["metric_performance"] = performance
@@ -1616,11 +2394,22 @@ class Database:
                 SET status = 'completed', metric_summary_json = ?, result_json = ?,
                     content_revision = content_revision + 1, finished_at = ?, updated_at = ?
                 WHERE id = ? AND metric_job_id = ?
-                  AND status IN ('metric_queued', 'metric_running')
+                  AND status = 'metric_running'
                 """,
                 (_json(metric_summary), _json(result), now, now, run_id, leader_job_id),
             )
-            return bool(cur.rowcount)
+            if not cur.rowcount:
+                return False
+            if not self._complete_source_job_in_transaction(
+                conn,
+                source_job_id,
+                source_job_status,
+                source_job_result,
+                now,
+            ):
+                conn.rollback()
+                return False
+            return True
 
     def update_run_metric_wave_progress(
         self,
@@ -1635,10 +2424,9 @@ class Database:
             cur = conn.execute(
                 """
                 UPDATE runs
-                SET progress_current = ?, progress_total = ?,
-                    status = 'metric_running', updated_at = ?
+                SET progress_current = ?, progress_total = ?, updated_at = ?
                 WHERE id = ? AND metric_job_id = ?
-                  AND status IN ('metric_queued', 'metric_running')
+                  AND status = 'metric_running'
                 """,
                 (int(current), int(total), now, run_id, leader_job_id),
             )
@@ -1666,10 +2454,11 @@ class Database:
             raise KeyError(f"run {run_id} not found")
         return int(row["content_revision"])
 
-    def fail_run(self, run_id: int, error: dict[str, Any]) -> None:
+    def fail_run(self, run_id: int, error: dict[str, Any]) -> bool:
         now = utc_ts()
         with self.connection() as conn:
-            conn.execute(
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
                 """
                 UPDATE runs
                 SET status = 'failed',
@@ -1678,9 +2467,12 @@ class Database:
                     finished_at = ?,
                     updated_at = ?
                 WHERE id = ?
+                  AND status NOT IN ('completed', 'failed', 'cancel_requested', 'canceled')
                 """,
                 (_json(error), now, now, run_id),
             )
+            if not cur.rowcount:
+                return False
             # Cancel sibling shard jobs that have not started yet so a worker
             # never claims them once the run is already known to have failed.
             # Already-running shards notice via the run-status check each
@@ -1692,79 +2484,232 @@ class Database:
                     error_json = ?,
                     finished_at = ?
                 WHERE status = 'queued'
-                  AND id IN (SELECT job_id FROM run_jobs WHERE run_id = ?)
+                  AND (
+                      id IN (SELECT job_id FROM run_jobs WHERE run_id = ?)
+                      OR id = (SELECT inference_job_id FROM runs WHERE id = ?)
+                      OR id = (SELECT metric_job_id FROM runs WHERE id = ?)
+                      OR CAST(json_extract(payload_json, '$.run_id') AS INTEGER) = ?
+                  )
                 """,
-                (_json({"message": "sibling shard failed the run"}), now, run_id),
+                (
+                    _json({"message": "sibling shard failed the run"}),
+                    now,
+                    run_id,
+                    run_id,
+                    run_id,
+                    run_id,
+                ),
             )
+            conn.execute(
+                """
+                UPDATE media_assets
+                SET state = 'unavailable', updated_at = ?
+                WHERE source_kind = 'run_artifact'
+                  AND id IN (
+                      SELECT asset_id FROM run_media_assets
+                      WHERE run_id = ?
+                        AND (
+                            COALESCE(json_extract(metadata_json, '$.input'), 0) != 1
+                            OR COALESCE(json_extract(metadata_json, '$.compare_snapshot'), 0) = 1
+                        )
+                  )
+                """,
+                (now, run_id),
+            )
+            return True
 
-    def request_run_cancel(self, run_id: int) -> None:
+    def fail_claimed_job_and_run(
+        self,
+        job_id: int,
+        run_id: int,
+        error: dict[str, Any],
+    ) -> bool:
+        """Atomically fail an active Run and its currently claimed Job.
+
+        Cancellation and failure are linearized by the ``BEGIN IMMEDIATE``
+        writer lock. If cancellation committed first, this method changes
+        neither object and the caller must converge cancellation instead.
+        """
         now = utc_ts()
-        run = self.get_run(run_id)
-        inference_job_id = run.get("inference_job_id")
-        metric_job_id = run.get("metric_job_id")
-        run_job_ids = [int(row["job_id"]) for row in self.list_run_jobs(run_id)]
-        job_rows = self.list_run_jobs(run_id)
-        has_running_job = any(str(row.get("status") or "") == "running" for row in job_rows)
         with self.connection() as conn:
-            if (
-                run["status"] not in {"completed", "failed", "canceled"}
-                and not has_running_job
-                and (inference_job_id is not None or metric_job_id is not None or run_job_ids)
-            ):
-                target_ids = list(dict.fromkeys(
-                    [
-                        *run_job_ids,
-                        *([int(inference_job_id)] if inference_job_id is not None else []),
-                        *([int(metric_job_id)] if metric_job_id is not None else []),
-                    ]
-                ))
-                placeholders = ",".join("?" for _ in target_ids)
-                conn.execute(
-                    f"""
-                    UPDATE jobs
-                    SET status = 'canceled',
-                        error_json = ?,
-                        finished_at = ?
-                    WHERE id IN ({placeholders}) AND status = 'queued'
-                    """,
-                    (
-                        _json({"message": "用户取消了排队中的 Run", "type": "RunCanceled"}),
-                        now,
-                        *target_ids,
-                    ),
-                )
-                conn.execute(
-                    """
+            conn.execute("BEGIN IMMEDIATE")
+            associated_job = conn.execute(
+                """
+                SELECT j.status
+                FROM jobs j
+                JOIN runs r ON r.id = ?
+                WHERE j.id = ?
+                  AND (
+                      EXISTS (
+                          SELECT 1 FROM run_jobs rj
+                          WHERE rj.run_id = r.id AND rj.job_id = j.id
+                      )
+                      OR j.id = r.inference_job_id
+                      OR j.id = r.metric_job_id
+                      OR CAST(json_extract(j.payload_json, '$.run_id') AS INTEGER) = r.id
+                  )
+                """,
+                (int(run_id), int(job_id)),
+            ).fetchone()
+            if associated_job is None or str(associated_job["status"] or "") != "running":
+                return False
+            cur = conn.execute(
+                """
                 UPDATE runs
-                SET status = 'canceled',
-                    error_json = ?,
+                SET status = 'failed', error_json = ?,
                     content_revision = content_revision + 1,
-                    finished_at = ?,
-                    updated_at = ?
+                    finished_at = ?, updated_at = ?
                 WHERE id = ?
-                    """,
-                    (
-                        _json({"message": "用户取消了排队中的 Run", "type": "RunCanceled"}),
-                        now,
-                        now,
-                        run_id,
-                    ),
-                )
-            elif run["status"] not in {"completed", "failed", "canceled"}:
-                conn.execute(
+                  AND status NOT IN ('completed', 'failed', 'cancel_requested', 'canceled')
+                """,
+                (_json(error), now, now, int(run_id)),
+            )
+            if cur.rowcount != 1:
+                return False
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'failed', error_json = ?, finished_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (_json(error), now, int(job_id)),
+            )
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'canceled', error_json = ?, finished_at = ?
+                WHERE status = 'queued'
+                  AND (
+                      id IN (SELECT job_id FROM run_jobs WHERE run_id = ?)
+                      OR id = (SELECT inference_job_id FROM runs WHERE id = ?)
+                      OR id = (SELECT metric_job_id FROM runs WHERE id = ?)
+                      OR CAST(json_extract(payload_json, '$.run_id') AS INTEGER) = ?
+                  )
+                """,
+                (
+                    _json({"message": "sibling shard failed the run", "type": "RunCanceled"}),
+                    now,
+                    int(run_id),
+                    int(run_id),
+                    int(run_id),
+                    int(run_id),
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE media_assets
+                SET state = 'unavailable', updated_at = ?
+                WHERE source_kind = 'run_artifact'
+                  AND id IN (
+                      SELECT asset_id FROM run_media_assets
+                      WHERE run_id = ?
+                        AND (
+                            COALESCE(json_extract(metadata_json, '$.input'), 0) != 1
+                            OR COALESCE(json_extract(metadata_json, '$.compare_snapshot'), 0) = 1
+                        )
+                  )
+                """,
+                (now, int(run_id)),
+            )
+            return True
+
+    def request_run_cancel(self, run_id: int) -> bool:
+        """Atomically fence new work and request/finish Run cancellation."""
+        now = utc_ts()
+        error = {"message": "User canceled the Run", "type": "RunCanceled"}
+        with self.connection() as conn:
+            # A reserved writer lock makes job observation, queued-job
+            # cancellation, and the Run transition one linearizable action.
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                "SELECT status, inference_job_id, metric_job_id FROM runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"run {run_id} not found")
+            if str(run["status"]) in RUN_TERMINAL_STATUSES:
+                return False
+
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'canceled', error_json = ?, finished_at = ?
+                WHERE status = 'queued'
+                  AND (
+                      id IN (SELECT job_id FROM run_jobs WHERE run_id = ?)
+                      OR id = ? OR id = ?
+                      OR CAST(json_extract(payload_json, '$.run_id') AS INTEGER) = ?
+                  )
+                """,
+                (
+                    _json(error),
+                    now,
+                    run_id,
+                    run["inference_job_id"],
+                    run["metric_job_id"],
+                    run_id,
+                ),
+            )
+            running = conn.execute(
+                """
+                SELECT 1
+                FROM jobs
+                WHERE status = 'running'
+                  AND (
+                      id IN (SELECT job_id FROM run_jobs WHERE run_id = ?)
+                      OR id = ? OR id = ?
+                      OR CAST(json_extract(payload_json, '$.run_id') AS INTEGER) = ?
+                  )
+                LIMIT 1
+                """,
+                (run_id, run["inference_job_id"], run["metric_job_id"], run_id),
+            ).fetchone()
+            if running is None:
+                cur = conn.execute(
                     """
                     UPDATE runs
-                    SET status = 'cancel_requested',
-                        updated_at = ?
+                    SET status = 'canceled', error_json = ?,
+                        content_revision = content_revision + 1,
+                        finished_at = ?, updated_at = ?
                     WHERE id = ?
+                      AND status NOT IN ('completed', 'failed', 'canceled')
+                    """,
+                    (_json(error), now, now, run_id),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    UPDATE runs
+                    SET status = 'cancel_requested', updated_at = ?
+                    WHERE id = ?
+                      AND status NOT IN ('completed', 'failed', 'canceled')
                     """,
                     (now, run_id),
                 )
+            if cur.rowcount:
+                conn.execute(
+                    """
+                    UPDATE media_assets
+                    SET state = 'unavailable', updated_at = ?
+                    WHERE source_kind = 'run_artifact'
+                      AND id IN (
+                          SELECT asset_id FROM run_media_assets
+                          WHERE run_id = ?
+                            AND (
+                                COALESCE(json_extract(metadata_json, '$.input'), 0) != 1
+                                OR COALESCE(json_extract(metadata_json, '$.compare_snapshot'), 0) = 1
+                            )
+                      )
+                    """,
+                    (now, run_id),
+                )
+            return bool(cur.rowcount)
 
-    def cancel_run(self, run_id: int, error: dict[str, Any] | None = None) -> None:
+    def cancel_run(self, run_id: int, error: dict[str, Any] | None = None) -> bool:
         now = utc_ts()
         with self.connection() as conn:
-            conn.execute(
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
                 """
                 UPDATE runs
                 SET status = 'canceled',
@@ -1773,23 +2718,146 @@ class Database:
                     finished_at = ?,
                     updated_at = ?
                 WHERE id = ?
+                  AND status NOT IN ('completed', 'failed', 'canceled')
                 """,
-                (_json(error or {"message": "Run 已取消"}), now, now, run_id),
+                (_json(error or {"message": "Run canceled", "type": "RunCanceled"}), now, now, run_id),
             )
+            if cur.rowcount:
+                conn.execute(
+                    """
+                    UPDATE media_assets
+                    SET state = 'unavailable', updated_at = ?
+                    WHERE source_kind = 'run_artifact'
+                      AND id IN (
+                          SELECT asset_id FROM run_media_assets
+                          WHERE run_id = ?
+                            AND (
+                                COALESCE(json_extract(metadata_json, '$.input'), 0) != 1
+                                OR COALESCE(json_extract(metadata_json, '$.compare_snapshot'), 0) = 1
+                            )
+                      )
+                    """,
+                    (now, run_id),
+                )
+            return bool(cur.rowcount)
 
-    def cancel_job(self, job_id: int, error: dict[str, Any] | None = None) -> None:
+    def converge_run_cancellation(self, run_id: int, job_id: int | None = None) -> bool:
+        """Stop active work after cancellation wins a Run state race."""
+        now = utc_ts()
+        error = {"message": "User canceled the Run", "type": "RunCanceled"}
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                "SELECT status, inference_job_id, metric_job_id FROM runs WHERE id = ?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"run {run_id} not found")
+            if str(run["status"]) not in {"cancel_requested", "canceled"}:
+                return False
+
+            associated_job_id: int | None = None
+            if job_id is not None:
+                associated = conn.execute(
+                    """
+                    SELECT 1
+                    FROM jobs j
+                    WHERE j.id = ?
+                      AND (
+                          j.id IN (SELECT job_id FROM run_jobs WHERE run_id = ?)
+                          OR j.id = ? OR j.id = ?
+                          OR CAST(json_extract(j.payload_json, '$.run_id') AS INTEGER) = ?
+                      )
+                    LIMIT 1
+                    """,
+                    (
+                        int(job_id),
+                        int(run_id),
+                        run["inference_job_id"],
+                        run["metric_job_id"],
+                        int(run_id),
+                    ),
+                ).fetchone()
+                if associated is not None:
+                    associated_job_id = int(job_id)
+
+            conn.execute(
+                """
+                UPDATE jobs
+                SET status = 'canceled', error_json = ?, finished_at = ?
+                WHERE (
+                        status = 'queued'
+                        OR (status = 'running' AND id = ?)
+                      )
+                      AND (
+                      id IN (SELECT job_id FROM run_jobs WHERE run_id = ?)
+                      OR id = ? OR id = ?
+                      OR CAST(json_extract(payload_json, '$.run_id') AS INTEGER) = ?
+                  )
+                """,
+                (
+                    _json(error), now, associated_job_id, run_id,
+                    run["inference_job_id"], run["metric_job_id"], run_id,
+                ),
+            )
+            running = conn.execute(
+                """
+                SELECT 1 FROM jobs
+                WHERE status = 'running'
+                  AND (
+                      id IN (SELECT job_id FROM run_jobs WHERE run_id = ?)
+                      OR id = ? OR id = ?
+                      OR CAST(json_extract(payload_json, '$.run_id') AS INTEGER) = ?
+                  )
+                LIMIT 1
+                """,
+                (run_id, run["inference_job_id"], run["metric_job_id"], run_id),
+            ).fetchone()
+            transitioned = False
+            if running is None and str(run["status"]) == "cancel_requested":
+                cur = conn.execute(
+                    """
+                    UPDATE runs
+                    SET status = 'canceled', error_json = ?,
+                        content_revision = content_revision + 1,
+                        finished_at = ?, updated_at = ?
+                    WHERE id = ? AND status = 'cancel_requested'
+                    """,
+                    (_json(error), now, now, run_id),
+                )
+                transitioned = bool(cur.rowcount)
+            conn.execute(
+                """
+                UPDATE media_assets
+                SET state = 'unavailable', updated_at = ?
+                WHERE source_kind = 'run_artifact'
+                  AND id IN (
+                      SELECT asset_id FROM run_media_assets
+                      WHERE run_id = ?
+                        AND (
+                            COALESCE(json_extract(metadata_json, '$.input'), 0) != 1
+                            OR COALESCE(json_extract(metadata_json, '$.compare_snapshot'), 0) = 1
+                        )
+                  )
+                """,
+                (now, run_id),
+            )
+            return transitioned or str(run["status"]) == "canceled"
+
+    def cancel_job(self, job_id: int, error: dict[str, Any] | None = None) -> bool:
         now = utc_ts()
         with self.connection() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE jobs
                 SET status = 'canceled',
                     error_json = ?,
                     finished_at = ?
-                WHERE id = ?
+                WHERE id = ? AND status IN ('queued', 'running')
                 """,
-                (_json(error or {"message": "Job 已取消"}), now, job_id),
+                (_json(error or {"message": "Job canceled", "type": "RunCanceled"}), now, job_id),
             )
+            return bool(cur.rowcount)
 
     def cancel_queued_run_jobs(self, run_id: int, reason: str = "Run cleanup requested") -> int:
         now = utc_ts()
@@ -1801,9 +2869,21 @@ class Database:
                     error_json = ?,
                     finished_at = ?
                 WHERE status = 'queued'
-                  AND id IN (SELECT job_id FROM run_jobs WHERE run_id = ?)
+                  AND (
+                      id IN (SELECT job_id FROM run_jobs WHERE run_id = ?)
+                      OR id = (SELECT inference_job_id FROM runs WHERE id = ?)
+                      OR id = (SELECT metric_job_id FROM runs WHERE id = ?)
+                      OR CAST(json_extract(payload_json, '$.run_id') AS INTEGER) = ?
+                  )
                 """,
-                (_json({"message": reason, "type": "RunCanceled"}), now, run_id),
+                (
+                    _json({"message": reason, "type": "RunCanceled"}),
+                    now,
+                    run_id,
+                    run_id,
+                    run_id,
+                    run_id,
+                ),
             )
             return int(cur.rowcount)
 
@@ -2198,7 +3278,14 @@ class Database:
                 UPDATE media_assets
                 SET state = 'unavailable', updated_at = ?
                 WHERE source_kind = 'run_artifact'
-                  AND id IN (SELECT asset_id FROM run_media_assets WHERE run_id = ?)
+                  AND id IN (
+                      SELECT asset_id FROM run_media_assets
+                      WHERE run_id = ?
+                        AND (
+                            COALESCE(json_extract(metadata_json, '$.input'), 0) != 1
+                            OR COALESCE(json_extract(metadata_json, '$.compare_snapshot'), 0) = 1
+                        )
+                  )
                 """,
                 (now, run_id),
             )
@@ -2945,9 +4032,36 @@ class Database:
                 UPDATE media_assets
                 SET state = 'unavailable', updated_at = ?
                 WHERE source_kind = 'run_artifact'
-                  AND id IN (SELECT asset_id FROM run_media_assets WHERE run_id = ?)
+                  AND (
+                      id IN (
+                          SELECT asset_id
+                          FROM run_media_assets
+                          WHERE run_id = ?
+                            AND (
+                                COALESCE(json_extract(metadata_json, '$.input'), 0) != 1
+                                OR COALESCE(json_extract(metadata_json, '$.compare_snapshot'), 0) = 1
+                            )
+                      )
+                      OR source_key IN (
+                          SELECT 'run_artifact:' || a.id
+                          FROM artifacts a
+                          WHERE a.job_id IN (
+                              SELECT job_id
+                              FROM run_jobs
+                              WHERE run_id = ?
+                              UNION
+                              SELECT inference_job_id
+                              FROM runs
+                              WHERE id = ? AND inference_job_id IS NOT NULL
+                              UNION
+                              SELECT metric_job_id
+                              FROM runs
+                              WHERE id = ? AND metric_job_id IS NOT NULL
+                          )
+                      )
+                  )
                 """,
-                (now, run_id),
+                (now, run_id, run_id, run_id, run_id),
             )
             return int(cur.rowcount)
 
@@ -2972,11 +4086,11 @@ class Database:
         run = self.get_run(run_id)
         return [int(run["inference_job_id"])] if run.get("inference_job_id") is not None else []
 
-    def update_run_progress_from_jobs(self, run_id: int, status: str | None = None) -> None:
+    def update_run_progress_from_jobs(self, run_id: int, status: str | None = None) -> bool:
         rows = self.list_run_jobs(run_id, "inference")
         current = sum(int(row.get("progress_current") or 0) for row in rows)
         total = sum(int(row.get("progress_total") or 0) for row in rows)
-        self.update_run_progress(run_id, current, total, status)
+        return self.update_run_progress(run_id, current, total, status)
 
     def summarize_run_artifacts(self, run_id: int) -> dict[str, Any]:
         by_kind: dict[str, int] = {}
@@ -2986,10 +4100,36 @@ class Database:
                 by_kind[kind] = by_kind.get(kind, 0) + int(count)
         return {"total": sum(by_kind.values()), "by_kind": by_kind}
 
-    def maybe_complete_multi_run_inference(self, run_id: int) -> bool:
+    def maybe_complete_multi_run_inference(
+        self,
+        run_id: int,
+        *,
+        source_job_id: int | None = None,
+        source_job_result: dict[str, Any] | None = None,
+    ) -> bool:
+        run = self.get_run(run_id)
+        if run["status"] in {"cancel_requested", "canceled"}:
+            self.converge_run_cancellation(run_id)
+            return False
+        if run["status"] in {"completed", "failed"}:
+            return False
         jobs = self.list_run_jobs(run_id, "inference")
         if not jobs:
             return False
+        source_original_status: str | None = None
+        if source_job_id is not None:
+            source_row = next(
+                (row for row in jobs if int(row["job_id"]) == int(source_job_id)),
+                None,
+            )
+            if source_row is None:
+                return False
+            source_original_status = str(source_row.get("status") or "")
+            if source_original_status not in {"running", "completed"}:
+                return False
+            if source_original_status == "running":
+                source_row["status"] = "completed"
+                source_row["result"] = dict(source_job_result or {})
         if any(job["status"] == "failed" for job in jobs):
             failed = next(job for job in jobs if job["status"] == "failed")
             self.fail_run(run_id, enrich_job_error(failed, failed.get("error") or {}))
@@ -2998,10 +4138,12 @@ class Database:
             self.cancel_run(run_id, {"message": "inference shard canceled"})
             return True
         if any(job["status"] != "completed" for job in jobs):
-            self.update_run_progress_from_jobs(run_id, "running")
+            if source_job_id is not None and source_original_status == "running":
+                if not self.complete_job(int(source_job_id), source_job_result):
+                    return False
+            self.update_run_progress_from_jobs(run_id)
             return False
 
-        run = self.get_run(run_id)
         output_health = _combine_output_health((job.get("result") or {}).get("output_health") for job in jobs)
         result = {
             "samples": sum(int(job.get("result", {}).get("samples") or 0) for job in jobs),
@@ -3020,36 +4162,242 @@ class Database:
             result["output_health"] = output_health
         artifact_summary = self.summarize_run_artifacts(run_id)
         if any(bool((job.get("payload") or {}).get("defer_video_finalize")) for job in jobs):
-            existing = self.list_run_jobs(run_id, "finalize")
-            if not existing:
-                self.add_run_job(
-                    run_id,
-                    "finalize",
-                    {
-                        "run_id": run_id,
-                        "inference_job_ids": [int(job["job_id"]) for job in jobs],
-                    },
-                    progress_total=1,
-                    shard_index=0,
-                    device=None,
-                    metadata={"source": "multi_device"},
-                )
-            self.complete_run_inference(run_id, result, artifact_summary, "finalize_queued")
-            return True
+            advanced = self.queue_run_finalize(
+                run_id,
+                result,
+                artifact_summary,
+                [int(job["job_id"]) for job in jobs],
+                source_job_id=source_job_id,
+                source_job_result=source_job_result,
+            )
+            if not advanced and source_job_id is not None and source_original_status == "running":
+                raise RuntimeError(f"run {run_id} rejected atomic finalize handoff")
+            return advanced
         metrics = list(run.get("metrics") or [])
         if metrics:
-            self.complete_run_inference(run_id, result, artifact_summary, "metric_queued")
             from vfieval.pipeline.metric_jobs import create_metric_wave
 
-            create_metric_wave(
-                self,
-                run_id,
-                metrics,
-                source=str((run.get("metadata") or {}).get("execution_mode") or "multi"),
-            )
+            try:
+                create_metric_wave(
+                    self,
+                    run_id,
+                    metrics,
+                    source=str((run.get("metadata") or {}).get("execution_mode") or "multi"),
+                    result=result,
+                    artifact_summary=artifact_summary,
+                    source_job_id=source_job_id,
+                    source_job_result=source_job_result,
+                )
+            except ValueError:
+                if source_job_id is not None and source_original_status == "running":
+                    raise RuntimeError(f"run {run_id} rejected atomic metric handoff")
+                return False
         else:
-            self.complete_run_inference(run_id, result, artifact_summary, "completed")
+            advanced = self.complete_run_inference(
+                run_id,
+                result,
+                artifact_summary,
+                "completed",
+                source_job_id=source_job_id,
+                source_job_result=source_job_result,
+            )
+            if not advanced and source_job_id is not None and source_original_status == "running":
+                raise RuntimeError(f"run {run_id} rejected atomic inference completion")
+            return advanced
         return True
+
+    def queue_run_finalize(
+        self,
+        run_id: int,
+        result: dict[str, Any],
+        artifact_summary: dict[str, Any],
+        inference_job_ids: Iterable[int],
+        *,
+        source_job_id: int | None = None,
+        source_job_result: dict[str, Any] | None = None,
+    ) -> bool:
+        """Atomically publish a finalize Job and the ``finalize_queued`` state."""
+        source_ids = sorted({int(job_id) for job_id in inference_job_ids})
+        if not source_ids:
+            return False
+        now = utc_ts()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run = conn.execute(
+                """
+                SELECT status, deleted_at, artifact_cleaned_at
+                FROM runs
+                WHERE id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                raise KeyError(f"run {run_id} not found")
+            source_job_status = self._source_job_status(
+                conn,
+                run_id,
+                source_job_id,
+                ("inference",),
+            )
+            if (
+                source_job_id is not None
+                and (
+                    int(source_job_id) not in source_ids
+                    or source_job_status not in {"running", "completed"}
+                )
+            ):
+                return False
+            if (
+                run["deleted_at"] is not None
+                or run["artifact_cleaned_at"] is not None
+                or conn.execute(
+                    """
+                    SELECT 1
+                    FROM run_purge_requests
+                    WHERE run_id = ?
+                      AND status IN ('requested', 'canceling', 'purging')
+                    LIMIT 1
+                    """,
+                    (run_id,),
+                ).fetchone()
+                is not None
+            ):
+                return False
+            existing_rows = conn.execute(
+                """
+                SELECT rj.job_id, j.kind, j.status, j.payload_json
+                FROM run_jobs rj
+                JOIN jobs j ON j.id = rj.job_id
+                WHERE rj.run_id = ? AND rj.role = 'finalize'
+                ORDER BY rj.job_id
+                """,
+                (run_id,),
+            ).fetchall()
+            existing = existing_rows[0] if len(existing_rows) == 1 else None
+            if existing_rows:
+                existing_payload = _loads(existing["payload_json"]) if existing is not None else {}
+                try:
+                    existing_source_ids = sorted(
+                        {
+                            int(job_id)
+                            for job_id in (
+                                existing_payload.get("inference_job_ids")
+                                if isinstance(existing_payload, dict)
+                                else []
+                            )
+                            or []
+                        }
+                    )
+                except (TypeError, ValueError):
+                    return False
+                if (
+                    existing is None
+                    or str(existing["kind"]) != "finalize"
+                    or str(existing["status"]) not in {"queued", "running"}
+                    or existing_source_ids != source_ids
+                ):
+                    return False
+
+            run_status = str(run["status"])
+            if run_status not in {"running", "finalize_queued", "finalizing"}:
+                return False
+
+            inference_rows = conn.execute(
+                """
+                SELECT rj.job_id, j.kind, j.status
+                FROM run_jobs rj
+                JOIN jobs j ON j.id = rj.job_id
+                WHERE rj.run_id = ? AND rj.role = 'inference'
+                ORDER BY rj.job_id
+                """,
+                (run_id,),
+            ).fetchall()
+            if (
+                [int(row["job_id"]) for row in inference_rows] != source_ids
+                or any(
+                    str(row["kind"]) != "inference"
+                    or (
+                        str(row["status"]) != "completed"
+                        and not (
+                            source_job_id is not None
+                            and int(row["job_id"]) == int(source_job_id)
+                            and str(row["status"]) == "running"
+                        )
+                    )
+                    for row in inference_rows
+                )
+            ):
+                return False
+
+            if existing is not None:
+                job_status = str(existing["status"])
+                if run_status == "finalize_queued" and job_status in {"queued", "running"}:
+                    if not self._complete_source_job_in_transaction(
+                        conn,
+                        source_job_id,
+                        source_job_status,
+                        source_job_result,
+                        now,
+                    ):
+                        raise RuntimeError(f"source Job {source_job_id} rejected finalize handoff completion")
+                    return True
+                if run_status == "finalizing" and job_status == "running":
+                    if not self._complete_source_job_in_transaction(
+                        conn,
+                        source_job_id,
+                        source_job_status,
+                        source_job_result,
+                        now,
+                    ):
+                        raise RuntimeError(f"source Job {source_job_id} rejected finalize handoff completion")
+                    return True
+                if run_status != "running" or job_status != "queued":
+                    return False
+
+            if existing is None:
+                job_cur = conn.execute(
+                    """
+                    INSERT INTO jobs(kind, status, payload_json, progress_total, created_at)
+                    VALUES ('finalize', 'queued', ?, 1, ?)
+                    """,
+                    (
+                        _json({"run_id": run_id, "inference_job_ids": source_ids}),
+                        now,
+                    ),
+                )
+                finalize_job_id = int(job_cur.lastrowid)
+                conn.execute(
+                    """
+                    INSERT INTO run_jobs(
+                        run_id, job_id, role, shard_index, device, metadata_json, created_at
+                    )
+                    VALUES (?, ?, 'finalize', 0, NULL, ?, ?)
+                    """,
+                    (run_id, finalize_job_id, _json({"source": "multi_device"}), now),
+                )
+
+            cur = conn.execute(
+                """
+                UPDATE runs
+                SET status = 'finalize_queued', result_json = ?,
+                    artifact_summary_json = ?,
+                    content_revision = content_revision + 1,
+                    updated_at = ?
+                WHERE id = ? AND status = 'running'
+                """,
+                (_json(result), _json(artifact_summary), now, run_id),
+            )
+            if not cur.rowcount:
+                return False
+            if not self._complete_source_job_in_transaction(
+                conn,
+                source_job_id,
+                source_job_status,
+                source_job_result,
+                now,
+            ):
+                raise RuntimeError(f"source Job {source_job_id} rejected finalize handoff completion")
+            return True
 
     def list_run_artifacts(self, run_id: int, kind: str | None = None) -> list[dict[str, Any]]:
         artifacts: list[dict[str, Any]] = []
@@ -3175,6 +4523,73 @@ class Database:
     def create_job(self, kind: str, payload: dict[str, Any], progress_total: int = 0) -> int:
         now = utc_ts()
         with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            run_id = payload.get("run_id")
+            run = None
+            if run_id is not None:
+                run = conn.execute(
+                    """
+                    SELECT status, deleted_at, artifact_cleaned_at
+                    FROM runs
+                    WHERE id = ?
+                    """,
+                    (int(run_id),),
+                ).fetchone()
+                if run is None:
+                    raise KeyError(f"run {run_id} not found")
+                purge_pending = conn.execute(
+                    """
+                    SELECT 1
+                    FROM run_purge_requests
+                    WHERE run_id = ?
+                      AND status IN ('requested', 'canceling', 'purging')
+                    LIMIT 1
+                    """,
+                    (int(run_id),),
+                ).fetchone()
+                if (
+                    str(run["status"] or "") in RUN_NON_PROGRESS_STATUSES
+                    or run["deleted_at"] is not None
+                    or run["artifact_cleaned_at"] is not None
+                    or purge_pending is not None
+                ):
+                    raise RuntimeError(f"run {run_id} rejects new {kind} Job publication")
+                allowed_statuses = {
+                    "decode": {"queued"},
+                    "inference": {"queued"},
+                    # Legacy callers may prepare one metric Job before the
+                    # inference/finalize completion CAS publishes it. It stays
+                    # unclaimable until ``set_run_metric_job`` advances the Run.
+                    "metric": {"queued", "running", "finalizing"},
+                }
+                if kind not in allowed_statuses:
+                    raise ValueError(f"run-bound generic Job kind is not supported: {kind}")
+                if str(run["status"] or "") not in allowed_statuses[kind]:
+                    raise RuntimeError(
+                        f"run {run_id} in {run['status']} rejects new {kind} Job publication"
+                    )
+                active_same_role = conn.execute(
+                    """
+                    SELECT 1
+                    FROM jobs active
+                    JOIN runs owner ON owner.id = ?
+                    WHERE active.kind = ?
+                      AND active.status IN ('queued', 'running')
+                      AND (
+                          EXISTS (
+                              SELECT 1 FROM run_jobs rj
+                              WHERE rj.run_id = owner.id AND rj.job_id = active.id
+                          )
+                          OR (? = 'inference' AND active.id = owner.inference_job_id)
+                          OR (? = 'metric' AND active.id = owner.metric_job_id)
+                          OR CAST(json_extract(active.payload_json, '$.run_id') AS INTEGER) = owner.id
+                      )
+                    LIMIT 1
+                    """,
+                    (int(run_id), str(kind), str(kind), str(kind)),
+                ).fetchone()
+                if active_same_role is not None:
+                    raise RuntimeError(f"run {run_id} already has an active {kind} Job")
             cur = conn.execute(
                 """
                 INSERT INTO jobs(kind, status, payload_json, progress_total, created_at)
@@ -3182,7 +4597,42 @@ class Database:
                 """,
                 (kind, _json(payload), progress_total, now),
             )
-            return int(cur.lastrowid)
+            job_id = int(cur.lastrowid)
+            if run_id is not None:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO run_jobs(
+                        run_id, job_id, role, shard_index, device, metadata_json, created_at
+                    )
+                    VALUES (?, ?, ?, 0, ?, '{}', ?)
+                    """,
+                    (
+                        int(run_id),
+                        job_id,
+                        kind,
+                        payload.get("device") or payload.get("metric_device"),
+                        now,
+                    ),
+                )
+                if kind == "inference":
+                    conn.execute(
+                        """
+                        UPDATE runs
+                        SET inference_job_id = COALESCE(inference_job_id, ?), updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (job_id, now, int(run_id)),
+                    )
+                elif kind == "decode":
+                    conn.execute(
+                        """
+                        UPDATE runs
+                        SET status = 'decoding', updated_at = ?
+                        WHERE id = ? AND status = 'queued'
+                        """,
+                        (now, int(run_id)),
+                    )
+            return job_id
 
     def list_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.query("SELECT * FROM jobs ORDER BY id DESC LIMIT ?", (limit,))
@@ -3209,21 +4659,33 @@ class Database:
                     f"""
                     SELECT j.*
                     FROM jobs j
-                    JOIN run_jobs rj ON rj.job_id = j.id
-                    JOIN runs r ON r.id = rj.run_id
+                    JOIN runs r ON (
+                        r.inference_job_id = j.id
+                        OR r.metric_job_id = j.id
+                        OR CAST(json_extract(j.payload_json, '$.run_id') AS INTEGER) = r.id
+                        OR EXISTS (
+                            SELECT 1 FROM run_jobs linked
+                            WHERE linked.run_id = r.id AND linked.job_id = j.id
+                        )
+                    )
+                    LEFT JOIN run_jobs rj
+                      ON rj.run_id = r.id AND rj.job_id = j.id
                     WHERE j.status = 'queued'
                       AND j.kind IN ({placeholders})
-                      AND (
-                          rj.device = ?
-                          OR (
-                              rj.device IS NULL
-                              AND j.kind = 'metric'
-                              AND json_extract(j.payload_json, '$.metric_device') = ?
-                          )
-                      )
+                      AND COALESCE(
+                          rj.device,
+                          json_extract(j.payload_json, '$.metric_device'),
+                          json_extract(j.payload_json, '$.device'),
+                          r.device
+                      ) = ?
                       AND r.deleted_at IS NULL
                       AND r.artifact_cleaned_at IS NULL
-                      AND r.status NOT IN ('completed', 'cancel_requested', 'canceled', 'failed')
+                      AND (
+                          (j.kind = 'decode' AND r.status IN ('queued', 'decoding'))
+                          OR (j.kind = 'inference' AND r.status IN ('queued', 'running'))
+                          OR (j.kind = 'finalize' AND r.status IN ('finalize_queued', 'finalizing'))
+                          OR (j.kind = 'metric' AND r.status IN ('metric_queued', 'metric_running'))
+                      )
                       AND NOT EXISTS (
                           SELECT 1 FROM run_purge_requests pr
                           WHERE pr.run_id = r.id
@@ -3232,7 +4694,7 @@ class Database:
                     ORDER BY j.created_at, j.id
                     LIMIT 1
                     """,
-                    (*tuple(kinds), device_filter, device_filter),
+                    (*tuple(kinds), device_filter),
                 ).fetchone()
             else:
                 row = conn.execute(
@@ -3247,7 +4709,36 @@ class Database:
                             AND (
                                 r.deleted_at IS NOT NULL
                                 OR r.artifact_cleaned_at IS NOT NULL
-                                OR r.status IN ('completed', 'cancel_requested', 'canceled', 'failed')
+                                OR NOT (
+                                    (j.kind = 'decode' AND r.status IN ('queued', 'decoding'))
+                                    OR (j.kind = 'inference' AND r.status IN ('queued', 'running'))
+                                    OR (j.kind = 'finalize' AND r.status IN ('finalize_queued', 'finalizing'))
+                                    OR (j.kind = 'metric' AND r.status IN ('metric_queued', 'metric_running'))
+                                )
+                                OR EXISTS (
+                                    SELECT 1 FROM run_purge_requests pr
+                                    WHERE pr.run_id = r.id
+                                      AND pr.status IN ('requested', 'canceling', 'purging')
+                                )
+                            )
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM runs r
+                          WHERE (
+                                r.inference_job_id = j.id
+                                OR r.metric_job_id = j.id
+                                OR CAST(json_extract(j.payload_json, '$.run_id') AS INTEGER) = r.id
+                            )
+                            AND (
+                                r.deleted_at IS NOT NULL
+                                OR r.artifact_cleaned_at IS NOT NULL
+                                OR NOT (
+                                    (j.kind = 'decode' AND r.status IN ('queued', 'decoding'))
+                                    OR (j.kind = 'inference' AND r.status IN ('queued', 'running'))
+                                    OR (j.kind = 'finalize' AND r.status IN ('finalize_queued', 'finalizing'))
+                                    OR (j.kind = 'metric' AND r.status IN ('metric_queued', 'metric_running'))
+                                )
                                 OR EXISTS (
                                     SELECT 1 FROM run_purge_requests pr
                                     WHERE pr.run_id = r.id
@@ -3268,7 +4759,7 @@ class Database:
                     "UPDATE run_jobs SET device = COALESCE(device, ?) WHERE job_id = ? AND role = 'metric'",
                     (device_filter, int(row["id"])),
                 )
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE jobs
                 SET status = 'running', worker_id = ?, started_at = ?
@@ -3276,6 +4767,9 @@ class Database:
                 """,
                 (worker_id, now, int(row["id"])),
             )
+            if cur.rowcount != 1:
+                conn.commit()
+                return None
             conn.commit()
         claimed = self.get_job(int(row["id"]))
         return claimed
@@ -3286,49 +4780,114 @@ class Database:
         current: int,
         total: int | None = None,
         result: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> bool:
+        assignments = ["progress_current = ?"]
+        params: list[Any] = [int(current)]
+        if total is not None:
+            assignments.append("progress_total = ?")
+            params.append(int(total))
+        if result is not None:
+            assignments.append("result_json = ?")
+            params.append(_json(result))
+        params.append(int(job_id))
         with self.connection() as conn:
-            if total is None and result is None:
-                conn.execute("UPDATE jobs SET progress_current = ? WHERE id = ?", (current, job_id))
-            elif total is None:
-                conn.execute(
-                    "UPDATE jobs SET progress_current = ?, result_json = ? WHERE id = ?",
-                    (current, _json(result), job_id),
-                )
-            elif result is None:
-                conn.execute(
-                    "UPDATE jobs SET progress_current = ?, progress_total = ? WHERE id = ?",
-                    (current, total, job_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE jobs SET progress_current = ?, progress_total = ?, result_json = ? WHERE id = ?",
-                    (current, total, _json(result), job_id),
-                )
+            cur = conn.execute(
+                f"""
+                UPDATE jobs
+                SET {', '.join(assignments)}
+                WHERE id = ? AND status = 'running'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM run_jobs rj
+                      JOIN runs r ON r.id = rj.run_id
+                      WHERE rj.job_id = jobs.id
+                        AND r.status IN ('failed', 'cancel_requested', 'canceled')
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM runs r
+                      WHERE (
+                            r.inference_job_id = jobs.id
+                            OR r.metric_job_id = jobs.id
+                            OR CAST(json_extract(jobs.payload_json, '$.run_id') AS INTEGER) = r.id
+                        )
+                        AND r.status IN ('failed', 'cancel_requested', 'canceled')
+                  )
+                """,
+                params,
+            )
+            return bool(cur.rowcount)
 
-    def complete_job(self, job_id: int, result: dict[str, Any] | None = None) -> None:
+    def complete_job(self, job_id: int, result: dict[str, Any] | None = None) -> bool:
         now = utc_ts()
         with self.connection() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE jobs
                 SET status = 'completed', result_json = ?, finished_at = ?
-                WHERE id = ?
+                WHERE id = ? AND status = 'running'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM run_jobs rj
+                      JOIN runs r ON r.id = rj.run_id
+                      WHERE rj.job_id = jobs.id
+                        AND r.status IN ('failed', 'cancel_requested', 'canceled')
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM runs r
+                      WHERE (
+                            r.inference_job_id = jobs.id
+                            OR r.metric_job_id = jobs.id
+                            OR CAST(json_extract(jobs.payload_json, '$.run_id') AS INTEGER) = r.id
+                        )
+                        AND r.status IN ('failed', 'cancel_requested', 'canceled')
+                  )
                 """,
                 (_json(result), now, job_id),
             )
+            if cur.rowcount:
+                return True
+            # Phase handoffs can complete the source Job in the same
+            # transaction as the Run transition. Accept only an identical
+            # replay as idempotent; conflicting or terminal callbacks remain
+            # rejected and cannot overwrite the stored result.
+            row = conn.execute(
+                "SELECT status, result_json FROM jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+            return bool(
+                row is not None
+                and str(row["status"] or "") == "completed"
+                and _loads(row["result_json"]) == _loads(_json(result))
+            )
 
-    def fail_job(self, job_id: int, error: dict[str, Any]) -> None:
+    def fail_job(self, job_id: int, error: dict[str, Any]) -> bool:
         now = utc_ts()
         with self.connection() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE jobs
                 SET status = 'failed', error_json = ?, finished_at = ?
-                WHERE id = ?
+                WHERE id = ? AND status = 'running'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM run_jobs rj
+                      JOIN runs r ON r.id = rj.run_id
+                      WHERE rj.job_id = jobs.id
+                        AND r.status IN ('cancel_requested', 'canceled')
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM runs r
+                      WHERE (
+                            r.inference_job_id = jobs.id
+                            OR r.metric_job_id = jobs.id
+                            OR CAST(json_extract(jobs.payload_json, '$.run_id') AS INTEGER) = r.id
+                        )
+                        AND r.status IN ('cancel_requested', 'canceled')
+                  )
                 """,
                 (_json(error), now, job_id),
             )
+            return bool(cur.rowcount)
 
     def touch_job(self, job_id: int) -> None:
         now = utc_ts()

@@ -756,11 +756,7 @@ class RunCleanupService:
                 return self.db.get_run_purge_request_by_id(int(request["id"]))
 
     def _active_jobs(self, run_id: int) -> list[dict[str, Any]]:
-        return [
-            row
-            for row in self.db.list_run_jobs(int(run_id))
-            if str(row.get("status") or "") == "running"
-        ]
+        return self.db.list_run_associated_jobs(int(run_id), statuses=("running",))
 
     def _prepare_protected_campaign_media(self, run_id: int) -> dict[str, Any]:
         try:

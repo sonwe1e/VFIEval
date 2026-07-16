@@ -17,6 +17,7 @@ MEDIA_ROLES = {"source", "gt", "pred"}
 MEDIA_KINDS = {"video", "frame_sequence"}
 SOURCE_KINDS = {"folder", "upload", "run_artifact", "evaluation_package"}
 MEDIA_STATES = {"ready", "unavailable", "deleted", "invalid"}
+CANONICAL_VIDEO_ARTIFACT_KINDS = ("pred_video", "gt_video", "diff_video")
 
 
 def _json(data: Any) -> str:
@@ -726,18 +727,316 @@ def folder_asset_id_map(db: Database, group_name: str) -> dict[str, int]:
     }
 
 
-def sync_run_assets(db: Database, workspace: WorkspaceConfig, run_id: int) -> list[dict[str, Any]]:
+def sync_run_assets(
+    db: Database,
+    workspace: WorkspaceConfig,
+    run_id: int,
+    *,
+    allow_running: bool = False,
+) -> list[dict[str, Any]]:
+    try:
+        return _sync_run_assets(
+            db,
+            workspace,
+            int(run_id),
+            allow_running=allow_running,
+        )
+    except Exception:
+        # ``upsert_asset`` and ``bind_run_asset`` intentionally remain small,
+        # reusable transactions. If anything fails between them, invalidate
+        # both bound assets and artifact-derived assets that have not yet been
+        # bound so no partial publication remains catalog-visible.
+        db.invalidate_run_media_assets(int(run_id))
+        raise
+
+
+def _run_video_artifacts(db: Database, run_id: int) -> dict[str, list[dict[str, Any]]]:
+    return {
+        kind: db.list_run_artifacts(int(run_id), kind=kind)
+        for kind in CANONICAL_VIDEO_ARTIFACT_KINDS
+    }
+
+
+def _expected_video_artifact_identities(
+    db: Database,
+    run: dict[str, Any],
+    artifacts: list[dict[str, Any]] | None = None,
+) -> set[tuple[str, str, str | None]] | None:
+    """Derive the canonical video publication contract from source samples.
+
+    New decoded-video and Compare samples carry explicit semantic metadata.
+    Legacy frame datasets do not, so ``None`` preserves their readable
+    compatibility surface instead of guessing requirements from file names.
+    """
+
+    metadata = dict(run.get("metadata") or {})
+    request = metadata.get("request") or {}
+    if not isinstance(request, dict):
+        request = {}
+    canonical_required = str(
+        metadata.get("artifact_contract") or request.get("artifact_contract") or ""
+    ) == "canonical-v1"
+    inference_job_ids = db.run_inference_job_ids(int(run["id"]))
+    if not canonical_required:
+        canonical_required = any(
+            str((artifact.get("metadata") or {}).get("artifact_contract") or "") == "canonical-v1"
+            for artifact in (artifacts or [])
+        )
+    if not canonical_required:
+        canonical_required = any(
+            str((db.get_job(int(job_id)).get("payload") or {}).get("artifact_contract") or "")
+            == "canonical-v1"
+            for job_id in inference_job_ids
+        )
+    if not canonical_required:
+        return None
+    profile = str(metadata.get("artifact_profile") or request.get("artifact_profile") or "evaluation")
+    if profile == "benchmark":
+        return set()
+    samples = db.list_samples(int(run["dataset_id"]))
+    selected_sample_ids: set[int] = set()
+    has_explicit_selection = False
+    for job_id in inference_job_ids:
+        payload = db.get_job(int(job_id)).get("payload") or {}
+        if payload.get("sample_ids") is None:
+            continue
+        has_explicit_selection = True
+        selected_sample_ids.update(int(sample_id) for sample_id in payload.get("sample_ids") or [])
+    if has_explicit_selection:
+        samples = [sample for sample in samples if int(sample["id"]) in selected_sample_ids]
+    video_samples = [
+        sample
+        for sample in samples
+        if str((sample.get("metadata") or {}).get("source_type") or "") in {"video", "compare"}
+        or bool((sample.get("metadata") or {}).get("compare_group"))
+    ]
+    if not video_samples:
+        return None
+
+    publish_pred_video = bool(
+        metadata.get(
+            "publish_compare_pred_video",
+            request.get("publish_compare_pred_video", True),
+        )
+    )
+    by_video: dict[str, list[dict[str, Any]]] = {}
+    for sample in video_samples:
+        sample_metadata = sample.get("metadata") or {}
+        video_name = str(
+            sample_metadata.get("video_name")
+            or sample_metadata.get("compare_group")
+            or "video"
+        )
+        by_video.setdefault(video_name, []).append(sample)
+
+    expected: set[tuple[str, str, str | None]] = set()
+    for video_name, group in by_video.items():
+        is_compare = any(
+            str((sample.get("metadata") or {}).get("source_type") or "") == "compare"
+            or bool((sample.get("metadata") or {}).get("compare_group"))
+            for sample in group
+        )
+        if is_compare:
+            track_keys = {
+                str((sample.get("metadata") or {}).get("compare_track_key"))
+                for sample in group
+                if (sample.get("metadata") or {}).get("compare_track_key") not in {None, ""}
+            }
+            identities = sorted(track_keys) if track_keys else [None]
+            for track_key in identities:
+                if publish_pred_video:
+                    expected.add(("pred_video", video_name, track_key))
+                expected.add(("diff_video", video_name, track_key))
+            expected.add(("gt_video", video_name, None))
+            continue
+
+        expected.add(("pred_video", video_name, None))
+        if any(str(sample.get("gt_path") or "").strip() for sample in group):
+            expected.add(("gt_video", video_name, None))
+            expected.add(("diff_video", video_name, None))
+    return expected
+
+
+def _require_expected_video_artifacts(
+    artifacts: list[dict[str, Any]],
+    expected: set[tuple[str, str, str | None]] | None,
+) -> None:
+    if expected is None:
+        return
+    actual = []
+    for artifact in artifacts:
+        metadata = artifact.get("metadata") or {}
+        track_value = metadata.get("compare_track_key")
+        actual.append(
+            (
+                str(artifact.get("kind") or ""),
+                str(metadata.get("video_name") or ""),
+                str(track_value) if track_value not in {None, ""} else None,
+            )
+        )
+    if len(actual) != len(set(actual)) or set(actual) != expected:
+        missing = sorted(expected - set(actual), key=str)
+        unexpected = sorted(set(actual) - expected, key=str)
+        raise ValueError(
+            "canonical video artifact contract changed before publication: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+
+
+def _require_materialized_video_artifacts(artifacts: list[dict[str, Any]]) -> None:
+    for artifact in artifacts:
+        path = Path(str(artifact.get("path") or "")).resolve()
+        try:
+            valid = path.is_file() and path.stat().st_size > 0
+        except OSError:
+            valid = False
+        if not valid:
+            raise ValueError(
+                f"canonical {artifact.get('kind') or 'video'} artifact "
+                f"{int(artifact['id'])} is missing or empty"
+            )
+
+
+def _stage_existing_video_assets(db: Database, artifact_ids: list[int]) -> None:
+    """Hide any prior publication before rebuilding all output bindings."""
+
+    ids = sorted({int(artifact_id) for artifact_id in artifact_ids})
+    if not ids:
+        return
+    placeholders = ",".join("?" for _ in ids)
+    source_keys = [f"run_artifact:{artifact_id}" for artifact_id in ids]
+    with db.connection() as conn:
+        conn.execute(
+            f"""
+            UPDATE media_assets
+            SET state = 'unavailable', updated_at = ?
+            WHERE source_kind = 'run_artifact'
+              AND source_key IN ({placeholders})
+            """,
+            (utc_ts(), *source_keys),
+        )
+
+
+def _activate_video_assets(
+    db: Database,
+    run_id: int,
+    artifacts: list[dict[str, Any]],
+    asset_ids: list[int],
+    allowed_statuses: set[str],
+) -> bool:
+    """Validate the publication snapshot and make all staged assets visible.
+
+    Holding ``BEGIN IMMEDIATE`` makes the final filesystem/row check and the
+    Run-state fence linearize with cancellation and cleanup transactions.
+    """
+
+    expected_artifacts = {int(artifact["id"]): artifact for artifact in artifacts}
+    staged_asset_ids = sorted({int(asset_id) for asset_id in asset_ids})
+    if not staged_asset_ids:
+        return True
+    asset_placeholders = ",".join("?" for _ in staged_asset_ids)
+    with db.connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        run_row = conn.execute(
+            "SELECT status, deleted_at, artifact_cleaned_at FROM runs WHERE id = ?",
+            (int(run_id),),
+        ).fetchone()
+        if (
+            run_row is None
+            or run_row["deleted_at"] is not None
+            or run_row["artifact_cleaned_at"] is not None
+            or str(run_row["status"] or "") not in allowed_statuses
+        ):
+            return False
+
+        rows = conn.execute(
+            """
+            SELECT DISTINCT a.id, a.kind, a.path, a.metadata_json
+            FROM artifacts a
+            WHERE a.kind IN ('pred_video', 'gt_video', 'diff_video')
+              AND a.job_id IN (
+                  SELECT job_id FROM run_jobs
+                  WHERE run_id = ? AND role = 'inference'
+                  UNION
+                  SELECT inference_job_id FROM runs
+                  WHERE id = ? AND inference_job_id IS NOT NULL
+              )
+            ORDER BY a.id
+            """,
+            (int(run_id), int(run_id)),
+        ).fetchall()
+        if {int(row["id"]) for row in rows} != set(expected_artifacts):
+            raise ValueError("canonical video artifact set changed during media publication")
+        for row in rows:
+            expected = expected_artifacts[int(row["id"])]
+            if (
+                str(row["kind"] or "") != str(expected.get("kind") or "")
+                or Path(str(row["path"] or "")).resolve()
+                != Path(str(expected.get("path") or "")).resolve()
+                or _loads(row["metadata_json"]) != dict(expected.get("metadata") or {})
+            ):
+                raise ValueError("canonical video artifact identity changed during media publication")
+        _require_materialized_video_artifacts([dict(row) for row in rows])
+
+        updated = conn.execute(
+            f"""
+            UPDATE media_assets
+            SET state = 'ready', updated_at = ?
+            WHERE source_kind = 'run_artifact'
+              AND deleted_at IS NULL
+              AND id IN ({asset_placeholders})
+            """,
+            (utc_ts(), *staged_asset_ids),
+        )
+        if int(updated.rowcount) != len(staged_asset_ids):
+            raise ValueError("one or more staged Run video assets are unavailable")
+    return True
+
+
+def _sync_run_assets(
+    db: Database,
+    workspace: WorkspaceConfig,
+    run_id: int,
+    *,
+    allow_running: bool = False,
+) -> list[dict[str, Any]]:
     run = db.get_run(int(run_id))
     if run.get("deleted_at") is not None or run.get("artifact_cleaned_at") is not None:
         db.invalidate_run_media_assets(int(run_id))
         return []
+    # Publication is a post-integrity phase. A late worker callback must never
+    # catalog outputs for a Run that cancellation/failure already fenced.
+    allowed_statuses = {"finalizing", "metric_queued", "metric_running", "completed"}
+    if allow_running:
+        allowed_statuses.add("running")
+    if str(run.get("status") or "") not in allowed_statuses:
+        return []
     metadata = run.get("metadata") or {}
+    video_artifacts = _run_video_artifacts(db, int(run_id))
+    all_video_artifacts = [
+        artifact
+        for kind in CANONICAL_VIDEO_ARTIFACT_KINDS
+        for artifact in video_artifacts[kind]
+    ]
+    expected_video_identities = _expected_video_artifact_identities(
+        db,
+        run,
+        all_video_artifacts,
+    )
+    _require_expected_video_artifacts(all_video_artifacts, expected_video_identities)
+    if not all_video_artifacts:
+        return []
+    _require_materialized_video_artifacts(all_video_artifacts)
     artifact_groups = [
-        (kind, role, db.list_run_artifacts(int(run_id), kind=kind))
+        (kind, role, video_artifacts[kind])
         for kind, role in (("pred_video", "pred"), ("gt_video", "gt"))
     ]
     if not any(artifacts for _kind, _role, artifacts in artifact_groups):
-        return []
+        raise ValueError("Run has canonical video artifacts but no publishable Pred or GT video")
+    _stage_existing_video_assets(
+        db,
+        [int(artifact["id"]) for artifact in all_video_artifacts],
+    )
     collection = ensure_collection(
         db,
         f"Run {run_id} · {run.get('name') or ''}",
@@ -752,24 +1051,23 @@ def sync_run_assets(db: Database, workspace: WorkspaceConfig, run_id: int) -> li
             """
             SELECT rma.asset_id, rma.track_label
             FROM run_media_assets rma
-            JOIN media_assets ma ON ma.id = rma.asset_id
-            WHERE rma.run_id = ? AND rma.role = 'pred' AND ma.source_kind != 'run_artifact'
+            WHERE rma.run_id = ? AND rma.role = 'pred'
+              AND json_extract(rma.metadata_json, '$.input') = 1
             """,
             (int(run_id),),
         )
     }
-    result: list[dict[str, Any]] = []
+    staged: list[dict[str, Any]] = []
     for kind, role, artifacts in artifact_groups:
         for artifact in artifacts:
             artifact_meta = artifact.get("metadata") or {}
             path = Path(str(artifact.get("path") or "")).resolve()
+            path_stat = path.stat()
             video_name = str(artifact_meta.get("video_name") or path.stem)
             track_label = str(artifact_meta.get("compare_track_label") or "")
             display = f"{video_name} - {track_label or run.get('name') or f'Run {run_id}'} - {role.upper()}"
-            state = "ready" if path.is_file() and run.get("artifact_cleaned_at") is None else "unavailable"
             asset_metadata = dict(artifact_meta)
-            if path.is_file():
-                asset_metadata["source_mtime_ns"] = int(path.stat().st_mtime_ns)
+            asset_metadata["source_mtime_ns"] = int(path_stat.st_mtime_ns)
             provenance = {
                 "run_id": int(run_id),
                 "artifact_id": int(artifact["id"]),
@@ -798,9 +1096,9 @@ def sync_run_assets(db: Database, workspace: WorkspaceConfig, run_id: int) -> li
                 original_name=path.name,
                 storage_path=path,
                 mime_type=artifact.get("mime_type"),
-                state=state,
-                content_sha256=_file_sha256(db, f"run_artifact:{int(artifact['id'])}", path) if path.is_file() else None,
-                size_bytes=path.stat().st_size if path.is_file() else 0,
+                state="unavailable",
+                content_sha256=_file_sha256(db, f"run_artifact:{int(artifact['id'])}", path),
+                size_bytes=path_stat.st_size,
                 frame_count=int(artifact_meta.get("frames") or 0),
                 width=int(artifact_meta.get("width") or 0),
                 height=int(artifact_meta.get("height") or 0),
@@ -819,65 +1117,117 @@ def sync_run_assets(db: Database, workspace: WorkspaceConfig, run_id: int) -> li
                 checkpoint=str(metadata.get("checkpoint") or ""),
                 metadata={"artifact_id": int(artifact["id"]), "artifact_kind": kind},
             )
-            if not is_compare and kind == "pred_video" and state == "ready":
-                # Only Runs that were explicitly bound to a canonical Item at
-                # creation time can publish a reusable prediction. This is the
-                # upgrade boundary: catalog sync never guesses bindings for
-                # legacy Run outputs from names, labels, or file hashes.
-                from vfieval.media_items import find_run_source_item, register_model_prediction
+            staged.append(
+                {
+                    "asset_id": int(asset["id"]),
+                    "artifact": artifact,
+                    "artifact_meta": artifact_meta,
+                    "kind": kind,
+                    "video_name": video_name,
+                    "track_label": track_label,
+                }
+            )
 
-                source_item = find_run_source_item(
+    # Re-read the Run-scoped rows so a deletion or replacement after the
+    # integrity check cannot publish a successful subset.
+    current_video_artifacts = _run_video_artifacts(db, int(run_id))
+    current_all_video_artifacts = [
+        artifact
+        for kind in CANONICAL_VIDEO_ARTIFACT_KINDS
+        for artifact in current_video_artifacts[kind]
+    ]
+    _require_expected_video_artifacts(current_all_video_artifacts, expected_video_identities)
+    if {int(row["id"]) for row in current_all_video_artifacts} != {
+        int(row["id"]) for row in all_video_artifacts
+    }:
+        raise ValueError("canonical video artifact set changed during media publication")
+    _require_materialized_video_artifacts(current_all_video_artifacts)
+    if not _activate_video_assets(
+        db,
+        int(run_id),
+        current_all_video_artifacts,
+        [int(row["asset_id"]) for row in staged],
+        allowed_statuses,
+    ):
+        with db.connection() as conn:
+            asset_ids = [int(row["asset_id"]) for row in staged]
+            placeholders = ",".join("?" for _ in asset_ids)
+            conn.execute(
+                f"UPDATE media_assets SET state = 'unavailable', updated_at = ? WHERE id IN ({placeholders})",
+                (utc_ts(), *asset_ids),
+            )
+        return []
+
+    result: list[dict[str, Any]] = []
+    for staged_row in staged:
+        asset = get_asset(db, int(staged_row["asset_id"]))
+        artifact = staged_row["artifact"]
+        artifact_meta = staged_row["artifact_meta"]
+        kind = str(staged_row["kind"])
+        video_name = str(staged_row["video_name"])
+        track_label = str(staged_row["track_label"])
+        if asset.get("state") != "ready":
+            raise ValueError(f"published media asset {int(asset['id'])} is not ready")
+        if not is_compare and kind == "pred_video":
+            # Only Runs that were explicitly bound to a canonical Item at
+            # creation time can publish a reusable prediction. This is the
+            # upgrade boundary: catalog sync never guesses bindings for
+            # legacy Run outputs from names, labels, or file hashes.
+            from vfieval.media_items import find_run_source_item, register_model_prediction
+
+            source_item = find_run_source_item(
+                db,
+                int(run_id),
+                video_name,
+                source_video_group=str(artifact_meta.get("source_video_group") or ""),
+                source_video_file=str(artifact_meta.get("source_video_file") or ""),
+            )
+            if source_item is not None:
+                request_metadata = metadata.get("request") or {}
+                if not isinstance(request_metadata, dict):
+                    request_metadata = {}
+                temporal_mapping = {
+                    key: artifact_meta[key]
+                    for key in (
+                        "source_frame_indices",
+                        "frame_step",
+                        "fps",
+                        "timestamps",
+                        "source_timestamps",
+                    )
+                    if artifact_meta.get(key) is not None
+                }
+                spatial_origin = {
+                    "width": int(artifact_meta.get("width") or 0),
+                    "height": int(artifact_meta.get("height") or 0),
+                    "source_width": artifact_meta.get("source_width"),
+                    "source_height": artifact_meta.get("source_height"),
+                    "resolution_mode": request_metadata.get("resolution_mode"),
+                    "artifact_contract": artifact_meta.get("artifact_contract"),
+                }
+                register_model_prediction(
                     db,
                     int(run_id),
-                    video_name,
-                    source_video_group=str(artifact_meta.get("source_video_group") or ""),
-                    source_video_file=str(artifact_meta.get("source_video_file") or ""),
+                    int(source_item["id"]),
+                    int(asset["id"]),
+                    temporal_mapping=temporal_mapping,
+                    spatial_origin=spatial_origin,
+                    metadata={
+                        "artifact_id": int(artifact["id"]),
+                        "artifact_kind": kind,
+                        "video_name": video_name,
+                    },
                 )
-                if source_item is not None:
-                    request_metadata = metadata.get("request") or {}
-                    if not isinstance(request_metadata, dict):
-                        request_metadata = {}
-                    temporal_mapping = {
-                        key: artifact_meta[key]
-                        for key in (
-                            "source_frame_indices",
-                            "frame_step",
-                            "fps",
-                            "timestamps",
-                            "source_timestamps",
-                        )
-                        if artifact_meta.get(key) is not None
-                    }
-                    spatial_origin = {
-                        "width": int(artifact_meta.get("width") or 0),
-                        "height": int(artifact_meta.get("height") or 0),
-                        "source_width": artifact_meta.get("source_width"),
-                        "source_height": artifact_meta.get("source_height"),
-                        "resolution_mode": request_metadata.get("resolution_mode"),
-                    }
-                    register_model_prediction(
-                        db,
-                        int(run_id),
-                        int(source_item["id"]),
-                        int(asset["id"]),
-                        temporal_mapping=temporal_mapping,
-                        spatial_origin=spatial_origin,
-                        metadata={
-                            "artifact_id": int(artifact["id"]),
-                            "artifact_kind": kind,
-                            "video_name": video_name,
-                        },
-                    )
-            if is_compare and reference_asset_id:
-                if kind == "gt_video":
-                    add_relation(db, reference_asset_id, int(asset["id"]), "generated_from")
-                    add_relation(db, reference_asset_id, int(asset["id"]), "aligned_gt_of")
-                elif kind == "pred_video":
-                    add_relation(db, reference_asset_id, int(asset["id"]), "pred_of")
-                    source_pred_id = input_pred_assets.get(track_label)
-                    if source_pred_id:
-                        add_relation(db, source_pred_id, int(asset["id"]), "generated_from")
-            result.append(asset)
+        if is_compare and reference_asset_id:
+            if kind == "gt_video":
+                add_relation(db, reference_asset_id, int(asset["id"]), "generated_from")
+                add_relation(db, reference_asset_id, int(asset["id"]), "aligned_gt_of")
+            elif kind == "pred_video":
+                add_relation(db, reference_asset_id, int(asset["id"]), "pred_of")
+                source_pred_id = input_pred_assets.get(track_label)
+                if source_pred_id:
+                    add_relation(db, source_pred_id, int(asset["id"]), "generated_from")
+        result.append(asset)
     inference_job_ids = db.run_inference_job_ids(int(run_id))
     unbound_metrics: list[dict[str, Any]] = []
     if inference_job_ids:
@@ -923,6 +1273,14 @@ def sync_run_assets(db: Database, workspace: WorkspaceConfig, run_id: int) -> li
             track_label=track_label,
             metadata={"backfilled": True},
         )
+    final_run = db.get_run(int(run_id))
+    if (
+        final_run.get("deleted_at") is not None
+        or final_run.get("artifact_cleaned_at") is not None
+        or str(final_run.get("status") or "") not in allowed_statuses
+    ):
+        db.invalidate_run_media_assets(int(run_id))
+        return []
     return result
 
 

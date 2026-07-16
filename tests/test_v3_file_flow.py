@@ -37,6 +37,7 @@ from vfieval.pipeline.finalize_runner import run_finalize_job
 from vfieval.pipeline.inference import run_inference_job
 from vfieval.pipeline.postprocess import validate_model_outputs
 from vfieval.server import (
+    _artifact_payload,
     _make_handler,
     _partition_samples_by_video,
     _resolve_execution_devices,
@@ -950,7 +951,7 @@ class Model:
                 device="cpu",
                 precision="fp32",
                 metrics=[],
-                metadata={"visualize_height": size[1], "visualize_width": size[0]},
+                metadata={"visualize_height": 512, "visualize_width": 512},
             )
 
             run_worker(db, workspace, WorkerOptions(role="inference", once=True, worker_id="preview-test-worker"))
@@ -981,6 +982,50 @@ class Model:
                 server.server_close()
                 thread.join(timeout=5)
 
+    def test_stale_preview_payload_and_route_fall_back_to_canonical(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            job_id = db.create_job("inference", {})
+            canonical_path = workspace.runs_dir / "1" / "samples" / "pred.png"
+            preview_path = canonical_path.parent / "preview" / canonical_path.name
+            canonical_path.parent.mkdir(parents=True, exist_ok=True)
+            preview_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (16, 12), (10, 20, 30)).save(canonical_path)
+            Image.new("RGB", (8, 6), (10, 20, 30)).save(preview_path)
+            artifact_id = db.add_artifact(
+                job_id,
+                None,
+                "pred",
+                str(canonical_path),
+                "image/png",
+                {"preview_path": str(preview_path)},
+            )
+            preview_path.write_bytes(b"")
+            artifact = db.list_artifacts(job_id=job_id, kind="pred")[0]
+            payload = _artifact_payload(artifact)
+            self.assertFalse(payload["has_preview"])
+            self.assertEqual(payload["preview_url"], payload["original_url"])
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(db, workspace))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                with urllib.request.urlopen(
+                    f"{base_url}/api/files/{artifact_id}?variant=preview",
+                    timeout=30,
+                ) as response:
+                    fallback_bytes = response.read()
+                with Image.open(io.BytesIO(fallback_bytes)) as fallback_image:
+                    self.assertEqual(fallback_image.size, (16, 12))
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
     def test_frontend_binds_sample_images_to_preview_urls_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
@@ -999,7 +1044,8 @@ class Model:
                 self.assertIn('<img src="${escapeHtml(url)}" alt="${escapeHtml(label)}" loading="lazy">', app_js)
                 self.assertIn('href="${escapeHtml(item.original_url || `/api/files/${item.id}`)}"', app_js)
                 self.assertIn('src="${escapeHtml(item.preview_url || `/api/files/${item.id}`)}"', app_js)
-                self.assertIn('<video controls playsinline preload="metadata" src="${escapeHtml(url)}"', app_js)
+                self.assertIn('<video controls playsinline preload="metadata" src="${escapeHtml(previewUrl)}"', app_js)
+                self.assertIn('href="${escapeHtml(originalUrl)}"', app_js)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -1372,12 +1418,16 @@ class Model:
                 {"run_id": run_id, "dataset_id": dataset_id, "metric_names": ["lpips_vit_patch"]},
                 progress_total=2,
             )
-            db.mark_run_started(run_id, "metric_running")
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertEqual(int(db.claim_next_job("direction-inference", ["inference"])["id"]), inference_job_id)
+            self.assertTrue(db.complete_job(inference_job_id, {"samples": 2}))
+            self.assertTrue(db.set_run_metric_job(run_id, metric_job_id))
+            self.assertEqual(int(db.claim_next_job("direction-metric", ["metric"])["id"]), metric_job_id)
+            self.assertTrue(db.mark_run_started(run_id, "metric_running"))
             db.add_metric_result(metric_job_id, inference_job_id, sample_a, "lpips_vit_patch", "completed", 0.10, {})
             db.add_metric_result(metric_job_id, inference_job_id, sample_b, "lpips_vit_patch", "completed", 0.80, {})
-            db.complete_job(inference_job_id, {"samples": 2})
-            db.complete_job(metric_job_id, {"summary": {"lpips_vit_patch": {"completed": 2}}})
-            db.complete_run_metrics(run_id, {"lpips_vit_patch": {"completed": 2, "mean": 0.45}})
+            self.assertTrue(db.complete_job(metric_job_id, {"summary": {"lpips_vit_patch": {"completed": 2}}}))
+            self.assertTrue(db.complete_run_metrics(run_id, {"lpips_vit_patch": {"completed": 2, "mean": 0.45}}))
 
             server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(db, workspace))
             thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1399,6 +1449,7 @@ class Model:
 
     def test_delete_running_run_hides_it_and_cancels_worker_at_boundary(self) -> None:
         import torch
+        from vfieval.pipeline.inference import _AsyncSavePipeline
 
         class SlowModel:
             def predict(self, img0, img1, t):
@@ -1413,6 +1464,16 @@ class Model:
                     "mask1": mask,
                 }
 
+        shutdown_entered = threading.Event()
+        release_shutdown = threading.Event()
+        original_shutdown = _AsyncSavePipeline.shutdown
+
+        def blocked_shutdown(pipeline, *args, **kwargs):
+            shutdown_entered.set()
+            if not release_shutdown.wait(timeout=10):
+                raise RuntimeError("test timed out waiting to release the save pipeline")
+            return original_shutdown(pipeline, *args, **kwargs)
+
         with tempfile.TemporaryDirectory() as tmp:
             workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
             workspace.ensure()
@@ -1425,7 +1486,10 @@ class Model:
             try:
                 group = next(row for row in list_video_groups(workspace) if row["name"] == "test_style")
                 selected_video = group["videos"][0]["name"]
-                with patch("vfieval.pipeline.inference.load_flow_mask_model", return_value=SlowModel()):
+                with (
+                    patch("vfieval.pipeline.inference.load_flow_mask_model", return_value=SlowModel()),
+                    patch.object(_AsyncSavePipeline, "shutdown", new=blocked_shutdown),
+                ):
                     created = _post(
                         base_url,
                         "/api/runs",
@@ -1455,6 +1519,20 @@ class Model:
                     self.assertTrue(deleted["deleting"])
                     self.assertEqual(deleted["purge_status"], "canceling")
 
+                    try:
+                        self.assertTrue(shutdown_entered.wait(timeout=10), "worker never entered save-pipeline shutdown")
+                        waiting_run = db.get_run(run_id)
+                        waiting_job = db.get_job(int(waiting_run["inference_job_id"]))
+                        self.assertEqual(waiting_run["status"], "cancel_requested")
+                        self.assertEqual(waiting_job["status"], "running")
+                        waiting_purge = _get(
+                            base_url,
+                            f"/api/run-purge-requests/{int(deleted['request_id'])}",
+                        )
+                        self.assertEqual(waiting_purge["status"], "canceling", waiting_purge)
+                    finally:
+                        release_shutdown.set()
+
                     visible_runs = _get(base_url, "/api/runs")
                     if run_id not in [int(item["id"]) for item in visible_runs]:
                         self.assertEqual(
@@ -1465,7 +1543,7 @@ class Model:
                     canceled_run = _wait_for_run(base_url, run_id)
                     self.assertEqual(canceled_run["status"], "canceled", canceled_run)
                     purge = _wait_for_purge(base_url, int(deleted["request_id"]))
-                    self.assertEqual(purge["status"], "completed")
+                    self.assertEqual(purge["status"], "completed", purge)
 
                     visible_runs = _get(base_url, "/api/runs")
                     self.assertNotIn(run_id, [int(item["id"]) for item in visible_runs])
@@ -1476,6 +1554,7 @@ class Model:
                     inference_job = db.get_job(int(canceled_run["inference_job_id"]))
                     self.assertEqual(inference_job["status"], "canceled")
             finally:
+                release_shutdown.set()
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=5)
@@ -1591,7 +1670,15 @@ class Model:
                 metadata={"output_dir": str(workspace.runs_dir)},
                 create_inference_job=False,
             )
-            db.complete_run_inference(run_id, {"output_dir": str(workspace.runs_dir)}, {"total": 1}, "completed")
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertTrue(
+                db.complete_run_inference(
+                    run_id,
+                    {"output_dir": str(workspace.runs_dir)},
+                    {"total": 1},
+                    "completed",
+                )
+            )
 
             run_dir = workspace.runs_dir / str(run_id)
             run_dir.mkdir(parents=True, exist_ok=True)
@@ -1653,7 +1740,9 @@ class Model:
                     created = post_json(base_url, "/api/runs", payload)
                 run_id = int(created["run_id"])
                 job_id = int(db.get_run(run_id)["inference_job_id"])
-                run_inference_job(db, workspace, job_id)
+                self.assertEqual(int(db.claim_next_job("compare-api", ["inference"])["id"]), job_id)
+                result = run_inference_job(db, workspace, job_id)
+                self.assertTrue(db.complete_job(job_id, result.__dict__))
 
                 run = db.get_run(run_id)
                 self.assertEqual(run["status"], "completed", run)
@@ -1673,6 +1762,52 @@ class Model:
                 self.assertIn("difference", sample_detail["artifacts"])
                 self.assertNotIn("flowt_0", sample_detail["artifacts"])
                 self.assertNotIn("mask0", sample_detail["artifacts"])
+            finally:
+                stop_server(server, thread)
+
+    def test_video_compare_run_honors_explicit_preview_dimensions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": tmp}, clear=False):
+            workspace, db = make_workspace(tmp)
+            gt_path = Path(tmp) / "videos" / "anime" / "clip.mp4"
+            gt_path.parent.mkdir(parents=True, exist_ok=True)
+            write_mp4(gt_path, [(index * 20, 0, 0) for index in range(3)])
+            pred_path = workspace.root / "pred.mp4"
+            write_mp4(pred_path, [(0, index * 20, 0) for index in range(3)])
+            run_a = add_completed_pred_run(
+                db, workspace, "ModelA", pred_path, source_video_path=gt_path
+            )
+            payload = {
+                "run_type": "video_compare",
+                "reference": {"kind": "video_group", "group": "anime", "video": "clip.mp4"},
+                "distorted": [
+                    {"kind": "run_artifact", "run_id": run_a, "video": "clip", "label": "ModelA"}
+                ],
+                "align_mode": "strict",
+                "visualize_height": 5,
+                "visualize_width": 7,
+            }
+
+            server, thread, base_url = start_server(db, workspace)
+            try:
+                with patch("vfieval.server._start_local_inference_worker", return_value=None):
+                    created = post_json(base_url, "/api/runs", payload)
+                run = db.get_run(int(created["run_id"]))
+                self.assertEqual(
+                    (run["metadata"]["visualize_height"], run["metadata"]["visualize_width"]),
+                    (5, 7),
+                )
+                self.assertEqual(
+                    (
+                        run["metadata"]["request"]["visualize_height"],
+                        run["metadata"]["request"]["visualize_width"],
+                    ),
+                    (5, 7),
+                )
+                job = db.get_job(int(run["inference_job_id"]))
+                self.assertEqual(
+                    (job["payload"]["visualize_height"], job["payload"]["visualize_width"]),
+                    (5, 7),
+                )
             finally:
                 stop_server(server, thread)
 
@@ -1702,11 +1837,13 @@ class Model:
 
                 run_id = int(created["run_id"])
                 job_id = int(db.get_run(run_id)["inference_job_id"])
+                self.assertEqual(int(db.claim_next_job("compare-bypass", ["inference"])["id"]), job_id)
                 with patch(
                     "vfieval.pipeline.inference.load_flow_mask_model",
                     side_effect=AssertionError("video_compare should not load model"),
                 ) as load_model:
                     result = run_inference_job(db, workspace, job_id)
+                self.assertTrue(db.complete_job(job_id, result.__dict__))
 
                 self.assertEqual(result.samples, 3)
                 self.assertFalse(load_model.called)
@@ -1953,7 +2090,8 @@ class Model:
                 {"run_id": run_id, "dataset_id": dataset_id, "metric_names": ["lpips_vit_patch", "vmaf"]},
                 progress_total=1,
             )
-            db.set_run_metric_job(run_id, metric_job_id)
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertTrue(db.set_run_metric_job(run_id, metric_job_id))
 
             queued_timeline = _run_timeline(db, run_id)
             queued_sample = queued_timeline["videos"][0]["samples"][0]
@@ -2303,9 +2441,13 @@ class Model:
             job1 = db.add_run_job(run_id, "inference", {"device": "npu:1"}, progress_total=1, shard_index=1, device="npu:1")
             metric_job = db.add_run_job(run_id, "metric", {"metric_names": ["lpips_vit_patch"]}, progress_total=0)
 
+            self.assertTrue(db.mark_run_started(run_id, "running"))
             self.assertEqual(db.claim_next_job("worker-npu-1", ["inference"], device_filter="npu:1")["id"], job1)
             self.assertEqual(db.claim_next_job("worker-npu-0", ["inference"], device_filter="npu:0")["id"], job0)
             self.assertIsNone(db.claim_next_job("worker-npu-0-again", ["inference"], device_filter="npu:0"))
+            self.assertTrue(db.complete_job(job0, {}))
+            self.assertTrue(db.complete_job(job1, {}))
+            self.assertTrue(db.set_run_metric_job(run_id, metric_job))
             self.assertEqual(db.claim_next_job("metric-worker", ["metric"])["id"], metric_job)
 
     def test_multi_npu_finalize_binds_lpips_metric_job_to_first_device(self) -> None:
@@ -2330,6 +2472,7 @@ class Model:
                 create_inference_job=False,
             )
             inference_job_ids = []
+            self.assertTrue(db.mark_run_started(run_id, "running"))
             for shard_index, device in enumerate(("npu:0", "npu:1")):
                 inference_job_id = db.add_run_job(
                     run_id,
@@ -2339,14 +2482,17 @@ class Model:
                     shard_index=shard_index,
                     device=device,
                 )
-                db.complete_job(inference_job_id, {"samples": 0, "performance": {}})
+                claimed = db.claim_next_job(
+                    f"finalize-inference-{shard_index}", ["inference"], device_filter=device
+                )
+                self.assertEqual(int(claimed["id"]), inference_job_id)
+                self.assertTrue(db.complete_job(inference_job_id, {"samples": 0, "performance": {}}))
                 inference_job_ids.append(inference_job_id)
-            finalize_job_id = db.add_run_job(
-                run_id,
-                "finalize",
-                {"run_id": run_id, "inference_job_ids": inference_job_ids},
-                progress_total=1,
+            self.assertTrue(
+                db.queue_run_finalize(run_id, {}, db.summarize_run_artifacts(run_id), inference_job_ids)
             )
+            finalize_job_id = int(db.list_run_jobs(run_id, "finalize")[0]["job_id"])
+            self.assertEqual(int(db.claim_next_job("finalize-worker", ["finalize"])["id"]), finalize_job_id)
 
             run_finalize_job(db, workspace, finalize_job_id)
 
@@ -2388,7 +2534,8 @@ class Model:
                 },
                 device=None,
             )
-            db.set_run_metric_job(run_id, metric_job_id)
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertTrue(db.set_run_metric_job(run_id, metric_job_id))
 
             claimed = db.claim_next_job("metric-npu-0", ["metric"], device_filter="npu:0")
 
@@ -2417,19 +2564,54 @@ class Model:
                 metadata={"execution_mode": "multi_npu", "devices": ["npu:0", "npu:1"]},
                 create_inference_job=False,
             )
-            db.add_run_job(
-                run_id,
-                "inference",
-                {"run_id": run_id, "dataset_id": dataset_id, "sample_ids": [1]},
-                shard_index=0,
-                device="npu:0",
-            )
-            db.add_run_job(
-                run_id,
-                "inference",
-                {"run_id": run_id, "dataset_id": dataset_id, "sample_ids": [2]},
-                shard_index=1,
-                device="npu:1",
+            inference_jobs = []
+            sample_ids = []
+            for index, device in enumerate(("npu:0", "npu:1")):
+                source = Path(tmp) / f"retry-source-{index}.png"
+                Image.new("RGB", (8, 8), (index, 0, 0)).save(source)
+                sample_id = db.add_sample(
+                    dataset_id,
+                    f"retry-{index}",
+                    str(source),
+                    str(source),
+                    str(source),
+                    {"source_type": "frames"},
+                )
+                sample_ids.append(sample_id)
+                inference_jobs.append(
+                    db.add_run_job(
+                        run_id,
+                        "inference",
+                        {
+                            "run_id": run_id,
+                            "dataset_id": dataset_id,
+                            "sample_ids": [sample_id],
+                            "artifact_profile": "evaluation",
+                        },
+                        shard_index=index,
+                        device=device,
+                    )
+                )
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            for index, (job_id, sample_id, device) in enumerate(
+                zip(inference_jobs, sample_ids, ("npu:0", "npu:1"))
+            ):
+                claimed = db.claim_next_job(
+                    f"retry-inference-{index}", ["inference"], device_filter=device
+                )
+                self.assertEqual(int(claimed["id"]), job_id)
+                for kind in ("pred", "gt", "difference"):
+                    path = Path(tmp) / f"retry-{sample_id}-{kind}.png"
+                    Image.new("RGB", (8, 8), (index, 1, 2)).save(path)
+                    db.add_artifact(job_id, sample_id, kind, str(path), "image/png", {})
+                self.assertTrue(db.complete_job(job_id, {"samples": 1}))
+            self.assertTrue(
+                db.complete_run_inference(
+                    run_id,
+                    {"samples": 2},
+                    db.summarize_run_artifacts(run_id),
+                    "completed",
+                )
             )
 
             retry = _retry_run_metrics(db, run_id)
@@ -2575,8 +2757,11 @@ class Model:
             job0 = db.add_run_job(run_id, "inference", {"run_id": run_id}, progress_total=1, shard_index=0, device="cuda:0")
             job1 = db.add_run_job(run_id, "inference", {"run_id": run_id}, progress_total=1, shard_index=1, device="cuda:1")
 
-            db.complete_job(job0, {"samples": 1, "output_health": health(1, 0.0, 0.0)})
-            db.complete_job(job1, {"samples": 2, "output_health": health(2, 2.0, 0.25)})
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertEqual(int(db.claim_next_job("health-0", ["inference"])["id"]), job0)
+            self.assertEqual(int(db.claim_next_job("health-1", ["inference"])["id"]), job1)
+            self.assertTrue(db.complete_job(job0, {"samples": 1, "output_health": health(1, 0.0, 0.0)}))
+            self.assertTrue(db.complete_job(job1, {"samples": 2, "output_health": health(2, 2.0, 0.25)}))
 
             self.assertTrue(db.maybe_complete_multi_run_inference(run_id))
             run = db.get_run(run_id)
@@ -2610,10 +2795,20 @@ class Model:
                 metrics=[],
                 create_inference_job=False,
             )
-            failing_job = db.add_run_job(
+            running_sibling_job = db.add_run_job(
                 run_id,
                 "inference",
-                {"run_id": run_id, "device": "cuda:0", "shard_index": 0, "shard_count": 2},
+                {"run_id": run_id, "device": "cuda:2", "shard_index": 2, "shard_count": 3},
+                progress_total=1,
+                shard_index=2,
+                device="cuda:2",
+            )
+            claimed = db.claim_next_job("running-sibling", ["inference"])
+            self.assertEqual(int(claimed["id"]), running_sibling_job)
+            db.add_run_job(
+                run_id,
+                "inference",
+                {"run_id": run_id, "device": "cuda:0", "shard_index": 0, "shard_count": 3},
                 progress_total=1,
                 shard_index=0,
                 device="cuda:0",
@@ -2621,7 +2816,7 @@ class Model:
             queued_sibling_job = db.add_run_job(
                 run_id,
                 "inference",
-                {"run_id": run_id, "device": "cuda:1", "shard_index": 1, "shard_count": 2},
+                {"run_id": run_id, "device": "cuda:1", "shard_index": 1, "shard_count": 3},
                 progress_total=1,
                 shard_index=1,
                 device="cuda:1",
@@ -2637,16 +2832,16 @@ class Model:
 
             # A sibling shard that was already running when the failure landed
             # must notice on its next cancellation check and stop itself.
-            running_sibling_job = db.add_run_job(
-                run_id,
-                "inference",
-                {"run_id": run_id, "device": "cuda:2", "shard_index": 2, "shard_count": 3},
-                progress_total=1,
-                shard_index=2,
-                device="cuda:2",
-            )
             with self.assertRaises(RunCanceled):
                 _raise_if_canceled(db, run_id, running_sibling_job)
+            running_job_row = db.get_job(running_sibling_job)
+            self.assertEqual(running_job_row["status"], "running")
+            self.assertTrue(
+                db.cancel_job(
+                    running_sibling_job,
+                    {"message": "sibling shard failed the run", "type": "RunCanceled"},
+                )
+            )
             running_job_row = db.get_job(running_sibling_job)
             self.assertEqual(running_job_row["status"], "canceled")
             self.assertEqual(running_job_row["error"]["message"], "sibling shard failed the run")
@@ -2730,7 +2925,9 @@ class Model:
                 patch("vfieval.devices.torch.device", side_effect=lambda _name: real_torch_device("cpu")),
                 patch("vfieval.pipeline.inference.load_flow_mask_model", side_effect=fake_load_model),
             ):
+                self.assertEqual(int(db.claim_next_job("npu-order", ["inference"])["id"]), job_id)
                 result = run_inference_job(db, workspace, job_id)
+            self.assertTrue(db.complete_job(job_id, result.__dict__))
 
             self.assertEqual(result.samples, 1)
             self.assertGreaterEqual(len(events), 2)

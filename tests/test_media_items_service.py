@@ -96,7 +96,16 @@ class MediaItemServiceTests(unittest.TestCase):
             [],
             metadata={"run_type": "model_inference"},
         )
-        db.complete_run_inference(run_id, {}, {}, "completed")
+        job_id = int(db.get_run(run_id)["inference_job_id"])
+        if not db.mark_run_started(run_id, "running"):
+            raise RuntimeError("test Run rejected inference start")
+        claimed = db.claim_next_job(f"item-service-{tag}", ["inference"])
+        if claimed is None or int(claimed["id"]) != job_id:
+            raise RuntimeError("test inference Job could not be claimed")
+        if not db.complete_run_inference(run_id, {}, {}, "completed"):
+            raise RuntimeError("test Run rejected inference completion")
+        if not db.complete_job(job_id, {}):
+            raise RuntimeError("test inference Job rejected completion")
         bind_run_source(db, run_id, item_id, video_name="clip.mp4")
         bind_run_asset(db, run_id, pred_asset["id"], "pred", video_name="clip.mp4")
         return run_id
@@ -432,7 +441,13 @@ class MediaItemServiceTests(unittest.TestCase):
                 self.assertEqual(plan["filter"], "lanczos")
                 self.assertTrue(plan["fingerprint"])
 
-                run_inference_job(db, workspace, int(compare_run["inference_job_id"]))
+                compare_job_id = int(compare_run["inference_job_id"])
+                self.assertEqual(
+                    int(db.claim_next_job("item-compare", ["inference"])["id"]),
+                    compare_job_id,
+                )
+                compare_result = run_inference_job(db, workspace, compare_job_id)
+                self.assertTrue(db.complete_job(compare_job_id, compare_result.__dict__))
                 self.assertEqual(db.list_run_artifacts(compare_run_id, kind="pred_video"), [])
                 self.assertTrue(db.list_run_artifacts(compare_run_id, kind="diff_video"))
                 inputs = get_json(base_url, f"/api/runs/{compare_run_id}/compare-inputs")

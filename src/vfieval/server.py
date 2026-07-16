@@ -87,6 +87,7 @@ from vfieval.uploads import (
     get_upload_session,
     receive_upload_part,
 )
+
 from vfieval.evaluations import (
     add_candidate,
     analysis_csv,
@@ -131,6 +132,7 @@ from vfieval.evaluations_v2 import (
 )
 
 
+CANONICAL_ARTIFACT_CONTRACT = "canonical-v1"
 TERMINAL_RUN_STATUSES = {"completed", "failed", "canceled"}
 COMPARE_SOURCE_RUN_STATUSES = {"completed", "metric_queued", "metric_running"}
 MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
@@ -954,11 +956,17 @@ def _make_handler(
                     job_id = int(match.group(1))
                     action = match.group(2)
                     if action == "complete":
-                        db.complete_job(job_id, body.get("result") or {})
+                        accepted = db.complete_job(job_id, body.get("result") or {})
                     elif action == "fail":
-                        db.fail_job(job_id, body.get("error") or {})
+                        accepted = db.fail_job(job_id, body.get("error") or {})
                     else:
-                        db.update_job_progress(job_id, int(body.get("current", 0)), body.get("total"))
+                        accepted = db.update_job_progress(job_id, int(body.get("current", 0)), body.get("total"))
+                    if not accepted:
+                        return self._error(
+                            HTTPStatus.CONFLICT,
+                            f"job {job_id} state rejected {action}",
+                            "JobStateConflict",
+                        )
                     return self._json({"job_id": job_id, "status": action})
                 match = re.fullmatch(r"/api/jobs/(\d+)/heartbeat", path)
                 if match:
@@ -1107,12 +1115,17 @@ def _make_handler(
             artifact = db.get("SELECT * FROM artifacts WHERE id = ?", (artifact_id,))
             if artifact is None:
                 return self._error(HTTPStatus.NOT_FOUND, "artifact not found")
-            metadata = json.loads(artifact.get("metadata_json") or "{}")
-            if variant == "preview" and metadata.get("preview_path"):
-                path = Path(metadata["preview_path"]).resolve()
-            else:
-                path = Path(artifact["path"]).resolve()
             workspace_root = workspace.root.resolve()
+            canonical_path = Path(artifact["path"]).resolve()
+            preview_path = _materialized_preview_path(artifact)
+            if (
+                variant == "preview"
+                and preview_path is not None
+                and _is_relative_to(preview_path, workspace_root)
+            ):
+                path = preview_path
+            else:
+                path = canonical_path
             if not _is_relative_to(path, workspace_root):
                 return self._error(HTTPStatus.FORBIDDEN, "artifact path is outside workspace")
             self._send_file(path)
@@ -1741,12 +1754,17 @@ def _compare_aligned_frame_paths(
     selected.sort(key=lambda pair: pair[0])
     paths: list[Path] = []
     fps = 0.0
+    run_job_ids = set(db.run_inference_job_ids(int(run["id"])))
     for _index, sample in selected:
         metadata = sample.get("metadata") or {}
         fps = fps or float(metadata.get("fps") or 0.0)
         kind = "gt" if is_gt else "pred"
         artifact = next(
-            (row for row in db.list_artifacts_by_sample(int(sample["id"])) if row.get("kind") == kind),
+            (
+                row
+                for row in db.list_artifacts_by_sample(int(sample["id"]))
+                if int(row.get("job_id") or 0) in run_job_ids and row.get("kind") == kind
+            ),
             None,
         )
         candidate = Path(str(artifact["path"])) if artifact else Path(
@@ -1897,6 +1915,7 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         "source": "folder_flow",
         "request": {
             "run_type": "model_inference",
+            "artifact_contract": CANONICAL_ARTIFACT_CONTRACT,
             "model_file": model_path.name,
             "video_group": group_label,
             "video_groups": groups,
@@ -1928,6 +1947,7 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
             "benchmark_samples": int(body.get("benchmark_samples") or 200),
         },
         "model_file": model_path.name,
+        "artifact_contract": CANONICAL_ARTIFACT_CONTRACT,
         "checkpoint": checkpoint_relative,
         "video_group": group_label,
         "video_groups": groups,
@@ -2004,7 +2024,8 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         progress_total=total_decode_frames,
         metadata={"phase": "decode"},
     )
-    db.update_run_progress(run_id, 0, total_decode_frames, "decoding")
+    if not db.update_run_progress(run_id, 0, total_decode_frames):
+        raise RuntimeError(f"run {run_id} rejected decode progress initialization")
     start_decode_worker(db, workspace)
     return {"run_id": run_id, "run": db.get_run(run_id), "preflight": preflight}
 
@@ -2282,6 +2303,13 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
     height = int(alignment.get("height") or 0)
     target_width = int(alignment.get("target_width") or 0)
     target_height = int(alignment.get("target_height") or 0)
+    run_height = target_height or height
+    run_width = target_width or width
+    visualize_height, visualize_width = _resolve_visualize_dimensions(
+        body,
+        run_height,
+        run_width,
+    )
     video_name = Path(reference_path).stem
     # Track labels become sample-name tokens (`{video}__{label}__{frame}`) and
     # per-track artifact directories (`videos/{video}/{label}/`). Two selected
@@ -2366,6 +2394,7 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
 
     metadata = {
         "run_type": "video_compare",
+        "artifact_contract": CANONICAL_ARTIFACT_CONTRACT,
         "source": "direct_compare",
         "reference_path": reference_path,
         "reference_asset_id": reference.get("asset_id"),
@@ -2376,6 +2405,8 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
         "reference_config": reference_config,
         "compare_target_width": target_width,
         "compare_target_height": target_height,
+        "visualize_height": visualize_height,
+        "visualize_width": visualize_width,
         "reference_needs_downscale": reference_needs_downscale,
         "compare_effective_frame_count": effective_frame_count,
         "media_item_id": int(body["media_item_id"]) if is_item_compare else None,
@@ -2385,11 +2416,14 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
         "metric_health": preflight.get("metrics", {}).get("health", {}),
         "request": {
             "run_type": "video_compare",
+            "artifact_contract": CANONICAL_ARTIFACT_CONTRACT,
             "reference": body.get("reference"),
             "distorted": body.get("distorted"),
             "extra_layers": body.get("extra_layers") if "extra_layers" in body else None,
             "align_mode": "strict",
             "metrics": metrics,
+            "visualize_height": visualize_height,
+            "visualize_width": visualize_width,
             "media_item_id": int(body["media_item_id"]) if is_item_compare else None,
             "pred_member_ids": [int(value) for value in (body.get("pred_member_ids") or [])],
             "spatial_policy": body.get("spatial_policy") or {},
@@ -2403,8 +2437,8 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
         name=body.get("name") or f"compare / {Path(reference_path).stem}",
         model_id=model_id,
         dataset_id=dataset_id,
-        height=target_height or height,
-        width=target_width or width,
+        height=run_height,
+        width=run_width,
         batch_size=1,
         device="cpu",
         precision="fp32",
@@ -2562,18 +2596,23 @@ def _default_run_name(
 
 
 def _resolve_visualize_dimensions(body: dict, height: int, width: int) -> tuple[int, int]:
-    """Resolution at which visual artifacts (PNGs) are saved for the run.
+    """Resolve the requested preview resolution.
 
-    Defaults to 832x1792 (H x W) and is clamped to the inference resolution so
-    display artifacts never upscale beyond what the model actually produced.
+    Canonical artifacts always use the Run's output resolution.  These values
+    affect only optional LANCZOS previews and therefore do not alter inference,
+    metrics, video publication, Compare, or Campaign inputs.
     """
     raw_h = body.get("visualize_height")
     raw_w = body.get("visualize_width")
-    vis_h = int(raw_h) if raw_h else DEFAULT_VISUALIZE_HEIGHT
-    vis_w = int(raw_w) if raw_w else DEFAULT_VISUALIZE_WIDTH
-    if vis_h <= 0 or vis_w <= 0:
-        vis_h, vis_w = DEFAULT_VISUALIZE_HEIGHT, DEFAULT_VISUALIZE_WIDTH
-    return min(vis_h, int(height)), min(vis_w, int(width))
+    vis_h = int(raw_h) if raw_h else min(DEFAULT_VISUALIZE_HEIGHT, int(height))
+    vis_w = int(raw_w) if raw_w else min(DEFAULT_VISUALIZE_WIDTH, int(width))
+    if vis_h <= 0:
+        vis_h = min(DEFAULT_VISUALIZE_HEIGHT, int(height))
+    if vis_w <= 0:
+        vis_w = min(DEFAULT_VISUALIZE_WIDTH, int(width))
+    # Explicit preview dimensions are exact, including intentional upscaling;
+    # they never feed canonical composition or metric inputs.
+    return vis_h, vis_w
 
 
 def _resolve_execution_devices(body: dict, execution_mode: str) -> list[str]:
@@ -2606,6 +2645,7 @@ def _create_inference_shards(
 ) -> None:
     samples = db.list_samples(dataset_id)
     partitions = _partition_samples_by_video(samples, devices)
+    job_specs: list[dict] = []
     for shard_index, device in enumerate(devices):
         sample_ids = partitions[shard_index]
         if not sample_ids:
@@ -2624,16 +2664,17 @@ def _create_inference_shards(
             "shard_index": shard_index,
             "shard_count": len(devices),
         }
-        db.add_run_job(
-            run_id,
-            "inference",
-            payload,
-            progress_total=len(sample_ids),
-            shard_index=shard_index,
-            device=device,
-            metadata={"metrics_after_all_shards": metrics},
+        job_specs.append(
+            {
+                "payload": payload,
+                "progress_total": len(sample_ids),
+                "shard_index": shard_index,
+                "device": device,
+                "metadata": {"metrics_after_all_shards": metrics},
+            }
         )
-    db.update_run_progress_from_jobs(run_id, "queued")
+    if not db.publish_inference_jobs(run_id, job_specs):
+        raise ValueError(f"Run {run_id} rejected inference shard publication")
 
 
 def _partition_samples_by_video(samples: list[dict], devices: list[str]) -> list[list[int]]:
@@ -3379,16 +3420,26 @@ def _video_artifact_tracks(db: Database, run_id: int, video_name: str) -> list[d
 
 
 def _video_artifact_tracks_from_rows(artifacts: list[dict]) -> list[dict[str, object]]:
-    return [
-        {
+    result: list[dict[str, object]] = []
+    for artifact in artifacts:
+        artifact_id = int(artifact["id"])
+        has_preview = _materialized_preview_path(artifact) is not None
+        preview_url = (
+            f"/api/files/{artifact_id}?variant=preview"
+            if has_preview
+            else f"/api/files/{artifact_id}"
+        )
+        result.append({
             "id": int(artifact["id"]),
             "kind": artifact["kind"],
-            "url": f"/api/files/{int(artifact['id'])}",
+            "url": preview_url,
+            "preview_url": preview_url,
+            "original_url": f"/api/files/{artifact_id}",
+            "has_preview": has_preview,
             "track_label": (artifact.get("metadata") or {}).get("compare_track_label"),
             "track_run_id": (artifact.get("metadata") or {}).get("compare_track_run_id"),
-        }
-        for artifact in artifacts
-    ]
+        })
+    return result
 
 
 def _video_artifacts_for_video(db: Database, run_id: int, video_name: str) -> list[dict]:
@@ -3418,8 +3469,14 @@ def _compare_layer_payloads(db: Database, run: dict[str, object], sample: dict) 
         source_sample = db.find_sample_by_video_frame(int(source_run_id), video_name, frame_index)
         if source_sample is None:
             continue
+        source_job_ids = db.run_inference_job_ids(int(source_run_id))
+        if not source_job_ids:
+            continue
         allowed_kinds = requested_layers.get(int(source_run_id), set()) if requested_layers is not None else None
-        for artifact in db.list_artifacts_by_sample(int(source_sample["id"])):
+        for artifact in db.list_artifacts_by_samples(
+            [int(source_sample["id"])],
+            job_ids=source_job_ids,
+        ):
             kind = str(artifact["kind"])
             if kind not in COMPARE_LAYER_ARTIFACTS:
                 continue
@@ -3539,9 +3596,28 @@ def _timeline_buckets(samples: list[dict], metric_name: str | None, bucket_count
     return buckets
 
 
+def _materialized_preview_path(artifact: dict) -> Path | None:
+    metadata = artifact.get("metadata")
+    if not isinstance(metadata, dict):
+        try:
+            metadata = json.loads(artifact.get("metadata_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata = {}
+    path_value = metadata.get("preview_path")
+    if not path_value:
+        return None
+    try:
+        path = Path(str(path_value)).resolve()
+        if path.is_file() and path.stat().st_size > 0:
+            return path
+    except OSError:
+        pass
+    return None
+
+
 def _artifact_payload(artifact: dict) -> dict[str, object]:
     artifact_id = int(artifact["id"])
-    has_preview = bool((artifact.get("metadata") or {}).get("preview_path"))
+    has_preview = _materialized_preview_path(artifact) is not None
     return {
         "id": artifact_id,
         "original": artifact_id,

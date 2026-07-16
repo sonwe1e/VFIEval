@@ -14,6 +14,10 @@ def create_metric_wave(
     *,
     source: str,
     retry: bool = False,
+    result: dict[str, Any] | None = None,
+    artifact_summary: dict[str, Any] | None = None,
+    source_job_id: int | None = None,
+    source_job_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Queue one frame-metric shard per inference device.
 
@@ -39,12 +43,18 @@ def create_metric_wave(
     video_names = [name for name in metric_names if metric_requires_video_input(name)]
     if not frame_names and not video_names:
         raise ValueError("metric wave requires metric_names")
+    retry_content_revision: int | None = None
+    if retry:
+        from vfieval.pipeline.artifact_integrity import require_metric_retry_integrity
+
+        retry_report = require_metric_retry_integrity(db, run_id)
+        retry_content_revision = int(retry_report.get("content_revision") or 0)
 
     wave_id = uuid.uuid4().hex
     all_inference_ids = [int(row["job_id"]) for row in inference_jobs]
     request = dict((run.get("metadata") or {}).get("request") or {})
     batch_size = _positive_int(request.get("metric_batch_size_per_device"))
-    job_ids: list[int] = []
+    job_specs: list[dict[str, Any]] = []
     devices: list[str] = []
     for index, inference_job in enumerate(inference_jobs):
         names = list(frame_names)
@@ -76,22 +86,32 @@ def create_metric_wave(
         }
         if batch_size is not None:
             payload["metric_batch_size_per_device"] = batch_size
-        job_id = db.add_run_job(
-            run_id,
-            "metric",
-            payload,
-            progress_total=0,
-            shard_index=index,
-            device=device,
-            metadata={"source": source, "metric_wave_id": wave_id, "leader": index == 0},
+        job_specs.append(
+            {
+                "payload": payload,
+                "progress_total": 0,
+                "shard_index": index,
+                "device": device,
+                "metadata": {"source": source, "metric_wave_id": wave_id, "leader": index == 0},
+            }
         )
-        job_ids.append(job_id)
         devices.append(device)
         if not frame_names:
             break
-    if not job_ids:
+    if not job_specs:
         raise ValueError("metric wave did not produce any jobs")
-    db.set_run_metric_job(run_id, job_ids[0])
+    job_ids = db.publish_metric_wave(
+        run_id,
+        job_specs,
+        retry=bool(retry),
+        result=result,
+        artifact_summary=artifact_summary,
+        expected_content_revision=retry_content_revision,
+        source_job_id=source_job_id,
+        source_job_result=source_job_result,
+    )
+    if not job_ids:
+        raise ValueError(f"Run {run_id} state rejected metric wave publication")
     return {
         "run_id": run_id,
         "metric_job_id": job_ids[0],
@@ -134,7 +154,7 @@ def metric_wave_status(db: Database, run: dict[str, Any]) -> str | None:
     return next(iter(statuses), None)
 
 
-def update_metric_wave_progress(db: Database, run_id: int, wave_id: str) -> None:
+def update_metric_wave_progress(db: Database, run_id: int, wave_id: str) -> bool:
     run = db.get_run(run_id)
     jobs = [
         row
@@ -145,19 +165,48 @@ def update_metric_wave_progress(db: Database, run_id: int, wave_id: str) -> None
     total = sum(int(row.get("progress_total") or 0) for row in jobs)
     leader_id = run.get("metric_job_id")
     if leader_id is not None:
-        db.update_run_metric_wave_progress(run_id, int(leader_id), current, total)
+        return db.update_run_metric_wave_progress(run_id, int(leader_id), current, total)
+    return False
 
 
-def maybe_complete_metric_wave(db: Database, run_id: int, wave_id: str) -> bool:
+def maybe_complete_metric_wave(
+    db: Database,
+    run_id: int,
+    wave_id: str,
+    *,
+    source_job_id: int | None = None,
+    source_job_result: dict[str, Any] | None = None,
+) -> bool:
     run = db.get_run(run_id)
     jobs = current_metric_wave_jobs(db, run)
     if not jobs or any(str(row.get("payload", {}).get("metric_wave_id") or "") != wave_id for row in jobs):
         return False
+    source_original_status: str | None = None
+    if source_job_id is not None:
+        source_row = next(
+            (row for row in jobs if int(row["job_id"]) == int(source_job_id)),
+            None,
+        )
+        if source_row is None:
+            return False
+        source_original_status = str(source_row.get("status") or "")
+        if source_original_status not in {"running", "completed"}:
+            return False
+        if source_original_status == "running":
+            source_row["status"] = "completed"
+            source_row["result"] = dict(source_job_result or {})
     expected_count = max(int((row.get("payload") or {}).get("metric_wave_count") or 1) for row in jobs)
     if len(jobs) != expected_count:
+        if source_job_id is not None and source_original_status == "running":
+            raise RuntimeError(
+                f"metric wave {wave_id} has {len(jobs)} Jobs, expected {expected_count}"
+            )
         return False
-    update_metric_wave_progress(db, run_id, wave_id)
     if any(row["status"] != "completed" for row in jobs):
+        if source_job_id is not None and source_original_status == "running":
+            if not db.complete_job(int(source_job_id), source_job_result):
+                return False
+        update_metric_wave_progress(db, run_id, wave_id)
         return False
 
     wave_names = {
@@ -193,7 +242,17 @@ def maybe_complete_metric_wave(db: Database, run_id: int, wave_id: str) -> bool:
         item.pop("value_sum", None)
         merged[name] = item
     leader_id = int(run["metric_job_id"])
-    return db.complete_run_metric_wave(run_id, leader_id, merged, performance)
+    completed = db.complete_run_metric_wave(
+        run_id,
+        leader_id,
+        merged,
+        performance,
+        source_job_id=source_job_id,
+        source_job_result=source_job_result,
+    )
+    if not completed and source_job_id is not None and source_original_status == "running":
+        raise RuntimeError(f"run {run_id} rejected atomic metric-wave completion")
+    return completed
 
 
 def _positive_int(value: Any) -> int | None:

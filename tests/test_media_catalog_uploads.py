@@ -27,6 +27,7 @@ from vfieval.media_assets import (
     sync_run_assets,
     upsert_asset,
 )
+import vfieval.media_assets as media_assets_module
 from vfieval.pipeline.inference import run_inference_job
 from vfieval.media_items import ensure_canonical_gt_item, register_external_prediction
 from vfieval.uploads import (
@@ -53,6 +54,174 @@ def _frame_zip(entries: list[tuple[str, bytes]]) -> bytes:
 
 
 class MediaCatalogUploadTests(unittest.TestCase):
+    def test_run_asset_publication_failure_invalidates_unbound_asset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            model_id = db.register_model("asset-failure", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("asset-failure", tmp, False)
+            run_id = db.create_run(
+                "asset-failure", model_id, dataset_id, 8, 8, 1, "cpu", "fp32", []
+            )
+            job_id = int(db.get_run(run_id)["inference_job_id"])
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertEqual(int(db.claim_next_job("asset-failure", ["inference"])["id"]), job_id)
+            video_path = write_mp4(
+                workspace.runs_dir / str(run_id) / "videos" / "clip" / "pred.mp4",
+                [(0, 0, 0), (10, 0, 0)],
+            )
+            db.add_artifact(
+                job_id,
+                None,
+                "pred_video",
+                str(video_path),
+                "video/mp4",
+                {"video_name": "clip", "frames": 2, "width": 8, "height": 8, "fps": 5},
+            )
+            result = {"samples": 2}
+            self.assertTrue(
+                db.complete_run_inference(
+                    run_id,
+                    result,
+                    db.summarize_run_artifacts(run_id),
+                    "completed",
+                    source_job_id=job_id,
+                    source_job_result=result,
+                )
+            )
+
+            with patch(
+                "vfieval.media_assets.bind_run_asset",
+                side_effect=RuntimeError("injected binding failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "injected binding failure"):
+                    sync_run_assets(db, workspace, run_id)
+
+            assets = db.query(
+                "SELECT state FROM media_assets WHERE source_kind = 'run_artifact'"
+            )
+            self.assertTrue(assets)
+            self.assertEqual({row["state"] for row in assets}, {"unavailable"})
+            self.assertEqual(
+                int(db.get("SELECT COUNT(*) AS count FROM run_media_assets WHERE run_id = ?", (run_id,))["count"]),
+                0,
+            )
+
+    def test_run_asset_publication_rechecks_canonical_video_before_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            model_id = db.register_model("asset-toctou", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("asset-toctou", tmp, False)
+            run_id = db.create_run(
+                "asset-toctou", model_id, dataset_id, 8, 8, 1, "cpu", "fp32", []
+            )
+            job_id = int(db.get_run(run_id)["inference_job_id"])
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertEqual(int(db.claim_next_job("asset-toctou", ["inference"])["id"]), job_id)
+            video_path = write_mp4(
+                workspace.runs_dir / str(run_id) / "videos" / "clip" / "pred.mp4",
+                [(0, 0, 0), (10, 0, 0)],
+            )
+            db.add_artifact(
+                job_id,
+                None,
+                "pred_video",
+                str(video_path),
+                "video/mp4",
+                {"video_name": "clip", "frames": 2, "width": 8, "height": 8, "fps": 5},
+            )
+            result = {"samples": 2}
+            self.assertTrue(
+                db.complete_run_inference(
+                    run_id,
+                    result,
+                    db.summarize_run_artifacts(run_id),
+                    "completed",
+                    source_job_id=job_id,
+                    source_job_result=result,
+                )
+            )
+
+            original_bind = media_assets_module.bind_run_asset
+
+            def bind_then_remove(*args, **kwargs):
+                original_bind(*args, **kwargs)
+                self.assertEqual(get_asset(db, int(args[2]))["state"], "unavailable")
+                video_path.unlink()
+
+            with patch("vfieval.media_assets.bind_run_asset", side_effect=bind_then_remove):
+                with self.assertRaisesRegex(ValueError, "missing or empty"):
+                    sync_run_assets(db, workspace, run_id)
+
+            assets = db.query(
+                "SELECT state FROM media_assets WHERE source_kind = 'run_artifact'"
+            )
+            self.assertTrue(assets)
+            self.assertEqual({row["state"] for row in assets}, {"unavailable"})
+
+    def test_run_asset_publication_rejects_missing_required_video_row(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            model_id = db.register_model("asset-row-toctou", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("asset-row-toctou", tmp, False)
+            db.add_sample(
+                dataset_id,
+                "clip_000000",
+                str(Path(tmp) / "img0.png"),
+                str(Path(tmp) / "img1.png"),
+                None,
+                {"source_type": "video", "video_name": "clip", "frame_index": 0},
+            )
+            run_id = db.create_run(
+                "asset-row-toctou",
+                model_id,
+                dataset_id,
+                8,
+                8,
+                1,
+                "cpu",
+                "fp32",
+                [],
+                metadata={
+                    "artifact_contract": "canonical-v1",
+                    "request": {"artifact_contract": "canonical-v1"},
+                },
+            )
+            job_id = int(db.get_run(run_id)["inference_job_id"])
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertEqual(int(db.claim_next_job("asset-row-toctou", ["inference"])["id"]), job_id)
+            video_path = write_mp4(
+                workspace.runs_dir / str(run_id) / "videos" / "clip" / "pred.mp4",
+                [(0, 0, 0), (10, 0, 0)],
+            )
+            artifact_id = db.add_artifact(
+                job_id,
+                None,
+                "pred_video",
+                str(video_path),
+                "video/mp4",
+                {"video_name": "clip", "frames": 2, "width": 8, "height": 8, "fps": 5},
+            )
+            result = {"samples": 1}
+            self.assertTrue(
+                db.complete_run_inference(
+                    run_id,
+                    result,
+                    db.summarize_run_artifacts(run_id),
+                    "completed",
+                    source_job_id=job_id,
+                    source_job_result=result,
+                )
+            )
+            with db.connection() as conn:
+                conn.execute("DELETE FROM artifacts WHERE id = ?", (artifact_id,))
+
+            with self.assertRaisesRegex(ValueError, "artifact contract changed"):
+                sync_run_assets(db, workspace, run_id)
+            self.assertEqual(
+                db.get("SELECT COUNT(*) AS count FROM media_assets")["count"],
+                0,
+            )
+
     def test_schema_migration_backup_is_created_once(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace, db = make_workspace(tmp)
@@ -406,9 +575,12 @@ class MediaCatalogUploadTests(unittest.TestCase):
                             "spatial_policy": {"mode": "smallest_pred", "filter": "lanczos"},
                             "metrics": [],
                         },
-                    )
+                )
                 run_id = int(created["run_id"])
-                run_inference_job(db, workspace, int(db.get_run(run_id)["inference_job_id"]))
+                job_id = int(db.get_run(run_id)["inference_job_id"])
+                self.assertEqual(int(db.claim_next_job("catalog-compare", ["inference"])["id"]), job_id)
+                result = run_inference_job(db, workspace, job_id)
+                self.assertTrue(db.complete_job(job_id, result.__dict__))
                 assets = sync_run_assets(db, workspace, run_id)
                 aligned = next(row for row in assets if row["role"] == "gt")
                 self.assertTrue(aligned["metadata"]["aligned_gt"])

@@ -107,12 +107,24 @@ def save_extra_tensor(tensor: torch.Tensor, path: str | Path, index: int = 0) ->
     return path
 
 
-def save_preview_image(source_path: str | Path, preview_path: str | Path, max_edge: int = 512) -> Path:
+def save_preview_image(
+    source_path: str | Path,
+    preview_path: str | Path,
+    max_edge: int = 512,
+    *,
+    height: int | None = None,
+    width: int | None = None,
+) -> Path:
     source_path = Path(source_path)
     preview_path = Path(preview_path)
     preview_path.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(source_path).convert("RGB") as image:
-        image.thumbnail((max_edge, max_edge))
+        if height is not None or width is not None:
+            if height is None or width is None or int(height) <= 0 or int(width) <= 0:
+                raise ValueError("preview height and width must both be positive")
+            image = image.resize((int(width), int(height)), Image.Resampling.LANCZOS)
+        else:
+            image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
         image.save(preview_path)
     return preview_path
 

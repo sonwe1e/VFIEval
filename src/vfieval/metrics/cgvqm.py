@@ -11,6 +11,9 @@ from vfieval.metrics.health import metric_health
 from vfieval.metrics.vmaf import VIDEO_SUFFIXES
 
 
+CGVQM_PATCH_SCALE = 4
+
+
 class CgvqmMetric:
     name = "cgvqm"
 
@@ -35,6 +38,7 @@ class CgvqmMetric:
             distorted,
             work_dir,
             int(health.get("video_eval_long_edge") or 720),
+            alignment=CGVQM_PATCH_SCALE,
         )
         payload = {
             "metric_name": self.name,
@@ -48,6 +52,7 @@ class CgvqmMetric:
             "repo_dir": health.get("repo_dir"),
             "weights_path": health.get("weights_path"),
             "video_eval_long_edge": int(health.get("video_eval_long_edge") or 720),
+            "patch_scale": CGVQM_PATCH_SCALE,
         }
         env = os.environ.copy()
         env.update({str(key): str(value) for key, value in (health.get("env") or {}).items()})
@@ -108,18 +113,26 @@ def _parse_driver_output(stdout: str, stderr: str) -> dict:
     return data
 
 
-def _prepare_eval_videos(reference: Path, distorted: Path, work_dir: Path, long_edge: int) -> tuple[Path, Path, dict]:
+def _prepare_eval_videos(
+    reference: Path,
+    distorted: Path,
+    work_dir: Path,
+    long_edge: int,
+    *,
+    alignment: int = CGVQM_PATCH_SCALE,
+) -> tuple[Path, Path, dict]:
     ref_info = _video_info(reference)
     dist_info = _video_info(distorted)
     if ref_info is None or dist_info is None:
         return reference, distorted, {"resize_status": "skipped_unreadable_video_metadata"}
     width, height, fps = ref_info
-    target_width, target_height = _bounded_even_size(width, height, long_edge)
+    target_width, target_height = _bounded_aligned_size(width, height, long_edge, alignment)
     if (target_width, target_height) == (width, height) and dist_info[:2] == (width, height):
         return reference, distorted, {
             "resize_status": "not_needed",
             "eval_width": width,
             "eval_height": height,
+            "eval_alignment": alignment,
         }
     eval_reference = work_dir / "cgvqm_ref_eval.mp4"
     eval_distorted = work_dir / "cgvqm_dist_eval.mp4"
@@ -129,6 +142,7 @@ def _prepare_eval_videos(reference: Path, distorted: Path, work_dir: Path, long_
         "resize_status": "resized",
         "eval_width": target_width,
         "eval_height": target_height,
+        "eval_alignment": alignment,
         "source_width": width,
         "source_height": height,
     }
@@ -152,15 +166,19 @@ def _video_info(path: Path) -> tuple[int, int, float] | None:
         return None
 
 
-def _bounded_even_size(width: int, height: int, long_edge: int) -> tuple[int, int]:
+def _bounded_aligned_size(width: int, height: int, long_edge: int, alignment: int) -> tuple[int, int]:
+    alignment = max(1, int(alignment))
     if max(width, height) <= long_edge:
-        return _even(width), _even(height)
+        return _aligned_floor(width, alignment), _aligned_floor(height, alignment)
     scale = float(long_edge) / float(max(width, height))
-    return _even(max(2, int(round(width * scale)))), _even(max(2, int(round(height * scale))))
+    return (
+        _aligned_floor(max(alignment, int(round(width * scale))), alignment),
+        _aligned_floor(max(alignment, int(round(height * scale))), alignment),
+    )
 
 
-def _even(value: int) -> int:
-    return max(2, int(value) - (int(value) % 2))
+def _aligned_floor(value: int, alignment: int) -> int:
+    return max(alignment, int(value) - (int(value) % alignment))
 
 
 def _resize_video(source: Path, target: Path, width: int, height: int, fps: float) -> None:

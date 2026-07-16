@@ -17,9 +17,14 @@ from vfieval.metrics import METRIC_NAMES, create_metric
 from vfieval.metrics.base import MetricBatchOutOfMemory, MetricUnavailable
 from vfieval.metrics.health import metric_cache_config, metric_requires_video_input
 from vfieval.pipeline.inference import RunCanceled
+from vfieval.pipeline.artifact_integrity import strict_video_pair_issue
 from vfieval.media_assets import bind_metric_result, run_asset_pair, sync_run_assets
 
 METRIC_CACHE_VERSION = "metric-cache-v3"
+
+
+class _MetricInputUnavailable(ValueError):
+    pass
 
 
 def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dict[str, Any]:
@@ -77,10 +82,12 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
     )
     video_metric_units = len(video_metric_inputs) if video_metric_inputs else 1
     total = len(artifacts) * len(frame_metric_names) + (video_metric_units * len(video_metric_names))
-    db.update_job_progress(job_id, 0, total)
+    _require_metric_cas(db, run_id, job_id, db.update_job_progress(job_id, 0, total), "Job progress")
     if run_id is not None:
         _raise_if_canceled(db, run_id, job_id)
-        db.mark_run_started(run_id, "metric_running")
+        _require_metric_cas(
+            db, run_id, job_id, db.mark_run_started(run_id, "metric_running"), "Run metric start"
+        )
         _publish_metric_progress(db, job_id, run_id, 0, total, payload)
 
     current = 0
@@ -149,7 +156,7 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                     reference_path = video_input.get("reference_path")
                     distorted_path = video_input.get("distorted_path")
                     if error:
-                        status = "failed"
+                        status = str(video_input.get("input_status") or "failed")
                         value = None
                         details = {
                             "reason": error,
@@ -238,12 +245,20 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
         "wave_id": payload.get("metric_wave_id"),
     }
     if run_id is not None and not payload.get("metric_wave_id"):
-        db.complete_run_metrics(
+        _require_metric_cas(
+            db,
             run_id,
-            {
-                name: {key: value for key, value in item.items() if key != "value_sum"}
-                for name, item in summary.items()
-            },
+            job_id,
+            db.complete_run_metrics(
+                run_id,
+                {
+                    name: {key: value for key, value in item.items() if key != "value_sum"}
+                    for name, item in summary.items()
+                },
+                source_job_id=job_id,
+                source_job_result=result,
+            ),
+            "Run metric completion",
         )
     return result
 
@@ -272,13 +287,51 @@ def _run_frame_metric_batches(
     outcomes: dict[int, tuple[str, float | None, dict[str, Any]]] = {}
     pending: list[dict[str, Any]] = []
     cache_hits = 0
+    pred_identity_counts: dict[tuple[int, int], int] = {}
+    paired_gt_by_identity: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for inference_job_id in sorted({int(artifact["job_id"]) for artifact in artifacts}):
+        for gt_artifact in db.list_artifacts(job_id=inference_job_id, kind="gt"):
+            if gt_artifact.get("sample_id") is None:
+                continue
+            identity = (inference_job_id, int(gt_artifact["sample_id"]))
+            paired_gt_by_identity.setdefault(identity, []).append(gt_artifact)
+    for artifact in artifacts:
+        if artifact.get("sample_id") is None:
+            continue
+        identity = (int(artifact["job_id"]), int(artifact["sample_id"]))
+        pred_identity_counts[identity] = pred_identity_counts.get(identity, 0) + 1
     for index, artifact in enumerate(artifacts):
         sample_id = artifact.get("sample_id")
         sample = samples.get(int(sample_id)) if sample_id is not None else None
-        reference_path = Path(sample["gt_path"]) if sample and sample.get("gt_path") else None
-        if reference_path is None:
-            outcomes[index] = ("skipped", None, {"reason": "sample has no ground-truth reference"})
+        if sample_id is None:
+            outcomes[index] = (
+                "unavailable",
+                None,
+                {"reason": "pred artifact has no sample_id; canonical GT identity cannot be resolved"},
+            )
             continue
+        identity = (int(artifact["job_id"]), int(sample_id))
+        if pred_identity_counts.get(identity, 0) != 1:
+            outcomes[index] = (
+                "unavailable",
+                None,
+                {
+                    "reason": "pred artifact identity is not unique within its inference Job",
+                    "inference_job_id": identity[0],
+                    "sample_id": identity[1],
+                    "pred_artifact_count": pred_identity_counts.get(identity, 0),
+                },
+            )
+            continue
+        reference_status, reference_path, reference_details = _resolve_frame_reference(
+            artifact,
+            sample,
+            paired_gt_by_identity.get(identity, []),
+        )
+        if reference_status is not None:
+            outcomes[index] = (reference_status, None, reference_details)
+            continue
+        assert reference_path is not None
         distorted_path = Path(artifact["path"])
         config: dict[str, Any] = {
             "cache_version": METRIC_CACHE_VERSION,
@@ -298,7 +351,11 @@ def _run_frame_metric_batches(
         cached = db.get_metric_cache(cache_key)
         if cached:
             cache_hits += 1
-            outcomes[index] = (cached["status"], cached["value"], {"cached": True, **cached["details"]})
+            outcomes[index] = (
+                cached["status"],
+                cached["value"],
+                {**cached["details"], **reference_details, "cached": True},
+            )
             continue
         pending.append(
             {
@@ -306,6 +363,7 @@ def _run_frame_metric_batches(
                 "sample_id": sample_id,
                 "reference": reference_path,
                 "distorted": distorted_path,
+                "reference_details": reference_details,
                 "cache_key": cache_key,
                 "work_dir": workspace.tmp_dir / "metrics" / metric_name / hashlib.sha1(cache_key.encode("utf-8")).hexdigest(),
             }
@@ -334,7 +392,11 @@ def _run_frame_metric_batches(
                 raise RuntimeError("metric batch returned an unexpected result count")
             for row, result in zip(rows, results):
                 db.set_metric_cache(row["cache_key"], metric_name, result.status, result.value, result.details)
-                outcomes[row["index"]] = (result.status, result.value, dict(result.details))
+                outcomes[row["index"]] = (
+                    result.status,
+                    result.value,
+                    {**dict(result.details), **row["reference_details"]},
+                )
             effective_batch = min(effective_batch, size)
             offset += size
             _publish_metric_progress(db, job_id, run_id, current + len(outcomes), total, job_payload)
@@ -345,7 +407,12 @@ def _run_frame_metric_batches(
                 continue
             unavailable_reason = str(exc)
             row = rows[0]
-            details = {"reason": unavailable_reason, "device": metric_device, "batch_size": 1}
+            details = {
+                "reason": unavailable_reason,
+                "device": metric_device,
+                "batch_size": 1,
+                **row["reference_details"],
+            }
             db.set_metric_cache(row["cache_key"], metric_name, "unavailable", None, details)
             outcomes[row["index"]] = ("unavailable", None, details)
             offset += 1
@@ -353,7 +420,11 @@ def _run_frame_metric_batches(
         except MetricUnavailable as exc:
             unavailable_reason = str(exc)
             for row in pending[offset:]:
-                details = {"reason": unavailable_reason, "device": metric_device}
+                details = {
+                    "reason": unavailable_reason,
+                    "device": metric_device,
+                    **row["reference_details"],
+                }
                 db.set_metric_cache(row["cache_key"], metric_name, "unavailable", None, details)
                 outcomes[row["index"]] = ("unavailable", None, details)
             offset = len(pending)
@@ -363,7 +434,12 @@ def _run_frame_metric_batches(
                 outcomes[row["index"]] = (
                     "failed",
                     None,
-                    {"reason": str(exc), "type": type(exc).__name__, "sample_id": row["sample_id"]},
+                    {
+                        "reason": str(exc),
+                        "type": type(exc).__name__,
+                        "sample_id": row["sample_id"],
+                        **row["reference_details"],
+                    },
                 )
             offset += size
             _publish_metric_progress(db, job_id, run_id, current + len(outcomes), total, job_payload)
@@ -416,6 +492,185 @@ def _run_frame_metric_batches(
     }
 
 
+def _resolve_frame_reference(
+    pred_artifact: dict[str, Any],
+    sample: dict[str, Any] | None,
+    paired: list[dict[str, Any]],
+) -> tuple[str | None, Path | None, dict[str, Any]]:
+    """Resolve the one GT artifact with the same Job/sample identity.
+
+    ``canonical-v1`` never falls back to a dataset source path. Historical
+    Runs may do so only after an exact spatial match, which keeps old results
+    readable without silently scoring a resized or semantically different GT.
+    """
+    sample_id = pred_artifact.get("sample_id")
+    inference_job_id = int(pred_artifact["job_id"])
+    if sample_id is None or sample is None:
+        return (
+            "unavailable",
+            None,
+            {
+                "reason": "pred artifact does not resolve to a dataset sample",
+                "inference_job_id": inference_job_id,
+                "sample_id": sample_id,
+            },
+        )
+    sample_id = int(sample_id)
+    pred_contract = str((pred_artifact.get("metadata") or {}).get("artifact_contract") or "")
+    identity = {
+        "inference_job_id": inference_job_id,
+        "sample_id": sample_id,
+        "artifact_contract": pred_contract or "legacy",
+    }
+    source_gt = str(sample.get("gt_path") or "").strip()
+    if not source_gt:
+        return (
+            "skipped",
+            None,
+            {
+                **identity,
+                "reason": "sample has no ground-truth reference",
+                **(
+                    {"ignored_unexpected_gt_artifact_ids": [int(row["id"]) for row in paired]}
+                    if paired
+                    else {}
+                ),
+            },
+        )
+    if len(paired) > 1:
+        return (
+            "unavailable",
+            None,
+            {
+                **identity,
+                "reason": "paired GT artifact identity is not unique",
+                "gt_artifact_count": len(paired),
+            },
+        )
+    paired_rejection: dict[str, Any] | None = None
+    if len(paired) == 1:
+        gt_artifact = paired[0]
+        gt_contract = str((gt_artifact.get("metadata") or {}).get("artifact_contract") or "")
+        if pred_contract == "canonical-v1" and gt_contract != "canonical-v1":
+            return (
+                "unavailable",
+                None,
+                {
+                    **identity,
+                    "reason": "canonical Pred is paired with a non-canonical GT artifact",
+                    "reference_source": "paired_gt_artifact",
+                    "reference_artifact_id": int(gt_artifact["id"]),
+                    "reference_artifact_contract": gt_contract or "legacy",
+                },
+            )
+        gt_path = Path(str(gt_artifact.get("path") or ""))
+        problem = _validate_metric_image_pair(gt_path, Path(str(pred_artifact.get("path") or "")))
+        if problem:
+            paired_rejection = {
+                "reason": f"paired GT artifact is unusable: {problem}",
+                "reference_artifact_id": int(gt_artifact["id"]),
+            }
+            if pred_contract == "canonical-v1":
+                return (
+                    "unavailable",
+                    None,
+                    {
+                        **identity,
+                        **paired_rejection,
+                        "reference_source": "paired_gt_artifact",
+                    },
+                )
+        else:
+            return (
+                None,
+                gt_path,
+                {
+                    **identity,
+                    "reference_source": "paired_gt_artifact",
+                    "reference_artifact_id": int(gt_artifact["id"]),
+                    "reference_artifact_contract": str(
+                        (gt_artifact.get("metadata") or {}).get("artifact_contract") or "legacy"
+                    ),
+                },
+            )
+
+    if pred_contract == "canonical-v1":
+        return (
+            "unavailable",
+            None,
+            {
+                **identity,
+                "reason": "canonical Pred has no unique materialized GT artifact from the same inference Job",
+            },
+        )
+    source_path = Path(source_gt)
+    problem = _validate_metric_image_pair(source_path, Path(str(pred_artifact.get("path") or "")))
+    if problem:
+        return (
+            "unavailable",
+            None,
+            {
+                **identity,
+                "reason": (
+                    f"{paired_rejection['reason']}; legacy source GT fallback rejected: {problem}"
+                    if paired_rejection is not None
+                    else f"legacy source GT fallback rejected: {problem}"
+                ),
+                "reference_source": "legacy_source_sample",
+                **(
+                    {
+                        "paired_gt_rejected_reason": paired_rejection["reason"],
+                        "paired_gt_artifact_id": paired_rejection["reference_artifact_id"],
+                    }
+                    if paired_rejection is not None
+                    else {}
+                ),
+            },
+        )
+    return (
+        None,
+        source_path,
+        {
+            **identity,
+            "reference_source": "legacy_source_sample",
+            "legacy_fallback": True,
+            "spatial_match": "exact",
+            **(
+                {
+                    "paired_gt_rejected_reason": paired_rejection["reason"],
+                    "paired_gt_artifact_id": paired_rejection["reference_artifact_id"],
+                }
+                if paired_rejection is not None
+                else {}
+            ),
+        },
+    )
+
+
+def _validate_metric_image_pair(reference_path: Path, distorted_path: Path) -> str | None:
+    for label, path in (("GT", reference_path), ("Pred", distorted_path)):
+        if not path.is_file():
+            return f"{label} file is missing"
+        try:
+            if path.stat().st_size <= 0:
+                return f"{label} file is empty"
+        except OSError as exc:
+            return f"{label} file cannot be inspected: {exc}"
+    try:
+        with Image.open(reference_path) as reference, Image.open(distorted_path) as distorted:
+            reference_size = tuple(reference.size)
+            distorted_size = tuple(distorted.size)
+    except Exception as exc:
+        return f"image header cannot be decoded: {exc}"
+    if reference_size != distorted_size:
+        return (
+            "GT/Pred dimensions differ "
+            f"({reference_size[0]}x{reference_size[1]} vs "
+            f"{distorted_size[0]}x{distorted_size[1]})"
+        )
+    return None
+
+
 def _publish_metric_progress(
     db: Database,
     job_id: int,
@@ -424,15 +679,21 @@ def _publish_metric_progress(
     total: int,
     payload: dict[str, Any],
 ) -> None:
-    db.update_job_progress(job_id, current, total)
+    _require_metric_cas(
+        db, run_id, job_id, db.update_job_progress(job_id, current, total), "Job progress"
+    )
     if run_id is None:
         return
     if payload.get("metric_wave_id"):
         from vfieval.pipeline.metric_jobs import update_metric_wave_progress
 
-        update_metric_wave_progress(db, run_id, str(payload["metric_wave_id"]))
+        if not update_metric_wave_progress(db, run_id, str(payload["metric_wave_id"])):
+            _raise_if_canceled(db, run_id, job_id)
+            raise RuntimeError(f"Run {run_id} rejected metric-wave progress CAS")
     else:
-        db.update_run_progress(run_id, current, total, "metric_running")
+        _require_metric_cas(
+            db, run_id, job_id, db.update_run_progress(run_id, current, total), "Run progress"
+        )
 
 
 def _positive_int(value: Any) -> int | None:
@@ -442,15 +703,27 @@ def _positive_int(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _require_metric_cas(
+    db: Database,
+    run_id: int | None,
+    job_id: int,
+    accepted: bool,
+    target: str,
+) -> None:
+    if accepted:
+        return
+    _raise_if_canceled(db, run_id, job_id)
+    raise RuntimeError(f"{target} rejected CAS")
+
+
 def _raise_if_canceled(db: Database, run_id: int | None, job_id: int) -> None:
     if run_id is None:
         return
     run = db.get_run(run_id)
     if run["status"] in {"cancel_requested", "canceled"}:
-        error = {"message": "用户取消了 Run", "type": "RunCanceled"}
-        db.cancel_job(job_id, error)
-        db.cancel_run(run_id, error)
         raise RunCanceled("用户取消了 Run")
+    if run["status"] == "failed":
+        raise RunCanceled("Run 已失败")
 
 
 def _compare_track_details(sample: dict[str, Any] | None, artifact: dict[str, Any] | None) -> dict[str, Any]:
@@ -520,7 +793,7 @@ def _collect_video_metric_inputs(
     files are not artifacts and never enter the media catalog.
     """
     if pred_videos:
-        return _published_video_metric_inputs(db, dataset, inference_job_ids, pred_videos)
+        return _published_video_metric_inputs(db, dataset, samples, inference_job_ids, pred_videos)
     if not _is_item_compare_without_pred_video(db, run_id, dataset, samples):
         return []
     return _item_compare_video_metric_inputs(
@@ -537,34 +810,112 @@ def _collect_video_metric_inputs(
 def _published_video_metric_inputs(
     db: Database,
     dataset: dict[str, Any],
+    samples: dict[int, dict[str, Any]],
     inference_job_ids: list[int],
     pred_videos: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     gt_videos: list[dict[str, Any]] = []
     for current_job_id in inference_job_ids:
         gt_videos.extend(db.list_artifacts(job_id=current_job_id, kind="gt_video"))
-    gt_by_name = {
-        artifact.get("metadata", {}).get("video_name"): artifact
-        for artifact in gt_videos
-        if artifact.get("metadata", {}).get("video_name")
+    gt_by_identity: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    for artifact in gt_videos:
+        video_name = str((artifact.get("metadata") or {}).get("video_name") or "")
+        if video_name:
+            gt_by_identity.setdefault((int(artifact["job_id"]), video_name), []).append(artifact)
+    # GT coverage is a property of one semantic video identity, not of the
+    # dataset as a whole.  A mixed video-pairs dataset may legitimately have a
+    # canonical Pred video without any GT for that specific clip even though a
+    # different clip in the same Run does have GT.  Treating either that other
+    # clip, or merely the presence of a canonical Pred, as proof of GT turns a
+    # valid ``skipped: no ground truth`` result into a false integrity error.
+    source_gt_video_names = {
+        str((sample.get("metadata") or {}).get("video_name") or "")
+        for sample in samples.values()
+        if str(sample.get("gt_path") or "").strip()
+        and str((sample.get("metadata") or {}).get("video_name") or "")
     }
     alignment_context = _metric_alignment_context(dataset)
     inputs: list[dict[str, Any]] = []
     for artifact in pred_videos:
-        video_name = artifact.get("metadata", {}).get("video_name")
-        reference_artifact = gt_by_name.get(video_name)
-        inputs.append(
-            {
-                "inference_job_id": int(artifact["job_id"]),
-                "video_name": video_name,
-                "reference_path": Path(reference_artifact["path"]) if reference_artifact is not None else None,
-                "distorted_path": Path(artifact["path"]),
-                "track_details": _compare_track_details(None, artifact),
-                "alignment_context": alignment_context,
-                "input_details": {"video_input": "published_pred_video"},
-            }
+        metadata = artifact.get("metadata") or {}
+        pred_contract = str(metadata.get("artifact_contract") or "")
+        video_name = str(metadata.get("video_name") or "")
+        inference_job_id = int(artifact["job_id"])
+        paired = gt_by_identity.get((inference_job_id, video_name), []) if video_name else []
+        source_has_gt = bool(video_name and video_name in source_gt_video_names)
+        # Source sample coverage is authoritative. Historical no-GT Runs can
+        # contain a stray gt_video row; it must never turn a skipped metric into
+        # a scored pair. New/retried Runs reject that row during integrity
+        # validation, while read compatibility simply ignores it here.
+        usable_paired = paired if source_has_gt else []
+        ignored_gt_ids = [int(row["id"]) for row in paired] if paired and not source_has_gt else []
+        record: dict[str, Any] = {
+            "inference_job_id": inference_job_id,
+            "video_name": video_name or None,
+            "reference_path": Path(usable_paired[0]["path"]) if len(usable_paired) == 1 else None,
+            "distorted_path": Path(artifact["path"]),
+            "track_details": _compare_track_details(None, artifact),
+            "alignment_context": alignment_context,
+            "input_details": {
+                "video_input": "published_pred_video",
+                "artifact_contract": pred_contract or "legacy",
+                "reference_artifact_id": int(usable_paired[0]["id"]) if len(usable_paired) == 1 else None,
+                "reference_artifact_contract": str(
+                    ((usable_paired[0].get("metadata") or {}).get("artifact_contract") or "legacy")
+                ) if len(usable_paired) == 1 else None,
+                "reference_inference_job_id": inference_job_id,
+                **({"ignored_unexpected_gt_artifact_ids": ignored_gt_ids} if ignored_gt_ids else {}),
+            },
+        }
+        pred_problem = _metric_file_problem(Path(str(artifact.get("path") or "")), "Pred video")
+        gt_problem = (
+            _metric_file_problem(Path(str(usable_paired[0].get("path") or "")), "GT video")
+            if len(usable_paired) == 1
+            else None
         )
+        if not video_name:
+            record.update(error="pred_video has no video_name identity", input_status="unavailable")
+        elif len(usable_paired) > 1:
+            record.update(
+                error="canonical GT video identity is not unique within the inference Job",
+                input_status="unavailable",
+            )
+        elif pred_problem:
+            record.update(error=pred_problem, input_status="unavailable")
+        elif (
+            len(usable_paired) == 1
+            and pred_contract == "canonical-v1"
+            and str((usable_paired[0].get("metadata") or {}).get("artifact_contract") or "") != "canonical-v1"
+        ):
+            record.update(
+                error="canonical pred_video is paired with a non-canonical gt_video artifact",
+                input_status="unavailable",
+            )
+        elif gt_problem:
+            record.update(error=gt_problem, input_status="unavailable")
+        elif len(usable_paired) == 1 and (
+            pair_issue := strict_video_pair_issue(artifact, usable_paired[0])
+        ) is not None:
+            record["input_details"]["video_pair_integrity"] = pair_issue
+            record.update(error=str(pair_issue["message"]), input_status="unavailable")
+        elif not usable_paired and source_has_gt:
+            record.update(
+                error="pred_video has no canonical gt_video from the same inference Job and video identity",
+                input_status="unavailable",
+            )
+        inputs.append(record)
     return inputs
+
+
+def _metric_file_problem(path: Path, label: str) -> str | None:
+    if not path.is_file():
+        return f"{label} file is missing"
+    try:
+        if path.stat().st_size <= 0:
+            return f"{label} file is empty"
+    except OSError as exc:
+        return f"{label} file cannot be inspected: {exc}"
+    return None
 
 
 def _is_item_compare_without_pred_video(
@@ -641,20 +992,20 @@ def _item_compare_video_metric_inputs(
     except (TypeError, ValueError):
         target_size = (0, 0)
 
-    pred_by_sample = {
-        int(artifact["sample_id"]): artifact
-        for artifact in pred_artifacts
-        if artifact.get("sample_id") is not None
-    }
-    gt_by_sample = {
-        int(artifact["sample_id"]): artifact
-        for artifact in db.list_artifacts_by_samples(
-            samples.keys(),
-            job_ids=inference_job_ids,
-            kind="gt",
-        )
-        if artifact.get("sample_id") is not None
-    }
+    pred_by_sample: dict[int, list[dict[str, Any]]] = {}
+    for artifact in pred_artifacts:
+        if artifact.get("sample_id") is not None:
+            pred_by_sample.setdefault(int(artifact["sample_id"]), []).append(artifact)
+    gt_by_identity: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for artifact in db.list_artifacts_by_samples(
+        samples.keys(),
+        job_ids=inference_job_ids,
+        kind="gt",
+    ):
+        if artifact.get("sample_id") is None:
+            continue
+        identity = (int(artifact["job_id"]), int(artifact["sample_id"]))
+        gt_by_identity.setdefault(identity, []).append(artifact)
     groups: dict[tuple[str, int, str], list[dict[str, Any]]] = {}
     for sample in samples.values():
         metadata = sample.get("metadata") or {}
@@ -683,7 +1034,8 @@ def _item_compare_video_metric_inputs(
     for (video_name, track_index, track_key), track_samples in sorted(groups.items()):
         ordered = sorted(track_samples, key=_compare_sample_order)
         first_sample = ordered[0]
-        first_artifact = pred_by_sample.get(int(first_sample["id"]))
+        first_candidates = pred_by_sample.get(int(first_sample["id"])) or []
+        first_artifact = first_candidates[0] if len(first_candidates) == 1 else None
         track_metadata = first_sample.get("metadata") or {}
         track_label = str(track_metadata.get("compare_track_label") or f"Pred {track_index + 1}")
         track_details = _compare_track_details(first_sample, first_artifact)
@@ -723,14 +1075,25 @@ def _item_compare_video_metric_inputs(
             pred_paths: list[Path] = []
             for sample in ordered:
                 sample_id = int(sample["id"])
-                pred_artifact = pred_by_sample.get(sample_id)
-                if pred_artifact is None:
-                    raise ValueError(f"Item Compare track is missing pred artifact for sample {sample_id}")
+                pred_candidates = pred_by_sample.get(sample_id) or []
+                if len(pred_candidates) != 1:
+                    raise ValueError(
+                        "Item Compare track requires one pred artifact for sample "
+                        f"{sample_id}; got {len(pred_candidates)}"
+                    )
+                pred_artifact = pred_candidates[0]
                 pred_paths.append(Path(str(pred_artifact["path"])).resolve())
-                gt_artifact = gt_by_sample.get(sample_id)
-                gt_path = Path(str(gt_artifact["path"])).resolve() if gt_artifact is not None else Path(
-                    str(sample.get("gt_path") or "")
-                ).resolve()
+                identity = (int(pred_artifact["job_id"]), sample_id)
+                reference_status, reference_path, reference_details = _resolve_frame_reference(
+                    pred_artifact,
+                    sample,
+                    gt_by_identity.get(identity, []),
+                )
+                if reference_status is not None or reference_path is None:
+                    raise _MetricInputUnavailable(
+                        str(reference_details.get("reason") or "paired GT unavailable")
+                    )
+                gt_path = reference_path.resolve()
                 gt_paths.append(gt_path)
             _validate_aligned_video_frames("GT", gt_paths, target_size)
             _validate_aligned_video_frames(track_label, pred_paths, target_size)
@@ -756,6 +1119,9 @@ def _item_compare_video_metric_inputs(
                 frame_paths=pred_paths,
                 fps=fps,
             )
+        except _MetricInputUnavailable as exc:
+            record["error"] = f"aligned Compare video input unavailable: {exc}"
+            record["input_status"] = "unavailable"
         except Exception as exc:
             record["error"] = f"aligned Compare video input unavailable: {exc}"
         inputs.append(record)

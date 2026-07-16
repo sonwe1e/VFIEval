@@ -397,11 +397,40 @@ def _downloaded_manifest(metric_name: str) -> dict[str, Any]:
 def _cgvqm_wrapper_source() -> str:
     return '''from __future__ import annotations
 
+import contextlib
 import importlib
 import json
 import os
 import sys
 from pathlib import Path
+
+
+class _BoundedStdoutCapture:
+    def __init__(self, limit: int = 16_384) -> None:
+        self.limit = max(1, int(limit))
+        self.text = ""
+        self.truncated = False
+
+    def write(self, value: str) -> int:
+        value = str(value)
+        combined = self.text + value
+        if len(combined) > self.limit:
+            combined = combined[-self.limit :]
+            self.truncated = True
+        self.text = combined
+        return len(value)
+
+    def flush(self) -> None:
+        return None
+
+    def details(self) -> dict:
+        text = self.text.strip()
+        if not text:
+            return {}
+        return {
+            "driver_stdout": text,
+            "driver_stdout_truncated": self.truncated,
+        }
 
 
 def _prepare_device(device_name: str) -> None:
@@ -423,16 +452,20 @@ def main() -> int:
     payload = json.load(sys.stdin)
     device = str(payload.get("device") or "cpu")
     os.environ["VFIEVAL_METRIC_DEVICE"] = device
+    captured_stdout = _BoundedStdoutCapture()
     try:
-        _prepare_device(device)
-        repo_dir = Path(payload["repo_dir"]).resolve()
-        sys.path.insert(0, str(repo_dir))
-        module = importlib.import_module("cgvqm")
-        value, details = _call_metric(module, payload)
+        with contextlib.redirect_stdout(captured_stdout):
+            _prepare_device(device)
+            repo_dir = Path(payload["repo_dir"]).resolve()
+            sys.path.insert(0, str(repo_dir))
+            module = importlib.import_module("cgvqm")
+            value, details = _call_metric(module, payload)
+        details = {**details, **captured_stdout.details()}
         print(json.dumps({"status": "completed", "value": float(value), "details": details}))
         return 0
     except Exception as exc:
-        print(json.dumps({"status": "unavailable", "value": None, "details": {"reason": str(exc), "type": type(exc).__name__}}))
+        details = {"reason": str(exc), "type": type(exc).__name__, **captured_stdout.details()}
+        print(json.dumps({"status": "unavailable", "value": None, "details": details}))
         return 0
 
 
@@ -440,10 +473,11 @@ def _call_metric(module, payload: dict) -> tuple[float, dict]:
     reference = payload["reference"]
     distorted = payload["distorted"]
     device = payload.get("device") or "cpu"
+    patch_scale = int(payload.get("patch_scale") or 4)
     run_cgvqm = getattr(module, "run_cgvqm", None)
     if callable(run_cgvqm):
         cgvqm_type = getattr(getattr(module, "CGVQM_TYPE", object), "CGVQM_2", None)
-        kwargs = {"device": device, "patch_pool": "max", "patch_scale": 4}
+        kwargs = {"device": device, "patch_pool": "max", "patch_scale": patch_scale}
         if cgvqm_type is not None:
             kwargs["cgvqm_type"] = cgvqm_type
         result = run_cgvqm(distorted, reference, **kwargs)
@@ -453,7 +487,7 @@ def _call_metric(module, payload: dict) -> tuple[float, dict]:
             "entrypoint": "run_cgvqm",
             "cgvqm_type": "CGVQM_2",
             "patch_pool": "max",
-            "patch_scale": 4,
+            "patch_scale": patch_scale,
         }
     for name in ("compute_cgvqm", "calculate_cgvqm", "evaluate", "cgvqm"):
         candidate = getattr(module, name, None)

@@ -38,10 +38,15 @@ def run_decode_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
             return
         run = db.get_run(run_id)
         if run["status"] in {"cancel_requested", "canceled"}:
-            error = {"message": "用户取消了解码任务", "type": "RunCanceled", "phase": "decode"}
-            db.cancel_job(job_id, error)
-            db.cancel_run(run_id, error)
             raise RunCanceled("用户取消了解码任务")
+        if run["status"] == "failed":
+            raise RunCanceled("Run 已失败")
+
+    def require_progress(accepted: bool, target: str) -> None:
+        if accepted:
+            return
+        ensure_not_canceled()
+        raise RuntimeError(f"{target} rejected decode progress CAS")
 
     def update_progress(event: dict[str, Any]) -> None:
         ensure_not_canceled()
@@ -74,16 +79,28 @@ def run_decode_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                 "fallback_reason": event.get("fallback_reason") or state.get("fallback_reason"),
             }
         )
-        db.update_job_progress(job_id, decoded_frames, total if total > 0 else None, result=dict(state))
+        require_progress(
+            db.update_job_progress(job_id, decoded_frames, total if total > 0 else None, result=dict(state)),
+            "Job",
+        )
         if run_id is not None:
-            db.update_run_progress(run_id, decoded_frames, total if total > 0 else None, "decoding")
+            require_progress(
+                db.update_run_progress(run_id, decoded_frames, total if total > 0 else None),
+                "Run",
+            )
 
     ensure_not_canceled()
     state["phase"] = "checking_cache"
-    db.update_job_progress(job_id, 0, total_frames if total_frames > 0 else None, result=dict(state))
+    require_progress(
+        db.update_job_progress(job_id, 0, total_frames if total_frames > 0 else None, result=dict(state)),
+        "Job",
+    )
     if run_id is not None:
-        db.mark_run_started(run_id, "decoding")
-        db.update_run_progress(run_id, 0, total_frames if total_frames > 0 else None, "decoding")
+        require_progress(db.mark_run_started(run_id, "decoding"), "Run state")
+        require_progress(
+            db.update_run_progress(run_id, 0, total_frames if total_frames > 0 else None),
+            "Run",
+        )
 
     samples = scan_dataset(
         db,
@@ -103,10 +120,13 @@ def run_decode_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
         state["phase"] = "indexing_cached_frames"
         state["backend"] = "cache"
     state.update({"status": "completed", "samples": int(samples)})
-    db.update_job_progress(
-        job_id,
-        int(state.get("decoded_frames") or 0),
-        int(state.get("total_frames") or 0) if int(state.get("total_frames") or 0) > 0 else None,
-        result=dict(state),
+    require_progress(
+        db.update_job_progress(
+            job_id,
+            int(state.get("decoded_frames") or 0),
+            int(state.get("total_frames") or 0) if int(state.get("total_frames") or 0) > 0 else None,
+            result=dict(state),
+        ),
+        "Job",
     )
     return dict(state)

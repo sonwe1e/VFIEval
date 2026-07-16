@@ -3,15 +3,30 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from PIL import Image
+import torch
 
 from vfieval.config import WorkspaceConfig
 from vfieval.datasets import scan_triplet_dataset
 from vfieval.db import Database
-from vfieval.orchestration import partition_samples_by_video
-from vfieval.pipeline.inference import _NpuSmiSampler
-from vfieval.performance import execution_profile_identity, record_execution_profile, recommend_execution_profile
+from vfieval.orchestration import _create_inference_shards, partition_samples_by_video
+from vfieval.pipeline.inference import (
+    DEFAULT_VISUALIZE_HEIGHT,
+    DEFAULT_VISUALIZE_WIDTH,
+    _AsyncSavePipeline,
+    _NpuSmiSampler,
+    _compose_canonical_chunks,
+    _postprocess_chunk_size,
+    _resolve_visualize_size,
+)
+from vfieval.performance import (
+    EXECUTION_PROFILE_CONTRACT,
+    execution_profile_identity,
+    record_execution_profile,
+    recommend_execution_profile,
+)
 from vfieval.worker import WorkerOptions, run_worker
 
 
@@ -37,6 +52,7 @@ class ArtifactProfileTests(unittest.TestCase):
                 "artifact_profile": "benchmark",
             }
             identity = execution_profile_identity(workspace, payload)
+            self.assertEqual(identity["execution_profile_contract"], EXECUTION_PROFILE_CONTRACT)
             record_execution_profile(db, identity, {"batch_size": 2}, {"steady_state_fps": 10})
             record_execution_profile(db, identity, {"batch_size": 1}, {"steady_state_fps": 5})
             recommended = recommend_execution_profile(db, workspace, payload)
@@ -46,6 +62,37 @@ class ArtifactProfileTests(unittest.TestCase):
     def test_npu_smi_usage_parser_is_optional_and_stable(self) -> None:
         parsed = _NpuSmiSampler._parse("AI Core Utilization Rate : 73\nMemory Usage : 41")
         self.assertEqual(parsed, {"aicore_percent": 73.0, "memory_percent": 41.0})
+
+    def test_canonical_postprocess_chunks_by_pixels_and_halves_on_oom(self) -> None:
+        self.assertEqual(_postprocess_chunk_size(64, 2160, 3840), 1)
+        self.assertEqual(_postprocess_chunk_size(64, 1080, 1920), 4)
+        img0 = torch.zeros((4, 3, 2, 2))
+        img1 = torch.ones((4, 3, 2, 2))
+        outputs = {
+            "flowt_0": torch.zeros((4, 2, 2, 2)),
+            "flowt_1": torch.zeros((4, 2, 2, 2)),
+            "mask0": torch.zeros((4, 1, 2, 2)),
+            "mask1": torch.zeros((4, 1, 2, 2)),
+        }
+        attempted: list[int] = []
+
+        def compose(left, _right, _outputs):
+            attempted.append(int(left.shape[0]))
+            if int(left.shape[0]) > 1:
+                raise RuntimeError("synthetic out of memory")
+            return {"pred": left, "warp0": left, "warp1": left, "blend": left}
+
+        with patch("vfieval.pipeline.inference.compose_interpolated", side_effect=compose):
+            chunks = list(_compose_canonical_chunks(img0, img1, outputs, initial_chunk_size=4))
+        self.assertEqual([(start, end) for start, end, _outputs, _composed in chunks], [(0, 1), (1, 2), (2, 3), (3, 4)])
+        self.assertEqual(attempted[:3], [4, 2, 1])
+
+        with patch(
+            "vfieval.pipeline.inference.compose_interpolated",
+            side_effect=RuntimeError("synthetic out of memory"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "out of memory"):
+                list(_compose_canonical_chunks(img0[:1], img1[:1], outputs, initial_chunk_size=1))
 
     def test_long_single_video_is_split_into_contiguous_balanced_segments(self) -> None:
         samples = [
@@ -58,6 +105,104 @@ class ArtifactProfileTests(unittest.TestCase):
         self.assertLessEqual(max(map(len, partitions)) - min(map(len, partitions)), 1)
         for part in partitions:
             self.assertEqual(part, list(range(min(part), max(part) + 1)))
+
+    def test_benchmark_shards_do_not_defer_nonexistent_video_artifacts(self) -> None:
+        db = Mock()
+        db.publish_inference_jobs.return_value = [11, 12]
+        samples = [
+            {"id": 1, "name": "a", "metadata": {"video_name": "a", "frame_index": 0}},
+            {"id": 2, "name": "b", "metadata": {"video_name": "b", "frame_index": 0}},
+        ]
+        common = {
+            "db": db,
+            "run_id": 1,
+            "model_id": 2,
+            "dataset_id": 3,
+            "height": 8,
+            "width": 8,
+            "precision": "fp32",
+            "metrics": [],
+            "devices": ["cuda:0", "cuda:1"],
+            "batch_size_per_device": 1,
+            "samples": samples,
+        }
+        _create_inference_shards(**common, artifact_profile="benchmark")
+        benchmark_specs = db.publish_inference_jobs.call_args.args[1]
+        self.assertTrue(benchmark_specs)
+        self.assertTrue(all(not spec["payload"]["defer_video_finalize"] for spec in benchmark_specs))
+
+        db.publish_inference_jobs.reset_mock()
+        _create_inference_shards(**common, artifact_profile="evaluation")
+        evaluation_specs = db.publish_inference_jobs.call_args.args[1]
+        self.assertTrue(all(spec["payload"]["defer_video_finalize"] for spec in evaluation_specs))
+
+    def test_preview_defaults_avoid_upscale_but_explicit_size_is_exact(self) -> None:
+        self.assertEqual(
+            _resolve_visualize_size({}, 1080, 1920),
+            (DEFAULT_VISUALIZE_HEIGHT, DEFAULT_VISUALIZE_WIDTH),
+        )
+        self.assertEqual(_resolve_visualize_size({}, 360, 640), (360, 640))
+        self.assertEqual(
+            _resolve_visualize_size(
+                {"visualize_height": 720, "visualize_width": 1280},
+                360,
+                640,
+            ),
+            (720, 1280),
+        )
+
+    def test_diagnostic_native_flow_and_mask_get_target_size_previews(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db, _model_id, dataset_id = self._workspace(Path(tmp))
+            sample = db.list_samples(dataset_id)[0]
+            job_id = db.create_job("inference", {"artifact_profile": "diagnostic"})
+            pipeline = _AsyncSavePipeline(
+                db=db,
+                job_id=job_id,
+                run_id=None,
+                is_shard=False,
+                run_dir=workspace.runs_dir / "diagnostic-preview",
+                save_workers=1,
+                max_inflight=1,
+                artifact_batch_size=16,
+                preview_height=12,
+                preview_width=16,
+            )
+            bundle = {
+                "pred": torch.zeros((3, 12, 16)),
+                "warp0": torch.zeros((3, 12, 16)),
+                "warp1": torch.zeros((3, 12, 16)),
+                "blend": torch.zeros((3, 12, 16)),
+                "mask0": torch.zeros((1, 6, 8)),
+                "mask1": torch.zeros((1, 6, 8)),
+                "flowt_0": torch.zeros((2, 6, 8)),
+                "flowt_1": torch.zeros((2, 6, 8)),
+            }
+            try:
+                pipeline._save_sample(sample, bundle, {}, None)
+                pipeline.shutdown()
+            except Exception:
+                pipeline.shutdown(suppress_errors=True)
+                raise
+
+            artifacts = {
+                row["kind"]: row for row in db.list_artifacts(job_id=job_id)
+            }
+            pred = artifacts["pred"]
+            self.assertTrue(pred["metadata"]["preview_uses_canonical"])
+            self.assertNotIn("preview_path", pred["metadata"])
+            for kind in ("flowt_0", "flowt_1", "mask0", "mask1"):
+                artifact = artifacts[kind]
+                metadata = artifact["metadata"]
+                self.assertEqual(
+                    (metadata["canonical_height"], metadata["canonical_width"]),
+                    (6, 8),
+                )
+                self.assertFalse(metadata["preview_uses_canonical"])
+                with Image.open(artifact["path"]) as canonical:
+                    self.assertEqual(canonical.size, (8, 6))
+                with Image.open(metadata["preview_path"]) as preview:
+                    self.assertEqual(preview.size, (16, 12))
 
     def test_completed_deferred_shards_queue_one_finalize_job(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -86,8 +231,11 @@ class ArtifactProfileTests(unittest.TestCase):
                 )
                 for index in range(2)
             ]
-            for job_id in job_ids:
-                db.complete_job(job_id, {"samples": 1, "performance": {"total_wall_seconds": 1}})
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            for index, job_id in enumerate(job_ids):
+                claimed = db.claim_next_job(f"inference-{index}", ["inference"])
+                self.assertEqual(int(claimed["id"]), job_id)
+                self.assertTrue(db.complete_job(job_id, {"samples": 1, "performance": {"total_wall_seconds": 1}}))
             self.assertTrue(db.maybe_complete_multi_run_inference(run_id))
             self.assertEqual(db.get_run(run_id)["status"], "finalize_queued")
             finalize = db.list_run_jobs(run_id, "finalize")
@@ -149,6 +297,14 @@ class ArtifactProfileTests(unittest.TestCase):
                 evaluation["result"]["performance"]["artifact_db_batches"],
                 evaluation["result"]["samples"],
             )
+            pred = db.list_artifacts(job_id=evaluation["id"], kind="pred")[0]
+            self.assertEqual(pred["metadata"]["artifact_contract"], "canonical-v1")
+            self.assertEqual(
+                (pred["metadata"]["preview_height"], pred["metadata"]["preview_width"]),
+                (12, 16),
+            )
+            self.assertTrue(pred["metadata"]["preview_uses_canonical"])
+            self.assertNotIn("preview_path", pred["metadata"])
 
             diagnostic = self._run_profile(db, workspace, model_id, dataset_id, "diagnostic")
             self.assertEqual(diagnostic["status"], "completed", diagnostic)

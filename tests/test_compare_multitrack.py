@@ -55,7 +55,9 @@ class CompareMultitrackTests(unittest.TestCase):
                     created = post_json(base_url, "/api/runs", payload)
                 run_id = int(created["run_id"])
                 job_id = int(db.get_run(run_id)["inference_job_id"])
-                run_inference_job(db, workspace, job_id)
+                self.assertEqual(int(db.claim_next_job("compare-multitrack", ["inference"])["id"]), job_id)
+                result = run_inference_job(db, workspace, job_id)
+                self.assertTrue(db.complete_job(job_id, result.__dict__))
 
                 run = db.get_run(run_id)
                 self.assertEqual(run["status"], "completed", run)
@@ -198,7 +200,9 @@ class CompareMultitrackTests(unittest.TestCase):
                     created = post_json(base_url, "/api/runs", payload)
                 run_id = int(created["run_id"])
                 job_id = int(db.get_run(run_id)["inference_job_id"])
-                run_inference_job(db, workspace, job_id)
+                self.assertEqual(int(db.claim_next_job("compare-labels", ["inference"])["id"]), job_id)
+                result = run_inference_job(db, workspace, job_id)
+                self.assertTrue(db.complete_job(job_id, result.__dict__))
 
                 run = db.get_run(run_id)
                 self.assertEqual(run["status"], "completed", run)
@@ -263,7 +267,9 @@ class CompareMultitrackTests(unittest.TestCase):
                     created = post_json(base_url, "/api/runs", payload)
                 run_id = int(created["run_id"])
                 job_id = int(db.get_run(run_id)["inference_job_id"])
-                run_inference_job(db, workspace, job_id)
+                self.assertEqual(int(db.claim_next_job("compare-source-indices", ["inference"])["id"]), job_id)
+                result = run_inference_job(db, workspace, job_id)
+                self.assertTrue(db.complete_job(job_id, result.__dict__))
 
                 run = db.get_run(run_id)
                 self.assertEqual(run["status"], "completed", run)
