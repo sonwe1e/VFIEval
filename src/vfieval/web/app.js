@@ -2283,6 +2283,14 @@ function renderCompareInputs(run) {
   return `<section class="compare-input-panel"><div class="panel-head"><div><h3>Compare 输入</h3><p class="muted">这些 Pred 引用原模型输出；Compare 不发布新的可复用 Pred。来源删除前会先切换到不可复用快照。</p></div></div>${renderAlignmentPlan(plan)}<div class="compare-input-grid">${rows.map((row) => renderCompareInputMedia(run.id, row)).join("")}</div></section>`;
 }
 
+function retriableMetricCount(runId) {
+  if (Number(state.metricSummary?.run_id) !== Number(runId)) return 0;
+  return Object.values(state.metricSummary?.metrics || {}).reduce(
+    (total, row) => total + Number(row?.failed || 0) + Number(row?.unavailable || 0),
+    0,
+  );
+}
+
 function renderRunDetail() {
   const run = state.selectedRun;
   if (!run) {
@@ -2300,6 +2308,7 @@ function renderRunDetail() {
       </div>
       <div class="actions">
         ${runStatusDisplay(run)}
+        ${retriableMetricCount(run.id) > 0 ? `<button class="secondary" data-retry-run-metrics="${run.id}" ${["metric_queued", "metric_running"].includes(run.status) ? "disabled" : ""} type="button">重试失败/不可用指标 (${retriableMetricCount(run.id)})</button>` : ""}
         <button class="secondary" data-refresh-run-results="${run.id}" type="button">刷新结果</button>
         <button class="secondary" data-rename-run="${run.id}" type="button">重命名</button>
         <button class="secondary" data-cancel-run="${run.id}" ${TERMINAL_STATUSES.has(run.status) ? "disabled" : ""} type="button">取消</button>
@@ -3373,6 +3382,12 @@ async function retryRun(runId) {
   await selectRun(created.run_id);
 }
 
+async function retryRunMetrics(runId) {
+  await api(`/api/runs/${runId}/metrics/retry`, { method: "POST", body: "{}" });
+  toast(`Run #${runId} 的失败/不可用指标已重新排队`);
+  await refreshRunsOnly({ forceSelected: Number(state.selectedRun?.id) === Number(runId) });
+}
+
 async function deleteRun(runId) {
   const result = await api(`/api/runs/${runId}`, { method: "DELETE" });
   toast(result.deleted ? `Run #${runId} 已清理并删除` : `Run #${runId} 已进入删除队列`);
@@ -3989,6 +4004,7 @@ function renderCampaignAnalysis() {
   const metrics = analysis.objective?.metrics || [];
   const correlations = analysis.cross_analysis?.metrics || [];
   const evaluatorVotes = analysis.evaluator_votes || [];
+  const ratings = Array.isArray(analysis.ratings?.methods) ? analysis.ratings.methods : [];
   const reasonRows = Object.entries(analysis.quality_reasons || {}).map(([reason, count]) => ({ reason, count }));
   const campaignId = Number(analysis.campaign?.id || state.selectedCampaignId);
   const analysisParams = new URLSearchParams();
@@ -4048,6 +4064,16 @@ function renderCampaignAnalysis() {
       { label: "冲突候选", render: (row) => escapeHtml((row.conflict_asset_ids || []).join(", ") || "-") },
     ])}</div></section>` : ""}
   `;
+  if (ratings.length) {
+    host.insertAdjacentHTML("beforeend", `
+      <section class="stats-block"><h3>\u53cc\u8bc4\u5206\uff08\u53ef\u9009\uff09</h3><div class="table compact-table">${table(ratings, [
+        { label: "\u65b9\u6cd5", render: (row) => escapeHtml(row.method_label || `method-${row.method_id}`) },
+        { label: "\u586b\u5199\u6570", render: (row) => Number(row.count || 0) },
+        { label: "\u5747\u503c", render: (row) => formatNumber(row.mean) },
+        { label: "\u4e2d\u4f4d\u6570", render: (row) => formatNumber(row.median) },
+      ])}</div></section>
+    `);
+  }
 }
 
 function renderEvaluationTask() {
@@ -4706,6 +4732,11 @@ document.addEventListener("click", async (event) => {
   const cancelButton = event.target.closest("[data-cancel-run]");
   if (cancelButton) {
     await cancelRun(Number(cancelButton.dataset.cancelRun));
+    return;
+  }
+  const retryMetricsButton = event.target.closest("[data-retry-run-metrics]");
+  if (retryMetricsButton) {
+    await retryRunMetrics(Number(retryMetricsButton.dataset.retryRunMetrics));
     return;
   }
   const retryButton = event.target.closest("[data-retry-run]");

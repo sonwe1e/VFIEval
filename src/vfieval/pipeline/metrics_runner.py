@@ -198,6 +198,7 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                                 cache_config=metric_cache_configs[metric_name],
                                 metric_device=metric_device,
                                 alignment_context=video_input.get("alignment_context") or _metric_alignment_context(dataset),
+                                retry=bool(payload.get("retry")),
                             )
                         details = {
                             "video_name": video_name,
@@ -349,7 +350,11 @@ def _run_frame_metric_batches(
             identity_cache=identity_cache,
         )
         cached = db.get_metric_cache(cache_key)
-        if cached:
+        retry_cached_failure = bool(job_payload.get("retry")) and cached and cached["status"] in {
+            "failed",
+            "unavailable",
+        }
+        if cached and not retry_cached_failure:
             cache_hits += 1
             outcomes[index] = (
                 cached["status"],
@@ -421,6 +426,7 @@ def _run_frame_metric_batches(
             unavailable_reason = str(exc)
             for row in pending[offset:]:
                 details = {
+                    **dict(getattr(exc, "details", {}) or {}),
                     "reason": unavailable_reason,
                     "device": metric_device,
                     **row["reference_details"],
@@ -435,6 +441,7 @@ def _run_frame_metric_batches(
                     "failed",
                     None,
                     {
+                        **dict(getattr(exc, "details", {}) or {}),
                         "reason": str(exc),
                         "type": type(exc).__name__,
                         "sample_id": row["sample_id"],
@@ -1359,6 +1366,7 @@ def _evaluate_with_cache(
     cache_config: dict[str, Any],
     metric_device: str = "cpu",
     alignment_context: dict[str, str] | None = None,
+    retry: bool = False,
 ) -> tuple[str, float | None, dict[str, Any]]:
     config = {
         "cache_version": METRIC_CACHE_VERSION,
@@ -1369,7 +1377,7 @@ def _evaluate_with_cache(
         config["alignment"] = dict(alignment_context)
     cache_key = metric_cache_key(metric_name, reference_path, distorted_path, config)
     cached = db.get_metric_cache(cache_key)
-    if cached:
+    if cached and not (retry and cached["status"] in {"failed", "unavailable"}):
         return cached["status"], cached["value"], {"cached": True, **cached["details"]}
 
     metric = create_metric(metric_name, workspace, device=metric_device)
@@ -1379,11 +1387,16 @@ def _evaluate_with_cache(
         db.set_metric_cache(cache_key, metric_name, result.status, result.value, result.details)
         return result.status, result.value, result.details
     except MetricUnavailable as exc:
-        details = {"reason": str(exc)}
+        details = {**dict(getattr(exc, "details", {}) or {}), "reason": str(exc)}
         db.set_metric_cache(cache_key, metric_name, "unavailable", None, details)
         return "unavailable", None, details
     except Exception as exc:
-        return "failed", None, {"reason": str(exc), "type": type(exc).__name__, "sample_id": sample_id}
+        return "failed", None, {
+            **dict(getattr(exc, "details", {}) or {}),
+            "reason": str(exc),
+            "type": type(exc).__name__,
+            "sample_id": sample_id,
+        }
 
 
 def metric_cache_key(

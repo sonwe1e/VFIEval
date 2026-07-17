@@ -11,7 +11,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Thread
 from typing import Any, Callable
 
 from PIL import Image
@@ -834,6 +834,8 @@ def _load_compare_source_frames_with_cache(
     workspace: WorkspaceConfig,
     source_path: Path,
     cache_prefix: str,
+    *,
+    trusted_source_signature: dict[str, Any] | None = None,
 ) -> tuple[
     list[Path],
     float | None,
@@ -850,7 +852,21 @@ def _load_compare_source_frames_with_cache(
     if source_path.is_file() and source_path.suffix.lower() in VIDEO_SUFFIXES:
         source_path = source_path.resolve()
         stat_before = source_path.stat()
-        source_sha256 = file_sha256(source_path)
+        identity_started = time.monotonic()
+        trusted = dict(trusted_source_signature or {})
+        trusted_sha256 = str(trusted.get("content_sha256") or "").strip().lower()
+        try:
+            trusted_size = int(trusted.get("size_bytes"))
+            trusted_mtime_ns = int(trusted.get("source_mtime_ns"))
+        except (TypeError, ValueError):
+            trusted_size = -1
+            trusted_mtime_ns = -1
+        trusted_identity = bool(
+            trusted_sha256
+            and trusted_size == int(stat_before.st_size)
+            and trusted_mtime_ns == int(stat_before.st_mtime_ns)
+        )
+        source_sha256 = trusted_sha256 if trusted_identity else file_sha256(source_path)
         stat_after_hash = source_path.stat()
         if (
             int(stat_before.st_size) != int(stat_after_hash.st_size)
@@ -866,7 +882,9 @@ def _load_compare_source_frames_with_cache(
             None,
             content_sha256=source_sha256,
         )
-        frames, fps, timestamps, _decode_info = _decode_video_cached(
+        identity_seconds = time.monotonic() - identity_started
+        decode_started = time.monotonic()
+        frames, fps, timestamps, decode_info = _decode_video_cached(
             db,
             workspace,
             source_path,
@@ -875,6 +893,7 @@ def _load_compare_source_frames_with_cache(
             cache_prefix,
             1,
         )
+        decode_seconds = time.monotonic() - decode_started
         stat_after_decode = source_path.stat()
         if (
             int(stat_after_hash.st_size) != int(stat_after_decode.st_size)
@@ -893,6 +912,11 @@ def _load_compare_source_frames_with_cache(
                 "source_sha256": source_sha256,
                 "source_size_bytes": int(stat_after_decode.st_size),
                 "source_mtime_ns": int(stat_after_decode.st_mtime_ns),
+                "source_identity": "trusted_catalog" if trusted_identity else "full_sha256",
+                "source_identity_seconds": identity_seconds,
+                "source_hash_seconds": 0.0 if trusted_identity else identity_seconds,
+                "decode_seconds": decode_seconds,
+                "cache_hit": bool(decode_info.get("cache_hit")),
             },
         )
     if source_path.is_dir():
@@ -1258,7 +1282,10 @@ def _decode_video_ffmpeg(
         "-y",
         "-hide_banner",
         "-loglevel",
-        "error",
+        "info",
+        "-progress",
+        "pipe:1",
+        "-nostats",
         "-i",
         str(video_path),
         "-vsync",
@@ -1268,24 +1295,87 @@ def _decode_video_ffmpeg(
         command.extend(["-frames:v", str(int(max_frames))])
     command.append(str(pattern))
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    last_count = -1
-    while process.poll() is None:
-        count = len(list(output_dir.glob("*.png")))
-        if progress_callback and count != last_count:
-            progress_callback({"event": "frame", "backend": "ffmpeg", "frames": count})
-            last_count = count
-        time.sleep(0.25)
-    stdout, stderr = process.communicate()
-    if process.returncode != 0:
+    progress_state = {"frames": 0, "out_time_seconds": 0.0}
+    progress_lines: list[str] = []
+
+    def read_progress() -> None:
+        assert process.stdout is not None
+        last_reported = -1
+        for raw_line in process.stdout:
+            line = raw_line.strip()
+            if not line:
+                continue
+            progress_lines.append(line)
+            key, separator, value = line.partition("=")
+            if not separator:
+                continue
+            if key == "frame":
+                try:
+                    progress_state["frames"] = max(0, int(value.strip()))
+                except ValueError:
+                    continue
+                if progress_callback and progress_state["frames"] != last_reported:
+                    progress_callback(
+                        {
+                            "event": "frame",
+                            "backend": "ffmpeg",
+                            "frames": progress_state["frames"],
+                        }
+                    )
+                    last_reported = progress_state["frames"]
+            elif key in {"out_time_us", "out_time_ms"}:
+                try:
+                    progress_state["out_time_seconds"] = max(
+                        progress_state["out_time_seconds"],
+                        float(value.strip()) / 1_000_000.0,
+                    )
+                except ValueError:
+                    continue
+
+    progress_thread = Thread(
+        target=read_progress,
+        name=f"vfieval-ffmpeg-progress-{video_path.stem}",
+        daemon=True,
+    )
+    progress_thread.start()
+    stderr = process.stderr.read() if process.stderr is not None else ""
+    returncode = process.wait()
+    progress_thread.join(timeout=5)
+    if process.stdout is not None:
+        process.stdout.close()
+    if process.stderr is not None:
+        process.stderr.close()
+    stdout = "\n".join(progress_lines)
+    if returncode != 0:
         raise RuntimeError((stderr or stdout or "ffmpeg decode failed").strip())
     frames = sorted(output_dir.glob("*.png"))
     if not frames:
         raise RuntimeError(f"ffmpeg produced no frames: {video_path}")
-    fps = _probe_video_fps(video_path)
+    fps = _ffmpeg_reported_fps(stderr) or _probe_video_fps(video_path)
+    if not math.isfinite(fps) or fps <= 0:
+        fps = 24.0
     timestamps = [index / fps for index in range(len(frames))]
     if progress_callback:
         progress_callback({"event": "video_done", "backend": "ffmpeg", "frames": len(frames)})
     return frames, fps, timestamps
+
+
+def _ffmpeg_reported_fps(stderr: str) -> float | None:
+    """Read the input stream FPS from the decode process, never its elapsed time."""
+
+    input_report = str(stderr or "").split("Output #0", 1)[0]
+    for line in input_report.splitlines():
+        if "Stream #" not in line or "Video:" not in line:
+            continue
+        match = re.search(r",\s*([0-9]+(?:\.[0-9]+)?)\s+fps(?:,|\s)", line)
+        if match is None:
+            match = re.search(r",\s*([0-9]+(?:\.[0-9]+)?)\s+tbr(?:,|\s)", line)
+        if match is None:
+            continue
+        fps = float(match.group(1))
+        if math.isfinite(fps) and fps > 0:
+            return fps
+    return None
 
 
 def _decode_worker_count(video_count: int, metadata: dict[str, Any]) -> int:
@@ -1304,18 +1394,6 @@ def _clear_decoded_frames(output_dir: Path) -> None:
 
 
 def _probe_video_fps(video_path: Path) -> float:
-    try:
-        import cv2
-
-        capture = cv2.VideoCapture(str(video_path))
-        try:
-            fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
-            if fps > 0:
-                return fps
-        finally:
-            capture.release()
-    except Exception:
-        pass
     ffprobe = shutil.which("ffprobe")
     if ffprobe:
         try:
@@ -1342,6 +1420,18 @@ def _probe_video_fps(video_path: Path) -> float:
             return _parse_rate(stream.get("avg_frame_rate")) or _parse_rate(stream.get("r_frame_rate")) or 24.0
         except Exception:
             pass
+    try:
+        import cv2
+
+        capture = cv2.VideoCapture(str(video_path))
+        try:
+            fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+            if fps > 0:
+                return fps
+        finally:
+            capture.release()
+    except Exception:
+        pass
     return 24.0
 
 

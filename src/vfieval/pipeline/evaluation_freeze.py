@@ -14,22 +14,23 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from PIL import Image, ImageChops
+from PIL import Image
 
 from vfieval.alignment import materialize_aligned_rgb
 
 
 SOURCE_SLOTS = ("gt", "pred_a", "pred_b")
-OUTPUT_SLOTS = ("gt", "pred_a", "pred_b", "diff_a", "diff_b")
+OUTPUT_SLOTS = SOURCE_SLOTS
 OUTPUT_NAMES = {
     "gt": "reference",
     "pred_a": "method-a",
     "pred_b": "method-b",
-    "diff_a": "diff-a",
-    "diff_b": "diff-b",
 }
+FREEZE_PIPELINE_VERSION = "campaign-freeze-stream-v2"
 FFMPEG_TIMEOUT_SECONDS = 600.0
 TIMESTAMP_TOLERANCE_SECONDS = 1e-3
+_STREAMING_BACKEND_CACHE: dict[tuple[str, int, int], bool] = {}
+_STREAMING_BACKEND_CACHE_LOCK = threading.Lock()
 
 CancelCheck = Callable[[], Any]
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -71,13 +72,14 @@ def freeze_campaign_media(
     ffmpeg: str | Path | None = None,
     ffprobe: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Freeze one aligned GT/A/B item and its two Diffs into private media.
+    """Freeze one aligned GT/A/B item into private media.
 
     Video frames are read once per logical source frame and sent directly to
     bounded rawvideo sinks.  Eligible source MP4s may instead be privately
-    remuxed, but A and B always take that path as a pair.  Frame sequences are
-    written directly to their five final PNG directories with no intermediate
-    sequence.
+    remuxed, but A and B always take that path as a pair. Frame sequences are
+    written directly to their three final PNG directories with no intermediate
+    sequence. Diff media was never consumed by Campaign playback and is no
+    longer materialized in stream-v2 packages.
     """
 
     started = time.monotonic()
@@ -118,10 +120,12 @@ def freeze_campaign_media(
 
     ffmpeg_path = _resolve_executable("ffmpeg", ffmpeg)
     ffprobe_path = _resolve_executable("ffprobe", ffprobe)
+    backend_started = time.monotonic()
     if not streaming_backend_available(ffmpeg_path, cancel_check=cancel_check):
         raise FreezeBackendUnavailable("Campaign streaming freeze requires FFmpeg with libx264")
     if ffprobe_path is None:
         raise FreezeBackendUnavailable("Campaign streaming freeze requires ffprobe")
+    timings["backend_check"] = time.monotonic() - backend_started
 
     _check_cancel(cancel_check)
     _progress(
@@ -231,8 +235,10 @@ def freeze_campaign_media(
 
     stream_slots = [slot for slot in OUTPUT_SLOTS if slot not in remuxed]
     cpu_count = max(1, int(os.cpu_count() or 1))
-    thread_count = max(1, max(1, cpu_count - 1) // max(1, len(stream_slots)))
-    pipeline = "remux+stream" if remuxed else "streaming"
+    thread_count = (
+        max(1, max(1, cpu_count - 1) // len(stream_slots)) if stream_slots else 0
+    )
+    pipeline = "remux" if not stream_slots else "remux+stream" if remuxed else "streaming"
     sinks: dict[str, _RawVideoSink] = {}
     sink_failures = _SinkFailureState()
     materialize_started = time.monotonic()
@@ -278,24 +284,11 @@ def freeze_campaign_media(
             _check_cancel(cancel_check)
             images = {
                 slot: materialize_aligned_rgb(plan, slot, normalized_sources[slot][index])
-                for slot in SOURCE_SLOTS
+                for slot in stream_slots
             }
             try:
-                diff_a = ImageChops.difference(images["gt"], images["pred_a"])
-                diff_b = ImageChops.difference(images["gt"], images["pred_b"])
-                try:
-                    frame_images = {
-                        "gt": images["gt"],
-                        "pred_a": images["pred_a"],
-                        "pred_b": images["pred_b"],
-                        "diff_a": diff_a,
-                        "diff_b": diff_b,
-                    }
-                    for slot, sink in sinks.items():
-                        sink.write(frame_images[slot].tobytes())
-                finally:
-                    diff_a.close()
-                    diff_b.close()
+                for slot, sink in sinks.items():
+                    sink.write(images[slot].tobytes())
             finally:
                 for image in images.values():
                     image.close()
@@ -341,6 +334,13 @@ def freeze_campaign_media(
                 ffprobe=ffprobe_path,
                 cancel_check=cancel_check,
             )
+    except Exception:
+        _remove_outputs(paths.values())
+        raise
+    timings["output_validate"] = time.monotonic() - validation_started
+
+    source_stability_started = time.monotonic()
+    try:
         for slot, signature in signatures.items():
             _assert_source_signature_unchanged(
                 slot, signature, cancel_check=cancel_check
@@ -348,7 +348,7 @@ def freeze_campaign_media(
     except Exception:
         _remove_outputs(paths.values())
         raise
-    timings["validate"] = time.monotonic() - validation_started
+    timings["source_stability"] = time.monotonic() - source_stability_started
 
     hash_started = time.monotonic()
     _progress(
@@ -384,6 +384,7 @@ def freeze_campaign_media(
         force=True,
     )
     return {
+        "version": FREEZE_PIPELINE_VERSION,
         "pipeline": pipeline,
         "frame_count": frame_count,
         "width": width,
@@ -393,6 +394,8 @@ def freeze_campaign_media(
         "artifacts": artifacts,
         "timings": timings,
         "remux": eligibility,
+        "stream_slots": stream_slots,
+        "remuxed_slots": sorted(remuxed),
     }
 
 
@@ -445,21 +448,8 @@ def _freeze_frame_sequence(
                 for slot in SOURCE_SLOTS
             }
             try:
-                diff_a = ImageChops.difference(images["gt"], images["pred_a"])
-                diff_b = ImageChops.difference(images["gt"], images["pred_b"])
-                try:
-                    outputs = {
-                        "gt": images["gt"],
-                        "pred_a": images["pred_a"],
-                        "pred_b": images["pred_b"],
-                        "diff_a": diff_a,
-                        "diff_b": diff_b,
-                    }
-                    for slot, image in outputs.items():
-                        image.save(paths[slot] / f"{index:06d}.png", format="PNG")
-                finally:
-                    diff_a.close()
-                    diff_b.close()
+                for slot, image in images.items():
+                    image.save(paths[slot] / f"{index:06d}.png", format="PNG")
             finally:
                 for image in images.values():
                     image.close()
@@ -514,6 +504,7 @@ def _freeze_frame_sequence(
         force=True,
     )
     return {
+        "version": FREEZE_PIPELINE_VERSION,
         "pipeline": "png_sequence",
         "frame_count": frame_count,
         "width": width,
@@ -523,6 +514,8 @@ def _freeze_frame_sequence(
         "artifacts": artifacts,
         "timings": timings,
         "remux": {slot: {"eligible": False, "reasons": ["frame_sequence"]} for slot in SOURCE_SLOTS},
+        "stream_slots": list(SOURCE_SLOTS),
+        "remuxed_slots": [],
     }
 
 
@@ -559,18 +552,36 @@ def remux_eligibility(
 
     temporal = plan.get("temporal") or {}
     frame_count = int(temporal.get("frame_count") or 0)
-    if str(temporal.get("mode") or "") != "exact":
-        reasons.append("temporal mapping is not full identity")
-    if int(temporal.get("reference_frame_count") or 0) != frame_count:
-        reasons.append("reference frame count is not full identity")
-    if int(temporal.get("mapping_count") or 0) != frame_count:
-        reasons.append("temporal mapping count is not full identity")
-    if frame_count > 0 and (
-        int(temporal.get("mapping_first") or 0) != 0
-        or int(temporal.get("mapping_last") if temporal.get("mapping_last") is not None else -1)
-        != frame_count - 1
-    ):
-        reasons.append("temporal mapping endpoints are not full identity")
+    temporal_mode = str(temporal.get("mode") or "")
+    if slot == "gt":
+        if temporal_mode != "exact":
+            reasons.append("GT requires indexed temporal materialization")
+        if int(temporal.get("reference_frame_count") or 0) != frame_count:
+            reasons.append("reference frame count is not full identity")
+        if int(temporal.get("mapping_count") or 0) != frame_count:
+            reasons.append("temporal mapping count is not full identity")
+        if frame_count > 0 and (
+            int(temporal.get("mapping_first") or 0) != 0
+            or int(
+                temporal.get("mapping_last")
+                if temporal.get("mapping_last") is not None
+                else -1
+            )
+            != frame_count - 1
+        ):
+            reasons.append("temporal mapping endpoints are not full identity")
+    else:
+        if temporal_mode not in {"exact", "indexed"}:
+            reasons.append("prediction temporal mapping is unsupported")
+        prediction_counts = list(temporal.get("prediction_frame_counts") or [])
+        prediction_index = 0 if slot == "pred_a" else 1
+        if (
+            prediction_index >= len(prediction_counts)
+            or int(prediction_counts[prediction_index] or 0) != frame_count
+        ):
+            reasons.append("prediction source is not the complete aligned frame sequence")
+        if int(temporal.get("mapping_count") or 0) != frame_count:
+            reasons.append("prediction temporal mapping count is incomplete")
 
     expected_timestamps = _finite_timestamps(timestamps)
     if expected_timestamps is None or len(expected_timestamps) != frame_count:
@@ -613,10 +624,7 @@ def remux_eligibility(
     observed_timestamps = _finite_timestamps(probe.get("timestamps"))
     if observed_timestamps is None or len(observed_timestamps) != frame_count:
         reasons.append("ffprobe timestamps are unavailable or incomplete")
-    elif any(
-        abs(left - right) > TIMESTAMP_TOLERANCE_SECONDS
-        for left, right in zip(expected_timestamps, observed_timestamps)
-    ):
+    elif not _relative_timelines_match(expected_timestamps, observed_timestamps):
         reasons.append("source timestamps changed after alignment")
     return {"eligible": not reasons, "reasons": reasons, "probe": probe}
 
@@ -894,6 +902,27 @@ def streaming_backend_available(
     executable = _resolve_executable("ffmpeg", ffmpeg)
     if executable is None:
         return False
+    _check_cancel(cancel_check)
+    try:
+        stat = Path(executable).stat()
+        cache_key = (str(Path(executable).resolve()), int(stat.st_size), int(stat.st_mtime_ns))
+    except OSError:
+        return False
+    with _STREAMING_BACKEND_CACHE_LOCK:
+        cached = _STREAMING_BACKEND_CACHE.get(cache_key)
+        if cached is not None:
+            _check_cancel(cancel_check)
+            return bool(cached)
+        available = _probe_streaming_backend(executable, cancel_check=cancel_check)
+        _STREAMING_BACKEND_CACHE[cache_key] = bool(available)
+        return bool(available)
+
+
+def _probe_streaming_backend(
+    executable: str,
+    *,
+    cancel_check: CancelCheck | None = None,
+) -> bool:
     process: subprocess.Popen[bytes] | None = None
     try:
         process = subprocess.Popen(
@@ -916,6 +945,13 @@ def streaming_backend_available(
     finally:
         if process is not None:
             _terminate_process(process)
+
+
+def _clear_streaming_backend_cache() -> None:
+    """Clear process-local capability state for focused tests."""
+
+    with _STREAMING_BACKEND_CACHE_LOCK:
+        _STREAMING_BACKEND_CACHE.clear()
 
 
 class _SinkFailureState:
@@ -1210,6 +1246,23 @@ def _collect_remux_eligibility(
             ffprobe=ffprobe,
             cancel_check=cancel_check,
         )
+    if all(result[slot]["eligible"] for slot in ("pred_a", "pred_b")):
+        left_timestamps = _finite_timestamps(
+            (result["pred_a"].get("probe") or {}).get("timestamps")
+        )
+        right_timestamps = _finite_timestamps(
+            (result["pred_b"].get("probe") or {}).get("timestamps")
+        )
+        if (
+            left_timestamps is None
+            or right_timestamps is None
+            or not _relative_timelines_match(left_timestamps, right_timestamps)
+        ):
+            for slot in ("pred_a", "pred_b"):
+                result[slot]["eligible"] = False
+                result[slot]["reasons"].append(
+                    "paired prediction relative timelines do not match"
+                )
     if not all(result[slot]["eligible"] for slot in ("pred_a", "pred_b")):
         for slot in ("pred_a", "pred_b"):
             if result[slot]["eligible"]:
@@ -1487,6 +1540,30 @@ def _finite_timestamps(values: Any) -> list[float] | None:
             return None
         parsed.append(number)
     return parsed
+
+
+def _relative_timestamps(values: Sequence[float]) -> list[float]:
+    if not values:
+        return []
+    origin = float(values[0])
+    return [float(value) - origin for value in values]
+
+
+def _relative_timelines_match(
+    left: Sequence[float],
+    right: Sequence[float],
+    *,
+    tolerance: float = TIMESTAMP_TOLERANCE_SECONDS,
+) -> bool:
+    if len(left) != len(right):
+        return False
+    return all(
+        abs(left_value - right_value) <= float(tolerance)
+        for left_value, right_value in zip(
+            _relative_timestamps(left),
+            _relative_timestamps(right),
+        )
+    )
 
 
 def _timestamps_are_cfr(timestamps: list[float], durations: list[float], fps: float) -> bool:

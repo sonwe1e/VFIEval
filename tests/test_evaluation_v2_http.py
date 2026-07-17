@@ -432,6 +432,113 @@ class EvaluationCampaignV2HttpTests(unittest.TestCase):
             finally:
                 stop_server(server, thread)
 
+    def test_blind_review_routes_are_opaque_editable_then_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _run_a, _run_b, body = self._campaign_fixture(
+                workspace, db, prefix="review-http"
+            )
+            server, thread, base_url = start_server(db, workspace)
+            try:
+                detail = self._publish_http(base_url, body)
+                campaign_id = int(detail["campaign"]["id"])
+                token = str(detail["campaign"]["public_token"])
+                evaluator_id = "review-http-evaluator"
+                status, session = _json_request(
+                    base_url,
+                    f"/api/blind/{token}/session",
+                    method="POST",
+                    payload={"evaluator_id": evaluator_id, "display_name": "Reviewer"},
+                )
+                self.assertEqual(status, 201, session)
+                task_token = str(session["task"]["token"])
+                status, vote = _json_request(
+                    base_url,
+                    f"/api/blind/{token}/tasks/{task_token}/vote",
+                    method="POST",
+                    payload={
+                        "evaluator_id": evaluator_id,
+                        "choice": "left",
+                        "left_rating": 4.25,
+                        "right_rating": 2.5,
+                    },
+                )
+                self.assertEqual(status, 200, vote)
+
+                query_id = urllib.parse.quote(evaluator_id)
+                status, reviews = _json_request(
+                    base_url, f"/api/blind/{token}/reviews?evaluator_id={query_id}"
+                )
+                self.assertEqual(status, 200, reviews)
+                self.assertTrue(reviews["editable"])
+                self.assertEqual(len(reviews["reviews"]), 1)
+                self.assertEqual(reviews["reviews"][0]["task_token"], task_token)
+                status, reviewed = _json_request(
+                    base_url,
+                    f"/api/blind/{token}/reviews/{task_token}?evaluator_id={query_id}",
+                )
+                self.assertEqual(status, 200, reviewed)
+                self.assertFalse(reviewed["task"]["read_only"])
+                self.assertEqual(reviewed["task"]["vote"]["choice"], "left")
+                self.assertEqual(reviewed["task"]["vote"]["left_rating"], 4.25)
+                media_status, _media_headers, media_body = _request(
+                    base_url, reviewed["task"]["left_url"]
+                )
+                self.assertEqual(media_status, 200)
+                self.assertTrue(media_body)
+                serialized = json.dumps(
+                    {"reviews": reviews, "reviewed": reviewed},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                for forbidden in (
+                    '"method_id"',
+                    '"run_id"',
+                    '"model"',
+                    '"checkpoint"',
+                    '"asset_id"',
+                    '"assignment_id"',
+                    "Secret Method Alpha",
+                    "Secret Method Beta",
+                ):
+                    self.assertNotIn(forbidden, serialized)
+
+                other_id = "review-http-other"
+                _json_request(
+                    base_url,
+                    f"/api/blind/{token}/session",
+                    method="POST",
+                    payload={"evaluator_id": other_id, "display_name": "Other"},
+                )
+                status, _other = _json_request(
+                    base_url,
+                    f"/api/blind/{token}/reviews/{task_token}?evaluator_id={other_id}",
+                )
+                self.assertEqual(status, 404)
+
+                status, closed = _json_request(
+                    base_url,
+                    f"/api/evaluation-campaigns/v2/{campaign_id}/close",
+                    method="POST",
+                    payload={},
+                )
+                self.assertEqual(status, 200, closed)
+                status, closed_review = _json_request(
+                    base_url,
+                    f"/api/blind/{token}/reviews/{task_token}?evaluator_id={query_id}",
+                )
+                self.assertEqual(status, 200, closed_review)
+                self.assertTrue(closed_review["task"]["read_only"])
+                status, rejected = _json_request(
+                    base_url,
+                    f"/api/blind/{token}/tasks/{task_token}/vote",
+                    method="POST",
+                    payload={"evaluator_id": evaluator_id, "choice": "tie"},
+                )
+                self.assertEqual(status, 400, rejected)
+            finally:
+                stop_server(server, thread)
+
 
 if __name__ == "__main__":
     unittest.main()

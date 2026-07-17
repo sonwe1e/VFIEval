@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from PIL import Image, ImageChops
+from PIL import Image
 
 from vfieval.alignment import materialize_aligned_rgb, plan_alignment
 from vfieval.pipeline import evaluation_freeze
@@ -47,6 +47,20 @@ def _frames(root: Path, slot: str, colors: list[tuple[int, int, int]], size=(8, 
 
 
 class CampaignFreezePipelineTests(unittest.TestCase):
+    def test_streaming_backend_capability_probe_is_cached_per_executable_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "ffmpeg.exe"
+            executable.write_bytes(b"fake ffmpeg")
+            evaluation_freeze._clear_streaming_backend_cache()
+            with patch.object(
+                evaluation_freeze, "_resolve_executable", return_value=str(executable)
+            ), patch.object(
+                evaluation_freeze, "_probe_streaming_backend", return_value=True
+            ) as probe:
+                self.assertTrue(evaluation_freeze.streaming_backend_available())
+                self.assertTrue(evaluation_freeze.streaming_backend_available())
+            self.assertEqual(probe.call_count, 1)
+
     def test_in_memory_alignment_uses_strict_dimensions_and_lanczos(self) -> None:
         plan = _plan(frame_count=1, gt_size=(16, 12))
         with tempfile.TemporaryDirectory() as temporary:
@@ -108,7 +122,7 @@ class CampaignFreezePipelineTests(unittest.TestCase):
                     progress_callback=progress.append,
                 )
             self.assertEqual(materialize.call_count, 6)
-            self.assertEqual(digest.call_count, 5)
+            self.assertEqual(digest.call_count, 3)
             self.assertEqual(set(result["artifacts"]), set(evaluation_freeze.OUTPUT_SLOTS))
             self.assertTrue(all(item["mode"] == "png_sequence" for item in result["artifacts"].values()))
             self.assertEqual(progress[-1]["stage"], "completed")
@@ -171,7 +185,7 @@ class CampaignFreezePipelineTests(unittest.TestCase):
                     )
             self.assertFalse(any(output.iterdir()))
 
-    def test_video_streams_five_outputs_with_a_single_source_read_per_frame(self) -> None:
+    def test_video_streams_three_outputs_with_a_single_source_read_per_frame(self) -> None:
         plan = _plan()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -233,7 +247,7 @@ class CampaignFreezePipelineTests(unittest.TestCase):
                     ffprobe=sys.executable,
                 )
             self.assertEqual(materialize.call_count, 6)
-            self.assertEqual(len(FakeSink.instances), 5)
+            self.assertEqual(len(FakeSink.instances), 3)
             self.assertTrue(all(len(sink.frames) == 2 for sink in FakeSink.instances))
             self.assertTrue(all(sink.kwargs["threads"] == result["encoder_threads"] for sink in FakeSink.instances))
             self.assertEqual(result["pipeline"], "streaming")
@@ -385,10 +399,10 @@ class CampaignFreezePipelineTests(unittest.TestCase):
                 )
                 self.assertEqual(probe["codec"], "h264")
 
-            decoded = {}
             ffmpeg = shutil.which("ffmpeg")
             assert ffmpeg is not None
-            for slot in ("gt", "pred_a", "diff_a"):
+            decoded = {}
+            for slot in evaluation_freeze.SOURCE_SLOTS:
                 frame = root / f"decoded-{slot}.png"
                 subprocess.run(
                     [
@@ -407,20 +421,9 @@ class CampaignFreezePipelineTests(unittest.TestCase):
                 with Image.open(frame) as image:
                     decoded[slot] = image.convert("RGB")
                     decoded[slot].load()
-            try:
-                expected_diff = ImageChops.difference(decoded["gt"], decoded["pred_a"])
-                try:
-                    residual = ImageChops.difference(expected_diff, decoded["diff_a"])
-                    try:
-                        max_error = max(high for _low, high in residual.getextrema())
-                    finally:
-                        residual.close()
-                finally:
-                    expected_diff.close()
-                self.assertLessEqual(max_error, 12)
-            finally:
-                for image in decoded.values():
-                    image.close()
+            self.assertEqual(set(decoded), set(evaluation_freeze.SOURCE_SLOTS))
+            for image in decoded.values():
+                image.close()
 
     @unittest.skipUnless(
         shutil.which("ffprobe") and evaluation_freeze.streaming_backend_available(),
@@ -463,12 +466,11 @@ class CampaignFreezePipelineTests(unittest.TestCase):
                 source_timestamps={slot: probe["timestamps"] for slot, probe in probes.items()},
                 expected_source_sha256=expected_sha256,
             )
-            self.assertEqual(second["pipeline"], "remux+stream")
+            self.assertEqual(second["pipeline"], "remux")
             self.assertEqual(second["artifacts"]["gt"]["mode"], "remux")
             self.assertEqual(second["artifacts"]["pred_a"]["mode"], "remux")
             self.assertEqual(second["artifacts"]["pred_b"]["mode"], "remux")
-            self.assertEqual(second["artifacts"]["diff_a"]["mode"], "stream")
-            self.assertEqual(second["artifacts"]["diff_b"]["mode"], "stream")
+            self.assertEqual(set(second["artifacts"]), set(evaluation_freeze.SOURCE_SLOTS))
 
     def test_remux_eligibility_rejects_rotation_and_non_identity(self) -> None:
         plan = _plan()
@@ -498,6 +500,66 @@ class CampaignFreezePipelineTests(unittest.TestCase):
                 )
         self.assertFalse(result["eligible"])
         self.assertIn("rotation metadata is not zero", result["reasons"])
+
+    def test_indexed_alignment_remuxes_complete_prediction_pair_but_not_gt(self) -> None:
+        plan = _plan(frame_count=3)
+        plan["temporal"].update(
+            {
+                "mode": "indexed",
+                "reference_frame_count": 5,
+                "frame_count": 3,
+                "prediction_frame_counts": [3, 3],
+                "mapping_count": 3,
+                "mapping_first": 0,
+                "mapping_last": 4,
+                "fps": 5.0,
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_media = {}
+            for slot in evaluation_freeze.SOURCE_SLOTS:
+                source_media[slot] = root / f"{slot}.mp4"
+                source_media[slot].write_bytes(slot.encode("ascii"))
+            source_timestamps = {
+                "gt": [0.0, 0.2, 0.4, 0.6, 0.8],
+                "pred_a": [10.0, 10.2, 10.4],
+                "pred_b": [20.0, 20.2, 20.4],
+            }
+
+            def probe(path, **_kwargs):
+                slot = Path(path).stem
+                return {
+                    "codec": "h264",
+                    "pix_fmt": "yuv420p",
+                    "rotation_degrees": 0.0,
+                    "width": 8,
+                    "height": 6,
+                    "frame_count": 3,
+                    "fps": 5.0,
+                    "cfr": True,
+                    "timestamps": source_timestamps[slot],
+                }
+
+            with patch.object(
+                evaluation_freeze, "probe_video_for_freeze", side_effect=probe
+            ) as probe_call:
+                result = evaluation_freeze._collect_remux_eligibility(
+                    plan,
+                    source_media,
+                    source_timestamps,
+                    expected_source_sha256={slot: slot * 64 for slot in source_media},
+                    fps=5.0,
+                    ffprobe=sys.executable,
+                )
+
+        self.assertFalse(result["gt"]["eligible"])
+        self.assertIn(
+            "GT requires indexed temporal materialization", result["gt"]["reasons"]
+        )
+        self.assertTrue(result["pred_a"]["eligible"])
+        self.assertTrue(result["pred_b"]["eligible"])
+        self.assertEqual(probe_call.call_count, 2)
 
     def test_missing_trusted_digest_disables_remux_without_probing(self) -> None:
         plan = _plan()

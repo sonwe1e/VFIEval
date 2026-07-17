@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import tempfile
 import sys
+import threading
+import time
 import unittest
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -17,13 +21,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from vfieval.evaluations_v2 import (
     EvaluationConflict,
+    SourceChanged,
+    _capture_source_tree_guard,
+    _objective_by_method,
+    _objective_metric_snapshot,
+    _validate_final_campaign_sources,
     blind_heartbeat,
     blind_media_asset,
     blind_payload,
+    blind_review_task,
+    blind_reviews,
     blind_session,
     blind_submit_vote,
     campaign_analysis_v2,
     campaign_export_v2,
+    close_campaign_v2,
     create_campaign_v2,
     get_campaign_v2,
     get_preparation_v2,
@@ -35,6 +47,7 @@ from vfieval.evaluations_v2 import (
 )
 from vfieval.evaluations import add_candidate, create_campaign, publish_campaign
 from vfieval.media_assets import (
+    bind_metric_result,
     create_collection,
     ensure_collection,
     get_asset,
@@ -46,6 +59,7 @@ from vfieval.media_items import (
     bind_run_source,
     ensure_canonical_gt_item,
     list_item_predictions,
+    register_external_prediction,
 )
 from vfieval.run_cleanup import RunCleanupService
 
@@ -84,6 +98,295 @@ class _FakeRawVideoSink:
 
 
 class EvaluationCampaignV2Tests(unittest.TestCase):
+    def test_final_campaign_source_validation_catches_earlier_item_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "item-one.mp4"
+            source.write_bytes(b"0123456789abcdef")
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            stat = source.stat()
+            guarded_source = {
+                "decode_cache": {
+                    "source_path": source,
+                    "source_sha256": digest,
+                    "source_size_bytes": stat.st_size,
+                    "source_mtime_ns": stat.st_mtime_ns,
+                }
+            }
+            guarded_asset = {"content_sha256": digest}
+            source.write_bytes(b"fedcba9876543210")
+            os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+            with self.assertRaisesRegex(SourceChanged, "source changed"):
+                _validate_final_campaign_sources(
+                    [(guarded_source, guarded_asset, "Item one Method A")]
+                )
+
+    def test_final_campaign_source_validation_hashes_frame_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "frames"
+            source.mkdir()
+            frame = source / "000000.png"
+            frame.write_bytes(b"frame-before")
+            guarded_source = {"source_tree_guard": _capture_source_tree_guard(source)}
+            frame.write_bytes(b"frame-after!")
+            with self.assertRaisesRegex(SourceChanged, "frame source changed"):
+                _validate_final_campaign_sources(
+                    [(guarded_source, {}, "Item one GT")]
+                )
+
+    def test_objective_snapshot_merges_shards_and_keeps_latest_real_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            run_id, _other_run, _body, _paths = self._two_runs(workspace, db)
+            run = db.get_run(run_id)
+            inference_job_id = int(run["inference_job_id"])
+            dataset_id = int(run["dataset_id"])
+            first_sample = db.query(
+                "SELECT id FROM samples WHERE dataset_id = ? ORDER BY id", (dataset_id,)
+            )[0]
+            sample_ids = [int(first_sample["id"])]
+            for index in (1, 2, 3):
+                sample_ids.append(
+                    db.add_sample(
+                        dataset_id,
+                        f"clip_{index:06d}",
+                        str(_paths[1]),
+                        str(_paths[1]),
+                        str(_paths[0]),
+                        {"video_name": "clip", "frame_index": index},
+                    )
+                )
+            unrelated_sample = db.add_sample(
+                dataset_id,
+                "other_000000",
+                str(_paths[1]),
+                str(_paths[1]),
+                str(_paths[0]),
+                {"video_name": "other", "frame_index": 0},
+            )
+            asset_id = int(
+                db.get(
+                    """
+                    SELECT asset_id FROM run_media_assets
+                    WHERE run_id = ? AND role = 'pred' AND video_name = 'clip'
+                    """,
+                    (run_id,),
+                )["asset_id"]
+            )
+            with db.connection() as conn:
+                conn.execute(
+                    "UPDATE runs SET metrics_json = ? WHERE id = ?",
+                    (json.dumps(["lpips_vit_patch"]), run_id),
+                )
+
+            old_job = db.add_run_job(
+                run_id,
+                "metric",
+                {"metric_names": ["lpips_vit_patch"], "metric_wave_id": "old"},
+                shard_index=0,
+                device="npu:0",
+            )
+            shard_a = db.add_run_job(
+                run_id,
+                "metric",
+                {"metric_names": ["lpips_vit_patch"], "metric_wave_id": "good"},
+                shard_index=0,
+                device="npu:0",
+            )
+            shard_b = db.add_run_job(
+                run_id,
+                "metric",
+                {"metric_names": ["lpips_vit_patch"], "metric_wave_id": "good"},
+                shard_index=1,
+                device="npu:1",
+            )
+            with db.connection() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status = 'completed' WHERE id IN (?, ?, ?)",
+                    (old_job, shard_a, shard_b),
+                )
+
+            def add_result(job_id, sample_id, status, value, details, *, bind):
+                result_id = db.add_metric_result(
+                    job_id,
+                    inference_job_id,
+                    sample_id,
+                    "lpips_vit_patch",
+                    status,
+                    value,
+                    details,
+                )
+                if bind:
+                    bind_metric_result(
+                        db,
+                        result_id,
+                        None,
+                        asset_id,
+                        video_name="clip",
+                    )
+                return result_id
+
+            add_result(
+                old_job,
+                sample_ids[0],
+                "unavailable",
+                None,
+                {"reason": "stale unavailable"},
+                bind=True,
+            )
+            add_result(shard_a, sample_ids[0], "completed", 0.2, {}, bind=True)
+            add_result(shard_b, sample_ids[1], "completed", 0.4, {}, bind=True)
+            add_result(
+                shard_a,
+                sample_ids[2],
+                "unavailable",
+                None,
+                {"reason": "bound frame unavailable"},
+                bind=True,
+            )
+            add_result(
+                shard_b,
+                sample_ids[3],
+                "unavailable",
+                None,
+                {"reason": "lpips_vit unavailable: frame 3"},
+                bind=False,
+            )
+            add_result(
+                shard_b,
+                unrelated_sample,
+                "unavailable",
+                None,
+                {"reason": "unrelated video failure"},
+                bind=False,
+            )
+            global_result = add_result(
+                shard_b,
+                None,
+                "unavailable",
+                None,
+                {"reason": "global startup failure"},
+                bind=False,
+            )
+            bind_metric_result(db, global_result, None, None, video_name="")
+
+            failed_a = db.add_run_job(
+                run_id,
+                "metric",
+                {"metric_names": ["lpips_vit_patch"], "metric_wave_id": "failed"},
+                shard_index=0,
+                device="npu:0",
+            )
+            failed_b = db.add_run_job(
+                run_id,
+                "metric",
+                {"metric_names": ["lpips_vit_patch"], "metric_wave_id": "failed"},
+                shard_index=1,
+                device="npu:1",
+            )
+            with db.connection() as conn:
+                conn.execute(
+                    "UPDATE jobs SET status = 'failed', error_json = ? WHERE id = ?",
+                    (json.dumps({"message": "root shard failed"}), failed_a),
+                )
+                conn.execute(
+                    "UPDATE jobs SET status = 'canceled', error_json = ? WHERE id = ?",
+                    (json.dumps({"message": "sibling canceled"}), failed_b),
+                )
+
+            methods = {
+                1: {"id": 1, "source_run_id": run_id, "label_snapshot": "Method A"}
+            }
+            bindings = [
+                {
+                    "source_asset_id": asset_id,
+                    "method_id": 1,
+                    "video_name": "clip",
+                    "expected_frame_count": 4,
+                }
+            ]
+            before_identity_fill = _objective_metric_snapshot(db, bindings, methods)
+            bind_metric_result(db, global_result, None, None, video_name="other")
+            snapshot = _objective_metric_snapshot(db, bindings, methods)
+            self.assertNotEqual(before_identity_fill["fingerprint"], snapshot["fingerprint"])
+            selected = sorted(snapshot["rows"], key=lambda row: int(row["sample_id"]))
+            self.assertEqual(
+                [row["status"] for row in selected],
+                ["completed", "completed", "unavailable"],
+            )
+            self.assertEqual(
+                [float(row["value"]) for row in selected if row["value"] is not None],
+                [0.2, 0.4],
+            )
+            self.assertNotIn(
+                (run_id, "lpips_vit_patch", "other"),
+                snapshot["result_fallback_reasons"],
+            )
+            self.assertEqual(
+                snapshot["job_fallback_reasons"][(run_id, "lpips_vit_patch", "")],
+                Counter({"root shard failed": 1, "sibling canceled": 1}),
+            )
+            objective = _objective_by_method(
+                db, bindings, methods, snapshot=snapshot
+            )
+            item = objective["items"][0]
+            self.assertEqual(item["status"], "unavailable")
+            self.assertEqual(item["frame_coverage"], {"expected": 4, "observed": 3, "completed": 2})
+            self.assertEqual(item["reason_counts"]["bound frame unavailable"], 1)
+            self.assertEqual(item["reason_counts"]["lpips_vit unavailable: frame 3"], 1)
+            self.assertNotIn("stale unavailable", item["reason_counts"])
+            self.assertNotIn("root shard failed", item["reason_counts"])
+            self.assertNotIn("unrelated video failure", item["reason_counts"])
+
+    def test_objective_statistics_weight_items_not_frame_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _workspace, db = make_workspace(tmp)
+            methods = {
+                1: {"id": 1, "source_run_id": 10, "label_snapshot": "Method A"}
+            }
+            bindings = [
+                {
+                    "source_asset_id": 101,
+                    "method_id": 1,
+                    "video_name": "short",
+                    "expected_frame_count": 2,
+                },
+                {
+                    "source_asset_id": 102,
+                    "method_id": 1,
+                    "video_name": "long",
+                    "expected_frame_count": 4,
+                },
+            ]
+            rows = []
+            row_id = 0
+            for asset_id, values in ((101, [0.0, 0.0]), (102, [1.0] * 4)):
+                for sample_id, value in enumerate(values):
+                    row_id += 1
+                    rows.append(
+                        {
+                            "id": row_id,
+                            "distorted_asset_id": asset_id,
+                            "metric_name": "lpips_vit_patch",
+                            "sample_id": asset_id * 10 + sample_id,
+                            "status": "completed",
+                            "value": value,
+                            "details": {},
+                        }
+                    )
+            snapshot = {
+                "asset_to_binding": {row["source_asset_id"]: row for row in bindings},
+                "rows": rows,
+                "run_states": {10: {"metrics": ["lpips_vit_patch"]}},
+                "fingerprint": "fixture",
+                "producer_state": [],
+            }
+            objective = _objective_by_method(db, bindings, methods, snapshot=snapshot)
+            metric = objective["metrics"][0]
+            self.assertEqual(metric["item_count"], 2)
+            self.assertEqual(metric["count"], 2)
+            self.assertEqual(metric["mean"], 0.5)
+            self.assertEqual(metric["frame_coverage"]["completed"], 6)
+
     def _upload_asset(self, db, collection_id, path, role, name):
         return upsert_asset(
             db,
@@ -290,7 +593,7 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
         )
         return plan, sources
 
-    def test_item_mode_publish_materializes_alignment_diff_and_frozen_members(self) -> None:
+    def test_item_mode_publish_materializes_three_streams_and_frozen_members(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace, db = make_workspace(tmp)
             item, body, source_paths = self._item_campaign(workspace, db)
@@ -316,7 +619,7 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             freeze_report = manifest_item["freeze_pipeline"]
             self.assertEqual(
                 set(freeze_report["outputs"]),
-                {"gt", "pred_a", "pred_b", "diff_a", "diff_b"},
+                {"gt", "pred_a", "pred_b"},
             )
             self.assertTrue(
                 all(output["mode"] for output in freeze_report["outputs"].values())
@@ -325,8 +628,7 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             self.assertFalse(list(package.rglob("*.png")))
             for method in manifest_item["methods"]:
                 self.assertTrue((package / method["path"]).is_file())
-                self.assertTrue((package / method["diff"]["path"]).is_file())
-                self.assertTrue(method["diff"]["sha256"])
+                self.assertNotIn("diff", method)
 
             preparation = get_preparation_v2(db, int(draft["id"]))
             self.assertEqual(preparation["state"], "completed")
@@ -334,7 +636,7 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             self.assertEqual(preparation["report"]["total"], 1)
             self.assertEqual(preparation["report"]["stage"], "completed")
             self.assertEqual(preparation["report"]["overall_fraction"], 1.0)
-            self.assertEqual(preparation["report"]["pipeline"], "campaign-freeze-stream-v1")
+            self.assertEqual(preparation["report"]["pipeline"], "campaign-freeze-stream-v2")
 
             frozen_assets = db.query(
                 "SELECT * FROM media_assets WHERE source_kind = 'evaluation_package' ORDER BY id"
@@ -620,7 +922,7 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             self.assertEqual(result["artifacts"]["pred_b"]["mode"], "remux")
             self.assertEqual(
                 {sink.path.name for sink in _FakeRawVideoSink.instances},
-                {"reference.mp4", "diff-a.mp4", "diff-b.mp4"},
+                {"reference.mp4"},
             )
             for slot in ("pred_a", "pred_b"):
                 frozen_path = Path(result["artifacts"][slot]["path"])
@@ -781,32 +1083,38 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
                 fps=5,
             )
             item = ensure_canonical_gt_item(db, int(gt_asset["id"]))
-            runs: list[int] = []
+            method_keys: list[str] = []
             for slot, color in (("a", (0, 1, 0)), ("b", (0, 0, 1))):
-                pred = write_mp4(
-                    workspace.runs_dir / f"frame-sequence-{slot}" / "pred.mp4",
-                    [color, color, color],
-                    size=(8, 8),
-                    fps=5,
-                )
-                run_id = add_completed_pred_run(
+                pred_dir = workspace.media_dir / f"frame-sequence-{slot}"
+                pred_dir.mkdir(parents=True, exist_ok=True)
+                for index in range(3):
+                    Image.new("RGB", (8, 8), color).save(pred_dir / f"{index:06d}.png")
+                pred_asset = upsert_asset(
                     db,
-                    workspace,
-                    f"frame-sequence-{slot}",
-                    pred,
-                    video_name="clip",
-                    size=(8, 8),
+                    collection_id=int(collection["id"]),
+                    source_key=f"upload:frame-sequence-{slot}",
+                    source_kind="upload",
+                    media_kind="frame_sequence",
+                    role="pred",
+                    display_name=f"frame-sequence-{slot}",
+                    original_name=f"frame-sequence-{slot}",
+                    storage_path=pred_dir,
+                    frame_count=3,
+                    width=8,
+                    height=8,
                     fps=5,
                 )
-                bind_run_source(db, run_id, int(item["id"]), video_name="clip")
-                sync_run_assets(db, workspace, run_id)
-                runs.append(run_id)
+                method_key = f"external:frame-sequence-{slot}"
+                register_external_prediction(
+                    db, int(item["id"]), int(pred_asset["id"]), method_key=method_key
+                )
+                method_keys.append(method_key)
             body = {
                 "name": "frame-sequence-campaign",
                 "public_title": "Frame sequence campaign",
                 "media_item_ids": [int(item["id"])],
-                "method_a": {"kind": "run", "run_id": runs[0]},
-                "method_b": {"kind": "run", "run_id": runs[1]},
+                "method_a": {"kind": "external", "method_key": method_keys[0]},
+                "method_b": {"kind": "external", "method_key": method_keys[1]},
             }
             published = publish_campaign_v2(
                 db,
@@ -1154,6 +1462,127 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             source_pred.write_bytes(b"source bytes changed after publish")
             self.assertEqual(frozen_pred.read_bytes(), before)
 
+    def test_optional_ratings_map_through_swap_and_reviews_update_in_place(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _run_a, _run_b, body, _paths = self._two_runs(workspace, db)
+            campaign = publish_campaign_v2(
+                db, workspace, create_campaign_v2(db, workspace, body)["id"]
+            )
+            token = str(campaign["public_token"])
+            session = blind_session(
+                db,
+                token,
+                {"evaluator_id": "ratings-browser", "display_name": "Ratings Tester"},
+            )
+            task = session["task"]
+            self.assertIsNotNone(task)
+
+            for invalid in (0.75, 5.25, 1.1, float("nan"), True, [4], {"value": 4}):
+                with self.assertRaisesRegex(ValueError, "0.25 steps"):
+                    blind_submit_vote(
+                        db,
+                        token,
+                        task["token"],
+                        "ratings-browser",
+                        {"choice": "left", "left_rating": invalid},
+                    )
+
+            blind_submit_vote(
+                db,
+                token,
+                task["token"],
+                "ratings-browser",
+                {
+                    "choice": "left",
+                    "left_rating": 4.25,
+                    "right_rating": None,
+                    "confidence": "medium",
+                    "note": "first",
+                },
+            )
+            stored = db.get(
+                """
+                SELECT v.*, a.side_swap
+                FROM evaluation_votes_v2 v
+                JOIN evaluation_assignments_v2 a ON a.id = v.assignment_id
+                WHERE v.evaluator_id = ?
+                """,
+                ("ratings-browser",),
+            )
+            self.assertIsNotNone(stored)
+            if int(stored["side_swap"]):
+                self.assertIsNone(stored["rating_a"])
+                self.assertEqual(float(stored["rating_b"]), 4.25)
+            else:
+                self.assertEqual(float(stored["rating_a"]), 4.25)
+                self.assertIsNone(stored["rating_b"])
+
+            listed = blind_reviews(db, token, "ratings-browser")
+            self.assertTrue(listed["editable"])
+            self.assertEqual(len(listed["reviews"]), 1)
+            self.assertEqual(listed["reviews"][0]["vote"]["left_rating"], 4.25)
+            self.assertIsNone(listed["reviews"][0]["vote"]["right_rating"])
+            reviewed = blind_review_task(db, token, task["token"], "ratings-browser")
+            self.assertTrue(reviewed["task"]["review"])
+            self.assertFalse(reviewed["task"]["read_only"])
+            self.assertEqual(reviewed["task"]["vote"]["choice"], "left")
+            serialized_reviews = json.dumps(
+                {"listed": listed, "reviewed": reviewed}, sort_keys=True
+            )
+            for forbidden in (
+                "method_id",
+                "run_id",
+                "model",
+                "checkpoint",
+                "asset_id",
+                "assignment_id",
+            ):
+                self.assertNotIn(forbidden, serialized_reviews)
+            blind_session(
+                db,
+                token,
+                {"evaluator_id": "other-browser", "display_name": "Other Tester"},
+            )
+            with self.assertRaises(KeyError):
+                blind_review_task(db, token, task["token"], "other-browser")
+
+            blind_submit_vote(
+                db,
+                token,
+                task["token"],
+                "ratings-browser",
+                {"choice": "right", "left_rating": None, "right_rating": 2.5},
+            )
+            self.assertEqual(
+                int(db.get("SELECT COUNT(*) AS count FROM evaluation_votes_v2")["count"]),
+                1,
+            )
+            updated = blind_review_task(db, token, task["token"], "ratings-browser")
+            self.assertEqual(updated["task"]["vote"]["choice"], "right")
+            self.assertIsNone(updated["task"]["vote"]["left_rating"])
+            self.assertEqual(updated["task"]["vote"]["right_rating"], 2.5)
+
+            analysis = campaign_analysis_v2(db, int(campaign["id"]), bootstrap_samples=0)
+            self.assertEqual(sum(row["count"] for row in analysis["ratings"]["methods"]), 1)
+            self.assertEqual(
+                [value for row in analysis["ratings"]["methods"] for value in [row["mean"]] if value is not None],
+                [2.5],
+            )
+
+            close_campaign_v2(db, int(campaign["id"]))
+            self.assertFalse(blind_reviews(db, token, "ratings-browser")["editable"])
+            closed_review = blind_review_task(db, token, task["token"], "ratings-browser")
+            self.assertTrue(closed_review["task"]["read_only"])
+            with self.assertRaisesRegex(ValueError, "not accepting votes"):
+                blind_submit_vote(
+                    db,
+                    token,
+                    task["token"],
+                    "ratings-browser",
+                    {"choice": "tie"},
+                )
+
     def test_superseded_preparation_claim_cannot_publish_or_clear_new_owner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace, db = make_workspace(tmp)
@@ -1241,6 +1670,47 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             completed = run_pending_preparations(db, workspace)
             self.assertEqual(completed, [{"campaign_id": campaign["id"], "status": "published"}])
             self.assertEqual(get_preparation_v2(db, campaign["id"])["state"], "completed")
+
+    def test_preparation_runner_serializes_concurrent_process_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            first_entered = threading.Event()
+            release_first = threading.Event()
+            state_lock = threading.Lock()
+            active = 0
+            max_active = 0
+            calls = 0
+
+            def fake_runner(*_args, **_kwargs):
+                nonlocal active, max_active, calls
+                with state_lock:
+                    calls += 1
+                    call_number = calls
+                    active += 1
+                    max_active = max(max_active, active)
+                try:
+                    if call_number == 1:
+                        first_entered.set()
+                        self.assertTrue(release_first.wait(5))
+                    return [{"call": call_number}]
+                finally:
+                    with state_lock:
+                        active -= 1
+
+            with patch(
+                "vfieval.evaluations_v2._run_pending_preparations_locked",
+                side_effect=fake_runner,
+            ):
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    first = pool.submit(run_pending_preparations, db, workspace)
+                    self.assertTrue(first_entered.wait(5))
+                    second = pool.submit(run_pending_preparations, db, workspace)
+                    time.sleep(0.1)
+                    self.assertFalse(second.done())
+                    release_first.set()
+                    self.assertEqual(first.result(timeout=5), [{"call": 1}])
+                    self.assertEqual(second.result(timeout=5), [{"call": 2}])
+            self.assertEqual(max_active, 1)
 
     def test_run_purge_keeps_published_frozen_campaign_playable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

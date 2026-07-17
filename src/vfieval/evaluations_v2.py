@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import quote
 
-from PIL import Image, ImageChops
+from PIL import Image
 
 from vfieval.compare_inputs import (
     inspect_compare_path,
@@ -31,6 +31,7 @@ from vfieval.db import Database, utc_ts
 from vfieval.evaluations import CONFIDENCE_VALUES, METRIC_DIRECTIONS, QUALITY_REASONS
 from vfieval.media_assets import get_asset, resolve_asset_path, slugify, sync_run_assets
 from vfieval.media_items import (
+    _assert_reusable_compare_prediction,
     get_media_item,
     list_item_predictions,
     list_methods_for_items,
@@ -38,6 +39,7 @@ from vfieval.media_items import (
     resolve_item_reference,
 )
 from vfieval.pipeline.evaluation_freeze import (
+    FREEZE_PIPELINE_VERSION,
     FreezeBackendUnavailable,
     FreezeCancelled,
     SourceChanged,
@@ -155,6 +157,8 @@ CREATE TABLE IF NOT EXISTS evaluation_votes_v2 (
     assignment_id INTEGER NOT NULL REFERENCES evaluation_assignments_v2(id) ON DELETE RESTRICT,
     choice TEXT NOT NULL CHECK(choice IN ('left', 'right', 'tie')),
     preferred_method_id INTEGER REFERENCES evaluation_methods_v2(id) ON DELETE SET NULL,
+    rating_a REAL,
+    rating_b REAL,
     reasons_json TEXT NOT NULL DEFAULT '[]',
     confidence TEXT NOT NULL DEFAULT '',
     note TEXT NOT NULL DEFAULT '',
@@ -196,6 +200,7 @@ class EvaluationConflict(ValueError):
 
 
 PREPARATION_CLAIM_STALE_SECONDS = 10 * 60
+_PREPARATION_RUNNER_LOCK = threading.Lock()
 
 
 def _json(value: Any) -> str:
@@ -244,6 +249,14 @@ def ensure_v2_schema(db: Database) -> None:
             conn.execute("ALTER TABLE evaluation_bindings_v2 ADD COLUMN source_member_id INTEGER")
         if "frozen_member_id" not in binding_columns:
             conn.execute("ALTER TABLE evaluation_bindings_v2 ADD COLUMN frozen_member_id INTEGER")
+        vote_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(evaluation_votes_v2)").fetchall()
+        }
+        if "rating_a" not in vote_columns:
+            conn.execute("ALTER TABLE evaluation_votes_v2 ADD COLUMN rating_a REAL")
+        if "rating_b" not in vote_columns:
+            conn.execute("ALTER TABLE evaluation_votes_v2 ADD COLUMN rating_b REAL")
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_eval_items_v2_media_item "
             "ON evaluation_items_v2(media_item_id, campaign_id)"
@@ -809,8 +822,26 @@ def _campaign_item_alignment(
     item_id: int,
     predictions: list[dict[str, Any]],
     spatial_policy: dict[str, Any],
+    *,
+    timings_out: dict[str, float] | None = None,
+    progress_callback: Any = None,
 ) -> tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]]]:
     from vfieval.datasets import _load_compare_source_frames_with_cache
+
+    timings: dict[str, float] = defaultdict(float)
+
+    def report(stage: str) -> None:
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": stage,
+                    "frame_current": 0,
+                    "frame_total": 0,
+                    "pipeline": FREEZE_PIPELINE_VERSION,
+                    "timings": dict(timings),
+                    "force": True,
+                }
+            )
 
     def available_timestamps(values: list[float | None] | None) -> list[float] | None:
         if not values or any(value is None for value in values):
@@ -824,21 +855,64 @@ def _campaign_item_alignment(
             width, height = image.size
         return int(width), int(height)
 
-    reference = resolve_compare_descriptor(
-        workspace,
-        db,
-        {"kind": "media_item", "item_id": int(item_id)},
-        role="reference",
+    def descriptor(
+        semantic_item: dict[str, Any],
+        member: dict[str, Any],
+        asset: dict[str, Any],
+        path: Path,
+    ) -> dict[str, Any]:
+        temporal = dict(member.get("temporal_mapping") or {})
+        metadata = dict(member.get("metadata") or {})
+        fps_value = temporal.get("fps")
+        if fps_value in {None, ""}:
+            fps_value = member.get("fps") or asset.get("fps") or semantic_item.get("fps")
+        return {
+            "path": str(path.resolve()),
+            "item_id": int(semantic_item["id"]),
+            "member_id": int(member["id"]),
+            "asset_id": int(asset["id"]),
+            "member_role": member.get("member_role"),
+            "producer_kind": member.get("producer_kind"),
+            "source_kind": asset.get("source_kind"),
+            "spatial_origin": dict(member.get("spatial_origin") or {}),
+            "allow_aspect_stretch": bool(metadata.get("aspect_stretch_confirmed")),
+            "temporal_mapping": temporal,
+            "source_frame_indices": temporal.get("source_frame_indices"),
+            "timestamps": temporal.get("timestamps"),
+            "fps": float(fps_value) if fps_value not in {None, ""} else None,
+        }
+
+    report("alignment_resolve")
+    resolve_started = time.monotonic()
+    reference_item, reference_member, reference_asset, reference_path = resolve_item_reference(
+        db, workspace, int(item_id)
     )
-    resolved_predictions = [
-        resolve_compare_descriptor(
-            workspace,
+    reference = descriptor(reference_item, reference_member, reference_asset, reference_path)
+    resolved_predictions: list[dict[str, Any]] = []
+    prediction_assets: list[dict[str, Any]] = []
+    for prediction in predictions:
+        prediction_item, member, asset, path = resolve_item_member(
             db,
-            {"kind": "media_item_member", "member_id": int(prediction["id"])},
-            role="distorted",
+            workspace,
+            int(prediction["id"]),
+            require_reusable=True,
         )
-        for prediction in predictions
-    ]
+        if int(prediction_item["id"]) != int(item_id):
+            raise ValueError("Campaign prediction no longer belongs to the selected Item")
+        _assert_reusable_compare_prediction(db, reference_item, member, asset)
+        resolved_predictions.append(descriptor(prediction_item, member, asset, path))
+        prediction_assets.append(asset)
+    timings["alignment_resolve"] += time.monotonic() - resolve_started
+
+    def trusted_signature(asset: dict[str, Any]) -> dict[str, Any]:
+        metadata = dict(asset.get("metadata") or {})
+        return {
+            "content_sha256": asset.get("content_sha256"),
+            "size_bytes": asset.get("size_bytes"),
+            "source_mtime_ns": metadata.get("source_mtime_ns"),
+        }
+
+    report("decode_cache")
     (
         reference_frames,
         reference_fps,
@@ -849,7 +923,17 @@ def _campaign_item_alignment(
         workspace,
         Path(str(reference["path"])),
         f"campaign_item_{item_id}_gt",
+        trusted_source_signature=trusted_signature(reference_asset),
     )
+    if reference_decode_cache:
+        timings["source_identity"] += float(
+            reference_decode_cache.get("source_identity_seconds") or 0.0
+        )
+        timings["source_hash"] += float(
+            reference_decode_cache.get("source_hash_seconds") or 0.0
+        )
+        timings["decode_cache"] += float(reference_decode_cache.get("decode_seconds") or 0.0)
+        timings["decode_cache_hits"] += float(bool(reference_decode_cache.get("cache_hit")))
     reference_width, reference_height = decoded_dimensions(reference_frames, "GT")
     reference.update(
         {
@@ -863,6 +947,12 @@ def _campaign_item_alignment(
             "decode_cache": reference_decode_cache,
         }
     )
+    if reference_decode_cache is None:
+        source_hash_started = time.monotonic()
+        reference["source_tree_guard"] = _capture_source_tree_guard(
+            Path(str(reference["path"]))
+        )
+        timings["source_hash"] += time.monotonic() - source_hash_started
     decoded: list[dict[str, Any]] = []
     for index, prediction in enumerate(resolved_predictions):
         _frames, fps, timestamps, decode_cache = _load_compare_source_frames_with_cache(
@@ -870,7 +960,13 @@ def _campaign_item_alignment(
             workspace,
             Path(str(prediction["path"])),
             f"campaign_item_{item_id}_pred_{index}",
+            trusted_source_signature=trusted_signature(prediction_assets[index]),
         )
+        if decode_cache:
+            timings["source_identity"] += float(decode_cache.get("source_identity_seconds") or 0.0)
+            timings["source_hash"] += float(decode_cache.get("source_hash_seconds") or 0.0)
+            timings["decode_cache"] += float(decode_cache.get("decode_seconds") or 0.0)
+            timings["decode_cache_hits"] += float(bool(decode_cache.get("cache_hit")))
         decoded_width, decoded_height = decoded_dimensions(
             _frames,
             f"Pred {chr(ord('A') + index)}",
@@ -902,7 +998,15 @@ def _campaign_item_alignment(
                 "decode_cache": decode_cache,
             }
         )
+        if decode_cache is None:
+            source_hash_started = time.monotonic()
+            source["source_tree_guard"] = _capture_source_tree_guard(
+                Path(str(prediction["path"]))
+            )
+            timings["source_hash"] += time.monotonic() - source_hash_started
         decoded.append(source)
+    report("alignment_plan")
+    alignment_started = time.monotonic()
     temporal = validate_temporal_alignment(reference, decoded)
     plan = plan_alignment(
         reference,
@@ -910,6 +1014,9 @@ def _campaign_item_alignment(
         spatial_policy=spatial_policy,
         temporal_summary=temporal,
     )
+    timings["alignment_plan"] += time.monotonic() - alignment_started
+    if timings_out is not None:
+        timings_out.update({str(name): float(value) for name, value in timings.items()})
     return plan, reference, decoded
 
 
@@ -1622,7 +1729,7 @@ class _PreparationProgressReporter:
                 "stage": "validating_sources",
                 "frame_current": 0,
                 "frame_total": 0,
-                "pipeline": "campaign-freeze-stream-v1",
+                "pipeline": FREEZE_PIPELINE_VERSION,
             },
             force=True,
         )
@@ -1638,7 +1745,7 @@ class _PreparationProgressReporter:
                 "stage": "item_completed",
                 "frame_current": 0,
                 "frame_total": 0,
-                "pipeline": "campaign-freeze-stream-v1",
+                "pipeline": FREEZE_PIPELINE_VERSION,
                 "item_timings": dict(timings or {}),
                 "timings": dict(timings or {}),
                 "current_override": self.item_index,
@@ -1681,7 +1788,7 @@ class _PreparationProgressReporter:
                 "frame_current": frame_current,
                 "frame_total": frame_total,
                 "overall_fraction": max(0.0, min(1.0, fractional)),
-                "pipeline": str(payload.pop("pipeline", "campaign-freeze-stream-v1")),
+                "pipeline": str(payload.pop("pipeline", FREEZE_PIPELINE_VERSION)),
                 **payload,
             }
             _update_preparation_progress(
@@ -1777,7 +1884,26 @@ def run_pending_preparations(
     limit: int = 4,
     stale_after_seconds: int = 600,
 ) -> list[dict[str, Any]]:
+    """Run Campaign preparation non-reentrantly within this service process."""
+
+    with _PREPARATION_RUNNER_LOCK:
+        return _run_pending_preparations_locked(
+            db,
+            workspace,
+            limit=limit,
+            stale_after_seconds=stale_after_seconds,
+        )
+
+
+def _run_pending_preparations_locked(
+    db: Database,
+    workspace: WorkspaceConfig,
+    *,
+    limit: int = 4,
+    stale_after_seconds: int = 600,
+) -> list[dict[str, Any]]:
     """Claim queued (or restart-stale) preparations and finish them idempotently."""
+
     ensure_v2_schema(db)
     cutoff = utc_ts() - max(60, int(stale_after_seconds))
     candidates = db.query(
@@ -1981,29 +2107,6 @@ def _write_private_png_sequence(frame_paths: list[Path], target: Path) -> list[P
     return outputs
 
 
-def _write_difference_sequence(
-    reference_frames: list[Path],
-    prediction_frames: list[Path],
-    target: Path,
-) -> list[Path]:
-    if len(reference_frames) != len(prediction_frames) or not reference_frames:
-        raise ValueError("Campaign V2 Diff requires equal, non-empty aligned frame sets")
-    if target.exists() or target.is_symlink():
-        raise FileExistsError(f"Campaign V2 package target already exists: {target}")
-    target.mkdir(parents=True, exist_ok=False)
-    outputs: list[Path] = []
-    for index, (reference, prediction) in enumerate(zip(reference_frames, prediction_frames)):
-        destination = target / f"{index:06d}.png"
-        with Image.open(reference) as left, Image.open(prediction) as right:
-            left_rgb = left.convert("RGB")
-            right_rgb = right.convert("RGB")
-            if left_rgb.size != right_rgb.size:
-                raise ValueError("Campaign V2 Diff received spatially unaligned frames")
-            ImageChops.difference(left_rgb, right_rgb).save(destination, format="PNG")
-        outputs.append(destination)
-    return outputs
-
-
 def _write_package_media(
     workspace: WorkspaceConfig,
     frame_paths: list[Path],
@@ -2124,6 +2227,21 @@ def _validate_campaign_decoded_source(
         raise FreezeCancelled("Campaign preparation was cancelled")
     descriptor = source.get("decode_cache")
     if not isinstance(descriptor, dict):
+        tree_guard = source.get("source_tree_guard")
+        if not isinstance(tree_guard, dict):
+            return
+        source_path = Path(str(tree_guard.get("source_path") or ""))
+        if not source_path.is_dir():
+            raise SourceChanged(f"Campaign {label} frame source is no longer available")
+        if not verify_content:
+            return
+        current = _capture_source_tree_guard(source_path, cancel_check=cancel_check)
+        if (
+            int(current["file_count"]) != int(tree_guard.get("file_count") or -1)
+            or int(current["size_bytes"]) != int(tree_guard.get("size_bytes") or -1)
+            or str(current["sha256"]) != str(tree_guard.get("sha256") or "")
+        ):
+            raise SourceChanged(f"Campaign {label} frame source changed while the package was freezing")
         return
     source_path_value = descriptor.get("source_path")
     source_digest = str(descriptor.get("source_sha256") or "").lower()
@@ -2168,6 +2286,76 @@ def _validate_campaign_decoded_source(
         raise SourceChanged(f"Campaign {label} source changed while the package was freezing")
 
 
+def _capture_source_tree_guard(
+    source_path: Path,
+    *,
+    cancel_check: Any = None,
+) -> dict[str, Any]:
+    """Fingerprint a frame-directory source without trusting directory mtimes."""
+
+    root = source_path.resolve()
+    if not root.is_dir() or root.is_symlink():
+        raise SourceChanged(f"Campaign frame source is unavailable or unsafe: {root}")
+    digest = hashlib.sha256()
+    size_bytes = 0
+    file_count = 0
+    for child in sorted(root.rglob("*")):
+        if cancel_check is not None and cancel_check():
+            raise FreezeCancelled("Campaign preparation was cancelled")
+        if child.is_symlink():
+            raise SourceChanged(f"Campaign frame source contains a symlink: {child.name}")
+        if not child.is_file():
+            continue
+        relative = child.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        with child.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+                if cancel_check is not None and cancel_check():
+                    raise FreezeCancelled("Campaign preparation was cancelled")
+                digest.update(chunk)
+                size_bytes += len(chunk)
+        file_count += 1
+    if file_count <= 0:
+        raise SourceChanged(f"Campaign frame source is empty: {root}")
+    return {
+        "source_path": root,
+        "sha256": digest.hexdigest(),
+        "size_bytes": size_bytes,
+        "file_count": file_count,
+    }
+
+
+def _validate_final_campaign_sources(
+    guards: Iterable[tuple[dict[str, Any], dict[str, Any], str]],
+    *,
+    cancel_check: Any = None,
+) -> float:
+    """Re-hash every distinct source after all Items have finished freezing."""
+
+    started = time.monotonic()
+    validated_source_identities: set[tuple[str, str]] = set()
+    for guarded_source, guarded_asset, guarded_label in guards:
+        descriptor = dict(guarded_source.get("decode_cache") or {})
+        tree_guard = dict(guarded_source.get("source_tree_guard") or {})
+        identity = (
+            str(descriptor.get("source_path") or tree_guard.get("source_path") or ""),
+            str(descriptor.get("source_sha256") or tree_guard.get("sha256") or ""),
+        )
+        if identity != ("", "") and identity in validated_source_identities:
+            continue
+        _validate_campaign_decoded_source(
+            guarded_source,
+            guarded_asset,
+            guarded_label,
+            verify_content=True,
+            cancel_check=cancel_check,
+        )
+        if identity != ("", ""):
+            validated_source_identities.add(identity)
+    return time.monotonic() - started
+
+
 def _stage_item_campaign_media(
     db: Database,
     workspace: WorkspaceConfig,
@@ -2178,7 +2366,11 @@ def _stage_item_campaign_media(
     *,
     cancel_check: Any = None,
     progress_callback: Any = None,
-) -> tuple[dict[tuple[int, str], dict[str, Any]], dict[str, Any]]:
+) -> tuple[
+    dict[tuple[int, str], dict[str, Any]],
+    dict[str, Any],
+    list[tuple[dict[str, Any], dict[str, Any], str]],
+]:
     """Materialize one Media Item GT/A/B package from its immutable AlignmentPlan."""
     media_item_id = int(item.get("media_item_id") or 0)
     if media_item_id <= 0:
@@ -2215,12 +2407,15 @@ def _stage_item_campaign_media(
         source_paths[slot] = member_path
 
     spatial_policy = dict((campaign.get("config") or {}).get("spatial_policy") or {})
+    alignment_timings: dict[str, float] = {}
     recomputed_plan, reference, decoded_predictions = _campaign_item_alignment(
         db,
         workspace,
         media_item_id,
         [members["a"], members["b"]],
         spatial_policy,
+        timings_out=alignment_timings,
+        progress_callback=progress_callback,
     )
     stored_plan = dict(item.get("alignment") or {})
     if not stored_plan.get("fingerprint"):
@@ -2293,24 +2488,6 @@ def _stage_item_campaign_media(
                 expected_width=target_width,
                 expected_height=target_height,
             )
-        for slot in ("a", "b"):
-            temporary_diff = video_dir / f".diff-{slot}-{uuid.uuid4().hex}-frames"
-            try:
-                diff_frames = _write_difference_sequence(
-                    aligned["gt"], aligned[f"pred_{slot}"], temporary_diff
-                )
-                output_paths[f"diff_{slot}"] = _write_package_media(
-                    workspace,
-                    diff_frames,
-                    video_dir / f"diff-{slot}{suffix}",
-                    media_kind=media_kind,
-                    fps=fps,
-                    expected_width=target_width,
-                    expected_height=target_height,
-                )
-            finally:
-                if temporary_diff.exists():
-                    shutil.rmtree(temporary_diff)
         artifacts: dict[str, dict[str, Any]] = {}
         for slot, path in output_paths.items():
             artifacts[slot] = {
@@ -2384,6 +2561,10 @@ def _stage_item_campaign_media(
             )
         except FreezeBackendUnavailable:
             freeze_result = legacy_freeze()
+        freeze_result["timings"] = {
+            **alignment_timings,
+            **dict(freeze_result.get("timings") or {}),
+        }
         frozen_artifacts = dict(freeze_result.get("artifacts") or {})
         source_validation_started = time.monotonic()
         if progress_callback is not None:
@@ -2408,8 +2589,11 @@ def _stage_item_campaign_media(
                 verify_content=True,
                 cancel_check=cancel_check,
             )
-        freeze_result.setdefault("timings", {})["source_stability"] = (
-            time.monotonic() - source_validation_started
+        item_source_stability = time.monotonic() - source_validation_started
+        freeze_timings = freeze_result.setdefault("timings", {})
+        freeze_timings["source_stability"] = (
+            float(freeze_timings.get("source_stability") or 0.0)
+            + item_source_stability
         )
 
     artifacts = dict(freeze_result["artifacts"])
@@ -2417,10 +2601,6 @@ def _stage_item_campaign_media(
         slot: Path(str(artifacts[slot]["path"]))
         for slot in ("gt", "pred_a", "pred_b")
     }
-    diff_paths = {
-        slot: Path(str(artifacts[f"diff_{slot}"]["path"])) for slot in ("a", "b")
-    }
-
     evaluation_item_id = int(item["id"])
     normalized_reference = _normalized_asset_snapshot(
         reference_asset,
@@ -2445,7 +2625,6 @@ def _stage_item_campaign_media(
     for slot in ("a", "b"):
         binding = by_slot[slot]
         path = output_paths[f"pred_{slot}"]
-        diff_path = diff_paths[slot]
         normalized_asset = _normalized_asset_snapshot(
             source_assets[slot],
             media_kind=media_kind,
@@ -2473,12 +2652,6 @@ def _stage_item_campaign_media(
                 "sha256": str(artifacts[f"pred_{slot}"]["sha256"]),
                 "size_bytes": int(artifacts[f"pred_{slot}"]["size_bytes"]),
                 "mode": str(artifacts[f"pred_{slot}"].get("mode") or "stream"),
-                "diff": {
-                    "path": diff_path.relative_to(staging).as_posix(),
-                    "sha256": str(artifacts[f"diff_{slot}"]["sha256"]),
-                    "size_bytes": int(artifacts[f"diff_{slot}"]["size_bytes"]),
-                    "mode": str(artifacts[f"diff_{slot}"].get("mode") or "stream"),
-                },
                 "temporal_mapping": dict(members[slot].get("temporal_mapping") or {}),
                 "transform": dict((stored_plan.get("sources") or {}).get(f"pred_{slot}") or {}),
             }
@@ -2506,7 +2679,7 @@ def _stage_item_campaign_media(
         },
         "methods": methods_manifest,
         "freeze_pipeline": {
-            "version": "campaign-freeze-stream-v1",
+            "version": str(freeze_result.get("version") or FREEZE_PIPELINE_VERSION),
             "pipeline": str(freeze_result.get("pipeline") or "unknown"),
             "encoder_threads": int(freeze_result.get("encoder_threads") or 0),
             "timings": {
@@ -2528,7 +2701,7 @@ def _stage_item_campaign_media(
             },
         },
     }
-    return frozen, manifest_item
+    return frozen, manifest_item, list(guarded_sources.values())
 
 
 def _register_frozen_member(
@@ -2838,7 +3011,7 @@ def publish_campaign_v2(
 
     manifest: dict[str, Any] = {
         "schema_version": 2,
-        "freeze_pipeline": "campaign-freeze-stream-v1",
+        "freeze_pipeline": FREEZE_PIPELINE_VERSION,
         "campaign_id": int(campaign_id),
         "created_at": started,
         "items": [],
@@ -2857,6 +3030,9 @@ def publish_campaign_v2(
 
             staging.mkdir(parents=True, exist_ok=False)
             frozen: dict[tuple[int, str], dict[str, Any]] = {}
+            final_source_guards: list[
+                tuple[dict[str, Any], dict[str, Any], str]
+            ] = []
             for item_index, item in enumerate(campaign["items"], start=1):
                 _require_preparation_claim(
                     db, int(campaign_id), claim_token, ownership_lost=ownership_lost
@@ -2864,7 +3040,7 @@ def publish_campaign_v2(
                 progress_reporter.start_item(item_index, str(item["video_name"]))
                 video_dir = staging / f"{int(item['id'])}-{slugify(str(item['video_name']))}"
                 if item.get("media_item_id") is not None:
-                    item_frozen, manifest_item = _stage_item_campaign_media(
+                    item_frozen, manifest_item, item_source_guards = _stage_item_campaign_media(
                         db,
                         workspace,
                         campaign,
@@ -2874,6 +3050,7 @@ def publish_campaign_v2(
                         cancel_check=check_preparation_cancelled,
                         progress_callback=progress_reporter.callback,
                     )
+                    final_source_guards.extend(item_source_guards)
                 else:
                     item_frozen, manifest_item = _stage_legacy_campaign_media(
                         db,
@@ -2900,6 +3077,12 @@ def publish_campaign_v2(
             _require_preparation_claim(
                 db, int(campaign_id), claim_token, ownership_lost=ownership_lost
             )
+            manifest["timings"] = {
+                "final_source_stability": _validate_final_campaign_sources(
+                    final_source_guards,
+                    cancel_check=check_preparation_cancelled,
+                )
+            }
             manifest_path = staging / "manifest.json"
             manifest_path.write_text(_json(manifest), encoding="utf-8")
 
@@ -3094,11 +3277,16 @@ def publish_campaign_v2(
                                 "size_bytes": _path_size(final_root),
                                 "stage": "completed",
                                 "overall_fraction": 1.0,
-                                "pipeline": "campaign-freeze-stream-v1",
+                                "pipeline": FREEZE_PIPELINE_VERSION,
                                 "timings": {
                                     "elapsed_seconds": round(
                                         time.monotonic() - preparation_started_monotonic,
                                         6,
+                                    ),
+                                    "final_source_stability": float(
+                                        dict(manifest.get("timings") or {}).get(
+                                            "final_source_stability", 0.0
+                                        )
                                     ),
                                     "items": item_timing_reports,
                                 },
@@ -3245,7 +3433,7 @@ def blind_session(
     lease_seconds: int = 300,
 ) -> dict[str, Any]:
     campaign = _campaign_by_token(db, campaign_token)
-    if campaign["status"] not in {"published", "closed"}:
+    if campaign["status"] not in {"published", "closed", "archived"}:
         raise ValueError("blind evaluation campaign is not available")
     evaluator_id = str(body.get("evaluator_id") or body.get("browser_uuid") or "").strip()
     display_name = str(body.get("display_name") or "").strip()
@@ -3441,6 +3629,115 @@ def _task_payload(
     }
 
 
+def _participant_vote_payload(row: dict[str, Any]) -> dict[str, Any]:
+    """Map canonical Method A/B ratings back to this evaluator's anonymous sides."""
+
+    swapped = bool(int(row.get("side_swap") or 0))
+    rating_a = float(row["rating_a"]) if row.get("rating_a") is not None else None
+    rating_b = float(row["rating_b"]) if row.get("rating_b") is not None else None
+    return {
+        "choice": str(row.get("choice") or ""),
+        "left_rating": rating_b if swapped else rating_a,
+        "right_rating": rating_a if swapped else rating_b,
+        "confidence": str(row.get("confidence") or ""),
+        "note": str(row.get("note") or ""),
+        "reasons": [str(value) for value in _loads(row.get("reasons_json"), [])],
+        "updated_at": row.get("updated_at"),
+    }
+
+
+def blind_reviews(
+    db: Database,
+    campaign_token: str,
+    evaluator_id: str,
+) -> dict[str, Any]:
+    """List only the caller's completed opaque tasks; never expose method identity."""
+
+    campaign = _campaign_by_token(db, campaign_token)
+    evaluator_id = str(evaluator_id or "").strip()
+    if not evaluator_id:
+        raise ValueError("evaluator_id is required")
+    if campaign["status"] not in {"published", "closed", "archived"}:
+        raise ValueError("blind evaluation reviews are not available")
+    if db.get("SELECT id FROM evaluators WHERE id = ?", (evaluator_id,)) is None:
+        raise KeyError("blind evaluator session not found")
+    rows = db.query(
+        """
+        SELECT t.task_token, i.video_name, a.side_swap,
+               v.choice, v.rating_a, v.rating_b, v.confidence, v.note,
+               v.reasons_json, v.updated_at
+        FROM evaluation_votes_v2 v
+        JOIN evaluation_tasks_v2 t ON t.id = v.task_id
+        JOIN evaluation_items_v2 i ON i.id = t.item_id
+        JOIN evaluation_assignments_v2 a ON a.id = v.assignment_id
+        WHERE t.campaign_id = ? AND v.evaluator_id = ?
+        ORDER BY v.updated_at DESC, v.id DESC
+        """,
+        (int(campaign["id"]), evaluator_id),
+    )
+    reviews = [
+        {
+            "task_token": str(row["task_token"]),
+            "video_name": str(row["video_name"]),
+            "vote": _participant_vote_payload(row),
+        }
+        for row in rows
+    ]
+    return {
+        "campaign": {
+            "title": str(campaign["public_title"]),
+            "status": str(campaign["status"]),
+        },
+        "editable": campaign["status"] == "published",
+        "reviews": reviews,
+    }
+
+
+def blind_review_task(
+    db: Database,
+    campaign_token: str,
+    task_token: str,
+    evaluator_id: str,
+) -> dict[str, Any]:
+    """Return one previously voted task through its original anonymous presentation."""
+
+    campaign = _campaign_by_token(db, campaign_token)
+    evaluator_id = str(evaluator_id or "").strip()
+    if not evaluator_id:
+        raise ValueError("evaluator_id is required")
+    if campaign["status"] not in {"published", "closed", "archived"}:
+        raise ValueError("blind evaluation reviews are not available")
+    row = db.get(
+        """
+        SELECT a.*, t.task_token, v.choice, v.rating_a, v.rating_b,
+               v.confidence, v.note, v.reasons_json, v.updated_at
+        FROM evaluation_votes_v2 v
+        JOIN evaluation_tasks_v2 t ON t.id = v.task_id
+        JOIN evaluation_assignments_v2 a ON a.id = v.assignment_id
+        WHERE t.campaign_id = ? AND t.task_token = ? AND v.evaluator_id = ?
+        """,
+        (int(campaign["id"]), str(task_token), evaluator_id),
+    )
+    if row is None:
+        raise KeyError("blind evaluation review not found")
+    task = _task_payload(db, campaign_token, row)
+    task.update(
+        {
+            "review": True,
+            "read_only": campaign["status"] != "published",
+            "vote": _participant_vote_payload(row),
+        }
+    )
+    return {
+        "campaign": {
+            "title": str(campaign["public_title"]),
+            "status": str(campaign["status"]),
+        },
+        "editable": campaign["status"] == "published",
+        "task": task,
+    }
+
+
 def _participant_results(analysis: dict[str, Any]) -> dict[str, Any]:
     def clean(section: dict[str, Any]) -> dict[str, Any]:
         return {
@@ -3451,10 +3748,30 @@ def _participant_results(analysis: dict[str, Any]) -> dict[str, Any]:
             ],
         }
 
+    ratings = analysis.get("ratings") or {}
+
+    def clean_ratings(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "label": row.get("method_label"),
+                "count": int(row.get("count") or 0),
+                "mean": row.get("mean"),
+                "median": row.get("median"),
+            }
+            for row in rows
+        ]
+
     return {
         "coverage": analysis["coverage"],
         "human": clean(analysis["human"]),
         "by_video": {video: clean(payload) for video, payload in analysis["by_video"].items()},
+        "ratings": {
+            "methods": clean_ratings(list(ratings.get("methods") or [])),
+            "by_video": {
+                str(video): clean_ratings(list(rows or []))
+                for video, rows in dict(ratings.get("by_video") or {}).items()
+            },
+        },
     }
 
 
@@ -3493,7 +3810,7 @@ def blind_payload(
     if campaign["status"] == "published":
         assignment = _lease_assignment(db, campaign, str(evaluator_id), lease_seconds)
     progress = _progress(db, int(campaign["id"]), str(evaluator_id))
-    if campaign["status"] == "closed":
+    if campaign["status"] in {"closed", "archived"}:
         progress.update(
             {
                 "total": int(progress["completed"]),
@@ -3632,11 +3949,19 @@ def blind_submit_vote(
     if confidence not in CONFIDENCE_VALUES:
         raise ValueError("confidence must be low, medium, high, or blank")
     note = str(body.get("note") or "").strip()[:4000]
+    left_rating = _parse_optional_vote_rating(body.get("left_rating"), "left_rating")
+    right_rating = _parse_optional_vote_rating(body.get("right_rating"), "right_rating")
     duration_raw = body.get("duration_ms")
     duration = max(0, int(duration_raw)) if duration_raw not in {None, ""} else None
     now = utc_ts()
     with db.connection() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        locked_campaign = conn.execute(
+            "SELECT status FROM evaluation_campaigns_v2 WHERE id = ?",
+            (int(campaign["id"]),),
+        ).fetchone()
+        if locked_campaign is None or str(locked_campaign["status"]) != "published":
+            raise ValueError("blind evaluation campaign is not accepting votes")
         assignment = conn.execute(
             """
             SELECT a.*, t.id AS task_id, t.binding_a_id, t.binding_b_id,
@@ -3674,17 +3999,21 @@ def blind_submit_vote(
         left_method = int(assignment["method_b_id"] if swap else assignment["method_a_id"])
         right_method = int(assignment["method_a_id"] if swap else assignment["method_b_id"])
         preferred_method = left_method if choice == "left" else right_method if choice == "right" else None
+        rating_a = right_rating if swap else left_rating
+        rating_b = left_rating if swap else right_rating
         presentation = {"swapped": swap, "choice": choice}
         conn.execute(
             """
             INSERT INTO evaluation_votes_v2(
                 task_id, evaluator_id, assignment_id, choice, preferred_method_id,
-                reasons_json, confidence, note, duration_ms, presentation_json,
+                rating_a, rating_b, reasons_json, confidence, note, duration_ms, presentation_json,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(task_id, evaluator_id) DO UPDATE SET
                 choice = excluded.choice,
                 preferred_method_id = excluded.preferred_method_id,
+                rating_a = excluded.rating_a,
+                rating_b = excluded.rating_b,
                 reasons_json = excluded.reasons_json,
                 confidence = excluded.confidence,
                 note = excluded.note,
@@ -3698,6 +4027,8 @@ def blind_submit_vote(
                 int(assignment["id"]),
                 choice,
                 preferred_method,
+                rating_a,
+                rating_b,
                 _json(reasons),
                 confidence,
                 note,
@@ -3724,6 +4055,23 @@ def blind_submit_vote(
         "next_task": payload["task"],
         **({"results": payload["results"]} if "results" in payload else {}),
     }
+
+
+def _parse_optional_vote_rating(value: Any, field: str) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be between 1 and 5 in 0.25 steps")
+    try:
+        rating = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be between 1 and 5 in 0.25 steps") from exc
+    if not math.isfinite(rating) or rating < 1.0 or rating > 5.0:
+        raise ValueError(f"{field} must be between 1 and 5 in 0.25 steps")
+    quarter = round(rating * 4.0)
+    if abs(rating * 4.0 - quarter) > 1e-9:
+        raise ValueError(f"{field} must be between 1 and 5 in 0.25 steps")
+    return quarter / 4.0
 
 
 def _bradley_terry(method_ids: list[int], observations: list[dict[str, Any]]) -> dict[int, float]:
@@ -3824,75 +4172,603 @@ def _rank_methods(
     return {"vote_count": len(observations), "ranking": ranking, "head_to_head": pair}
 
 
-def _objective_by_method(
+def _ratings_by_method(
+    votes: list[dict[str, Any]],
+    tasks: dict[int, dict[str, Any]],
+    methods: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
+    """Summarize optional canonical ratings without affecting pairwise ranking."""
+
+    grouped: dict[int, list[float]] = defaultdict(list)
+    by_video_values: dict[tuple[str, int], list[float]] = defaultdict(list)
+    for vote in votes:
+        task = tasks.get(int(vote["task_id"]))
+        if task is None:
+            continue
+        video_name = str(task["video_name"])
+        for column, method_column in (
+            ("rating_a", "method_a_id"),
+            ("rating_b", "method_b_id"),
+        ):
+            value = vote.get(column)
+            if value is None:
+                continue
+            method_id = int(task[method_column])
+            rating = float(value)
+            grouped[method_id].append(rating)
+            by_video_values[(video_name, method_id)].append(rating)
+
+    def summary(method_id: int, values: list[float]) -> dict[str, Any]:
+        ordered = sorted(float(value) for value in values)
+        return {
+            "method_id": method_id,
+            "method_label": str(methods[method_id]["label_snapshot"]),
+            "count": len(ordered),
+            "mean": statistics.mean(ordered) if ordered else None,
+            "median": statistics.median(ordered) if ordered else None,
+        }
+
+    method_rows = [summary(method_id, grouped.get(method_id, [])) for method_id in sorted(methods)]
+    videos = sorted({str(task["video_name"]) for task in tasks.values()})
+    by_video = {
+        video: [
+            summary(method_id, by_video_values.get((video, method_id), []))
+            for method_id in sorted(methods)
+        ]
+        for video in videos
+    }
+    return {"methods": method_rows, "by_video": by_video}
+
+
+FRAME_OBJECTIVE_METRICS = {"lpips_vit_patch", "lpips_convnext"}
+
+
+def _objective_metric_snapshot(
     db: Database,
     bindings: list[dict[str, Any]],
     methods: dict[int, dict[str, Any]],
 ) -> dict[str, Any]:
-    asset_to_binding = {
-        int(row["source_asset_id"]): (int(row["method_id"]), str(row.get("video_name") or ""))
-        for row in bindings
-    }
-    if not asset_to_binding:
-        return {"metrics": [], "by_video": {}}
-    placeholders = ",".join("?" for _ in asset_to_binding)
-    rows = db.query(
-        f"""
-        SELECT mr.metric_name, mr.status, mr.value, mab.distorted_asset_id
-        FROM metric_asset_bindings mab
-        JOIN metric_results mr ON mr.id = mab.metric_result_id
-        WHERE mab.distorted_asset_id IN ({placeholders})
-        """,
-        tuple(sorted(asset_to_binding)),
+    """Select latest metric units from only the selected asset's producer Run."""
+
+    asset_to_binding = {int(row["source_asset_id"]): row for row in bindings}
+    run_ids = sorted(
+        {
+            int(method["source_run_id"])
+            for method in methods.values()
+            if method.get("source_run_id") is not None
+        }
     )
-    grouped: dict[tuple[str, int], list[float]] = defaultdict(list)
-    statuses: dict[tuple[str, int], Counter[str]] = defaultdict(Counter)
-    video_grouped: dict[tuple[str, str, int], list[float]] = defaultdict(list)
-    video_statuses: dict[tuple[str, str, int], Counter[str]] = defaultdict(Counter)
+    run_states: dict[int, dict[str, Any]] = {}
+    allowed_jobs: dict[int, set[int]] = defaultdict(set)
+    inference_jobs: dict[int, set[int]] = defaultdict(set)
+    metric_job_rows: list[dict[str, Any]] = []
+    legacy_metric_jobs: dict[int, int] = {}
+    if run_ids:
+        placeholders = ",".join("?" for _ in run_ids)
+        for row in db.query(
+            f"SELECT id, content_revision, inference_job_id, metric_job_id, metrics_json "
+            f"FROM runs WHERE id IN ({placeholders})",
+            tuple(run_ids),
+        ):
+            run_id = int(row["id"])
+            run_states[run_id] = {
+                "content_revision": int(row.get("content_revision") or 0),
+                "metrics": [str(value) for value in (_loads(row.get("metrics_json")) or [])],
+            }
+            if row.get("inference_job_id") is not None:
+                inference_jobs[run_id].add(int(row["inference_job_id"]))
+            if row.get("metric_job_id") is not None:
+                metric_job_id = int(row["metric_job_id"])
+                allowed_jobs[run_id].add(metric_job_id)
+                legacy_metric_jobs[metric_job_id] = run_id
+        for row in db.query(
+            f"""
+            SELECT rj.run_id, rj.job_id, rj.role, rj.shard_index, rj.device,
+                   j.status,
+                   j.payload_json, j.error_json
+            FROM run_jobs rj
+            JOIN jobs j ON j.id = rj.job_id
+            WHERE rj.run_id IN ({placeholders})
+            """,
+            tuple(run_ids),
+        ):
+            run_id = int(row["run_id"])
+            if str(row["role"]) == "metric":
+                allowed_jobs[run_id].add(int(row["job_id"]))
+                metric_job_rows.append(row)
+            elif str(row["role"]) == "inference":
+                inference_jobs[run_id].add(int(row["job_id"]))
+        collected_metric_jobs = {int(row["job_id"]) for row in metric_job_rows}
+        missing_legacy_jobs = sorted(set(legacy_metric_jobs) - collected_metric_jobs)
+        if missing_legacy_jobs:
+            legacy_placeholders = ",".join("?" for _ in missing_legacy_jobs)
+            for row in db.query(
+                f"""
+                SELECT id AS job_id, status, payload_json, error_json
+                FROM jobs WHERE id IN ({legacy_placeholders})
+                """,
+                tuple(missing_legacy_jobs),
+            ):
+                row["run_id"] = legacy_metric_jobs[int(row["job_id"])]
+                row["shard_index"] = 0
+                row["device"] = None
+                metric_job_rows.append(row)
+
+    rows: list[dict[str, Any]] = []
+    if asset_to_binding:
+        placeholders = ",".join("?" for _ in asset_to_binding)
+        rows = db.query(
+            f"""
+            SELECT mr.id, mr.job_id, mr.inference_job_id, mr.sample_id,
+                   mr.metric_name, mr.status, mr.value, mr.details_json,
+                   mab.distorted_asset_id, mab.video_name AS binding_video_name,
+                   mab.track_label AS binding_track_label
+            FROM metric_asset_bindings mab
+            JOIN metric_results mr ON mr.id = mab.metric_result_id
+            WHERE mab.distorted_asset_id IN ({placeholders})
+            ORDER BY mr.id
+            """,
+            tuple(sorted(asset_to_binding)),
+        )
+
+    latest: dict[tuple[Any, ...], dict[str, Any]] = {}
     for row in rows:
-        method_id, video_name = asset_to_binding[int(row["distorted_asset_id"])]
-        key = (str(row["metric_name"]), method_id)
-        video_key = (video_name, str(row["metric_name"]), method_id)
-        statuses[key][str(row["status"])] += 1
-        video_statuses[video_key][str(row["status"])] += 1
-        if row["status"] == "completed" and row.get("value") is not None:
-            grouped[key].append(float(row["value"]))
-            video_grouped[video_key].append(float(row["value"]))
-    def summary(
-        name: str,
-        method_id: int,
-        values: list[float],
-        counts: Counter[str],
-    ) -> dict[str, Any]:
-        values = sorted(values)
+        asset_id = int(row["distorted_asset_id"])
+        binding = asset_to_binding[asset_id]
+        method = methods[int(binding["method_id"])]
+        producer_run_id = method.get("source_run_id")
+        if producer_run_id is None:
+            continue
+        run_id = int(producer_run_id)
+        if (
+            int(row["job_id"]) not in allowed_jobs.get(run_id, set())
+            and int(row["inference_job_id"]) not in inference_jobs.get(run_id, set())
+        ):
+            continue
+        details = _loads(row.pop("details_json", None))
+        row["details"] = details if isinstance(details, dict) else {}
+        if row.get("sample_id") is not None:
+            unit_identity: tuple[Any, ...] = ("sample", int(row["sample_id"]))
+        else:
+            unit_identity = (
+                "video",
+                str(row.get("binding_video_name") or row["details"].get("video_name") or ""),
+            )
+        key = (asset_id, str(row["metric_name"]), *unit_identity)
+        current = latest.get(key)
+        if current is None or int(row["id"]) > int(current["id"]):
+            latest[key] = row
+
+    # Some metric failures are published before an asset binding can be
+    # materialized (for example, a device/driver failure at job startup).  Use
+    # the latest unit across every producer-Run shard to retain that real
+    # diagnostic, while allowing a later completed retry to supersede an old
+    # unavailable row even when their binding metadata differs.
+    job_to_run = {
+        int(job_id): int(run_id)
+        for run_id, job_ids in allowed_jobs.items()
+        for job_id in job_ids
+    }
+    inference_to_run = {
+        int(job_id): int(run_id)
+        for run_id, job_ids in inference_jobs.items()
+        for job_id in job_ids
+    }
+    run_campaign_videos: dict[int, set[str]] = defaultdict(set)
+    for binding in asset_to_binding.values():
+        method = methods[int(binding["method_id"])]
+        if method.get("source_run_id") is not None:
+            run_campaign_videos[int(method["source_run_id"])].add(
+                str(binding.get("video_name") or "")
+            )
+    all_latest: dict[tuple[Any, ...], dict[str, Any]] = {}
+    metric_job_ids = sorted(job_to_run)
+    inference_job_ids = sorted(inference_to_run)
+    clauses: list[str] = []
+    params: list[Any] = []
+    if metric_job_ids:
+        clauses.append(f"job_id IN ({','.join('?' for _ in metric_job_ids)})")
+        params.extend(metric_job_ids)
+    if inference_job_ids:
+        clauses.append(
+            f"inference_job_id IN ({','.join('?' for _ in inference_job_ids)})"
+        )
+        params.extend(inference_job_ids)
+    if clauses and asset_to_binding:
+        asset_placeholders = ",".join("?" for _ in asset_to_binding)
+        for row in db.query(
+            f"""
+            SELECT mr.id, mr.job_id, mr.inference_job_id, mr.sample_id,
+                   mr.metric_name, mr.status, mr.value, mr.details_json,
+                   mab.distorted_asset_id,
+                   mab.video_name AS binding_video_name,
+                   s.metadata_json AS sample_metadata_json
+            FROM metric_results mr
+            LEFT JOIN metric_asset_bindings mab ON mab.metric_result_id = mr.id
+            LEFT JOIN samples s ON s.id = mr.sample_id
+            WHERE ({' OR '.join('mr.' + clause for clause in clauses)})
+              AND (
+                  mab.distorted_asset_id IS NULL
+                  OR mab.distorted_asset_id IN ({asset_placeholders})
+              )
+            ORDER BY mr.id
+            """,
+            tuple([*params, *sorted(asset_to_binding)]),
+        ):
+            run_id = job_to_run.get(int(row["job_id"])) or inference_to_run.get(
+                int(row["inference_job_id"])
+            )
+            if run_id is None:
+                continue
+            if row.get("distorted_asset_id") is not None:
+                campaign_binding = asset_to_binding.get(int(row["distorted_asset_id"]))
+                if campaign_binding is None:
+                    continue
+                campaign_method = methods[int(campaign_binding["method_id"])]
+                if int(campaign_method.get("source_run_id") or -1) != int(run_id):
+                    continue
+            details = _loads(row.pop("details_json", None))
+            row["details"] = details if isinstance(details, dict) else {}
+            sample_metadata = _loads(row.pop("sample_metadata_json", None))
+            sample_metadata = sample_metadata if isinstance(sample_metadata, dict) else {}
+            video_name = str(
+                row.get("binding_video_name")
+                or row["details"].get("video_name")
+                or sample_metadata.get("video_name")
+                or sample_metadata.get("compare_group")
+                or sample_metadata.get("video_file")
+                or ""
+            )
+            campaign_videos = run_campaign_videos.get(int(run_id), set())
+            if video_name and video_name not in campaign_videos:
+                aliases = [
+                    candidate
+                    for candidate in campaign_videos
+                    if Path(candidate).name == Path(video_name).name
+                    or Path(candidate).stem == Path(video_name).stem
+                ]
+                if len(aliases) == 1:
+                    video_name = aliases[0]
+            if video_name not in campaign_videos and (
+                video_name or row.get("sample_id") is not None
+            ):
+                continue
+            row["video_name"] = video_name
+            if row.get("sample_id") is not None:
+                identity: tuple[Any, ...] = ("sample", int(row["sample_id"]))
+            else:
+                identity = ("video", video_name)
+            key = (int(run_id), str(row["metric_name"]), *identity)
+            current = all_latest.get(key)
+            if current is None or int(row["id"]) > int(current["id"]):
+                row["producer_run_id"] = int(run_id)
+                all_latest[key] = row
+
+    result_fallback_reasons: dict[tuple[int, str, str], Counter[str]] = defaultdict(Counter)
+    selected_ids = {int(row["id"]) for row in latest.values()}
+    for row in all_latest.values():
+        if int(row["id"]) in selected_ids or str(row.get("status")) not in {
+            "failed",
+            "unavailable",
+            "skipped",
+        }:
+            continue
+        details = dict(row.get("details") or {})
+        reason = str(details.get("reason") or details.get("type") or row.get("status"))
+        video_name = str(row.get("video_name") or details.get("video_name") or "")
+        result_fallback_reasons[
+            (int(row["producer_run_id"]), str(row["metric_name"]), video_name)
+        ][reason] += 1
+
+    metric_jobs_by_key: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in metric_job_rows:
+        row = dict(row)
+        run_id = int(row["run_id"])
+        payload = _loads(row.get("payload_json"))
+        payload = payload if isinstance(payload, dict) else {}
+        row["payload"] = payload
+        names = payload.get("metrics") or payload.get("metric_names") or []
+        if isinstance(names, str):
+            names = [names]
+        if not names and payload.get("metric_name"):
+            names = [payload["metric_name"]]
+        if not names:
+            names = run_states.get(run_id, {}).get("metrics", [])
+        for metric_name in names:
+            metric_jobs_by_key[(run_id, str(metric_name))].append(row)
+
+    selected_metric_jobs: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    for key, candidates in metric_jobs_by_key.items():
+        waves: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        legacy: list[dict[str, Any]] = []
+        for row in candidates:
+            wave_id = str(dict(row.get("payload") or {}).get("metric_wave_id") or "")
+            if wave_id:
+                waves[wave_id].append(row)
+            else:
+                legacy.append(row)
+        latest_wave = max(
+            waves.values(),
+            key=lambda rows: max(int(row["job_id"]) for row in rows),
+            default=[],
+        )
+        legacy_by_shard: dict[tuple[int, str], dict[str, Any]] = {}
+        for row in legacy:
+            payload = dict(row.get("payload") or {})
+            shard_key = (
+                int(row.get("shard_index") or payload.get("shard_index") or 0),
+                str(row.get("device") or payload.get("metric_device") or ""),
+            )
+            current = legacy_by_shard.get(shard_key)
+            if current is None or int(row["job_id"]) > int(current["job_id"]):
+                legacy_by_shard[shard_key] = row
+        latest_legacy = list(legacy_by_shard.values())
+        wave_rank = max((int(row["job_id"]) for row in latest_wave), default=-1)
+        legacy_rank = max((int(row["job_id"]) for row in latest_legacy), default=-1)
+        selected_metric_jobs[key] = latest_wave if wave_rank >= legacy_rank else latest_legacy
+
+    job_fallback_reasons: dict[tuple[int, str, str], Counter[str]] = defaultdict(Counter)
+    for (run_id, metric_name), job_rows in selected_metric_jobs.items():
+        for row in job_rows:
+            status = str(row.get("status") or "")
+            if status not in {"failed", "canceled"}:
+                continue
+            error = _loads(row.get("error_json"))
+            error = error if isinstance(error, dict) else {}
+            reason = str(
+                error.get("reason")
+                or error.get("message")
+                or error.get("type")
+                or status
+            )
+            job_fallback_reasons[(run_id, metric_name, "")][reason] += 1
+
+    fingerprint_payload = {
+        "runs": [
+            {
+                "id": run_id,
+                "content_revision": int(run_states.get(run_id, {}).get("content_revision") or 0),
+            }
+            for run_id in run_ids
+        ],
+        "latest": [
+            {
+                "id": int(row["id"]),
+                "asset_id": int(row["distorted_asset_id"]),
+                "metric_name": str(row["metric_name"]),
+                "status": str(row["status"]),
+            }
+            for row in sorted(latest.values(), key=lambda value: int(value["id"]))
+        ],
+        "unbound_latest": [
+            {
+                "id": int(row["id"]),
+                "run_id": int(row["producer_run_id"]),
+                "metric_name": str(row["metric_name"]),
+                "status": str(row["status"]),
+                "video_name": str(row.get("video_name") or ""),
+                "reason": str(
+                    dict(row.get("details") or {}).get("reason")
+                    or dict(row.get("details") or {}).get("type")
+                    or ""
+                ),
+            }
+            for row in sorted(all_latest.values(), key=lambda value: int(value["id"]))
+            if int(row["id"]) not in selected_ids
+        ],
+        "metric_jobs": [
+            {
+                "id": int(row["job_id"]),
+                "run_id": int(run_id),
+                "metric_name": str(metric_name),
+                "status": str(row.get("status") or ""),
+            }
+            for (run_id, metric_name), rows in sorted(selected_metric_jobs.items())
+            for row in sorted(rows, key=lambda value: int(value["job_id"]))
+        ],
+        "result_fallback": [
+            {
+                "run_id": int(run_id),
+                "metric_name": str(metric_name),
+                "video_name": str(video_name),
+                "reasons": dict(sorted(counter.items())),
+            }
+            for (run_id, metric_name, video_name), counter in sorted(
+                result_fallback_reasons.items()
+            )
+        ],
+        "job_fallback": [
+            {
+                "run_id": int(run_id),
+                "metric_name": str(metric_name),
+                "video_name": str(video_name),
+                "reasons": dict(sorted(counter.items())),
+            }
+            for (run_id, metric_name, video_name), counter in sorted(
+                job_fallback_reasons.items()
+            )
+        ],
+    }
+    fingerprint = hashlib.sha256(_json(fingerprint_payload).encode("utf-8")).hexdigest()
+    return {
+        "asset_to_binding": asset_to_binding,
+        "rows": list(latest.values()),
+        "run_states": run_states,
+        "result_fallback_reasons": result_fallback_reasons,
+        "job_fallback_reasons": job_fallback_reasons,
+        "fingerprint": fingerprint,
+        "producer_state": fingerprint_payload["runs"],
+    }
+
+
+def _objective_by_method(
+    db: Database,
+    bindings: list[dict[str, Any]],
+    methods: dict[int, dict[str, Any]],
+    *,
+    snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    snapshot = snapshot or _objective_metric_snapshot(db, bindings, methods)
+    asset_to_binding = dict(snapshot.get("asset_to_binding") or {})
+    latest_rows = list(snapshot.get("rows") or [])
+    rows_by_asset_metric: dict[tuple[int, str], list[dict[str, Any]]] = defaultdict(list)
+    for row in latest_rows:
+        rows_by_asset_metric[(int(row["distorted_asset_id"]), str(row["metric_name"]))].append(row)
+
+    item_results: list[dict[str, Any]] = []
+    for asset_id, binding in sorted(
+        asset_to_binding.items(),
+        key=lambda item: (str(item[1].get("video_name") or ""), int(item[1]["method_id"])),
+    ):
+        method_id = int(binding["method_id"])
+        method = methods[method_id]
+        producer_run_id = method.get("source_run_id")
+        requested = set()
+        if producer_run_id is not None:
+            requested.update(
+                str(value)
+                for value in dict(snapshot.get("run_states") or {})
+                .get(int(producer_run_id), {})
+                .get("metrics", [])
+            )
+        requested.update(
+            name for current_asset, name in rows_by_asset_metric if current_asset == int(asset_id)
+        )
+        for metric_name in sorted(requested):
+            metric_rows = rows_by_asset_metric.get((int(asset_id), metric_name), [])
+            expected = (
+                max(1, int(binding.get("expected_frame_count") or 0))
+                if metric_name in FRAME_OBJECTIVE_METRICS
+                else 1
+            )
+            status_counts = Counter(str(row.get("status") or "unavailable") for row in metric_rows)
+            completed_values = [
+                float(row["value"])
+                for row in metric_rows
+                if row.get("status") == "completed" and row.get("value") is not None
+            ]
+            reasons: Counter[str] = Counter()
+            for row in metric_rows:
+                details = dict(row.get("details") or {})
+                if str(row.get("status")) in {"failed", "unavailable", "skipped"}:
+                    reason = str(details.get("reason") or details.get("type") or row.get("status"))
+                    reasons[reason] += 1
+            observed = len(metric_rows)
+            completed = len(completed_values)
+            if observed != expected or completed != expected:
+                result_fallback = dict(snapshot.get("result_fallback_reasons") or {})
+                job_fallback = dict(snapshot.get("job_fallback_reasons") or {})
+                video_name = str(binding.get("video_name") or "")
+                if producer_run_id is not None:
+                    result_reasons = result_fallback.get(
+                        (int(producer_run_id), metric_name, video_name), {}
+                    ) or result_fallback.get(
+                        (int(producer_run_id), metric_name, ""), {}
+                    )
+                    reasons.update(result_reasons)
+                    if not reasons:
+                        reasons.update(
+                            job_fallback.get(
+                                (int(producer_run_id), metric_name, ""), {}
+                            )
+                        )
+            if status_counts["failed"]:
+                status = "failed"
+            elif status_counts["unavailable"]:
+                status = "unavailable"
+            elif status_counts["skipped"]:
+                status = "skipped"
+            elif observed != expected or completed != expected:
+                status = "unavailable"
+                reasons[f"incomplete metric coverage: completed {completed}/{expected}, observed {observed}"] += 1
+            else:
+                status = "completed"
+            value = statistics.mean(completed_values) if status == "completed" else None
+            item_results.append(
+                {
+                    "video_name": str(binding.get("video_name") or ""),
+                    "metric_name": metric_name,
+                    "direction": METRIC_DIRECTIONS.get(metric_name, "lower_is_better"),
+                    "method_id": method_id,
+                    "method_label": str(method["label_snapshot"]),
+                    "status": status,
+                    "value": value,
+                    "frame_coverage": {
+                        "expected": expected,
+                        "observed": observed,
+                        "completed": completed,
+                    },
+                    "reason_counts": dict(sorted(reasons.items())),
+                }
+            )
+
+    def summary(name: str, method_id: int, units: list[dict[str, Any]]) -> dict[str, Any]:
+        values = sorted(
+            float(unit["value"])
+            for unit in units
+            if unit.get("status") == "completed" and unit.get("value") is not None
+        )
+        counts = Counter(str(unit["status"]) for unit in units)
+        reasons: Counter[str] = Counter()
+        for unit in units:
+            reasons.update(dict(unit.get("reason_counts") or {}))
         return {
             "metric_name": name,
             "direction": METRIC_DIRECTIONS.get(name, "lower_is_better"),
             "method_id": method_id,
             "method_label": methods[method_id]["label_snapshot"],
             "status_counts": dict(counts),
+            "reason_counts": dict(sorted(reasons.items())),
+            "item_count": len(units),
             "count": len(values),
             "mean": statistics.mean(values) if values else None,
             "median": statistics.median(values) if values else None,
             "p10": _percentile(values, 0.1) if values else None,
             "p90": _percentile(values, 0.9) if values else None,
+            "frame_coverage": {
+                "expected": sum(int(unit["frame_coverage"]["expected"]) for unit in units),
+                "observed": sum(int(unit["frame_coverage"]["observed"]) for unit in units),
+                "completed": sum(int(unit["frame_coverage"]["completed"]) for unit in units),
+            },
         }
-    metrics = []
-    for name, method_id in sorted(set(grouped) | set(statuses)):
-        metrics.append(
-            summary(name, method_id, grouped.get((name, method_id), []), statuses[(name, method_id)])
+
+    keys = sorted({(str(row["metric_name"]), int(row["method_id"])) for row in item_results})
+    metrics = [
+        summary(
+            name,
+            method_id,
+            [
+                row
+                for row in item_results
+                if str(row["metric_name"]) == name and int(row["method_id"]) == method_id
+            ],
         )
+        for name, method_id in keys
+    ]
     by_video: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for video_name, name, method_id in sorted(set(video_grouped) | set(video_statuses)):
-        by_video[video_name].append(
-            summary(
-                name,
-                method_id,
-                video_grouped.get((video_name, name, method_id), []),
-                video_statuses[(video_name, name, method_id)],
+    for video_name in sorted({str(row["video_name"]) for row in item_results}):
+        video_rows = [row for row in item_results if str(row["video_name"]) == video_name]
+        for name, method_id in sorted(
+            {(str(row["metric_name"]), int(row["method_id"])) for row in video_rows}
+        ):
+            by_video[video_name].append(
+                summary(
+                    name,
+                    method_id,
+                    [
+                        row
+                        for row in video_rows
+                        if str(row["metric_name"]) == name and int(row["method_id"]) == method_id
+                    ],
+                )
             )
-        )
-    return {"metrics": metrics, "by_video": dict(by_video)}
+    return {
+        "metrics": metrics,
+        "by_video": dict(by_video),
+        "items": item_results,
+        "metric_fingerprint": str(snapshot.get("fingerprint") or ""),
+        "producer_state": list(snapshot.get("producer_state") or []),
+    }
 
 
 def campaign_analysis_v2(
@@ -3904,7 +4780,37 @@ def campaign_analysis_v2(
 ) -> dict[str, Any]:
     campaign = get_campaign_v2(db, int(campaign_id))
     samples = max(0, min(5000, int(bootstrap_samples)))
-    cache_key = _json({"bootstrap_samples": samples, "video": str(video or "")})
+    methods = {int(row["id"]): row for row in campaign["methods"]}
+    bindings: list[dict[str, Any]] = []
+    for item in campaign["items"]:
+        video_name = str(item["video_name"])
+        if video and video_name != str(video):
+            continue
+        temporal = dict((item.get("alignment") or {}).get("temporal") or {})
+        planned_frame_count = int(temporal.get("frame_count") or 0)
+        for binding in item["bindings"]:
+            expected_frame_count = planned_frame_count
+            if expected_frame_count <= 0:
+                asset = db.get(
+                    "SELECT frame_count FROM media_assets WHERE id = ?",
+                    (int(binding["source_asset_id"]),),
+                ) or {}
+                expected_frame_count = int(asset.get("frame_count") or 0)
+            bindings.append(
+                {
+                    **binding,
+                    "video_name": video_name,
+                    "expected_frame_count": expected_frame_count,
+                }
+            )
+    objective_snapshot = _objective_metric_snapshot(db, bindings, methods)
+    cache_key = _json(
+        {
+            "bootstrap_samples": samples,
+            "video": str(video or ""),
+            "objective_fingerprint": str(objective_snapshot["fingerprint"]),
+        }
+    )
     cached = db.get(
         """
         SELECT payload_json FROM evaluation_analysis_cache_v2
@@ -3914,7 +4820,6 @@ def campaign_analysis_v2(
     )
     if cached is not None:
         return _loads(cached["payload_json"])
-    methods = {int(row["id"]): row for row in campaign["methods"]}
     method_ids = sorted(methods)
     clauses = ["t.campaign_id = ?"]
     params: list[Any] = [int(campaign_id)]
@@ -3989,11 +4894,6 @@ def campaign_analysis_v2(
     completed_tasks = sum(
         1 for task in tasks if counts[int(task["id"])] >= int(campaign["target_votes"])
     )
-    bindings = [
-        {**binding, "video_name": str(item["video_name"])}
-        for item in campaign["items"]
-        for binding in item["bindings"]
-    ]
     alignment_items = [
         {
             "evaluation_item_id": int(item["id"]),
@@ -4024,8 +4924,14 @@ def campaign_analysis_v2(
         },
         "human": human,
         "by_video": by_video,
+        "ratings": _ratings_by_method(votes, task_by_id, methods),
         "quality_reasons": dict(sorted(reason_counts.items())),
-        "objective": _objective_by_method(db, bindings, methods),
+        "objective": _objective_by_method(
+            db,
+            bindings,
+            methods,
+            snapshot=objective_snapshot,
+        ),
         "alignment": {
             "items": alignment_items,
             "fingerprints": [row["fingerprint"] for row in alignment_items],

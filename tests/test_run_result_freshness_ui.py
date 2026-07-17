@@ -64,6 +64,14 @@ class RunResultFreshnessUiTests(unittest.TestCase):
         self.assertIn('name="metric_batch_size_per_device"', self.index_html)
         self.assertIn("metric_batch_size_per_device: data.metric_batch_size_per_device", self.app_js)
 
+    def test_run_detail_can_retry_only_failed_or_unavailable_metrics(self) -> None:
+        self.assertIn("function retriableMetricCount(runId)", self.app_js)
+        self.assertIn("row?.failed", self.app_js)
+        self.assertIn("row?.unavailable", self.app_js)
+        self.assertIn("data-retry-run-metrics", self.app_js)
+        self.assertIn("function retryRunMetrics(runId)", self.app_js)
+        self.assertIn("/metrics/retry", self.app_js)
+
 
 if __name__ == "__main__":
     unittest.main()

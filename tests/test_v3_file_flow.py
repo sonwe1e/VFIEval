@@ -2614,6 +2614,34 @@ class Model:
                 )
             )
 
+            db.add_metric_result(
+                inference_jobs[0],
+                inference_jobs[0],
+                sample_ids[0],
+                "lpips_vit_patch",
+                "unavailable",
+                None,
+                {"reason": "old transient failure"},
+            )
+            db.add_metric_result(
+                inference_jobs[0],
+                inference_jobs[0],
+                sample_ids[0],
+                "lpips_vit_patch",
+                "completed",
+                0.2,
+                {},
+            )
+            db.add_metric_result(
+                inference_jobs[0],
+                inference_jobs[0],
+                sample_ids[0],
+                "lpips_convnext",
+                "unavailable",
+                None,
+                {"reason": "device unavailable"},
+            )
+
             retry = _retry_run_metrics(db, run_id)
 
             metric_job = db.get_job(retry["metric_job_id"])
@@ -2621,6 +2649,12 @@ class Model:
             metric_jobs = db.list_run_jobs(run_id, "metric")
             self.assertEqual([row["device"] for row in metric_jobs], ["npu:0", "npu:1"])
             self.assertTrue(all(row["payload"]["retry"] for row in metric_jobs))
+            self.assertTrue(
+                all(
+                    row["payload"]["metric_names"] == ["lpips_convnext"]
+                    for row in metric_jobs
+                )
+            )
             self.assertEqual(retry["metric_job_ids"], [row["job_id"] for row in metric_jobs])
 
     def test_multi_npu_worker_failure_preserves_shard_context_for_run_error(self) -> None:

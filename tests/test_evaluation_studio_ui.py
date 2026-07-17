@@ -144,15 +144,36 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn('"function"', start_sync)
         self.assertIn('addEventListener("timeupdate"', self.blind_js)
         self.assertIn('addEventListener("waiting", handleMediaWaiting)', self.blind_js)
-        self.assertIn('addEventListener("ended"', self.blind_js)
+        create_media = self._function_source("createMediaNode")
+        self.assertIn('addEventListener("pause", handleMediaPause)', create_media)
+        self.assertIn('addEventListener("ended", handleMediaEnded)', create_media)
+        self.assertLess(
+            create_media.index('addEventListener("pause", handleMediaPause)'),
+            create_media.index('if (side === "reference")'),
+        )
         self.assertNotIn("0.08", self.blind_js)
 
         waiting = self._function_source("handleMediaWaiting")
-        self.assertIn("pauseSynchronizedPlayback(", waiting)
+        self.assertIn("blindState.syncPlayIntent", waiting)
+        self.assertIn("blindState.syncAttempt += 1", waiting)
+        self.assertIn("pauseVideosInternally()", waiting)
+        self.assertNotIn("pauseSynchronizedPlayback(", waiting)
+        ready = self._function_source("handleMediaCanPlay")
+        self.assertIn("maybeResumeBufferedPlayback()", ready)
+        self.assertIn(
+            "playSynchronizedVideos(true)",
+            self._function_source("maybeResumeBufferedPlayback"),
+        )
         pause_all = self._function_source("pauseSynchronizedPlayback")
-        self.assertIn("activeVideos()", pause_all)
-        self.assertIn("pause()", pause_all)
+        self.assertIn("pauseVideosInternally()", pause_all)
+        internal_pause = self._function_source("pauseVideosInternally")
+        self.assertIn("activeVideos()", internal_pause)
+        self.assertIn("pause()", internal_pause)
+        self.assertNotIn('dataset.mediaSide === "reference"', internal_pause)
         self.assertIn("setSyncStatus(", pause_all)
+        seeked = self._function_source("handleReferenceSeeked")
+        self.assertIn("blindState.syncWaiting", seeked)
+        self.assertIn('"stalled"', seeked)
         self.assertIn('byId("sync-status")', self._function_source("setSyncStatus"))
         for control in ("master-play", "master-seek", "master-rate", "master-loop"):
             self.assertIn(f'byId("{control}")', self.blind_js)
@@ -160,7 +181,7 @@ class EvaluationStudioUiTests(unittest.TestCase):
     def test_blind_task_replacement_stops_old_synchronization_and_media(self) -> None:
         stop = self._function_source("stopSynchronization")
         self.assertIn("cancelFrameSynchronization()", stop)
-        self.assertIn("pause()", stop)
+        self.assertIn("pauseVideosInternally()", stop)
         cancel = self._function_source("cancelFrameSynchronization")
         self.assertIn("cancelVideoFrameCallback", cancel)
         render_task = self._function_source("renderTask")
@@ -170,8 +191,26 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn("const mediaGeneration = blindState.mediaGeneration", play)
         self.assertIn("videos.every((video) => isCurrentMedia(video))", play)
         reference_play = self._function_source("handleReferencePlay")
-        self.assertIn("mediaGeneration !== blindState.mediaGeneration", reference_play)
-        self.assertIn("isCurrentMedia(peer)", reference_play)
+        self.assertIn("isCurrentMedia(clock)", reference_play)
+        self.assertIn("playSynchronizedVideos(false)", reference_play)
+
+    def test_blind_vote_ratings_reviews_and_sticky_controls_are_present(self) -> None:
+        for token in (
+            'name="choice"',
+            'id="left-rating"',
+            'id="right-rating"',
+            'step="0.25"',
+            'id="review-list"',
+        ):
+            self.assertIn(token, self.blind_html)
+        self.assertIn("position: sticky", self.blind_css)
+        self.assertIn("grid-template-areas", self.blind_css)
+        submit = self._function_source("submitVote")
+        self.assertIn("left_rating", submit)
+        self.assertIn("right_rating", submit)
+        self.assertIn("reasons: []", submit)
+        self.assertIn("function loadReviews", self.blind_js)
+        self.assertIn("function openReview", self.blind_js)
 
     def test_blind_frame_sequences_share_one_index_across_all_three_images(self) -> None:
         factory = self._function_source("createMediaNode")

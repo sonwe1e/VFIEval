@@ -37,6 +37,11 @@
           <p class="muted">参考 GT 仅用于观察；请选择质量更好的候选，或选择平局。</p>
         </div>
 
+        <div id="review-toolbar" class="review-toolbar hidden">
+          <button id="review-back" class="secondary" type="button">返回已评列表</button>
+          <span id="review-mode-label" class="muted"></span>
+        </div>
+
         <div class="blind-media-toolbar">
           <div class="view-switch" role="group" aria-label="媒体显示方式">
             <span class="view-switch-label">显示方式</span>
@@ -74,25 +79,30 @@
         </div>
 
         <form id="vote-form">
-          <fieldset>
-            <legend>判断依据（可多选）</legend>
-            <div id="quality-reasons" class="reason-grid"></div>
+          <fieldset class="outcome-fieldset">
+            <legend>请选择谁更好（必选）</legend>
+            <div class="outcome-options">
+              <label><input name="choice" value="left" type="radio" required><span>候选 A 更好</span></label>
+              <label><input name="choice" value="tie" type="radio" required><span>平局</span></label>
+              <label><input name="choice" value="right" type="radio" required><span>候选 B 更好</span></label>
+            </div>
           </fieldset>
+          <div class="rating-grid">
+            <label for="left-rating"><span>候选 A 评分（可选）</span><input id="left-rating" name="left_rating" type="number" min="1" max="5" step="0.25" inputmode="decimal" placeholder="1–5"></label>
+            <label for="right-rating"><span>候选 B 评分（可选）</span><input id="right-rating" name="right_rating" type="number" min="1" max="5" step="0.25" inputmode="decimal" placeholder="1–5"></label>
+          </div>
           <div class="vote-meta">
             <label><span>置信度</span><select name="confidence"><option value="">未填写</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option></select></label>
             <label class="note"><span>备注</span><textarea name="note" maxlength="4000" rows="2"></textarea></label>
           </div>
-          <div class="vote-actions">
-            <button name="choice" value="left" type="submit">候选 A 更好</button>
-            <button name="choice" value="tie" class="secondary" type="submit">平局</button>
-            <button name="choice" value="right" type="submit">候选 B 更好</button>
-          </div>
+          <div class="vote-save-actions"><button id="save-vote" type="submit">保存并继续</button></div>
         </form>
       </section>
 
       <section id="complete-panel" class="panel hidden">
         <h2>个人任务已完成</h2>
         <p class="muted">以下为当前实时结果；新投票进入后统计可能继续变化。</p>
+        <div id="review-list" class="review-list"></div>
         <div id="live-results"></div>
       </section>
 

@@ -105,15 +105,15 @@ User rating (1–5, 0.25 step) + free-text issue per run; content-scoped (video/
 ### 8. Metrics (health, assets, execution)
 - **Names/registry:** `metrics/names.py`, `metrics/registry.py`
 - **Health/assets:** `metrics/health.py` (`metrics_health`, downloads via `prepare-metrics`)
-- **Execution:** `pipeline/metrics_runner.py` (batched scoring/cache), `pipeline/metric_jobs.py` (multi-device wave creation/progress/aggregation); per-metric `metrics/feature.py` (lpips_*), `metrics/vmaf.py`, `metrics/cgvqm.py`
-- **Routes:** `GET /api/metrics/health`
-- **Frontend:** `app.js` `renderMetricOptions` (L261), `renderMetricHealthTable` (L870), `renderMetricEnvironmentPanel` (L914)
+- **Execution:** `pipeline/metrics_runner.py` (batched scoring/cache and retry cache policy), `pipeline/metric_jobs.py` (multi-device wave creation/progress/aggregation); per-metric `metrics/feature.py` (lpips_*), `metrics/vmaf.py`, `metrics/cgvqm.py` (bounded driver protocol diagnostics)
+- **Routes:** `GET /api/metrics/health`, `POST /api/runs/{id}/metrics/retry`
+- **Frontend:** `app.js` `renderMetricOptions`, `renderMetricHealthTable`, `renderMetricEnvironmentPanel`, Run Detail failed/unavailable metric retry action
 - **CLI:** `cli.py` `prepare-metrics [--check-only|--force]`
 - **Tests:** `tests/test_metrics.py`
 
 ### 9. Run detail / timeline / sample APIs (scoped reads — perf-critical)
 - **API:** `server.py` `_run_detail` (L1505), `_run_videos` (L1797), `_run_video_timeline` (L1839), `_run_sample_payload` (L2270), `_run_metric_summary` (L2332). Legacy full-load: `_run_timeline` (L1696, deprecated).
-- **Routes:** `GET /api/runs/{id}` `/videos` `/videos/{name}/timeline` `/samples/{id}` `/metric-summary`; `/timeline` returns `X-Deprecated`
+- **Routes:** `GET /api/runs/{id}` `/videos` `/videos/{name}/timeline` `/samples/{id}` `/metric-summary`; `POST /api/runs/{id}/metrics/retry`; `/timeline` returns `X-Deprecated`
 - **Backing (scoped):** `db.list_samples_by_video` (L615), `list_artifacts_by_sample` (L1937), `list_metrics_by_sample` (L2022)
 - **Indices:** `idx_artifacts_sample(sample_id, kind)`, `idx_metric_results_sample(sample_id, metric_name)`, `idx_run_jobs_device(device)`
 - **Rule:** these handlers must NOT call `_run_timeline` or iterate the whole run.
@@ -169,14 +169,14 @@ User rating (1–5, 0.25 step) + free-text issue per run; content-scoped (video/
 - **Tests:** `tests/test_artifact_profiles.py`, `tests/test_artifact_integrity.py`
 
 ### 16. Blind evaluation V2 + frozen Campaign packages
-- **Core:** `evaluations_v2.py` `list_run_outputs`, `preview_campaign_v2`, `create_campaign_v2`, `request_publish_campaign_v2`, `run_pending_preparations`, `publish_campaign_v2`, blind session/payload/media/heartbeat/vote functions, `campaign_analysis_v2`, `campaign_export_v2`; `pipeline/evaluation_freeze.py` owns bounded rawvideo/remux package materialization
-- **Lifecycle:** draft → preparing → published → closed/archived; failed preparation can be retried. Publish deep-validates every selected GT/A/B item, builds staging, freezes under `.vfieval/evaluations/{campaign_id}`, writes a SHA-256 manifest, registers evaluation-package assets, then creates tasks atomically.
+- **Core:** `evaluations_v2.py` `list_run_outputs`, `preview_campaign_v2`, `create_campaign_v2`, `request_publish_campaign_v2`, `run_pending_preparations`, `publish_campaign_v2`, blind session/payload/media/heartbeat/vote/review functions, `campaign_analysis_v2`, `campaign_export_v2`; `pipeline/evaluation_freeze.py` owns three-stream bounded rawvideo/paired-remux package materialization
+- **Lifecycle:** draft → preparing → published → closed/archived; failed preparation can be retried. Publish deep-validates every selected GT/A/B item, builds staging, freezes under `.vfieval/evaluations/{campaign_id}`, revalidates all source content, writes a SHA-256 manifest, registers evaluation-package assets, then creates tasks atomically. New packages omit Diff; historical Diff entries remain readable.
 - **Tables:** `evaluation_campaigns_v2`, `evaluation_methods_v2`, `evaluation_items_v2`, `evaluation_bindings_v2`, `evaluation_preparations_v2`, `evaluation_tasks_v2`, `evaluation_assignments_v2`, `evaluation_votes_v2`, `evaluation_analysis_cache_v2`; shared identity table `evaluators`
 - **Admin routes:** `GET /api/evaluation-campaigns`, `POST /api/evaluation-campaigns/v2/preview`, `POST /api/evaluation-campaigns/v2`, `GET /api/evaluation-campaigns/v2/{id}[/{analysis,export}]`, `POST /api/evaluation-campaigns/v2/{id}/{publish,close,archive}`
-- **Participant routes:** `/evaluate/{opaque_token}`; `/api/blind/{token}`, `/session`, task-token `/media/{reference,left,right}`, `/vote`, `/heartbeat`
+- **Participant routes:** `/evaluate/{opaque_token}`; `/api/blind/{token}`, `/session`, `/reviews`, `/reviews/{task_token}`, task-token `/media/{reference,left,right}`, `/vote`, `/heartbeat`
 - **Frontend:** `studio.js` + `studio.css` for method picker, common-video matrix, preparation status, packages and organizer analysis; `blind.html` + `blind.js` + `blind.css` is isolated from the main navigation.
 - **Privacy/concurrency:** participant payloads use opaque campaign/task/assignment/media URLs, stable side randomization, renewable assignment leases, and transactionally capped target votes. Results unlock only after the evaluator finishes all eligible tasks.
-- **Analysis:** pairwise ties are half-wins, Bradley–Terry/bootstrap is deterministic, and human/objective results remain separate.
+- **Analysis:** pairwise ties are half-wins, Bradley–Terry/bootstrap is deterministic, optional quarter-step A/B ratings are separate, objective metrics aggregate Item-first across latest producer-Run shards, and human/objective results remain separate.
 - **Legacy:** `evaluations.py` schema v1 stays read-only/exportable/archivable through `legacy_campaigns_readonly`; do not infer a V2 migration from labels.
 - **Tests:** `tests/test_evaluation_campaigns_v2.py`, `tests/test_evaluation_studio_ui.py`, `tests/test_evaluation_campaigns.py`
 

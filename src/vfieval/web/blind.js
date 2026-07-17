@@ -38,6 +38,10 @@ const blindState = {
   evaluatorId: readLocalValue("vfieval-evaluator-id") || newEvaluatorId(),
   evaluatorName: readLocalValue("vfieval-evaluator-name"),
   payload: null,
+  reviews: [],
+  reviewMode: false,
+  reviewReadOnly: false,
+  reviewTask: null,
   taskStartedAt: 0,
   frameIndex: 0,
   mediaGeneration: 0,
@@ -45,8 +49,9 @@ const blindState = {
   wipeSupported: true,
   wipeDivider: null,
   syncClock: null,
-  syncExpectedPlaying: false,
+  syncPlayIntent: false,
   syncWaiting: false,
+  syncAttempt: 0,
   syncFrameCallbackId: null,
   syncFrameCallbackGeneration: 0,
   syncUsesFrameCallback: false,
@@ -126,7 +131,9 @@ function withFrame(url, frame) {
 }
 
 function currentTask() {
-  return (blindState.payload && (blindState.payload.task || blindState.payload.next_task)) || null;
+  return blindState.reviewTask
+    || (blindState.payload && (blindState.payload.task || blindState.payload.next_task))
+    || null;
 }
 
 function setSyncStatus(message, state = "ready") {
@@ -228,8 +235,9 @@ function createMediaNode(task, side, label) {
   const video = document.createElement("video");
   video.controls = false;
   video.playsInline = true;
-  video.preload = "metadata";
+  video.preload = "auto";
   video.dataset.mediaSide = side;
+  video.dataset.mediaLabel = label;
   video.dataset.mediaGeneration = String(blindState.mediaGeneration);
   const rateControl = byId("master-rate");
   const loopControl = byId("master-loop");
@@ -239,17 +247,17 @@ function createMediaNode(task, side, label) {
   video.addEventListener("loadedmetadata", () => updateMediaAspectRatio(video));
   video.addEventListener("resize", () => updateMediaAspectRatio(video));
   video.addEventListener("waiting", handleMediaWaiting);
-  video.addEventListener("error", () => {
-    if (isCurrentMedia(video)) mediaLoadError(label);
-  });
+  video.addEventListener("canplay", handleMediaCanPlay);
+  video.addEventListener("playing", handleMediaPlaying);
+  video.addEventListener("pause", handleMediaPause);
+  video.addEventListener("ended", handleMediaEnded);
+  video.addEventListener("error", handleMediaErrorState);
   if (side === "reference") {
     video.addEventListener("timeupdate", syncFromClockVideo);
     video.addEventListener("play", handleReferencePlay);
-    video.addEventListener("pause", handleReferencePause);
     video.addEventListener("seeking", handleReferenceSeeking);
     video.addEventListener("seeked", handleReferenceSeeked);
     video.addEventListener("ratechange", handleReferenceRateChange);
-    video.addEventListener("ended", handleReferenceEnded);
   }
   return video;
 }
@@ -263,11 +271,40 @@ function mediaCard(media, label, className = "") {
   return card;
 }
 
+function populateVoteForm(task) {
+  const form = byId("vote-form");
+  if (!form) return;
+  form.reset();
+  const vote = (task && task.vote) || {};
+  form.querySelectorAll('input[name="choice"]').forEach((input) => {
+    input.checked = input.value === String(vote.choice || "");
+  });
+  const leftRating = form.elements.left_rating;
+  const rightRating = form.elements.right_rating;
+  if (leftRating) leftRating.value = vote.left_rating == null ? "" : String(vote.left_rating);
+  if (rightRating) rightRating.value = vote.right_rating == null ? "" : String(vote.right_rating);
+  if (form.elements.confidence) form.elements.confidence.value = String(vote.confidence || "");
+  if (form.elements.note) form.elements.note.value = String(vote.note || "");
+  const readOnly = Boolean(task && task.read_only);
+  form.querySelectorAll("input, select, textarea, button").forEach((control) => {
+    control.disabled = readOnly;
+  });
+  const save = byId("save-vote");
+  if (save) {
+    save.classList.toggle("hidden", readOnly);
+    save.textContent = task && task.review ? "保存修改" : "保存并继续";
+  }
+}
+
 function renderTask(task) {
   stopSynchronization();
   blindState.mediaGeneration += 1;
   setHidden("task-panel", !task);
   if (!task) {
+    blindState.reviewTask = null;
+    blindState.reviewMode = false;
+    blindState.reviewReadOnly = false;
+    setHidden("review-toolbar", true);
     if (blindState.leaseTimer) clearInterval(blindState.leaseTimer);
     blindState.leaseTimer = null;
     replaceContent(byId("media-grid"));
@@ -275,6 +312,17 @@ function renderTask(task) {
     setSyncStatus("当前没有待评媒体。", "ready");
     return;
   }
+  blindState.reviewMode = Boolean(task.review);
+  blindState.reviewReadOnly = Boolean(task.read_only);
+  if (task.review && blindState.leaseTimer) {
+    clearInterval(blindState.leaseTimer);
+    blindState.leaseTimer = null;
+  }
+  setHidden("review-toolbar", !task.review);
+  byId("review-mode-label").textContent = task.read_only
+    ? "Campaign 已关闭，只读回看"
+    : "正在修改已提交结果";
+  populateVoteForm(task);
   byId("task-video").textContent = task.video_name || "视频";
   const grid = byId("media-grid");
   grid.style.setProperty("--media-aspect-ratio", "16 / 9");
@@ -302,19 +350,15 @@ function renderTask(task) {
   updateMediaAspectRatio(right);
   updateWipePosition(50);
   setViewMode(blindState.viewMode);
-  const reasons = byId("quality-reasons");
-  replaceContent(reasons, ...(task.quality_reasons || []).map((reason) => {
-    const label = document.createElement("label");
-    const input = document.createElement("input");
-    input.type = "checkbox";
-    input.name = "reason";
-    input.value = reason;
-    label.append(input, document.createTextNode(reason));
-    return label;
-  }));
   const frameCount = Math.max(1, Number(task.frame_count || 1));
   const mediaKinds = new Set(["reference", "left", "right"].map((side) => task[`${side}_media_kind`] || "video"));
   const hasFrames = mediaKinds.has("frame_sequence");
+  const syncStatus = byId("sync-status");
+  const playbackControls = byId("playback-controls");
+  const mediaToolbar = document.querySelector(".blind-media-toolbar");
+  if (syncStatus && (hasFrames ? mediaToolbar : playbackControls)) {
+    (hasFrames ? mediaToolbar : playbackControls).appendChild(syncStatus);
+  }
   if (mediaKinds.size > 1) {
     showError(new Error("这个任务混用了视频与帧序列，无法提供可靠同步播放，请联系组织者重新发布。"));
     byId("vote-form").classList.add("hidden");
@@ -335,7 +379,7 @@ function renderTask(task) {
     setSyncStatus("三路视频已就绪，播放时将以参考 GT 为时钟。", "ready");
   }
   blindState.taskStartedAt = Date.now();
-  startLeaseHeartbeat(task);
+  if (!task.review) startLeaseHeartbeat(task);
 }
 
 function renderResults(results) {
@@ -365,6 +409,69 @@ function renderResults(results) {
   replaceContent(host, grid);
 }
 
+function ratingLabel(value) {
+  return value == null || value === "" ? "未评分" : `${Number(value).toFixed(2)} 分`;
+}
+
+function renderReviews(payload) {
+  const list = (payload && payload.reviews) || [];
+  blindState.reviews = list;
+  const host = byId("review-list");
+  if (!host) return;
+  if (!list.length) {
+    host.textContent = "尚无可回看的已评视频。";
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  list.forEach((row, index) => {
+    const vote = row.vote || {};
+    const item = document.createElement("div");
+    item.className = "review-row";
+    const summary = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = row.video_name || `已评视频 ${index + 1}`;
+    const detail = document.createElement("p");
+    const choice = vote.choice === "left" ? "A 更好" : vote.choice === "right" ? "B 更好" : "平局";
+    detail.className = "muted";
+    detail.textContent = `${choice} · A ${ratingLabel(vote.left_rating)} · B ${ratingLabel(vote.right_rating)}`;
+    summary.append(title, detail);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "secondary";
+    button.dataset.reviewTask = row.task_token;
+    button.textContent = payload.editable ? "回看并修改" : "只读回看";
+    item.append(summary, button);
+    fragment.appendChild(item);
+  });
+  replaceContent(host, fragment);
+}
+
+async function loadReviews() {
+  if (!blindState.evaluatorName) return;
+  const payload = await blindApi(
+    `/api/blind/${encodeURIComponent(blindState.token)}/reviews?evaluator_id=${encodeURIComponent(blindState.evaluatorId)}`,
+  );
+  renderReviews(payload);
+}
+
+async function openReview(taskToken) {
+  const payload = await blindApi(
+    `/api/blind/${encodeURIComponent(blindState.token)}/reviews/${encodeURIComponent(taskToken)}?evaluator_id=${encodeURIComponent(blindState.evaluatorId)}`,
+  );
+  blindState.reviewTask = payload.task;
+  blindState.reviewMode = true;
+  blindState.reviewReadOnly = !payload.editable;
+  setHidden("complete-panel", true);
+  renderTask(payload.task);
+}
+
+async function leaveReview() {
+  blindState.reviewTask = null;
+  blindState.reviewMode = false;
+  blindState.reviewReadOnly = false;
+  await loadBlindPayload();
+}
+
 function renderPayload(payload) {
   blindState.payload = payload;
   const campaign = payload.campaign || {};
@@ -375,7 +482,10 @@ function renderPayload(payload) {
   renderTask(payload.task || payload.next_task || null);
   const complete = Boolean(progress.complete);
   setHidden("complete-panel", !complete);
-  if (complete) renderResults(payload.results);
+  if (complete) {
+    renderResults(payload.results);
+    loadReviews().catch(showError);
+  }
   const noTask = !(payload.task || payload.next_task);
   if (!noTask || complete) {
     if (blindState.retryTimer) clearTimeout(blindState.retryTimer);
@@ -452,12 +562,19 @@ async function saveSession(event) {
 async function submitVote(event) {
   event.preventDefault();
   const voteForm = event.currentTarget;
-  const submitter = event.submitter || document.activeElement;
-  const task = blindState.payload && (blindState.payload.task || blindState.payload.next_task);
-  if (!task || !submitter || !submitter.value) return;
+  const task = currentTask();
+  if (!task || blindState.reviewReadOnly) return;
+  const form = new FormData(voteForm);
+  const choice = String(form.get("choice") || "");
+  if (!choice) {
+    showError(new Error("请选择候选 A、平局或候选 B。"));
+    return;
+  }
   const buttons = voteForm.querySelectorAll("button");
   buttons.forEach((button) => { button.disabled = true; });
-  const form = new FormData(voteForm);
+  const wasReview = blindState.reviewMode;
+  const leftRaw = String(form.get("left_rating") || "").trim();
+  const rightRaw = String(form.get("right_rating") || "").trim();
   try {
     const payload = await blindApi(
       `/api/blind/${encodeURIComponent(blindState.token)}/tasks/${encodeURIComponent(task.token)}/vote`,
@@ -465,8 +582,10 @@ async function submitVote(event) {
         method: "POST",
         body: JSON.stringify({
           evaluator_id: blindState.evaluatorId,
-          choice: submitter.value,
-          reasons: form.getAll("reason"),
+          choice,
+          reasons: [],
+          left_rating: leftRaw ? Number(leftRaw) : null,
+          right_rating: rightRaw ? Number(rightRaw) : null,
           confidence: String(form.get("confidence") || ""),
           note: String(form.get("note") || ""),
           duration_ms: Math.max(0, Date.now() - blindState.taskStartedAt),
@@ -474,6 +593,14 @@ async function submitVote(event) {
       },
     );
     voteForm.reset();
+    if (wasReview) {
+      blindState.reviewTask = null;
+      blindState.reviewMode = false;
+      blindState.reviewReadOnly = false;
+      await loadBlindPayload();
+      showToast("修改已保存");
+      return;
+    }
     renderPayload({
       ...blindState.payload,
       ...payload,
@@ -549,26 +676,12 @@ function cancelFrameSynchronization() {
   blindState.syncUsesFrameCallback = false;
 }
 
-function stopSynchronization() {
-  blindState.syncExpectedPlaying = false;
-  blindState.syncWaiting = false;
-  cancelFrameSynchronization();
-  activeVideos().forEach((video) => {
-    try {
-      video.pause();
-    } catch (_error) {
-      // A detached or failed media element is safe to abandon during task replacement.
-    }
-  });
-  blindState.syncClock = null;
-}
-
 function startFrameSynchronization() {
   cancelFrameSynchronization();
   const clock = blindState.syncClock || referenceVideo();
   if (
     !clock
-    || !blindState.syncExpectedPlaying
+    || !blindState.syncPlayIntent
     || typeof clock.requestVideoFrameCallback !== "function"
   ) return;
   blindState.syncClock = clock;
@@ -577,7 +690,7 @@ function startFrameSynchronization() {
     blindState.syncFrameCallbackId = null;
     if (
       generation !== blindState.syncFrameCallbackGeneration
-      || !blindState.syncExpectedPlaying
+      || !blindState.syncPlayIntent
       || blindState.syncClock !== clock
     ) return;
     const mediaTime = metadata && Number.isFinite(Number(metadata.mediaTime))
@@ -613,121 +726,14 @@ function applyPlaybackSettings() {
   });
 }
 
-function pauseSynchronizedPlayback(message = "已暂停，三路媒体保持在同一时间位置。", state = "ready") {
-  blindState.syncExpectedPlaying = false;
-  cancelFrameSynchronization();
-  activeVideos().forEach((video) => video.pause());
-  const playButton = byId("master-play");
-  if (playButton) playButton.textContent = "全部播放";
-  setSyncStatus(message, state);
-}
-
-function handlePlayFailure(_error) {
-  blindState.syncWaiting = false;
-  pauseSynchronizedPlayback("浏览器未能同时启动三路媒体，已全部暂停。", "error");
-  showError(new Error("无法同时播放三路媒体，请重试。"));
-}
-
-async function playSynchronizedVideos() {
-  const mediaGeneration = blindState.mediaGeneration;
-  const videos = activeVideos();
-  if (!videos.length) return;
-  const playbackIsCurrent = () => (
-    mediaGeneration === blindState.mediaGeneration
-    && videos.every((video) => isCurrentMedia(video))
-  );
-  const clock = videos.find((video) => video.dataset.mediaSide === "reference") || videos[0];
-  blindState.syncClock = clock;
-  blindState.syncWaiting = false;
-  applyPlaybackSettings();
-  synchronizeFollowers(Number(clock.currentTime || 0), true);
-  blindState.syncExpectedPlaying = true;
-  setSyncStatus("正在对齐并启动三路视频…", "ready");
-  try {
-    await Promise.all(videos.map((video) => {
-      const attempt = video.play();
-      return attempt && typeof attempt.then === "function" ? attempt : Promise.resolve();
-    }));
-  } catch (_error) {
-    videos.forEach((video) => video.pause());
-    if (!playbackIsCurrent()) return;
-    blindState.syncExpectedPlaying = false;
-    cancelFrameSynchronization();
-    setSyncStatus("浏览器未能同时启动三路媒体，已全部暂停。", "error");
-    throw new Error("无法同时播放三路媒体，请确认浏览器允许播放后重试。");
-  }
-  if (!playbackIsCurrent()) {
-    videos.forEach((video) => video.pause());
-    return;
-  }
-  if (!blindState.syncExpectedPlaying) return;
-  startFrameSynchronization();
-  byId("master-play").textContent = "全部暂停";
-  setSyncStatus("同步播放中；参考 GT 是主时钟。", "playing");
-}
-
-async function toggleMasterPlayback() {
-  const videos = activeVideos();
-  if (!videos.length) return;
-  if (blindState.syncExpectedPlaying || videos.some((video) => !video.paused)) {
-    blindState.syncWaiting = false;
-    pauseSynchronizedPlayback();
-    return;
-  }
-  await playSynchronizedVideos();
-}
-
 function syncFromClockVideo(event) {
   const video = event.currentTarget;
   if (!isCurrentMedia(video)) return;
   if (!Number.isFinite(video.duration) || video.duration <= 0) return;
   updateMasterSeek(Number(video.currentTime || 0), Number(video.duration));
-  if (blindState.syncExpectedPlaying && !blindState.syncUsesFrameCallback) {
+  if (blindState.syncPlayIntent && !blindState.syncUsesFrameCallback) {
     synchronizeFollowers(Number(video.currentTime || 0));
   }
-}
-
-function handleReferencePlay(event) {
-  const clock = event.currentTarget;
-  if (!isCurrentMedia(clock)) return;
-  const mediaGeneration = blindState.mediaGeneration;
-  if (blindState.syncClock && blindState.syncClock !== clock) return;
-  blindState.syncClock = clock;
-  if (!blindState.syncExpectedPlaying) {
-    blindState.syncExpectedPlaying = true;
-    blindState.syncWaiting = false;
-    applyPlaybackSettings();
-    synchronizeFollowers(Number(clock.currentTime || 0), true);
-    activeVideos().forEach((peer) => {
-      if (peer === clock || !peer.paused) return;
-      try {
-        const attempt = peer.play();
-        if (attempt && typeof attempt.catch === "function") {
-          attempt.catch((error) => {
-            if (mediaGeneration !== blindState.mediaGeneration || !isCurrentMedia(peer)) {
-              peer.pause();
-              return;
-            }
-            handlePlayFailure(error);
-          });
-        }
-      } catch (error) {
-        if (mediaGeneration === blindState.mediaGeneration && isCurrentMedia(peer)) {
-          handlePlayFailure(error);
-        }
-      }
-    });
-  }
-  startFrameSynchronization();
-  byId("master-play").textContent = "全部暂停";
-  setSyncStatus("同步播放中；参考 GT 是主时钟。", "playing");
-}
-
-function handleReferencePause(event) {
-  const clock = event.currentTarget;
-  if (!isCurrentMedia(clock)) return;
-  if (!blindState.syncExpectedPlaying || blindState.syncWaiting || clock.ended) return;
-  pauseSynchronizedPlayback();
 }
 
 function handleReferenceSeeking(event) {
@@ -743,9 +749,13 @@ function handleReferenceSeeked(event) {
   if (!isCurrentMedia(clock)) return;
   synchronizeFollowers(Number(clock.currentTime || 0), true);
   updateMasterSeek(Number(clock.currentTime || 0), Number(clock.duration));
+  if (blindState.syncWaiting) {
+    setSyncStatus("媒体仍在缓冲，三路视频已保持对齐暂停。", "stalled");
+    return;
+  }
   setSyncStatus(
-    blindState.syncExpectedPlaying ? "同步播放中；参考 GT 是主时钟。" : "三路视频已定位到同一时间。",
-    blindState.syncExpectedPlaying ? "playing" : "ready",
+    blindState.syncPlayIntent ? "同步播放中；参考 GT 是主时钟。" : "三路视频已定位到同一时间。",
+    blindState.syncPlayIntent ? "playing" : "ready",
   );
 }
 
@@ -757,21 +767,170 @@ function handleReferenceRateChange(event) {
   });
 }
 
-function handleReferenceEnded(event) {
+function pauseVideosInternally() {
+  activeVideos().forEach((video) => {
+    try {
+      if (!video.paused) {
+        video.dataset.syncInternalPausePending = String(
+          Number(video.dataset.syncInternalPausePending || 0) + 1,
+        );
+      }
+      video.pause();
+    } catch (_error) {
+      // Detached media is abandoned by the generation guard.
+    }
+  });
+}
+
+function stopSynchronization() {
+  blindState.syncPlayIntent = false;
+  blindState.syncWaiting = false;
+  blindState.syncAttempt += 1;
+  cancelFrameSynchronization();
+  pauseVideosInternally();
+  blindState.syncClock = null;
+}
+
+function pauseSynchronizedPlayback(message = "已暂停，三路媒体保持在同一时间位置。", state = "ready") {
+  blindState.syncPlayIntent = false;
+  blindState.syncWaiting = false;
+  blindState.syncAttempt += 1;
+  cancelFrameSynchronization();
+  pauseVideosInternally();
+  const playButton = byId("master-play");
+  if (playButton) playButton.textContent = "全部播放";
+  setSyncStatus(message, state);
+}
+
+function handlePlayFailure(error) {
+  blindState.syncWaiting = false;
+  blindState.syncPlayIntent = false;
+  blindState.syncAttempt += 1;
+  cancelFrameSynchronization();
+  pauseVideosInternally();
+  const message = error && error.message ? error.message : "未知播放错误";
+  setSyncStatus("三路媒体未能启动，已保持对齐暂停。", "error");
+  showError(new Error(`无法同步播放三路媒体：${message}`));
+}
+
+function isAbortPlayError(error) {
+  return Boolean(error && (error.name === "AbortError" || error.code === 20));
+}
+
+function mediaReadyForPlayback(video) {
+  return isCurrentMedia(video)
+    && !video.error
+    && Number(video.readyState || 0) >= 3
+    && video.dataset.syncBuffering !== "true";
+}
+
+async function playSynchronizedVideos(automatic = false) {
+  const mediaGeneration = blindState.mediaGeneration;
+  const videos = activeVideos();
+  if (!videos.length) return;
+  const attempt = ++blindState.syncAttempt;
+  const playbackIsCurrent = () => (
+    mediaGeneration === blindState.mediaGeneration
+    && attempt === blindState.syncAttempt
+    && videos.every((video) => isCurrentMedia(video))
+  );
+  const clock = videos.find((video) => video.dataset.mediaSide === "reference") || videos[0];
+  blindState.syncClock = clock;
+  blindState.syncPlayIntent = true;
+  blindState.syncWaiting = false;
+  videos.forEach((video) => { video.dataset.syncBuffering = "false"; });
+  applyPlaybackSettings();
+  synchronizeFollowers(Number(clock.currentTime || 0), true);
+  setSyncStatus(automatic ? "缓冲完成，正在恢复同步播放…" : "正在对齐并启动三路视频…", "ready");
+  try {
+    await Promise.all(videos.map((video) => {
+      const result = video.play();
+      return result && typeof result.then === "function" ? result : Promise.resolve();
+    }));
+  } catch (error) {
+    if (
+      !playbackIsCurrent()
+      || blindState.syncWaiting
+    ) return;
+    if (isAbortPlayError(error)) {
+      pauseSynchronizedPlayback(
+        "播放启动被浏览器中断，三路视频已对齐暂停；请点击继续。",
+        "stalled",
+      );
+      byId("master-play").textContent = "点击继续播放";
+      return;
+    }
+    if (automatic && error && error.name === "NotAllowedError") {
+      blindState.syncPlayIntent = false;
+      blindState.syncAttempt += 1;
+      pauseVideosInternally();
+      synchronizeFollowers(Number(clock.currentTime || 0), true);
+      byId("master-play").textContent = "点击继续播放";
+      setSyncStatus("三路视频已对齐；浏览器阻止自动恢复，请点击继续。", "stalled");
+      return;
+    }
+    handlePlayFailure(error);
+    return;
+  }
+  if (!playbackIsCurrent() || !blindState.syncPlayIntent || blindState.syncWaiting) return;
+  startFrameSynchronization();
+  byId("master-play").textContent = "全部暂停";
+  setSyncStatus("同步播放中；参考 GT 是主时钟。", "playing");
+}
+
+async function toggleMasterPlayback() {
+  const videos = activeVideos();
+  if (!videos.length) return;
+  if (blindState.syncPlayIntent || videos.some((video) => !video.paused)) {
+    pauseSynchronizedPlayback();
+    return;
+  }
+  await playSynchronizedVideos(false);
+}
+
+function handleReferencePlay(event) {
   const clock = event.currentTarget;
   if (!isCurrentMedia(clock)) return;
-  if (clock.loop && blindState.syncExpectedPlaying) return;
+  blindState.syncClock = clock;
+  if (!blindState.syncPlayIntent) {
+    playSynchronizedVideos(false).catch(handlePlayFailure);
+    return;
+  }
+  if (blindState.syncWaiting) return;
+  startFrameSynchronization();
+}
+
+function handleMediaPause(event) {
+  const clock = event.currentTarget;
+  if (!isCurrentMedia(clock)) return;
+  const internalPausePending = Number(clock.dataset.syncInternalPausePending || 0);
+  if (internalPausePending > 0) {
+    if (internalPausePending === 1) delete clock.dataset.syncInternalPausePending;
+    else clock.dataset.syncInternalPausePending = String(internalPausePending - 1);
+    return;
+  }
+  if (!blindState.syncPlayIntent || blindState.syncWaiting || clock.ended) return;
+  pauseSynchronizedPlayback();
+}
+
+function handleMediaEnded(event) {
+  const clock = event.currentTarget;
+  if (!isCurrentMedia(clock)) return;
+  if (clock.loop && blindState.syncPlayIntent) return;
+  const anchor = Number(clock.currentTime || clock.duration || 0);
   blindState.syncWaiting = false;
-  blindState.syncExpectedPlaying = false;
+  blindState.syncPlayIntent = false;
+  blindState.syncAttempt += 1;
   cancelFrameSynchronization();
+  pauseVideosInternally();
   activeVideos().forEach((peer) => {
-    if (peer !== clock) {
-      peer.pause();
-      try {
-        if (Number.isFinite(peer.duration)) peer.currentTime = peer.duration;
-      } catch (_error) {
-        // A failed follower can remain at its last decoded frame.
-      }
+    try {
+      const peerDuration = Number(peer.duration);
+      peer.currentTime = Number.isFinite(peerDuration) && peerDuration > 0
+        ? Math.min(Math.max(0, anchor), peerDuration)
+        : Math.max(0, anchor);
+    } catch (_error) {
+      // Keep the last decoded frame when a follower cannot seek to its end.
     }
   });
   byId("master-play").textContent = "全部播放";
@@ -779,13 +938,60 @@ function handleReferenceEnded(event) {
 }
 
 function handleMediaWaiting(event) {
-  if (!isCurrentMedia(event.currentTarget)) return;
-  if (!blindState.syncExpectedPlaying) return;
+  const media = event.currentTarget;
+  if (!isCurrentMedia(media) || !blindState.syncPlayIntent) return;
+  media.dataset.syncBuffering = "true";
   blindState.syncWaiting = true;
-  pauseSynchronizedPlayback(
-    "检测到媒体缓冲，已暂停全部视频以保持对齐；缓冲完成后请重新播放。",
-    "stalled",
-  );
+  blindState.syncAttempt += 1;
+  cancelFrameSynchronization();
+  pauseVideosInternally();
+  byId("master-play").textContent = "缓冲中";
+  setSyncStatus("媒体正在缓冲，三路视频已暂时对齐暂停；就绪后会自动恢复。", "stalled");
+}
+
+function maybeResumeBufferedPlayback() {
+  if (!blindState.syncPlayIntent || !blindState.syncWaiting) return;
+  const videos = activeVideos();
+  if (!videos.length || !videos.every(mediaReadyForPlayback)) return;
+  blindState.syncWaiting = false;
+  const clock = blindState.syncClock || referenceVideo();
+  if (clock) synchronizeFollowers(Number(clock.currentTime || 0), true);
+  playSynchronizedVideos(true).catch(handlePlayFailure);
+}
+
+function handleMediaCanPlay(event) {
+  const media = event.currentTarget;
+  if (!isCurrentMedia(media)) return;
+  media.dataset.syncBuffering = "false";
+  maybeResumeBufferedPlayback();
+}
+
+function handleMediaPlaying(event) {
+  const media = event.currentTarget;
+  if (!isCurrentMedia(media)) return;
+  media.dataset.syncBuffering = "false";
+  if (
+    blindState.syncPlayIntent
+    && !blindState.syncWaiting
+    && activeVideos().every((video) => !video.paused)
+  ) {
+    setSyncStatus("同步播放中；参考 GT 是主时钟。", "playing");
+  }
+}
+
+function handleMediaErrorState(event) {
+  const media = event.currentTarget;
+  if (!isCurrentMedia(media)) return;
+  blindState.syncWaiting = false;
+  blindState.syncPlayIntent = false;
+  blindState.syncAttempt += 1;
+  cancelFrameSynchronization();
+  pauseVideosInternally();
+  setSyncStatus("检测到真实媒体解码或网络错误，已停止三路播放。", "error");
+  const detail = media.error && media.error.message
+    ? media.error.message
+    : `MediaError ${Number((media.error && media.error.code) || 0)}`;
+  showError(new Error(`${media.dataset.mediaLabel || "媒体"} 播放失败：${detail}`));
 }
 
 function seekVideos(value) {
@@ -803,7 +1009,7 @@ function seekVideos(value) {
 
 function updateFrame(value) {
   blindState.frameIndex = Number(value);
-  const task = (blindState.payload && (blindState.payload.task || blindState.payload.next_task)) || {};
+  const task = currentTask() || {};
   const total = Math.max(1, Number(task.frame_count || 1));
   byId("frame-label").textContent = `帧 ${blindState.frameIndex + 1}/${total}`;
   document.querySelectorAll("[data-frame-base]").forEach((image) => { image.src = withFrame(image.dataset.frameBase, blindState.frameIndex); });
@@ -824,6 +1030,8 @@ function startLeaseHeartbeat(task) {
 
 function initializeBlindPage() {
   blindState.wipeDivider = byId("wipe-divider");
+  const syncStatus = byId("sync-status");
+  if (syncStatus) byId("playback-controls").appendChild(syncStatus);
   blindState.wipeSupported = supportsWipeView();
   updateWipePosition(50);
   setViewMode(blindState.wipeSupported ? "wipe" : "full");
@@ -841,6 +1049,11 @@ function initializeBlindPage() {
   byId("frame-range").addEventListener("input", (event) => updateFrame(event.currentTarget.value));
   byId("view-wipe").addEventListener("click", () => setViewMode("wipe"));
   byId("view-full").addEventListener("click", () => setViewMode("full"));
+  byId("review-back").addEventListener("click", () => leaveReview().catch(showError));
+  byId("review-list").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-review-task]");
+    if (button) openReview(button.dataset.reviewTask).catch(showError);
+  });
   if (blindState.wipeDivider) {
     blindState.wipeDivider.addEventListener("input", (event) => updateWipePosition(event.currentTarget.value));
   }

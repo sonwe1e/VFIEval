@@ -113,6 +113,8 @@ from vfieval.evaluations_v2 import (
     blind_heartbeat,
     blind_media_asset,
     blind_payload,
+    blind_review_task,
+    blind_reviews,
     blind_session,
     blind_submit_vote,
     campaign_analysis_v2,
@@ -146,7 +148,14 @@ def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -
     cleanup_stale_uploads(db, workspace)
     ensure_v2_schema(db)
     cleanup_service = RunCleanupService(db, workspace)
-    handler = _make_handler(db, workspace, cleanup_service=cleanup_service)
+    preparation_stop = threading.Event()
+    preparation_wake = threading.Event()
+    handler = _make_handler(
+        db,
+        workspace,
+        cleanup_service=cleanup_service,
+        preparation_wake_event=preparation_wake,
+    )
     server = ThreadingHTTPServer((host, port), handler)
     cleanup_stop = threading.Event()
     cleanup_thread = threading.Thread(
@@ -156,10 +165,9 @@ def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -
         daemon=True,
     )
     cleanup_thread.start()
-    preparation_stop = threading.Event()
     preparation_thread = threading.Thread(
         target=_run_evaluation_preparations_forever,
-        args=(db, workspace, preparation_stop),
+        args=(db, workspace, preparation_stop, preparation_wake),
         name="vfieval-evaluation-preparation",
         daemon=True,
     )
@@ -172,6 +180,7 @@ def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -
     finally:
         cleanup_stop.set()
         preparation_stop.set()
+        preparation_wake.set()
         cleanup_thread.join(timeout=5)
         preparation_thread.join(timeout=5)
 
@@ -180,19 +189,25 @@ def _run_evaluation_preparations_forever(
     db: Database,
     workspace: WorkspaceConfig,
     stop_event: threading.Event,
+    wake_event: threading.Event | None = None,
 ) -> None:
     while not stop_event.is_set():
         try:
             run_pending_preparations(db, workspace, limit=1)
         except Exception as exc:
             print(f"evaluation preparation loop failed: {type(exc).__name__}: {exc}")
-        stop_event.wait(1.0)
+        if wake_event is None:
+            stop_event.wait(1.0)
+        else:
+            wake_event.wait(1.0)
+            wake_event.clear()
 
 
 def _make_handler(
     db: Database,
     workspace: WorkspaceConfig,
     cleanup_service: RunCleanupService | None = None,
+    preparation_wake_event: threading.Event | None = None,
 ):
     # Idempotent startup backfill keeps legacy folder/run resources addressable
     # by stable asset IDs. Subsequent asset-list requests only rescan folders;
@@ -359,6 +374,20 @@ def _make_handler(
                         )
                     return self._json(_evaluation_campaign_v2_payload(db, campaign_id))
                 match = re.fullmatch(r"/api/blind/([A-Za-z0-9_-]+)(?:/tasks/([A-Za-z0-9_-]+)/media/(reference|left|right))?", path)
+                review_match = re.fullmatch(
+                    r"/api/blind/([A-Za-z0-9_-]+)/reviews(?:/([A-Za-z0-9_-]+))?",
+                    path,
+                )
+                if review_match:
+                    token, task_token = review_match.groups()
+                    evaluator_id = str(query.get("evaluator_id", [""])[0]).strip()
+                    if not evaluator_id:
+                        return self._error(HTTPStatus.BAD_REQUEST, "evaluator_id is required")
+                    if task_token:
+                        return self._json(
+                            blind_review_task(db, token, task_token, evaluator_id)
+                        )
+                    return self._json(blind_reviews(db, token, evaluator_id))
                 if match:
                     token, task_token, side = match.groups()
                     if task_token and side:
@@ -690,13 +719,18 @@ def _make_handler(
                     try:
                         if action == "publish":
                             result = request_publish_campaign_v2(db, campaign_id)
-                            threading.Thread(
-                                target=run_pending_preparations,
-                                args=(db, workspace),
-                                kwargs={"limit": 1},
-                                name=f"vfieval-evaluation-{campaign_id}",
-                                daemon=True,
-                            ).start()
+                            if preparation_wake_event is not None:
+                                preparation_wake_event.set()
+                            else:
+                                # Embedded/test servers do not own the resident
+                                # preparation loop, so retain an asynchronous pump.
+                                threading.Thread(
+                                    target=run_pending_preparations,
+                                    args=(db, workspace),
+                                    kwargs={"limit": 1},
+                                    name=f"vfieval-evaluation-{campaign_id}",
+                                    daemon=True,
+                                ).start()
                             return self._json(result, status=HTTPStatus.ACCEPTED)
                         if action == "close":
                             campaign = close_campaign_v2(db, campaign_id)
@@ -3800,15 +3834,24 @@ def _latest_metric_rows(metrics: list[dict]) -> list[dict]:
     latest: dict[tuple[object, ...], dict] = {}
     for row in metrics:
         details = row.get("details") or {}
-        video_name = details.get("video_name")
-        key = (
-            row.get("sample_id"),
-            row["metric_name"],
-            video_name,
-            details.get("compare_track_label"),
-            details.get("compare_track_run_id"),
-        )
-        latest[key] = row
+        sample_id = row.get("sample_id")
+        if sample_id is not None:
+            key = ("sample", int(sample_id), row["metric_name"])
+        else:
+            track_identity = (
+                details.get("compare_track_label")
+                or details.get("compare_track_key")
+                or details.get("compare_track_run_id")
+            )
+            key = (
+                "video",
+                row["metric_name"],
+                details.get("video_name"),
+                track_identity,
+            )
+        current = latest.get(key)
+        if current is None or int(row.get("id") or 0) > int(current.get("id") or 0):
+            latest[key] = row
     return list(latest.values())
 
 
@@ -3979,17 +4022,18 @@ def _retry_run_metrics(db: Database, run_id: int) -> dict:
     inference_job_ids = db.run_inference_job_ids(run_id)
     if not inference_job_ids:
         raise ValueError("Run has no inference job")
+    metric_rows = db.list_run_metrics(run_id)
     failed_names = sorted(
         {
             row["metric_name"]
-            for row in db.list_run_metrics(run_id)
+            for row in _latest_metric_rows(metric_rows)
             if row["status"] in {"failed", "unavailable"}
         }
     )
-    if not failed_names:
+    if not failed_names and not metric_rows:
         failed_names = list(run.get("metrics") or [])
     if not failed_names:
-        raise ValueError("Run has no metrics to retry")
+        raise ValueError("Run has no failed or unavailable metrics to retry")
     from vfieval.pipeline.metric_jobs import create_metric_wave
 
     return create_metric_wave(db, run_id, failed_names, source="retry", retry=True)

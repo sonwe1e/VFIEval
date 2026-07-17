@@ -12,7 +12,12 @@ from unittest.mock import patch
 from PIL import Image
 
 from vfieval.config import WorkspaceConfig
-from vfieval.datasets import _decode_video_cached, _publish_decode_staging
+from vfieval.datasets import (
+    _decode_video_cached,
+    _ffmpeg_reported_fps,
+    _load_compare_source_frames_with_cache,
+    _publish_decode_staging,
+)
 from vfieval.db import Database
 from vfieval.file_inputs import decode_cache_dir, decode_cache_key
 
@@ -44,7 +49,65 @@ def _write_valid_cache(cache_dir: Path, cache_key: str) -> None:
     )
 
 
+class FfmpegDecodeMetadataTests(unittest.TestCase):
+    def test_source_fps_comes_from_input_stream_not_progress_duration(self) -> None:
+        report = """
+Input #0, mov, from 'clip.mp4':
+  Stream #0:0: Video: h264, yuv420p, 1920x1080, 23.98 fps, 24 tbr
+Output #0, image2, to '%06d.png':
+  Stream #0:0: Video: png, rgb24, 1920x1080, 120 fps, 120 tbr
+"""
+        self.assertEqual(_ffmpeg_reported_fps(report), 23.98)
+
+
 class DecodeCacheCoordinationTests(unittest.TestCase):
+    def test_trusted_catalog_identity_skips_hash_and_stat_change_forces_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = _workspace(tmp)
+            video = Path(tmp) / "clip.mp4"
+            video.write_bytes(b"source")
+            frame = Path(tmp) / "000000.png"
+            Image.new("RGB", (4, 4), (1, 2, 3)).save(frame)
+            stat = video.stat()
+            trusted = {
+                "content_sha256": "a" * 64,
+                "size_bytes": stat.st_size,
+                "source_mtime_ns": stat.st_mtime_ns,
+            }
+            decoded = ([frame], 5.0, [0.0], {"cache_hit": False})
+            with patch("vfieval.datasets._decode_video_cached", return_value=decoded), patch(
+                "vfieval.datasets.file_sha256",
+                side_effect=AssertionError("trusted identity must not rehash"),
+            ):
+                _frames, _fps, _timestamps, descriptor = (
+                    _load_compare_source_frames_with_cache(
+                        db,
+                        workspace,
+                        video,
+                        "trusted-test",
+                        trusted_source_signature=trusted,
+                    )
+                )
+            self.assertEqual(descriptor["source_identity"], "trusted_catalog")
+            self.assertEqual(descriptor["source_hash_seconds"], 0.0)
+
+            video.write_bytes(b"source changed and stat no longer matches")
+            with patch("vfieval.datasets._decode_video_cached", return_value=decoded), patch(
+                "vfieval.datasets.file_sha256", return_value="b" * 64
+            ) as digest:
+                _frames, _fps, _timestamps, changed = (
+                    _load_compare_source_frames_with_cache(
+                        db,
+                        workspace,
+                        video,
+                        "trusted-test",
+                        trusted_source_signature=trusted,
+                    )
+                )
+            digest.assert_called_once_with(video.resolve())
+            self.assertEqual(changed["source_identity"], "full_sha256")
+            self.assertEqual(changed["source_sha256"], "b" * 64)
+
     def test_concurrent_same_key_decodes_once_and_leaves_no_private_staging(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace, db = _workspace(tmp)

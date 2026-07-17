@@ -21,9 +21,17 @@ from vfieval.db import Database
 from vfieval.metrics.feature import ConvNextFeatureMetric, DinoPatchMetric, _resolve_metric_device
 from vfieval.metrics import METRIC_NAMES, create_metric
 from vfieval.metrics.base import MetricBatchOutOfMemory, MetricResult, MetricUnavailable
-from vfieval.metrics.cgvqm import _bounded_aligned_size
+from vfieval.metrics.cgvqm import (
+    CgvqmMetric,
+    CgvqmMetricFailed,
+    CgvqmMetricUnavailable,
+    _bounded_aligned_size,
+    _parse_driver_output,
+    _validate_eval_frame_counts,
+)
 from vfieval.metrics.health import metric_cache_config, metric_health, prepare_metric_asset_manifest
 from vfieval.pipeline.metrics_runner import (
+    METRIC_CACHE_VERSION,
     _evaluate_with_cache,
     _published_video_metric_inputs,
     _resolve_frame_reference,
@@ -847,6 +855,84 @@ class MetricTests(unittest.TestCase):
         width, height = _bounded_aligned_size(96, 64, 720, 4)
         self.assertEqual((width, height), (96, 64))
 
+    def test_cgvqm_protocol_parser_uses_last_valid_json_and_bounds_diagnostics(self) -> None:
+        payload = _parse_driver_output(
+            "warning before protocol\n"
+            '{"status":"completed","value":0.25}\n'
+            "third-party noise\n"
+            '{"status":"completed","value":0.75,"details":{"source":"last"}}\n',
+            "driver warning",
+        )
+        self.assertEqual(payload["value"], 0.75)
+        self.assertEqual(payload["details"]["source"], "last")
+        self.assertIn("warning before protocol", payload["details"]["driver_nonprotocol_stdout"])
+        self.assertIn("third-party noise", payload["details"]["driver_nonprotocol_stdout"])
+        self.assertEqual(payload["details"]["driver_stderr"], "driver warning")
+        self.assertEqual(payload["details"]["driver_returncode"], 0)
+
+    def test_cgvqm_protocol_parser_distinguishes_empty_bad_json_and_nonzero_exit(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "no JSON protocol output"):
+            _parse_driver_output("", "", returncode=0)
+        with self.assertRaisesRegex(RuntimeError, "no valid JSON protocol object"):
+            _parse_driver_output("not-json", "decoder warning", returncode=0)
+        with self.assertRaisesRegex(RuntimeError, "exited with code 7"):
+            _parse_driver_output(
+                '{"status":"failed","details":{"reason":"model crashed"}}',
+                "trace tail",
+                returncode=7,
+            )
+
+    def test_cgvqm_frame_count_mismatch_preserves_actual_counts(self) -> None:
+        with self.assertRaises(CgvqmMetricUnavailable) as caught:
+            _validate_eval_frame_counts(12, 11)
+        self.assertEqual(caught.exception.details["eval_reference_frame_count"], 12)
+        self.assertEqual(caught.exception.details["eval_distorted_frame_count"], 11)
+
+    def test_cgvqm_timeout_preserves_bounded_driver_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = WorkspaceConfig.from_root(root / ".vfieval")
+            workspace.ensure()
+            reference = root / "ref.mp4"
+            distorted = root / "dist.mp4"
+            reference.write_bytes(b"ref")
+            distorted.write_bytes(b"dist")
+            health = {
+                "available": True,
+                "status": "available",
+                "reason": None,
+                "driver_command": ["fake-cgvqm"],
+                "video_eval_long_edge": 720,
+                "manifest_path": str(root / "manifest.json"),
+                "implementation_mode": "cgvqm_wrapper",
+                "env": {},
+            }
+            timeout = subprocess.TimeoutExpired(
+                ["fake-cgvqm"],
+                600,
+                output="driver started",
+                stderr="device still busy",
+            )
+            with patch("vfieval.metrics.cgvqm.metric_health", return_value=health), patch(
+                "vfieval.metrics.cgvqm._prepare_eval_videos",
+                return_value=(
+                    reference,
+                    distorted,
+                    {
+                        "eval_reference_frame_count": 12,
+                        "eval_distorted_frame_count": 12,
+                    },
+                ),
+            ), patch("vfieval.metrics.cgvqm.subprocess.run", side_effect=timeout):
+                with self.assertRaises(CgvqmMetricFailed) as caught:
+                    CgvqmMetric(workspace, device="npu:0").evaluate(
+                        reference, distorted, root / "work"
+                    )
+            self.assertTrue(caught.exception.details["driver_timed_out"])
+            self.assertEqual(caught.exception.details["driver_stdout"], "driver started")
+            self.assertEqual(caught.exception.details["driver_stderr"], "device still busy")
+            self.assertEqual(caught.exception.details["eval_reference_frame_count"], 12)
+
     def test_metric_cache_key_uses_file_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -862,6 +948,61 @@ class MetricTests(unittest.TestCase):
 
             self.assertNotEqual(key1, key2)
             self.assertNotEqual(key1, key1_config)
+
+    def test_metric_retry_bypasses_cached_unavailable_and_replaces_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = WorkspaceConfig.from_root(root / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            reference = root / "ref.mp4"
+            distorted = root / "dist.mp4"
+            reference.write_bytes(b"reference")
+            distorted.write_bytes(b"distorted")
+            cache_config = {"adapter": "test"}
+            cache_key = metric_cache_key(
+                "cgvqm",
+                reference,
+                distorted,
+                {
+                    "cache_version": METRIC_CACHE_VERSION,
+                    "metric": cache_config,
+                    "metric_device": "npu:0",
+                },
+            )
+            db.set_metric_cache(
+                cache_key,
+                "cgvqm",
+                "unavailable",
+                None,
+                {"reason": "temporary device failure"},
+            )
+
+            class RecoveredMetric:
+                calls = 0
+
+                def evaluate(self, _reference, _distorted, _work_dir):
+                    self.calls += 1
+                    return MetricResult("completed", 0.33, {"recovered": True})
+
+            metric = RecoveredMetric()
+            with patch("vfieval.pipeline.metrics_runner.create_metric", return_value=metric):
+                status, value, details = _evaluate_with_cache(
+                    db,
+                    workspace,
+                    "cgvqm",
+                    reference,
+                    distorted,
+                    None,
+                    cache_config,
+                    metric_device="npu:0",
+                    retry=True,
+                )
+            self.assertEqual(metric.calls, 1)
+            self.assertEqual((status, value), ("completed", 0.33))
+            self.assertTrue(details["recovered"])
+            self.assertEqual(db.get_metric_cache(cache_key)["status"], "completed")
 
     def test_metric_cache_config_changes_when_manifest_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1032,8 +1173,8 @@ class MetricTests(unittest.TestCase):
             _write_cgvqm_manifest(metric_dir)
             reference = tmp_path / "ref.mp4"
             distorted = tmp_path / "dist.mp4"
-            reference.write_bytes(b"ref")
-            distorted.write_bytes(b"dist")
+            _write_metric_video(reference, (0, 0, 0))
+            _write_metric_video(distorted, (1, 1, 1))
 
             with patch("vfieval.metrics.health.importlib.util.find_spec", return_value=object()):
                 metric = create_metric("cgvqm", workspace, device="cpu")
@@ -1055,8 +1196,8 @@ class MetricTests(unittest.TestCase):
             _write_cgvqm_manifest(metric_dir)
             reference = tmp_path / "ref.mp4"
             distorted = tmp_path / "dist.mp4"
-            reference.write_bytes(b"ref")
-            distorted.write_bytes(b"dist")
+            _write_metric_video(reference, (0, 0, 0))
+            _write_metric_video(distorted, (1, 1, 1))
 
             with patch("vfieval.metrics.health.importlib.util.find_spec", return_value=object()):
                 metric = create_metric("cgvqm", workspace, device="cpu")
@@ -1073,8 +1214,8 @@ class MetricTests(unittest.TestCase):
             _write_cgvqm_manifest(metric_dir)
             reference = tmp_path / "ref.mp4"
             distorted = tmp_path / "dist.mp4"
-            reference.write_bytes(b"ref")
-            distorted.write_bytes(b"dist")
+            _write_metric_video(reference, (0, 0, 0))
+            _write_metric_video(distorted, (1, 1, 1))
 
             with patch("vfieval.metrics.health.importlib.util.find_spec", return_value=object()):
                 metric = create_metric("cgvqm", workspace, device="cpu")
@@ -1459,8 +1600,8 @@ class MetricTests(unittest.TestCase):
             _write_cgvqm_manifest(metric_dir)
             reference = tmp_path / "ref.mp4"
             distorted = tmp_path / "dist.mp4"
-            reference.write_bytes(b"ref")
-            distorted.write_bytes(b"dist")
+            _write_metric_video(reference, (0, 0, 0))
+            _write_metric_video(distorted, (1, 1, 1))
             (tmp_path / "av.py").write_text("", encoding="utf-8")
             env = os.environ.copy()
             env["PYTHONPATH"] = str(tmp_path) + os.pathsep + str(ROOT / "src") + os.pathsep + env.get("PYTHONPATH", "")
@@ -1522,6 +1663,19 @@ def _write_image_pair(tmp_path: Path) -> tuple[Path, Path]:
     Image.new("RGB", (4, 4), (0, 0, 0)).save(reference)
     Image.new("RGB", (4, 4), (1, 1, 1)).save(distorted)
     return reference, distorted
+
+
+def _write_metric_video(path: Path, color: tuple[int, int, int]) -> None:
+    from vfieval.pipeline.inference import _write_mp4
+
+    frame_dir = path.parent / f"{path.stem}-frames"
+    frame_dir.mkdir(parents=True, exist_ok=True)
+    frames: list[Path] = []
+    for index in range(3):
+        frame = frame_dir / f"{index:06d}.png"
+        Image.new("RGB", (8, 8), color).save(frame)
+        frames.append(frame)
+    _write_mp4(frames, path, 5.0)
 
 
 def _write_manifest(
