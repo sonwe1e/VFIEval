@@ -37,6 +37,15 @@
           <p class="muted">参考 GT 仅用于观察；请选择质量更好的候选，或选择平局。</p>
         </div>
 
+        <div class="blind-media-toolbar">
+          <div class="view-switch" role="group" aria-label="媒体显示方式">
+            <span class="view-switch-label">显示方式</span>
+            <button id="view-wipe" class="view-option" type="button" aria-pressed="true" aria-controls="media-grid">重叠对比</button>
+            <button id="view-full" class="view-option" type="button" aria-pressed="false" aria-controls="media-grid">完整视图</button>
+          </div>
+          <p id="sync-status" class="sync-status" role="status" aria-live="polite">等待媒体就绪</p>
+        </div>
+
         <div id="playback-controls" class="playback-controls">
           <button id="master-play" type="button">全部播放</button>
           <label class="seek-label"><span>时间</span><input id="master-seek" type="range" min="0" max="1000" value="0"></label>
@@ -44,7 +53,22 @@
           <label class="check"><input id="master-loop" type="checkbox" checked>循环</label>
         </div>
 
-        <div id="media-grid" class="media-grid"></div>
+        <div id="media-grid" class="media-grid view-wipe"></div>
+        <div class="wipe-control-shell">
+          <label class="wipe-control-label" for="wipe-divider">候选 A / B 分界位置</label>
+          <input
+            id="wipe-divider"
+            type="range"
+            min="0"
+            max="100"
+            step="1"
+            value="50"
+            aria-label="候选 A 与候选 B 的分界位置"
+            aria-valuetext="候选 A 50%，候选 B 50%"
+            aria-describedby="wipe-instructions"
+          >
+          <p id="wipe-instructions" class="wipe-instructions muted">拖动分界线查看同一位置的差异；键盘可使用左右方向键、Home 和 End。触屏上下滑动仍可滚动页面。</p>
+        </div>
         <div id="frame-control" class="frame-control hidden">
           <label><span id="frame-label">帧 1/1</span><input id="frame-range" type="range" min="0" max="0" value="0"></label>
         </div>

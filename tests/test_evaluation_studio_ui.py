@@ -17,7 +17,24 @@ class EvaluationStudioUiTests(unittest.TestCase):
         cls.studio_css = (WEB / "studio.css").read_text(encoding="utf-8")
         cls.blind_html = (WEB / "blind.html").read_text(encoding="utf-8")
         cls.blind_js = (WEB / "blind.js").read_text(encoding="utf-8")
+        cls.blind_css = (WEB / "blind.css").read_text(encoding="utf-8")
         cls.server_py = (ROOT / "src" / "vfieval" / "server.py").read_text(encoding="utf-8")
+
+    def _function_source(self, name: str) -> str:
+        match = re.search(
+            rf"^(?:async\s+)?function\s+{re.escape(name)}\s*\(",
+            self.blind_js,
+            flags=re.MULTILINE,
+        )
+        self.assertIsNotNone(match, f"blind.js is missing function {name}")
+        assert match is not None
+        following = re.search(
+            r"^(?:async\s+)?function\s+[A-Za-z_$][\w$]*\s*\(",
+            self.blind_js[match.end():],
+            flags=re.MULTILINE,
+        )
+        end = match.end() + following.start() if following is not None else len(self.blind_js)
+        return self.blind_js[match.start():end]
 
     def test_literal_dom_dependencies_exist(self) -> None:
         index_ids = set(re.findall(r'id="([^"]+)"', self.index_html))
@@ -34,8 +51,152 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertNotIn('class="nav-item', self.blind_html)
         self.assertIn('/api/blind/', self.blind_js)
         self.assertIn('task.token', self.blind_js)
-        for forbidden in ("run_id", "checkpoint", "asset_id"):
+        for forbidden in (
+            "run_id",
+            "checkpoint",
+            "asset_id",
+            "method_id",
+            "binding_id",
+            "task_id",
+            "model_name",
+            "source_run",
+        ):
             self.assertNotIn(forbidden, self.blind_js)
+        for anonymous_label in ("参考 GT", "候选 A", "候选 B"):
+            self.assertIn(anonymous_label, self.blind_js)
+
+    def test_blind_large_format_hooks_default_to_wipe_with_full_view_available(self) -> None:
+        for hook in ("view-wipe", "view-full", "wipe-divider", "wipe-instructions", "sync-status"):
+            self.assertIn(f'id="{hook}"', self.blind_html)
+        self.assertRegex(
+            self.blind_html,
+            r'id="view-wipe"[^>]*aria-pressed="true"',
+        )
+        self.assertRegex(
+            self.blind_html,
+            r'id="view-full"[^>]*aria-pressed="false"',
+        )
+        self.assertRegex(
+            self.blind_html,
+            r'id="media-grid"[^>]*class="[^"]*view-wipe',
+        )
+        divider = re.search(
+            r'<input\s+[^>]*id="wipe-divider"[^>]*>',
+            self.blind_html,
+            flags=re.DOTALL,
+        )
+        self.assertIsNotNone(divider)
+        assert divider is not None
+        self.assertIn('value="50"', divider.group(0))
+        self.assertIn('aria-valuetext=', divider.group(0))
+        self.assertIn('aria-describedby="wipe-instructions"', divider.group(0))
+
+    def test_blind_view_switch_reuses_exactly_three_media_nodes(self) -> None:
+        render_task = self._function_source("renderTask")
+        for side in ("reference", "left", "right"):
+            self.assertIn(f'createMediaNode(task, "{side}"', render_task)
+        self.assertEqual(render_task.count("createMediaNode(task,"), 3)
+        self.assertIn("mediaCard(", render_task)
+        self.assertIn("candidate-stage", render_task)
+        self.assertLess(
+            render_task.index('mediaCard(left, "候选 A"'),
+            render_task.index('mediaCard(right, "候选 B"'),
+        )
+
+        set_view = self._function_source("setViewMode")
+        self.assertIn("view-wipe", set_view)
+        self.assertIn("view-full", set_view)
+        self.assertNotIn("createMediaNode", set_view)
+        self.assertNotIn("replaceContent", set_view)
+        self.assertNotIn(".src =", set_view)
+        self.assertNotIn("frameIndex", set_view)
+
+    def test_blind_wipe_updates_clip_position_and_accessible_value(self) -> None:
+        update = self._function_source("updateWipePosition")
+        self.assertIn("--wipe-position", update)
+        self.assertIn("aria-valuetext", update)
+        self.assertIn("blindState.wipeDivider", update)
+        initialize = self._function_source("initializeBlindPage")
+        self.assertIn('blindState.wipeDivider = byId("wipe-divider")', initialize)
+        for token in (
+            "--wipe-position",
+            "--media-aspect-ratio",
+            ".candidate-stage",
+            ".candidate-a",
+            ".candidate-b",
+            "clip-path: inset(",
+            "touch-action: pan-y",
+            ".media-grid.view-full",
+        ):
+            self.assertIn(token, self.blind_css)
+
+    def test_blind_video_sync_uses_frame_callback_with_timeupdate_fallback(self) -> None:
+        for function_name in (
+            "startFrameSynchronization",
+            "stopSynchronization",
+            "syncFromClockVideo",
+            "handleMediaWaiting",
+        ):
+            self._function_source(function_name)
+        start_sync = self._function_source("startFrameSynchronization")
+        self.assertIn("requestVideoFrameCallback", start_sync)
+        self.assertIn('typeof', start_sync)
+        self.assertIn('"function"', start_sync)
+        self.assertIn('addEventListener("timeupdate"', self.blind_js)
+        self.assertIn('addEventListener("waiting", handleMediaWaiting)', self.blind_js)
+        self.assertIn('addEventListener("ended"', self.blind_js)
+        self.assertNotIn("0.08", self.blind_js)
+
+        waiting = self._function_source("handleMediaWaiting")
+        self.assertIn("pauseSynchronizedPlayback(", waiting)
+        pause_all = self._function_source("pauseSynchronizedPlayback")
+        self.assertIn("activeVideos()", pause_all)
+        self.assertIn("pause()", pause_all)
+        self.assertIn("setSyncStatus(", pause_all)
+        self.assertIn('byId("sync-status")', self._function_source("setSyncStatus"))
+        for control in ("master-play", "master-seek", "master-rate", "master-loop"):
+            self.assertIn(f'byId("{control}")', self.blind_js)
+
+    def test_blind_task_replacement_stops_old_synchronization_and_media(self) -> None:
+        stop = self._function_source("stopSynchronization")
+        self.assertIn("cancelFrameSynchronization()", stop)
+        self.assertIn("pause()", stop)
+        cancel = self._function_source("cancelFrameSynchronization")
+        self.assertIn("cancelVideoFrameCallback", cancel)
+        render_task = self._function_source("renderTask")
+        self.assertIn("stopSynchronization()", render_task)
+        self.assertLess(render_task.index("stopSynchronization()"), render_task.index("replaceContent("))
+        play = self._function_source("playSynchronizedVideos")
+        self.assertIn("const mediaGeneration = blindState.mediaGeneration", play)
+        self.assertIn("videos.every((video) => isCurrentMedia(video))", play)
+        reference_play = self._function_source("handleReferencePlay")
+        self.assertIn("mediaGeneration !== blindState.mediaGeneration", reference_play)
+        self.assertIn("isCurrentMedia(peer)", reference_play)
+
+    def test_blind_frame_sequences_share_one_index_across_all_three_images(self) -> None:
+        factory = self._function_source("createMediaNode")
+        self.assertIn('document.createElement("img")', factory)
+        self.assertIn("dataset.frameBase", factory)
+        self.assertIn("blindState.frameIndex", factory)
+        update = self._function_source("updateFrame")
+        self.assertIn('querySelectorAll("[data-frame-base]")', update)
+        self.assertIn("withFrame(image.dataset.frameBase, blindState.frameIndex)", update)
+        set_view = self._function_source("setViewMode")
+        self.assertNotIn("frameIndex", set_view)
+        self.assertNotIn(".src =", set_view)
+
+    def test_blind_clip_path_fallback_forces_full_view(self) -> None:
+        supports_wipe = self._function_source("supportsWipeView")
+        self.assertIn('CSS.supports("aspect-ratio", "16 / 9")', supports_wipe)
+        self.assertIn('CSS.supports("clip-path", clipValue)', supports_wipe)
+        self.assertIn("calc(100% - var(--wipe-position, 50%))", supports_wipe)
+        initialize = self._function_source("initializeBlindPage")
+        self.assertIn("blindState.wipeSupported = supportsWipeView()", initialize)
+        self.assertIn('setViewMode(blindState.wipeSupported ? "wipe" : "full")', initialize)
+        set_view = self._function_source("setViewMode")
+        self.assertIn("wipeButton.disabled = !blindState.wipeSupported", set_view)
+        self.assertIn("@supports not ((clip-path: inset(0 50% 0 0))", self.blind_css)
+        self.assertIn("-webkit-clip-path: inset(0 50% 0 0)", self.blind_css)
 
     def test_studio_keys_campaigns_by_schema_and_posts_item_first_methods(self) -> None:
         self.assertIn("selectedCampaignKey", self.studio_js)
