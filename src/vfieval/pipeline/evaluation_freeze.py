@@ -26,9 +26,12 @@ OUTPUT_NAMES = {
     "pred_a": "method-a",
     "pred_b": "method-b",
 }
-FREEZE_PIPELINE_VERSION = "campaign-freeze-stream-v2"
+FREEZE_PIPELINE_VERSION = "campaign-freeze-stream-v3"
 FFMPEG_TIMEOUT_SECONDS = 600.0
 TIMESTAMP_TOLERANCE_SECONDS = 1e-3
+GOP_TARGET_INTERVAL_SECONDS = 1.0
+REMUX_FIRST_KEYFRAME_TOLERANCE_SECONDS = 0.1
+REMUX_MAX_KEYFRAME_INTERVAL_SECONDS = 2.0
 _STREAMING_BACKEND_CACHE: dict[tuple[str, int, int], bool] = {}
 _STREAMING_BACKEND_CACHE_LOCK = threading.Lock()
 
@@ -56,6 +59,61 @@ class RemuxError(FreezeError):
     """A compatibility failure which may safely fall back to pixel streaming."""
 
 
+def _policy_fingerprint(payload: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _video_stability_policy(fps: float) -> dict[str, Any]:
+    """Return the deterministic browser-seek policy for a v3 frozen video."""
+
+    resolved_fps = float(fps)
+    if not math.isfinite(resolved_fps) or resolved_fps <= 0:
+        raise ValueError("Campaign freeze fps must be a positive finite number")
+    gop_frames = max(
+        1,
+        int(math.floor(resolved_fps * GOP_TARGET_INTERVAL_SECONDS + 0.5)),
+    )
+    payload: dict[str, Any] = {
+        "version": "campaign-video-stability-v1",
+        "encoding": {
+            "codec": "h264",
+            "encoder": "libx264",
+            "crf": 18,
+            "pixel_format": "yuv420p",
+            "faststart": True,
+            "gop_mode": "fixed_closed",
+            "target_interval_seconds": GOP_TARGET_INTERVAL_SECONDS,
+            "gop_frames": gop_frames,
+            "keyint_min_frames": gop_frames,
+            "scene_cut_threshold": 0,
+            "open_gop": False,
+        },
+        "prediction_remux": {
+            "first_keyframe_tolerance_seconds": REMUX_FIRST_KEYFRAME_TOLERANCE_SECONDS,
+            "max_keyframe_interval_seconds": REMUX_MAX_KEYFRAME_INTERVAL_SECONDS,
+            "paired": True,
+        },
+    }
+    payload["fingerprint"] = _policy_fingerprint(payload)
+    return payload
+
+
+def _frame_sequence_stability_policy() -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "version": "campaign-video-stability-v1",
+        "encoding": {"applicable": False, "media_kind": "frame_sequence"},
+        "prediction_remux": {"applicable": False},
+    }
+    payload["fingerprint"] = _policy_fingerprint(payload)
+    return payload
+
+
 def freeze_campaign_media(
     plan: Mapping[str, Any],
     sources: Mapping[str, Sequence[str | Path]],
@@ -79,7 +137,7 @@ def freeze_campaign_media(
     remuxed, but A and B always take that path as a pair. Frame sequences are
     written directly to their three final PNG directories with no intermediate
     sequence. Diff media was never consumed by Campaign playback and is no
-    longer materialized in stream-v2 packages.
+    longer materialized in stream-v2 and later packages.
     """
 
     started = time.monotonic()
@@ -112,6 +170,8 @@ def freeze_campaign_media(
         return result
     if media_kind != "video":
         raise ValueError(f"unsupported Campaign freeze media_kind: {media_kind}")
+    stability_policy = _video_stability_policy(resolved_fps)
+    gop_policy = dict(stability_policy["encoding"])
     if width % 2 or height % 2:
         raise ValueError(
             "browser-compatible H.264/yuv420p requires even dimensions; "
@@ -179,6 +239,7 @@ def freeze_campaign_media(
                     fps=resolved_fps,
                     ffmpeg=ffmpeg_path,
                     ffprobe=ffprobe_path,
+                    stability_policy=stability_policy,
                     cancel_check=cancel_check,
                 )
             except RemuxError as exc:
@@ -215,6 +276,7 @@ def freeze_campaign_media(
                         fps=resolved_fps,
                         ffmpeg=ffmpeg_path,
                         ffprobe=ffprobe_path,
+                        stability_policy=stability_policy,
                         cancel_check=cancel_check,
                     )
             except RemuxError as exc:
@@ -261,6 +323,7 @@ def freeze_campaign_media(
                 fps=resolved_fps,
                 threads=thread_count,
                 ffmpeg=ffmpeg_path,
+                gop_policy=gop_policy,
                 cancel_check=cancel_check,
                 failure_state=sink_failures,
             )
@@ -323,15 +386,17 @@ def freeze_campaign_media(
         timings=dict(timings),
         force=True,
     )
+    output_probes: dict[str, dict[str, Any]] = {}
     try:
         for slot in stream_slots:
-            validate_frozen_video(
+            output_probes[slot] = validate_frozen_video(
                 paths[slot],
                 width=width,
                 height=height,
                 frame_count=frame_count,
                 fps=resolved_fps,
                 ffprobe=ffprobe_path,
+                stability_policy=stability_policy,
                 cancel_check=cancel_check,
             )
     except Exception:
@@ -374,6 +439,16 @@ def freeze_campaign_media(
         raise
     timings["hash"] = time.monotonic() - hash_started
     timings["total"] = time.monotonic() - started
+    keyframe_probe = {
+        slot: {
+            **_keyframe_probe_summary(
+                output_probes.get(slot)
+                or dict((eligibility.get(slot) or {}).get("probe") or {})
+            ),
+            "basis": "frozen_output" if slot in output_probes else "remux_source",
+        }
+        for slot in OUTPUT_SLOTS
+    }
     _progress(
         progress_callback,
         stage="completed",
@@ -396,6 +471,10 @@ def freeze_campaign_media(
         "remux": eligibility,
         "stream_slots": stream_slots,
         "remuxed_slots": sorted(remuxed),
+        "gop_policy": gop_policy,
+        "keyframe_probe": keyframe_probe,
+        "stability_policy": stability_policy,
+        "stability_policy_fingerprint": str(stability_policy["fingerprint"]),
     }
 
 
@@ -503,6 +582,7 @@ def _freeze_frame_sequence(
         timings=dict(timings),
         force=True,
     )
+    stability_policy = _frame_sequence_stability_policy()
     return {
         "version": FREEZE_PIPELINE_VERSION,
         "pipeline": "png_sequence",
@@ -516,7 +596,126 @@ def _freeze_frame_sequence(
         "remux": {slot: {"eligible": False, "reasons": ["frame_sequence"]} for slot in SOURCE_SLOTS},
         "stream_slots": list(SOURCE_SLOTS),
         "remuxed_slots": [],
+        "gop_policy": dict(stability_policy["encoding"]),
+        "keyframe_probe": {},
+        "stability_policy": stability_policy,
+        "stability_policy_fingerprint": str(stability_policy["fingerprint"]),
     }
+
+
+def _keyframe_probe_summary(probe: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return a bounded, manifest-safe summary of an ffprobe keyframe scan."""
+
+    payload = dict(probe or {})
+    keyframes = _finite_timestamps(payload.get("keyframe_timestamps"))
+    timestamps = _finite_timestamps(payload.get("timestamps"))
+    fps = float(payload.get("fps") or 0.0)
+    frame_count = _int_or_none(payload.get("frame_count"))
+    probe_mode = str(payload.get("keyframe_probe_mode") or "full_frames")
+    first_frame = _float_or_none(payload.get("first_frame_timestamp"))
+    if first_frame is None and timestamps:
+        first_frame = float(timestamps[0])
+    duration = _float_or_none(payload.get("duration_seconds"))
+    full_timeline_required = probe_mode != "keyframes_only"
+    complete = (
+        bool(keyframes)
+        and first_frame is not None
+        and payload.get("keyframe_probe_complete") is not False
+        and (
+            not full_timeline_required
+            or (
+                bool(timestamps)
+                and (frame_count in {None, 0} or len(timestamps or []) == frame_count)
+            )
+        )
+    )
+    if (timestamps is not None and any(
+        right < left for left, right in zip(timestamps, timestamps[1:])
+    )) or (keyframes is not None and any(
+        right < left for left, right in zip(keyframes, keyframes[1:])
+    )):
+        complete = False
+    first_keyframe = float(keyframes[0]) if keyframes else None
+    first_offset = (
+        float(first_keyframe) - float(first_frame)
+        if first_keyframe is not None and first_frame is not None
+        else None
+    )
+    maximum_interval: float | None = None
+    if complete and keyframes is not None and first_frame is not None:
+        intervals = [
+            max(0.0, float(right) - float(left))
+            for left, right in zip(keyframes, keyframes[1:])
+        ]
+        intervals.append(max(0.0, float(keyframes[0]) - float(first_frame)))
+        timeline_end: float | None = None
+        if timestamps:
+            durations = _finite_timestamps(payload.get("frame_durations")) or []
+            final_duration = (
+                float(durations[-1])
+                if durations and float(durations[-1]) > 0
+                else (1.0 / fps if fps > 0 else 0.0)
+            )
+            timeline_end = float(timestamps[-1]) + final_duration
+        elif duration is not None and duration > 0:
+            timeline_end = float(first_frame) + float(duration)
+        if timeline_end is None or timeline_end + TIMESTAMP_TOLERANCE_SECONDS < keyframes[-1]:
+            complete = False
+        else:
+            intervals.append(max(0.0, timeline_end - float(keyframes[-1])))
+            maximum_interval = max(intervals) if intervals else 0.0
+    fingerprint_payload = {
+        "first_frame": round(float(first_frame), 9) if first_frame is not None else None,
+        "duration": round(float(duration), 9) if duration is not None else None,
+        "keyframes": [round(float(value), 9) for value in (keyframes or [])],
+    }
+    return {
+        "complete": bool(complete),
+        "count": len(keyframes or []),
+        "first_frame_seconds": first_frame,
+        "first_keyframe_seconds": first_keyframe,
+        "first_keyframe_offset_seconds": first_offset,
+        # Compatibility alias for the v3 preview implementation.
+        "first_seconds": first_keyframe,
+        "max_interval_seconds": maximum_interval,
+        "timestamps_sha256": _policy_fingerprint(fingerprint_payload),
+        "probe_mode": probe_mode,
+    }
+
+
+def _prediction_keyframe_reasons(
+    summary: Mapping[str, Any],
+    stability_policy: Mapping[str, Any],
+) -> list[str]:
+    policy = dict(stability_policy.get("prediction_remux") or {})
+    if not bool(summary.get("complete")):
+        return ["keyframe timestamps are unavailable or incomplete"]
+    reasons: list[str] = []
+    first_offset = _float_or_none(summary.get("first_keyframe_offset_seconds"))
+    if first_offset is None:
+        first = _float_or_none(summary.get("first_keyframe_seconds"))
+        first_frame = _float_or_none(summary.get("first_frame_seconds"))
+        if first is not None and first_frame is not None:
+            first_offset = first - first_frame
+    first_tolerance = float(
+        policy.get("first_keyframe_tolerance_seconds")
+        or REMUX_FIRST_KEYFRAME_TOLERANCE_SECONDS
+    )
+    if (
+        first_offset is None
+        or abs(first_offset) > first_tolerance + TIMESTAMP_TOLERANCE_SECONDS
+    ):
+        reasons.append("first keyframe is not near the first frame")
+    maximum = _float_or_none(summary.get("max_interval_seconds"))
+    maximum_allowed = float(
+        policy.get("max_keyframe_interval_seconds")
+        or REMUX_MAX_KEYFRAME_INTERVAL_SECONDS
+    )
+    if maximum is None or maximum > maximum_allowed + TIMESTAMP_TOLERANCE_SECONDS:
+        reasons.append(
+            f"maximum keyframe interval exceeds {maximum_allowed:.3f} seconds"
+        )
+    return reasons
 
 
 def remux_eligibility(
@@ -606,6 +805,12 @@ def remux_eligibility(
         raise
     except (OSError, RuntimeError, ValueError) as exc:
         return {"eligible": False, "reasons": [*reasons, f"ffprobe failed: {exc}"], "probe": None}
+    policy_fps = float(
+        fps if fps not in {None, 0, 0.0} else temporal.get("fps") or 0.0
+    )
+    stability_policy = _video_stability_policy(policy_fps if policy_fps > 0 else 1.0)
+    keyframe_probe = _keyframe_probe_summary(probe)
+    reasons.extend(_prediction_keyframe_reasons(keyframe_probe, stability_policy))
     if str(probe.get("codec") or "").lower() != "h264":
         reasons.append("codec is not H.264")
     if str(probe.get("pix_fmt") or "").lower() != "yuv420p":
@@ -626,7 +831,17 @@ def remux_eligibility(
         reasons.append("ffprobe timestamps are unavailable or incomplete")
     elif not _relative_timelines_match(expected_timestamps, observed_timestamps):
         reasons.append("source timestamps changed after alignment")
-    return {"eligible": not reasons, "reasons": reasons, "probe": probe}
+    keyframe_probe["remux_gate_applied"] = True
+    keyframe_probe["policy_compliant"] = not _prediction_keyframe_reasons(
+        keyframe_probe,
+        stability_policy,
+    )
+    return {
+        "eligible": not reasons,
+        "reasons": reasons,
+        "probe": probe,
+        "keyframe_probe": keyframe_probe,
+    }
 
 
 def probe_video_for_freeze(
@@ -634,6 +849,7 @@ def probe_video_for_freeze(
     *,
     ffprobe: str | Path | None = None,
     include_timestamps: bool = True,
+    include_keyframes: bool | None = None,
     cancel_check: CancelCheck | None = None,
 ) -> dict[str, Any]:
     """Probe stream-copy eligibility and final package invariants with ffprobe."""
@@ -642,6 +858,11 @@ def probe_video_for_freeze(
     executable = _resolve_executable("ffprobe", ffprobe)
     if executable is None:
         raise RuntimeError("ffprobe is unavailable")
+    scan_keyframes = (
+        bool(include_timestamps)
+        if include_keyframes is None
+        else bool(include_keyframes)
+    )
     metadata_command = [
         executable,
         "-v",
@@ -650,8 +871,8 @@ def probe_video_for_freeze(
         "-show_entries",
         (
             "stream=index,codec_type,codec_name,pix_fmt,width,height,avg_frame_rate,r_frame_rate,"
-            "nb_frames,nb_read_packets,duration:stream_tags=rotate:"
-            "stream_side_data=side_data_type,rotation:format=duration"
+            "nb_frames,nb_read_packets,start_time,duration:stream_tags=rotate:"
+            "stream_side_data=side_data_type,rotation:format=start_time,duration"
         ),
         "-of",
         "json",
@@ -668,7 +889,9 @@ def probe_video_for_freeze(
         raise ValueError(f"video stream not found: {source}")
     timestamps: list[float] = []
     durations: list[float] = []
-    if include_timestamps:
+    keyframe_timestamps: list[float] = []
+    if include_timestamps or scan_keyframes:
+        keyframes_only = bool(scan_keyframes and not include_timestamps)
         frame_payload = _run_json(
             [
                 executable,
@@ -676,9 +899,13 @@ def probe_video_for_freeze(
                 "error",
                 "-select_streams",
                 "v:0",
+                *(["-skip_frame", "nokey"] if keyframes_only else []),
                 "-show_frames",
                 "-show_entries",
-                "frame=best_effort_timestamp_time,pts_time,pkt_duration_time,duration_time",
+                (
+                    "frame=best_effort_timestamp_time,pts_time,pkt_duration_time,"
+                    "duration_time,key_frame,pict_type"
+                ),
                 "-of",
                 "json",
                 str(source),
@@ -693,14 +920,22 @@ def probe_video_for_freeze(
                 else frame.get("pts_time")
             )
             if timestamp is not None:
-                timestamps.append(timestamp)
-            duration = _float_or_none(
-                frame.get("pkt_duration_time")
-                if frame.get("pkt_duration_time") is not None
-                else frame.get("duration_time")
-            )
-            if duration is not None:
-                durations.append(duration)
+                if include_timestamps:
+                    timestamps.append(timestamp)
+                try:
+                    is_keyframe = int(frame.get("key_frame") or 0) == 1
+                except (TypeError, ValueError):
+                    is_keyframe = False
+                if scan_keyframes and is_keyframe:
+                    keyframe_timestamps.append(timestamp)
+            if include_timestamps:
+                duration = _float_or_none(
+                    frame.get("pkt_duration_time")
+                    if frame.get("pkt_duration_time") is not None
+                    else frame.get("duration_time")
+                )
+                if duration is not None:
+                    durations.append(duration)
     fps = _parse_rate(video.get("avg_frame_rate")) or _parse_rate(video.get("r_frame_rate")) or 0.0
     nominal_fps = _parse_rate(video.get("r_frame_rate")) or fps
     packet_count = _int_or_none(video.get("nb_read_packets"))
@@ -718,6 +953,17 @@ def probe_video_for_freeze(
     width, height = coded_width, coded_height
     if _rotation_swaps_dimensions(rotation):
         width, height = coded_height, coded_width
+    format_payload = payload.get("format") or {}
+    first_frame_timestamp = (
+        float(timestamps[0])
+        if timestamps
+        else _float_or_none(video.get("start_time"))
+    )
+    if first_frame_timestamp is None and isinstance(format_payload, Mapping):
+        first_frame_timestamp = _float_or_none(format_payload.get("start_time"))
+    duration_seconds = _float_or_none(video.get("duration"))
+    if duration_seconds is None and isinstance(format_payload, Mapping):
+        duration_seconds = _float_or_none(format_payload.get("duration"))
     cfr = _timestamps_are_cfr(timestamps, durations, fps)
     if fps <= 0 or nominal_fps <= 0 or abs(fps - nominal_fps) > 1e-6:
         cfr = False
@@ -735,6 +981,18 @@ def probe_video_for_freeze(
         "declared_frame_count": declared_frame_count,
         "fps": fps,
         "timestamps": timestamps,
+        "frame_durations": durations,
+        "first_frame_timestamp": first_frame_timestamp,
+        "duration_seconds": duration_seconds,
+        "keyframe_timestamps": keyframe_timestamps,
+        "keyframe_probe_complete": bool(scan_keyframes),
+        "keyframe_probe_mode": (
+            "full_frames"
+            if include_timestamps
+            else "keyframes_only"
+            if scan_keyframes
+            else "none"
+        ),
         "cfr": cfr,
         "audio_stream_count": sum(1 for item in streams if item.get("codec_type") == "audio"),
         "stream_count": len(streams),
@@ -751,6 +1009,7 @@ def remux_video(
     fps: float,
     ffmpeg: str | Path | None = None,
     ffprobe: str | Path | None = None,
+    stability_policy: Mapping[str, Any] | None = None,
     cancel_check: CancelCheck | None = None,
 ) -> Path:
     """Create and validate a private, video-only faststart stream-copy."""
@@ -823,6 +1082,7 @@ def remux_video(
             frame_count=frame_count,
             fps=fps,
             ffprobe=ffprobe,
+            stability_policy=stability_policy,
             cancel_check=cancel_check,
         )
         _check_cancel(cancel_check)
@@ -850,6 +1110,7 @@ def validate_frozen_video(
     frame_count: int,
     fps: float,
     ffprobe: str | Path | None = None,
+    stability_policy: Mapping[str, Any] | None = None,
     cancel_check: CancelCheck | None = None,
 ) -> dict[str, Any]:
     """Validate frozen MP4 structure without decoding all pixels again."""
@@ -859,6 +1120,7 @@ def validate_frozen_video(
         target,
         ffprobe=ffprobe,
         include_timestamps=False,
+        include_keyframes=stability_policy is not None,
         cancel_check=cancel_check,
     )
     errors: list[str] = []
@@ -882,13 +1144,28 @@ def validate_frozen_video(
             f"declared frame count changed: expected {frame_count}, got {int(declared_frame_count)}"
         )
     if packet_count is None and declared_frame_count is None:
-        errors.append("frame and packet counts are unavailable")
+        if int(probe.get("frame_count") or 0) != int(frame_count):
+            errors.append(
+                f"decoded frame count changed: expected {frame_count}, "
+                f"got {int(probe.get('frame_count') or 0)}"
+            )
     if abs(float(probe.get("fps") or 0.0) - float(fps)) > 1e-6:
         errors.append(f"fps changed: expected {fps}, got {probe.get('fps')}")
     if int(probe.get("audio_stream_count") or 0) != 0:
         errors.append("frozen package contains an audio stream")
     if not _mp4_has_faststart(target):
         errors.append("MP4 moov atom is not before media data")
+    if stability_policy is not None:
+        keyframe_probe = _keyframe_probe_summary(probe)
+        keyframe_errors = _prediction_keyframe_reasons(
+            keyframe_probe,
+            stability_policy,
+        )
+        errors.extend(f"frozen GOP {reason}" for reason in keyframe_errors)
+        probe["keyframe_probe"] = {
+            **keyframe_probe,
+            "policy_compliant": not keyframe_errors,
+        }
     if errors:
         raise ValueError("invalid Campaign frozen video: " + "; ".join(errors))
     return probe
@@ -988,6 +1265,7 @@ class _RawVideoSink:
         fps: float,
         threads: int,
         ffmpeg: str,
+        gop_policy: Mapping[str, Any] | None = None,
         cancel_check: CancelCheck | None = None,
         failure_state: _SinkFailureState | None = None,
     ) -> None:
@@ -997,6 +1275,7 @@ class _RawVideoSink:
         self.fps = float(fps)
         self.threads = max(1, int(threads))
         self.ffmpeg = str(ffmpeg)
+        self.gop_policy = dict(gop_policy or _video_stability_policy(self.fps)["encoding"])
         self.cancel_check = cancel_check
         self.failure_state = failure_state or _SinkFailureState()
         self._queue: queue.Queue[bytes | object] = queue.Queue(maxsize=1)
@@ -1011,7 +1290,34 @@ class _RawVideoSink:
         if self.path.exists() or self.path.is_symlink():
             raise FileExistsError(f"Campaign package target already exists: {self.path}")
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        command = [
+        command = self.command()
+        self._process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=self._stderr,
+        )
+        self._thread = threading.Thread(
+            target=self._writer,
+            name=f"campaign-freeze-{self.path.stem}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def command(self) -> list[str]:
+        """Build the deterministic v3 libx264 command for tests and diagnostics."""
+
+        gop_frames = max(1, int(self.gop_policy.get("gop_frames") or 1))
+        keyint_min = max(
+            1,
+            int(self.gop_policy.get("keyint_min_frames") or gop_frames),
+        )
+        scene_cut_threshold = int(self.gop_policy.get("scene_cut_threshold") or 0)
+        x264_params = (
+            f"keyint={gop_frames}:min-keyint={keyint_min}:"
+            f"scenecut={scene_cut_threshold}:open-gop=0"
+        )
+        return [
             self.ffmpeg,
             "-y",
             "-v",
@@ -1039,6 +1345,14 @@ class _RawVideoSink:
             "veryfast",
             "-crf",
             "18",
+            "-g",
+            str(gop_frames),
+            "-keyint_min",
+            str(keyint_min),
+            "-sc_threshold",
+            str(scene_cut_threshold),
+            "-x264-params",
+            x264_params,
             "-pix_fmt",
             "yuv420p",
             "-threads",
@@ -1047,18 +1361,6 @@ class _RawVideoSink:
             "+faststart",
             str(self.path),
         ]
-        self._process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=self._stderr,
-        )
-        self._thread = threading.Thread(
-            target=self._writer,
-            name=f"campaign-freeze-{self.path.stem}",
-            daemon=True,
-        )
-        self._thread.start()
 
     def write(self, frame: bytes) -> None:
         if len(frame) != self.width * self.height * 3:

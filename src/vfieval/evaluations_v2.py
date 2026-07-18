@@ -25,7 +25,7 @@ from vfieval.compare_inputs import (
     validate_strict_alignment,
     validate_strict_decoded_alignment,
 )
-from vfieval.alignment import materialize_frame_sets, plan_alignment, validate_temporal_alignment
+from vfieval.alignment import plan_alignment, validate_temporal_alignment
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database, utc_ts
 from vfieval.evaluations import CONFIDENCE_VALUES, METRIC_DIRECTIONS, QUALITY_REASONS
@@ -46,6 +46,9 @@ from vfieval.pipeline.evaluation_freeze import (
     freeze_campaign_media,
 )
 from vfieval.run_cleanup import cache_lease
+
+
+LEGACY_COPY_FREEZE_PIPELINE_VERSION = "campaign-freeze-legacy-copy-v1"
 
 
 CAMPAIGN_V2_SCHEMA = """
@@ -2091,70 +2094,6 @@ def _frozen_target(directory: Path, role: str, source: Path) -> Path:
     return directory / f"{role}{suffix}"
 
 
-def _write_private_png_sequence(frame_paths: list[Path], target: Path) -> list[Path]:
-    """Materialize private RGB PNG bytes, never links into a mutable cache/source."""
-    if target.exists() or target.is_symlink():
-        raise FileExistsError(f"Campaign V2 package target already exists: {target}")
-    target.mkdir(parents=True, exist_ok=False)
-    outputs: list[Path] = []
-    for index, source in enumerate(frame_paths):
-        destination = target / f"{index:06d}.png"
-        with Image.open(source) as image:
-            image.convert("RGB").save(destination, format="PNG")
-        outputs.append(destination)
-    if not outputs:
-        raise ValueError("Campaign V2 cannot freeze an empty frame set")
-    return outputs
-
-
-def _write_package_media(
-    workspace: WorkspaceConfig,
-    frame_paths: list[Path],
-    target: Path,
-    *,
-    media_kind: str,
-    fps: float | None,
-    expected_width: int,
-    expected_height: int,
-) -> Path:
-    """Write one normalized package medium and verify its exact dimensions/count."""
-    if media_kind == "frame_sequence":
-        outputs = _write_private_png_sequence(frame_paths, target)
-        with Image.open(outputs[0]) as image:
-            actual_size = image.size
-        if actual_size != (int(expected_width), int(expected_height)):
-            raise ValueError(
-                "Campaign V2 normalized frame dimensions changed while freezing: "
-                f"expected {expected_width}x{expected_height}, got {actual_size[0]}x{actual_size[1]}"
-            )
-        return target
-    if media_kind != "video":
-        raise ValueError(f"unsupported Campaign V2 package media_kind: {media_kind}")
-
-    temporary_frames = target.parent / f".{target.stem}-{uuid.uuid4().hex}-frames"
-    try:
-        private_frames = _write_private_png_sequence(frame_paths, temporary_frames)
-        from vfieval.pipeline.inference import _write_mp4
-
-        _write_mp4(private_frames, target, float(fps or 24.0))
-    finally:
-        if temporary_frames.exists():
-            shutil.rmtree(temporary_frames)
-    observed = inspect_compare_path(workspace, target)
-    actual_size = (int(observed.get("width") or 0), int(observed.get("height") or 0))
-    if actual_size != (int(expected_width), int(expected_height)):
-        raise ValueError(
-            "Campaign V2 normalized video dimensions changed while encoding: "
-            f"expected {expected_width}x{expected_height}, got {actual_size[0]}x{actual_size[1]}"
-        )
-    if int(observed.get("frame_count") or 0) != len(frame_paths):
-        raise ValueError(
-            "Campaign V2 normalized video frame count changed while encoding: "
-            f"expected {len(frame_paths)}, got {int(observed.get('frame_count') or 0)}"
-        )
-    return target
-
-
 def _normalized_asset_snapshot(
     source_asset: dict[str, Any],
     *,
@@ -2455,58 +2394,7 @@ def _stage_item_campaign_media(
     fps_value = (stored_plan.get("temporal") or {}).get("fps")
     fps = float(fps_value) if fps_value is not None else None
     media_kind = str(semantic_item.get("media_kind") or "video")
-    suffix = ".mp4" if media_kind == "video" else ""
     video_dir.mkdir(parents=True, exist_ok=False)
-
-    def legacy_freeze() -> dict[str, Any]:
-        """Compatibility path used only when the streaming backend is unavailable."""
-
-        legacy_started = time.monotonic()
-        if progress_callback is not None:
-            progress_callback(
-                {
-                    "stage": "legacy_materializing",
-                    "frame_current": 0,
-                    "frame_total": frame_count,
-                    "pipeline": "legacy_png",
-                    "force": True,
-                }
-            )
-        aligned = materialize_frame_sets(db, workspace, stored_plan, sources)
-        output_paths: dict[str, Path] = {}
-        for slot, role in (
-            ("gt", "reference"),
-            ("pred_a", "method-a"),
-            ("pred_b", "method-b"),
-        ):
-            output_paths[slot] = _write_package_media(
-                workspace,
-                aligned[slot],
-                video_dir / f"{role}{suffix}",
-                media_kind=media_kind,
-                fps=fps,
-                expected_width=target_width,
-                expected_height=target_height,
-            )
-        artifacts: dict[str, dict[str, Any]] = {}
-        for slot, path in output_paths.items():
-            artifacts[slot] = {
-                "path": path,
-                "sha256": _path_sha256(path),
-                "size_bytes": _path_size(path),
-                "mode": "legacy_png",
-            }
-        return {
-            "pipeline": "legacy_png",
-            "frame_count": frame_count,
-            "width": target_width,
-            "height": target_height,
-            "fps": float(fps or 24.0),
-            "encoder_threads": 0,
-            "artifacts": artifacts,
-            "timings": {"total": time.monotonic() - legacy_started},
-            "remux": {},
-        }
 
     guarded_sources = {
         "gt": (reference, reference_asset, "GT"),
@@ -2559,8 +2447,12 @@ def _stage_item_campaign_media(
                 cancel_check=cancel_check,
                 progress_callback=progress_callback,
             )
-        except FreezeBackendUnavailable:
-            freeze_result = legacy_freeze()
+        except FreezeBackendUnavailable as exc:
+            raise FreezeBackendUnavailable(
+                "Campaign video publication requires the stream-v3 FFmpeg/ffprobe "
+                "backend; refusing a legacy encoder fallback because it cannot "
+                "guarantee the frozen GOP policy"
+            ) from exc
         freeze_result["timings"] = {
             **alignment_timings,
             **dict(freeze_result.get("timings") or {}),
@@ -2682,6 +2574,20 @@ def _stage_item_campaign_media(
             "version": str(freeze_result.get("version") or FREEZE_PIPELINE_VERSION),
             "pipeline": str(freeze_result.get("pipeline") or "unknown"),
             "encoder_threads": int(freeze_result.get("encoder_threads") or 0),
+            "gop_policy": dict(freeze_result.get("gop_policy") or {}),
+            "keyframe_probe": {
+                str(slot): dict(payload)
+                for slot, payload in dict(
+                    freeze_result.get("keyframe_probe") or {}
+                ).items()
+                if isinstance(payload, dict)
+            },
+            "stability_policy": dict(
+                freeze_result.get("stability_policy") or {}
+            ),
+            "stability_policy_fingerprint": str(
+                freeze_result.get("stability_policy_fingerprint") or ""
+            ),
             "timings": {
                 str(name): float(value)
                 for name, value in dict(freeze_result.get("timings") or {}).items()
@@ -2871,6 +2777,7 @@ def _stage_legacy_campaign_media(
     staging: Path,
 ) -> tuple[dict[tuple[int, str], dict[str, Any]], dict[str, Any]]:
     """Retain the exact asset-mode freeze path for pre-Item Campaign drafts."""
+    legacy_started = time.monotonic()
     reference_asset, reference_path = _managed_source_asset(
         db, workspace, int(item["reference_source_asset_id"]), "reference"
     )
@@ -2935,6 +2842,17 @@ def _stage_legacy_campaign_media(
             "size_bytes": _path_size(reference_target),
         },
         "methods": bindings_manifest,
+        "freeze_pipeline": {
+            "version": LEGACY_COPY_FREEZE_PIPELINE_VERSION,
+            "pipeline": "legacy_copy",
+            "encoder_threads": 0,
+            "timings": {"total": time.monotonic() - legacy_started},
+            "outputs": {
+                "gt": {"mode": "clone"},
+                "pred_a": {"mode": "clone"},
+                "pred_b": {"mode": "clone"},
+            },
+        },
     }
     return frozen, manifest_item
 
@@ -3076,6 +2994,18 @@ def publish_campaign_v2(
 
             _require_preparation_claim(
                 db, int(campaign_id), claim_token, ownership_lost=ownership_lost
+            )
+            item_pipeline_versions = {
+                str(
+                    dict(item_payload.get("freeze_pipeline") or {}).get("version")
+                    or LEGACY_COPY_FREEZE_PIPELINE_VERSION
+                )
+                for item_payload in manifest["items"]
+            }
+            manifest["freeze_pipeline"] = (
+                next(iter(item_pipeline_versions))
+                if len(item_pipeline_versions) == 1
+                else "campaign-freeze-mixed-v3"
             )
             manifest["timings"] = {
                 "final_source_stability": _validate_final_campaign_sources(
@@ -3277,7 +3207,7 @@ def publish_campaign_v2(
                                 "size_bytes": _path_size(final_root),
                                 "stage": "completed",
                                 "overall_fraction": 1.0,
-                                "pipeline": FREEZE_PIPELINE_VERSION,
+                                "pipeline": str(manifest["freeze_pipeline"]),
                                 "timings": {
                                     "elapsed_seconds": round(
                                         time.monotonic() - preparation_started_monotonic,
@@ -3585,6 +3515,40 @@ def _lease_assignment(
         }
 
 
+def _common_frozen_fps(*values: Any) -> float | None:
+    """Return an FPS only when every frozen stream reports the same valid value."""
+
+    fps_values: list[float] = []
+    for value in values:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            fps = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(fps) or fps <= 0:
+            return None
+        fps_values.append(fps)
+    if not fps_values:
+        return None
+    first = fps_values[0]
+    if any(
+        not math.isclose(first, candidate, rel_tol=1e-6, abs_tol=1e-6)
+        for candidate in fps_values[1:]
+    ):
+        return None
+    return first
+
+
+def _common_available_frozen_fps(*values: Any) -> float | None:
+    """Recover duration from matching historical rows even when one FPS is absent."""
+
+    available = [value for value in values if value is not None]
+    if not available:
+        return None
+    return _common_frozen_fps(*available)
+
+
 def _task_payload(
     db: Database,
     campaign_token: str,
@@ -3596,6 +3560,8 @@ def _task_payload(
                ba.frozen_asset_id AS asset_a_id, bb.frozen_asset_id AS asset_b_id,
                gra.media_kind AS reference_media_kind,
                gaa.media_kind AS media_a_kind, gba.media_kind AS media_b_kind,
+               gra.fps AS reference_fps, gaa.fps AS media_a_fps,
+               gba.fps AS media_b_fps,
                MIN(gra.frame_count, gaa.frame_count, gba.frame_count) AS frame_count
         FROM evaluation_tasks_v2 t
         JOIN evaluation_items_v2 i ON i.id = t.item_id
@@ -3614,6 +3580,19 @@ def _task_payload(
     assignment_query = quote(str(assignment["assignment_token"]), safe="")
     base = f"/api/blind/{campaign_token}/tasks/{task_token}/media"
     swap = bool(int(assignment["side_swap"] or 0))
+    frame_count = int(row["frame_count"] or 0)
+    frozen_fps_values = (
+        row["reference_fps"],
+        row["media_a_fps"],
+        row["media_b_fps"],
+    )
+    fps = _common_frozen_fps(*frozen_fps_values)
+    duration_fps = fps or _common_available_frozen_fps(*frozen_fps_values)
+    duration_seconds = (
+        frame_count / duration_fps
+        if frame_count > 0 and duration_fps is not None
+        else None
+    )
     return {
         "token": task_token,
         "video_name": str(row["video_name"]),
@@ -3623,7 +3602,9 @@ def _task_payload(
         "reference_media_kind": str(row["reference_media_kind"]),
         "left_media_kind": str(row["media_b_kind"] if swap else row["media_a_kind"]),
         "right_media_kind": str(row["media_a_kind"] if swap else row["media_b_kind"]),
-        "frame_count": int(row["frame_count"] or 0),
+        "frame_count": frame_count,
+        "fps": fps,
+        "duration_seconds": duration_seconds,
         "quality_reasons": sorted(QUALITY_REASONS),
         "lease_expires_at": float(assignment["lease_expires_at"]),
     }

@@ -42,20 +42,45 @@
           <span id="review-mode-label" class="muted"></span>
         </div>
 
+        <div class="media-control-dock">
         <div class="blind-media-toolbar">
-          <div class="view-switch" role="group" aria-label="媒体显示方式">
-            <span class="view-switch-label">显示方式</span>
-            <button id="view-wipe" class="view-option" type="button" aria-pressed="true" aria-controls="media-grid">重叠对比</button>
-            <button id="view-full" class="view-option" type="button" aria-pressed="false" aria-controls="media-grid">完整视图</button>
+          <div class="media-toolbar-groups">
+            <div class="view-switch" role="group" aria-label="媒体显示方式">
+              <span class="view-switch-label">显示方式</span>
+              <button id="view-wipe" class="view-option" type="button" aria-pressed="true" aria-controls="media-grid">分割线</button>
+              <button id="view-full" class="view-option" type="button" aria-pressed="false" aria-controls="media-grid">完整</button>
+            </div>
+            <div id="playback-scope" class="scope-switch" role="group" aria-label="参与同步播放的媒体">
+              <span class="view-switch-label">播放范围</span>
+              <button class="scope-option" data-playback-scope="all" type="button" aria-pressed="true" aria-controls="media-grid" aria-label="两个视图同步">两个视图同步</button>
+              <button class="scope-option" data-playback-scope="reference" type="button" aria-pressed="false" aria-controls="media-grid">仅 GT</button>
+              <button class="scope-option scope-wipe-only" data-playback-scope="candidates" type="button" aria-pressed="false" aria-controls="media-grid">仅候选对比</button>
+              <button class="scope-option scope-full-only hidden" data-playback-scope="left" type="button" aria-pressed="false" aria-controls="media-grid">仅 A</button>
+              <button class="scope-option scope-full-only hidden" data-playback-scope="right" type="button" aria-pressed="false" aria-controls="media-grid">仅 B</button>
+            </div>
           </div>
           <p id="sync-status" class="sync-status" role="status" aria-live="polite">等待媒体就绪</p>
         </div>
 
         <div id="playback-controls" class="playback-controls">
-          <button id="master-play" type="button">全部播放</button>
-          <label class="seek-label"><span>时间</span><input id="master-seek" type="range" min="0" max="1000" value="0"></label>
+          <button id="master-play" type="button">播放所选</button>
+          <div class="frame-stepper video-frame-stepper">
+            <button id="master-prev" class="secondary frame-step" type="button" aria-label="上一帧">上一帧</button>
+            <label class="seek-label"><span id="master-frame-label">帧 1/1</span><input id="master-seek" type="range" min="0" max="0" step="1" value="0" aria-label="视频帧位置"></label>
+            <button id="master-next" class="secondary frame-step" type="button" aria-label="下一帧">下一帧</button>
+          </div>
           <label><span>倍速</span><select id="master-rate"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
           <label class="check"><input id="master-loop" type="checkbox" checked>循环</label>
+        </div>
+
+        <div id="frame-control" class="frame-control hidden">
+          <div class="frame-stepper frame-sequence-stepper">
+            <button id="frame-prev" class="secondary frame-step" type="button" aria-label="上一帧">上一帧</button>
+            <label><span id="frame-label">帧 1/1</span><input id="frame-range" type="range" min="0" max="0" step="1" value="0" aria-label="帧序列位置"></label>
+            <button id="frame-next" class="secondary frame-step" type="button" aria-label="下一帧">下一帧</button>
+          </div>
+        </div>
+        <button id="media-reload" class="secondary media-reload hidden" type="button">重新加载</button>
         </div>
 
         <div id="media-grid" class="media-grid view-wipe"></div>
@@ -74,10 +99,6 @@
           >
           <p id="wipe-instructions" class="wipe-instructions muted">拖动分界线查看同一位置的差异；键盘可使用左右方向键、Home 和 End。触屏上下滑动仍可滚动页面。</p>
         </div>
-        <div id="frame-control" class="frame-control hidden">
-          <label><span id="frame-label">帧 1/1</span><input id="frame-range" type="range" min="0" max="0" value="0"></label>
-        </div>
-
         <form id="vote-form">
           <fieldset class="outcome-fieldset">
             <legend>请选择谁更好（必选）</legend>

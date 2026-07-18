@@ -62,6 +62,7 @@ from vfieval.media_items import (
     register_external_prediction,
 )
 from vfieval.run_cleanup import RunCleanupService
+from vfieval.pipeline.evaluation_freeze import FreezeBackendUnavailable
 
 from v13_test_utils import add_completed_pred_run, make_workspace, write_mp4
 
@@ -624,6 +625,14 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             self.assertTrue(
                 all(output["mode"] for output in freeze_report["outputs"].values())
             )
+            self.assertEqual(freeze_report["version"], "campaign-freeze-stream-v3")
+            self.assertEqual(freeze_report["gop_policy"]["gop_frames"], 5)
+            self.assertEqual(set(freeze_report["keyframe_probe"]), {"gt", "pred_a", "pred_b"})
+            self.assertEqual(len(freeze_report["stability_policy_fingerprint"]), 64)
+            self.assertEqual(
+                freeze_report["stability_policy_fingerprint"],
+                freeze_report["stability_policy"]["fingerprint"],
+            )
             self.assertIn("total", freeze_report["timings"])
             self.assertFalse(list(package.rglob("*.png")))
             for method in manifest_item["methods"]:
@@ -636,7 +645,7 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             self.assertEqual(preparation["report"]["total"], 1)
             self.assertEqual(preparation["report"]["stage"], "completed")
             self.assertEqual(preparation["report"]["overall_fraction"], 1.0)
-            self.assertEqual(preparation["report"]["pipeline"], "campaign-freeze-stream-v2")
+            self.assertEqual(preparation["report"]["pipeline"], "campaign-freeze-stream-v3")
 
             frozen_assets = db.query(
                 "SELECT * FROM media_assets WHERE source_kind = 'evaluation_package' ORDER BY id"
@@ -742,6 +751,24 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             self.assertEqual(set(digest_counts), artifact_paths)
             self.assertTrue(all(digest_counts[path] == 1 for path in artifact_paths))
 
+    def test_item_mode_refuses_a_legacy_video_encoder_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _item, body, _source_paths = self._item_campaign(workspace, db)
+            draft = create_campaign_v2(db, workspace, body)
+            with patch(
+                "vfieval.evaluations_v2.freeze_campaign_media",
+                side_effect=FreezeBackendUnavailable("fixture backend unavailable"),
+            ):
+                with self.assertRaisesRegex(
+                    FreezeBackendUnavailable,
+                    "refusing a legacy encoder fallback",
+                ):
+                    publish_campaign_v2(db, workspace, int(draft["id"]))
+
+            self.assertFalse((workspace.evaluations_dir / str(draft["id"])).exists())
+            self.assertEqual(get_preparation_v2(db, int(draft["id"]))["state"], "failed")
+
     def test_rotation_and_resize_force_streaming_and_disable_paired_pred_remux(self) -> None:
         from vfieval.pipeline import evaluation_freeze as freeze
 
@@ -770,6 +797,8 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
                     "frame_count": 2,
                     "fps": 5.0,
                     "timestamps": [0.0, 0.2],
+                    "frame_durations": [0.2, 0.2],
+                    "keyframe_timestamps": [0.0],
                     "cfr": True,
                     "audio_stream_count": 0,
                 }
@@ -1348,6 +1377,18 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             self.assertEqual(published["tasks"], 1)
             package = workspace.root / "evaluations" / str(campaign["id"])
             self.assertTrue((package / "manifest.json").is_file())
+            manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                manifest["freeze_pipeline"], "campaign-freeze-legacy-copy-v1"
+            )
+            self.assertEqual(
+                manifest["items"][0]["freeze_pipeline"]["version"],
+                "campaign-freeze-legacy-copy-v1",
+            )
+            self.assertEqual(
+                get_preparation_v2(db, int(campaign["id"]))["report"]["pipeline"],
+                "campaign-freeze-legacy-copy-v1",
+            )
             frozen = db.query(
                 "SELECT * FROM media_assets WHERE source_kind = 'evaluation_package' ORDER BY id"
             )
@@ -1477,6 +1518,9 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             )
             task = session["task"]
             self.assertIsNotNone(task)
+            self.assertEqual(task["frame_count"], 3)
+            self.assertEqual(task["fps"], 5.0)
+            self.assertAlmostEqual(task["duration_seconds"], 0.6)
 
             for invalid in (0.75, 5.25, 1.1, float("nan"), True, [4], {"value": 4}):
                 with self.assertRaisesRegex(ValueError, "0.25 steps"):
@@ -1527,6 +1571,10 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             self.assertTrue(reviewed["task"]["review"])
             self.assertFalse(reviewed["task"]["read_only"])
             self.assertEqual(reviewed["task"]["vote"]["choice"], "left")
+            self.assertEqual(reviewed["task"]["fps"], task["fps"])
+            self.assertEqual(
+                reviewed["task"]["duration_seconds"], task["duration_seconds"]
+            )
             serialized_reviews = json.dumps(
                 {"listed": listed, "reviewed": reviewed}, sort_keys=True
             )
@@ -1569,6 +1617,52 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
                 [value for row in analysis["ratings"]["methods"] for value in [row["mean"]] if value is not None],
                 [2.5],
             )
+
+            with db.connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE media_assets
+                    SET fps = NULL
+                    WHERE id = (
+                        SELECT frozen_reference_asset_id
+                        FROM evaluation_items_v2
+                        WHERE campaign_id = ?
+                    )
+                    """,
+                    (int(campaign["id"]),),
+                )
+            historical_review = blind_review_task(
+                db, token, task["token"], "ratings-browser"
+            )
+            self.assertIsNone(historical_review["task"]["fps"])
+            self.assertAlmostEqual(
+                historical_review["task"]["duration_seconds"], 0.6
+            )
+
+            with db.connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE media_assets
+                    SET fps = NULL
+                    WHERE id IN (
+                        SELECT frozen_reference_asset_id
+                        FROM evaluation_items_v2
+                        WHERE campaign_id = ?
+                        UNION
+                        SELECT bindings.frozen_asset_id
+                        FROM evaluation_bindings_v2 AS bindings
+                        JOIN evaluation_items_v2 AS items
+                          ON items.id = bindings.item_id
+                        WHERE items.campaign_id = ?
+                    )
+                    """,
+                    (int(campaign["id"]), int(campaign["id"])),
+                )
+            unknown_timing_review = blind_review_task(
+                db, token, task["token"], "ratings-browser"
+            )
+            self.assertIsNone(unknown_timing_review["task"]["fps"])
+            self.assertIsNone(unknown_timing_review["task"]["duration_seconds"])
 
             close_campaign_v2(db, int(campaign["id"]))
             self.assertFalse(blind_reviews(db, token, "ratings-browser")["editable"])

@@ -147,16 +147,17 @@ class EvaluationStudioUiTests(unittest.TestCase):
         create_media = self._function_source("createMediaNode")
         self.assertIn('addEventListener("pause", handleMediaPause)', create_media)
         self.assertIn('addEventListener("ended", handleMediaEnded)', create_media)
-        self.assertLess(
-            create_media.index('addEventListener("pause", handleMediaPause)'),
-            create_media.index('if (side === "reference")'),
-        )
+        for event_name in ("timeupdate", "play", "seeking", "seeked", "ratechange"):
+            self.assertIn(f'addEventListener("{event_name}"', create_media)
+        self.assertNotIn('if (side === "reference")', create_media)
         self.assertNotIn("0.08", self.blind_js)
 
         waiting = self._function_source("handleMediaWaiting")
         self.assertIn("blindState.syncPlayIntent", waiting)
         self.assertIn("blindState.syncAttempt += 1", waiting)
         self.assertIn("pauseVideosInternally()", waiting)
+        self.assertIn("markRecoveryContext(initialBuffering)", waiting)
+        self.assertIn("bufferingDiagnostic(media, target)", waiting)
         self.assertNotIn("pauseSynchronizedPlayback(", waiting)
         ready = self._function_source("handleMediaCanPlay")
         self.assertIn("maybeResumeBufferedPlayback()", ready)
@@ -181,7 +182,10 @@ class EvaluationStudioUiTests(unittest.TestCase):
     def test_blind_task_replacement_stops_old_synchronization_and_media(self) -> None:
         stop = self._function_source("stopSynchronization")
         self.assertIn("cancelFrameSynchronization()", stop)
-        self.assertIn("pauseVideosInternally()", stop)
+        self.assertIn("pauseVideosInternally(allVideos())", stop)
+        self.assertIn("abortPreload()", stop)
+        self.assertIn("stopStreamMonitoring()", stop)
+        self.assertIn("releaseBlobUrls()", stop)
         cancel = self._function_source("cancelFrameSynchronization")
         self.assertIn("cancelVideoFrameCallback", cancel)
         render_task = self._function_source("renderTask")
@@ -189,10 +193,195 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertLess(render_task.index("stopSynchronization()"), render_task.index("replaceContent("))
         play = self._function_source("playSynchronizedVideos")
         self.assertIn("const mediaGeneration = blindState.mediaGeneration", play)
-        self.assertIn("videos.every((video) => isCurrentMedia(video))", play)
+        self.assertIn("const scopeEpoch = blindState.scopeEpoch", play)
+        self.assertIn("videos.every((video) => isCurrentMedia(video) && isActiveMedia(video))", play)
         reference_play = self._function_source("handleReferencePlay")
-        self.assertIn("isCurrentMedia(clock)", reference_play)
+        self.assertIn("isActiveClock(clock)", reference_play)
         self.assertIn("playSynchronizedVideos(false)", reference_play)
+
+    def test_blind_playback_scope_is_dynamic_and_resets_with_each_view_and_task(self) -> None:
+        for scope in ("all", "reference", "candidates", "left", "right"):
+            self.assertIn(f'data-playback-scope="{scope}"', self.blind_html)
+        self.assertIn("两个视图同步", self.blind_html)
+        self.assertIn("仅候选对比", self.blind_html)
+        dock_start = self.blind_html.index('<div class="media-control-dock">')
+        dock_end = self.blind_html.index('<div id="media-grid"', dock_start)
+        dock_markup = self.blind_html[dock_start:dock_end]
+        self.assertIn('id="playback-scope"', dock_markup)
+        self.assertIn('id="playback-controls"', dock_markup)
+        self.assertIn('id="frame-control"', dock_markup)
+        self.assertIn(".media-control-dock { position: sticky", self.blind_css)
+
+        scopes = self._function_source("playbackScopesForView")
+        self.assertIn('["all", "reference", "left", "right"]', scopes)
+        self.assertIn('["all", "reference", "candidates"]', scopes)
+        active = self._function_source("activeMediaSides")
+        for side_scope in ("reference", "candidates", "left", "right"):
+            self.assertIn(f'blindState.playbackScope === "{side_scope}"', active)
+        clock = self._function_source("playbackClock")
+        self.assertIn('dataset.mediaSide === "reference"', clock)
+        self.assertIn("videos[0]", clock)
+
+        set_scope = self._function_source("setPlaybackScope")
+        self.assertIn("pauseAndAlignForPlaybackChange()", set_scope)
+        self.assertIn("advancePlaybackScopeEpoch()", set_scope)
+        self.assertIn("blindState.syncClock = playbackClock()", set_scope)
+        self.assertNotIn("playSynchronizedVideos", set_scope)
+        self.assertNotIn(".play()", set_scope)
+        set_view = self._function_source("setViewMode")
+        self.assertIn(
+            'setPlaybackScope(changed ? "all" : blindState.playbackScope, true)',
+            set_view,
+        )
+        self.assertNotIn("playSynchronizedVideos", set_view)
+        self.assertNotIn(".play()", set_view)
+        self.assertNotIn("scopeByView", self.blind_js)
+        render = self._function_source("renderTask")
+        self.assertIn('blindState.viewMode = blindState.wipeSupported ? "wipe" : "full"', render)
+        self.assertIn('blindState.playbackScope = "all"', render)
+
+    def test_blind_short_video_preload_is_atomic_abortable_and_reports_anonymous_progress(self) -> None:
+        self.assertIn("FULL_BLOB_PRELOAD_TOTAL_MAX_BYTES = 256 * 1024 * 1024", self.blind_js)
+        self.assertIn("FULL_BLOB_PRELOAD_MAX_DURATION_SECONDS = 30", self.blind_js)
+        self.assertNotIn("SHORT_VIDEO_BLOB_MAX_FRAMES", self.blind_js)
+        prepare = self._function_source("prepareTaskVideoSources")
+        self.assertIn("task && task.duration_seconds", prepare)
+        self.assertIn("Promise.all(sourceUrls.map", prepare)
+        self.assertIn("contentLengths.reduce", prepare)
+        self.assertIn("FULL_BLOB_PRELOAD_TOTAL_MAX_BYTES", prepare)
+        self.assertIn("preloadContextIsCurrent(mediaGeneration, scopeEpoch, videos)", prepare)
+        self.assertLess(prepare.index("const blobs = await Promise.all"), prepare.index("createdUrls.push"))
+
+        reader = self._function_source("readPreloadResponseBlob")
+        self.assertIn("response.body.getReader()", reader)
+        self.assertIn("row.received", reader)
+        self.assertIn("signal && signal.aborted", reader)
+        self.assertIn("preloadContextIsCurrent(mediaGeneration, scopeEpoch, videos)", reader)
+        self.assertIn("preloadOperationWithNoProgressTimeout", reader)
+        timeout = self._function_source("preloadOperationWithNoProgressTimeout")
+        self.assertIn("STREAM_NO_PROGRESS_RELOAD_MS", timeout)
+        self.assertIn('error.name = "TimeoutError"', timeout)
+        progress = self._function_source("updateAtomicPreloadProgress")
+        for label in ('row.label', 'row.received', 'row.total', '" · "'):
+            self.assertIn(label, progress)
+        self.assertIn('["GT", "A", "B"]', prepare)
+
+        abort = self._function_source("abortPreload")
+        self.assertIn("controller.abort()", abort)
+        self.assertIn("preloadController", self.blind_js)
+        advance = self._function_source("advancePlaybackScopeEpoch")
+        self.assertIn("blindState.scopeEpoch += 1", advance)
+        self.assertIn("abortPreload()", advance)
+        self.assertIn("startTaskVideoPreparation(currentTask())", advance)
+
+    def test_blind_stream_watermarks_reload_and_fatal_vote_gate_are_explicit(self) -> None:
+        for contract in (
+            "STREAM_INITIAL_WATER_SECONDS = 10",
+            "STREAM_LOW_WATER_SECONDS = 1.5",
+            "STREAM_RESUME_WATER_SECONDS = 5",
+            "STREAM_NO_PROGRESS_RELOAD_MS = 60_000",
+            "STREAM_MONITOR_INTERVAL_MS = 250",
+        ):
+            self.assertIn(contract, self.blind_js)
+        play = self._function_source("playSynchronizedVideos")
+        self.assertIn("videos.every(mediaReadyForInitialPlayback)", play)
+        self.assertIn("markRecoveryContext(true)", play)
+        self.assertIn(
+            "blindState.initialBufferScopeEpoch !== scopeEpoch",
+            play,
+        )
+        self.assertIn("requiresInitialBuffer", play)
+        self.assertIn("blindState.initialBufferScopeEpoch = scopeEpoch", play)
+        self.assertLess(play.index("videos.every(mediaReadyForInitialPlayback)"), play.index("video.play()"))
+        waiting = self._function_source("handleMediaWaiting")
+        self.assertIn("const initialBuffering = blindState.syncInitialBuffering", waiting)
+        self.assertIn("markRecoveryContext(initialBuffering)", waiting)
+        self.assertIn("bufferingDiagnostic(media, target)", waiting)
+        self.assertIn("isActiveMedia(media)", waiting)
+        canplay = self._function_source("handleMediaCanPlay")
+        self.assertIn("isActiveMedia(media)", canplay)
+        self.assertIn("recoveryContextIsCurrent()", canplay)
+        self.assertIn("finishMediaReloadIfReady()", canplay)
+        self.assertLess(
+            canplay.index("finishMediaReloadIfReady()"),
+            canplay.index("!isActiveMedia(media)"),
+        )
+
+        stalled = self._function_source("stopStalledAutoResume")
+        self.assertIn("streamAutoResumeBlocked = true", stalled)
+        self.assertIn('setHidden("media-reload", false)', stalled)
+        self.assertNotIn(".src =", stalled)
+        reload_media = self._function_source("reloadTaskMedia")
+        self.assertIn("video.src = sourceUrl", reload_media)
+        self.assertIn("mediaReloadGeneration", reload_media)
+        finish_reload = self._function_source("finishMediaReloadIfReady")
+        self.assertIn("mediaReloadScopeEpoch", finish_reload)
+        self.assertIn("mediaReloadAttempt", finish_reload)
+        self.assertIn("clearTaskMediaFatal()", finish_reload)
+
+        media_error = self._function_source("handleMediaErrorState")
+        self.assertIn("isCurrentMedia(media)", media_error)
+        self.assertNotIn("isActiveMedia(media)", media_error)
+        self.assertIn("markTaskMediaFatal", media_error)
+        fatal = self._function_source("markTaskMediaFatal")
+        self.assertIn("setVoteMediaBlocked(true)", fatal)
+        submit = self._function_source("submitVote")
+        self.assertIn("blindState.mediaFatal", submit)
+        self.assertIn("blindState.mediaReloadPending", submit)
+        self.assertIn("blindState.frameSequencePending", submit)
+
+    def test_blind_integer_frame_timeline_previews_then_commits_frame_midpoints(self) -> None:
+        for hook in ("master-prev", "master-next", "master-frame-label", "frame-prev", "frame-next"):
+            self.assertIn(f'id="{hook}"', self.blind_html)
+        self.assertRegex(self.blind_html, r'id="master-seek"[^>]*step="1"')
+        initialize = self._function_source("initializeBlindPage")
+        self.assertIn('addEventListener("input", (event) => previewVideoFrame', initialize)
+        self.assertIn('addEventListener("change", (event) => commitVideoFrameScrub', initialize)
+        self.assertIn('addEventListener("pointerup", finishInterruptedVideoScrub)', initialize)
+        self.assertIn('addEventListener("pointercancel", finishInterruptedVideoScrub)', initialize)
+        self.assertIn('addEventListener("lostpointercapture", finishInterruptedVideoScrub)', initialize)
+        self.assertIn('addEventListener("blur", finishInterruptedVideoScrub)', initialize)
+        self.assertIn('addEventListener("input", (event) => previewSequenceFrame', initialize)
+        self.assertIn('addEventListener("change", (event) => updateFrame', initialize)
+        self.assertNotIn(".src =", self._function_source("previewSequenceFrame"))
+        self.assertNotIn("currentTime", self._function_source("previewVideoFrame"))
+
+        seek_frame = self._function_source("seekVideoToFrame")
+        self.assertIn("(index + 0.5) / fps", seek_frame)
+        self.assertIn("(index + 0.5) / taskFrameCount()", seek_frame)
+        self.assertIn("pendingFrameIndex", seek_frame)
+        reliability = self._function_source("frameSteppingIsReliable")
+        self.assertIn("taskFramesPerSecond()", reliability)
+        self.assertIn("reliableMediaDuration(video)", reliability)
+        step = self._function_source("stepVideoFrame")
+        self.assertIn("frameSteppingIsReliable(playbackClock())", step)
+        start_sync = self._function_source("startFrameSynchronization")
+        self.assertIn("metadata.mediaTime", start_sync)
+        self.assertIn("updateMasterSeek(mediaTime", start_sync)
+        paused_correction = self._function_source("schedulePausedFrameCorrection")
+        self.assertIn("requestVideoFrameCallback", paused_correction)
+        self.assertIn("metadata.mediaTime", paused_correction)
+        self.assertIn("mediaGeneration !== blindState.mediaGeneration", paused_correction)
+        self.assertIn("scopeEpoch !== blindState.scopeEpoch", paused_correction)
+        self.assertIn("attempt !== blindState.syncAttempt", paused_correction)
+        seeked = self._function_source("handleReferenceSeeked")
+        self.assertIn("schedulePausedFrameCorrection(clock)", seeked)
+        update_seek = self._function_source("updateMasterSeek")
+        self.assertIn("blindState.videoScrubbing", update_seek)
+        preview = self._function_source("previewVideoFrame")
+        self.assertIn("beginVideoFrameScrub()", preview)
+        self.assertIn("blindState.videoScrubDirty = true", preview)
+        commit = self._function_source("commitVideoFrameScrub")
+        self.assertIn("blindState.videoScrubbing = false", commit)
+        self.assertIn("blindState.videoScrubDirty", commit)
+        self.assertIn("seekVideos(value)", commit)
+
+        for token in (
+            "position: sticky",
+            'grid-template-areas: "play timeline timeline" "rate loop status"',
+            ".frame-stepper",
+        ):
+            self.assertIn(token, self.blind_css)
 
     def test_blind_vote_ratings_reviews_and_sticky_controls_are_present(self) -> None:
         for token in (
@@ -216,13 +405,74 @@ class EvaluationStudioUiTests(unittest.TestCase):
         factory = self._function_source("createMediaNode")
         self.assertIn('document.createElement("img")', factory)
         self.assertIn("dataset.frameBase", factory)
-        self.assertIn("blindState.frameIndex", factory)
+        self.assertIn("handleFrameSequenceLoad", factory)
+        self.assertIn("handleFrameSequenceError", factory)
+        self.assertNotIn(".src =", factory.split('document.createElement("video")')[0])
+        render = self._function_source("renderTask")
+        self.assertIn("startFrameSequenceRequest(allFrameSequenceImages(), blindState.frameIndex)", render)
         update = self._function_source("updateFrame")
-        self.assertIn('querySelectorAll("[data-frame-base]")', update)
-        self.assertIn("withFrame(image.dataset.frameBase, blindState.frameIndex)", update)
+        self.assertIn("replaceFrameSequenceImages(blindState.frameIndex)", update)
+        source = self._function_source("setFrameSequenceSource")
+        self.assertIn("withFrame(image.dataset.frameBase, frame)", source)
+        self.assertIn("withReloadNonce", source)
         set_view = self._function_source("setViewMode")
         self.assertNotIn("frameIndex", set_view)
         self.assertNotIn(".src =", set_view)
+
+    def test_blind_frame_sequence_errors_block_votes_and_retry_all_three_atomically(self) -> None:
+        error = self._function_source("handleFrameSequenceError")
+        self.assertIn("isCurrentMedia(image)", error)
+        self.assertIn("mediaLoadError", error)
+        load_error = self._function_source("mediaLoadError")
+        self.assertIn("markTaskMediaFatal(message)", load_error)
+        start = self._function_source("startFrameSequenceRequest")
+        self.assertIn("frameSequencePending = true", start)
+        self.assertIn("setVoteMediaBlocked(true)", start)
+        self.assertIn("armFrameSequenceWatchdog()", start)
+        watchdog = self._function_source("armFrameSequenceWatchdog")
+        self.assertIn("STREAM_NO_PROGRESS_RELOAD_MS", watchdog)
+        self.assertIn("markTaskMediaFatal", watchdog)
+        finish_request = self._function_source("finishFrameSequenceRequestIfReady")
+        self.assertIn("images.length !== 3", finish_request)
+        self.assertIn("frameSequenceRequestToken", finish_request)
+        self.assertIn("setVoteMediaBlocked(false)", finish_request)
+
+        reload_media = self._function_source("reloadTaskMedia")
+        self.assertIn("allFrameSequenceImages()", reload_media)
+        self.assertIn("reloadFrameSequenceMedia()", reload_media)
+        reload_frames = self._function_source("reloadFrameSequenceMedia")
+        self.assertIn("images.length !== 3", reload_frames)
+        self.assertIn("replaceFrameSequenceImages(blindState.frameIndex, nonce)", reload_frames)
+        self.assertIn("mediaReloadGeneration", reload_frames)
+        self.assertIn("mediaReloadScopeEpoch", reload_frames)
+        self.assertIn("mediaReloadAttempt", reload_frames)
+        self.assertIn("STREAM_NO_PROGRESS_RELOAD_MS", reload_frames)
+        finish = self._function_source("finishFrameSequenceReloadIfReady")
+        self.assertIn("images.length !== 3", finish)
+        self.assertIn('image.dataset.reloadReady === "true"', finish)
+        self.assertIn("clearTaskMediaFatal()", finish)
+        replacement = self._function_source("replacementFrameSequenceImage")
+        self.assertIn("image.replaceWith(replacement)", replacement)
+
+    def test_blind_bfcache_pause_and_restore_preserve_media_lifecycle(self) -> None:
+        initialize = self._function_source("initializeBlindPage")
+        self.assertIn('addEventListener("pagehide", handleBlindPageHide)', initialize)
+        self.assertIn('addEventListener("pageshow", handleBlindPageShow)', initialize)
+        page_hide = self._function_source("handleBlindPageHide")
+        self.assertIn("event.persisted", page_hide)
+        self.assertIn("pauseForPageCache()", page_hide)
+        self.assertIn("stopSynchronization()", page_hide)
+        cached_pause = self._function_source("pauseForPageCache")
+        self.assertNotIn("syncAttempt += 1", cached_pause)
+        self.assertNotIn("releaseBlobUrls()", cached_pause)
+        self.assertIn("abortPreload()", cached_pause)
+        self.assertIn("clearMediaReloadTimer()", cached_pause)
+        page_show = self._function_source("handleBlindPageShow")
+        self.assertIn("startStreamMonitoring()", page_show)
+        self.assertIn("streamLastProgressAt", page_show)
+        self.assertIn("armFrameSequenceWatchdog()", page_show)
+        self.assertIn("finishMediaReloadIfReady()", page_show)
+        self.assertIn("finishFrameSequenceRequestIfReady()", page_show)
 
     def test_blind_clip_path_fallback_forces_full_view(self) -> None:
         supports_wipe = self._function_source("supportsWipeView")

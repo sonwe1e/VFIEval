@@ -372,6 +372,9 @@ class EvaluationCampaignV2HttpTests(unittest.TestCase):
                 self.assertEqual(status, 201, session)
                 task = session["task"]
                 self.assertIsNotNone(task)
+                self.assertEqual(task["frame_count"], 3)
+                self.assertEqual(task["fps"], 5.0)
+                self.assertAlmostEqual(task["duration_seconds"], 0.6)
 
                 # Participant JSON may contain only the opaque campaign/task URL
                 # tokens and display-oriented data, never organizer identities.
@@ -481,6 +484,8 @@ class EvaluationCampaignV2HttpTests(unittest.TestCase):
                 self.assertFalse(reviewed["task"]["read_only"])
                 self.assertEqual(reviewed["task"]["vote"]["choice"], "left")
                 self.assertEqual(reviewed["task"]["vote"]["left_rating"], 4.25)
+                self.assertEqual(reviewed["task"]["fps"], 5.0)
+                self.assertAlmostEqual(reviewed["task"]["duration_seconds"], 0.6)
                 media_status, _media_headers, media_body = _request(
                     base_url, reviewed["task"]["left_url"]
                 )
