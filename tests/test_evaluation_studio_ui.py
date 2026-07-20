@@ -418,6 +418,32 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn("function loadReviews", self.blind_js)
         self.assertIn("function openReview", self.blind_js)
 
+    def test_blind_unpublished_lifecycle_never_renders_completion_or_reviews(self) -> None:
+        availability = self._function_source("campaignParticipantAvailable")
+        lifecycle = self._function_source("unavailableCampaignMessage")
+        render = self._function_source("renderPayload")
+        load = self._function_source("loadBlindPayload")
+        visibility = self._function_source("initializeBlindPage")
+        self.assertIn('["published", "closed", "archived"]', availability)
+        for status in ('status === "preparing"', 'status === "failed"', 'status === "draft"'):
+            self.assertIn(status, lifecycle)
+        self.assertIn("盲测正在发布准备中", lifecycle)
+        self.assertIn("页面会自动刷新", lifecycle)
+        self.assertIn("请联系组织者确认发布状态", lifecycle)
+        self.assertIn("if (unavailable) {", render)
+        self.assertIn('setHidden("complete-panel", true)', render)
+        self.assertIn("if (unavailable.retry) scheduleTaskRetry()", render)
+        self.assertLess(render.index("if (unavailable) {"), render.index("if (complete) {"))
+        self.assertIn("const payload = await blindApi", load)
+        self.assertIn("renderPayload(payload);", load)
+        self.assertIn("if (campaignParticipantAvailable(payload.campaign))", load)
+        self.assertLess(
+            load.index("renderPayload(payload);"),
+            load.index('byId("progress").textContent = "等待加入"'),
+        )
+        self.assertIn('blindState.payload.campaign.status || ""', visibility)
+        self.assertIn(') === "preparing"', visibility)
+
     def test_blind_frame_sequences_share_one_index_across_all_three_images(self) -> None:
         factory = self._function_source("createMediaNode")
         self.assertIn('document.createElement("img")', factory)
@@ -726,8 +752,11 @@ class EvaluationStudioUiTests(unittest.TestCase):
 
     def test_studio_renders_and_copies_an_absolute_participant_link(self) -> None:
         self.assertIn("function participantShareUrl(shareUrl, campaign)", self.studio_js)
+        availability = self._studio_function_source("campaignParticipantAvailable")
+        self.assertIn('["published", "closed", "archived"]', availability)
         self.assertIn("new URL(rawUrl, location.origin).href", self.studio_js)
-        self.assertIn("const shareUrl = participantShareUrl(payload.share_url || campaign.share_url, campaign);", self.studio_js)
+        self.assertIn("const shareUrl = campaignParticipantAvailable(campaign)", self.studio_js)
+        self.assertIn("? participantShareUrl(payload.share_url || campaign.share_url, campaign)", self.studio_js)
         self.assertIn('value="${safe(shareUrl)}"', self.studio_js)
         self.assertIn('data-copy-share="${safe(shareUrl)}"', self.studio_js)
         self.assertIn("navigator.clipboard.writeText(copy.dataset.copyShare)", self.studio_js)

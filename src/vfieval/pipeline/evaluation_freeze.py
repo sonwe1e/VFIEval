@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -28,6 +29,7 @@ OUTPUT_NAMES = {
 }
 FREEZE_PIPELINE_VERSION = "campaign-freeze-stream-v3"
 FFMPEG_TIMEOUT_SECONDS = 600.0
+FFMPEG_PIPE_EXIT_TIMEOUT_SECONDS = 2.0
 TIMESTAMP_TOLERANCE_SECONDS = 1e-3
 GOP_TARGET_INTERVAL_SECONDS = 1.0
 REMUX_FIRST_KEYFRAME_TOLERANCE_SECONDS = 0.1
@@ -1455,15 +1457,26 @@ class _RawVideoSink:
                 item = self._queue.get()
                 if item is self._SENTINEL:
                     break
-                process.stdin.write(item)
-            process.stdin.close()
+                try:
+                    process.stdin.write(item)
+                except OSError as exc:
+                    if not _is_broken_pipe_error(exc):
+                        raise
+                    raise self._broken_pipe_failure(process) from exc
+            try:
+                process.stdin.close()
+            except OSError as exc:
+                if not _is_broken_pipe_error(exc):
+                    raise
+                raise self._broken_pipe_failure(process) from exc
             process.stdin = None
             returncode = process.wait(timeout=FFMPEG_TIMEOUT_SECONDS)
             if self._aborted.is_set():
                 return
             if returncode != 0:
                 raise RuntimeError(
-                    f"FFmpeg/libx264 failed for {self.path.name}: {self._stderr_detail()}"
+                    f"FFmpeg/libx264 failed for {self.path.name} "
+                    f"(exit code {returncode}): {self._stderr_detail()}"
                 )
         except BaseException as exc:
             if not self._aborted.is_set():
@@ -1471,6 +1484,38 @@ class _RawVideoSink:
                 self.failure_state.record(self.path.name, exc)
             if process is not None:
                 _terminate_process(process)
+
+    def _broken_pipe_failure(self, process: subprocess.Popen[bytes]) -> RuntimeError:
+        """Turn an encoder pipe closure into a useful child-process diagnostic."""
+
+        returncode = process.poll()
+        wait_note = ""
+        if returncode is None:
+            try:
+                returncode = process.wait(timeout=FFMPEG_PIPE_EXIT_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                _terminate_process(process)
+                returncode = process.poll()
+                wait_note = (
+                    f"; encoder did not exit within {FFMPEG_PIPE_EXIT_TIMEOUT_SECONDS:g}s "
+                    "after closing stdin and was terminated"
+                )
+            except OSError as exc:
+                _terminate_process(process)
+                returncode = process.poll()
+                wait_note = f"; failed to wait for encoder: {_error_detail(exc)}"
+
+        stderr_detail = self._stderr_detail()
+        if stderr_detail == "unknown encoder error":
+            stderr_detail = (
+                "no FFmpeg stderr was captured; check whether FFmpeg was terminated "
+                "externally and verify server memory, disk space, and encoder availability"
+            )
+        exit_code = "unknown" if returncode is None else str(returncode)
+        return RuntimeError(
+            f"Campaign FFmpeg sink {self.path.name} closed stdin unexpectedly "
+            f"(exit code {exit_code}){wait_note}; stderr: {stderr_detail}"
+        )
 
     def _stderr_detail(self) -> str:
         try:
@@ -1964,3 +2009,7 @@ def _remove_outputs(paths: Sequence[Path] | Any) -> None:
 def _error_detail(value: Any) -> str:
     compact = " ".join(str(value or "").strip().split())
     return compact[-1200:] or "unknown error"
+
+
+def _is_broken_pipe_error(error: OSError) -> bool:
+    return isinstance(error, BrokenPipeError) or error.errno == errno.EPIPE

@@ -165,6 +165,48 @@ class EvaluationCampaignV2HttpTests(unittest.TestCase):
         self.assertNotIn("://", str(detail["share_url"]))
         return detail
 
+    def test_unpublished_blind_link_returns_wait_state_without_reviews(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _run_a, _run_b, body = self._campaign_fixture(
+                workspace,
+                db,
+                prefix="unpublished-link",
+            )
+            campaign = create_campaign_v2(db, workspace, body)
+            campaign_id = int(campaign["id"])
+            token = str(campaign["public_token"])
+            server, thread, base_url = start_server(db, workspace)
+            try:
+                for status_value in ("draft", "preparing", "failed"):
+                    with db.connection() as conn:
+                        conn.execute(
+                            "UPDATE evaluation_campaigns_v2 SET status = ? WHERE id = ?",
+                            (status_value, campaign_id),
+                        )
+                    status, payload = _json_request(
+                        base_url,
+                        f"/api/blind/{token}?evaluator_id=stale-browser-session",
+                    )
+                    self.assertEqual(status, 200, payload)
+                    self.assertEqual(payload["campaign"]["status"], status_value)
+                    self.assertFalse(payload["progress"]["complete"])
+                    self.assertEqual(
+                        payload["progress"]["waiting"],
+                        status_value == "preparing",
+                    )
+                    self.assertIsNone(payload["task"])
+                    self.assertNotIn("results", payload)
+
+                status, reviews = _json_request(
+                    base_url,
+                    f"/api/blind/{token}/reviews?evaluator_id=stale-browser-session",
+                )
+                self.assertEqual(status, 400, reviews)
+                self.assertIn("not available", reviews["error"]["message"])
+            finally:
+                stop_server(server, thread)
+
     def test_campaign_v2_delete_route_requires_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace, db = make_workspace(tmp)

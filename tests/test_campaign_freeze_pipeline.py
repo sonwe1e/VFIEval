@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import sys
 import shutil
 import subprocess
@@ -47,6 +48,75 @@ def _frames(root: Path, slot: str, colors: list[tuple[int, int, int]], size=(8, 
 
 
 class CampaignFreezePipelineTests(unittest.TestCase):
+    def test_encoder_broken_pipe_reports_sink_exit_code_and_stderr_to_siblings(self) -> None:
+        class BrokenStdin:
+            def write(self, _frame: bytes) -> None:
+                raise OSError(errno.EPIPE, "Broken pipe")
+
+            def close(self) -> None:
+                return None
+
+        class FailedEncoder:
+            def __init__(self, stderr) -> None:
+                self.stdin = BrokenStdin()
+                self.returncode = None
+                self.wait_calls = 0
+                stderr.write(b"Error initializing output stream: insufficient resources\n")
+
+            def poll(self):
+                return self.returncode
+
+            def wait(self, timeout=None):
+                self.wait_calls += 1
+                self.returncode = 23
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.returncode = 23
+
+            def kill(self) -> None:
+                self.returncode = 23
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            failure_state = evaluation_freeze._SinkFailureState()
+            failed = evaluation_freeze._RawVideoSink(
+                root / "method-a.mp4",
+                width=8,
+                height=6,
+                fps=24.0,
+                threads=1,
+                ffmpeg=sys.executable,
+                failure_state=failure_state,
+            )
+            sibling = evaluation_freeze._RawVideoSink(
+                root / "method-b.mp4",
+                width=8,
+                height=6,
+                fps=24.0,
+                threads=1,
+                ffmpeg=sys.executable,
+                failure_state=failure_state,
+            )
+            process = FailedEncoder(failed._stderr)
+            failed._process = process
+            failed._queue.put(bytes(8 * 6 * 3))
+            try:
+                failed._writer()
+                with self.assertRaises(RuntimeError) as caught:
+                    sibling._raise_error()
+            finally:
+                failed.abort()
+                sibling.abort()
+
+        message = str(caught.exception)
+        self.assertIn("Campaign encoder method-a.mp4 failed", message)
+        self.assertIn("exit code 23", message)
+        self.assertIn("insufficient resources", message)
+        self.assertNotIn("[Errno 32]", message)
+        self.assertNotIn("Broken pipe", message)
+        self.assertGreaterEqual(process.wait_calls, 1)
+
     def test_v3_encoder_uses_fixed_one_second_closed_gop(self) -> None:
         policy = evaluation_freeze._video_stability_policy(23.976)
         encoding = policy["encoding"]

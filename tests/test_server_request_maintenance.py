@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import json
 import os
+from contextlib import redirect_stdout
 from pathlib import Path
 import tempfile
 import threading
@@ -15,10 +17,105 @@ from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
 from vfieval.media_assets import ensure_collection, upsert_asset
 from vfieval.run_cleanup import RunCleanupService
-from vfieval.server import _make_handler
+from vfieval.server import (
+    _log_evaluation_preparation_results,
+    _make_handler,
+    _run_evaluation_preparations_forever,
+)
 
 
 class ServerRequestMaintenanceTests(unittest.TestCase):
+    def test_campaign_preparation_terminal_logs_are_sanitized_and_single_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            db = MagicMock(spec=Database)
+            db.query.return_value = [
+                {
+                    "public_token": "secret-campaign-token-123456789",
+                    "label_snapshot": "Private Method Name",
+                    "source_track_label": "private-track",
+                },
+                {
+                    "public_token": "secret-campaign-token-123456789",
+                    "label_snapshot": "A",
+                    "source_track_label": "a",
+                },
+            ]
+            error_message = (
+                f"Private Method Name slot A failed at "
+                f"{workspace.root / 'evaluations' / '7' / 'a.mp4'}\n"
+                "(exit code 32); stderr: encoder stopped; "
+                "encoder availability; "
+                "https://server/evaluate/secret-campaign-token-123456789"
+            )
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                _log_evaluation_preparation_results(
+                    db,
+                    workspace,
+                    [
+                        {"campaign_id": 6, "status": "published"},
+                        {
+                            "campaign_id": 7,
+                            "status": "failed",
+                            "error": {
+                                "type": "RuntimeError",
+                                "message": error_message,
+                            },
+                        },
+                        {
+                            "campaign_id": 8,
+                            "status": "preparing",
+                            "report": {"frame_current": 100},
+                        },
+                    ],
+                )
+
+            lines = output.getvalue().splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(lines[0], "Campaign V2 6 preparation published")
+            self.assertIn("Campaign V2 7 preparation failed: RuntimeError", lines[1])
+            self.assertIn("exit code 32", lines[1])
+            self.assertIn("stderr: encoder stopped", lines[1])
+            self.assertIn("encoder availability", lines[1])
+            self.assertIn("<method>", lines[1])
+            self.assertIn("<path>", lines[1])
+            self.assertIn("<url>", lines[1])
+            self.assertNotIn("Private Method Name", lines[1])
+            self.assertNotIn("secret-campaign-token", lines[1])
+            self.assertNotIn(str(workspace.root), lines[1])
+            self.assertNotIn("evaluations", lines[1])
+            self.assertNotIn("a.mp4", lines[1])
+
+    def test_campaign_preparation_loop_logs_only_returned_terminal_results(self) -> None:
+        workspace = MagicMock(spec=WorkspaceConfig)
+        db = MagicMock(spec=Database)
+        stop_event = MagicMock(spec=threading.Event)
+        stop_event.is_set.side_effect = [False, False, True]
+
+        output = io.StringIO()
+        with patch(
+            "vfieval.server.run_pending_preparations",
+            side_effect=[
+                [
+                    {"campaign_id": 9, "status": "preparing"},
+                    {"campaign_id": 10, "status": "published"},
+                ],
+                [],
+            ],
+        ) as run_pending, patch(
+            "vfieval.server.process_campaign_purge_requests_v2",
+            return_value=[],
+        ), redirect_stdout(output):
+            _run_evaluation_preparations_forever(db, workspace, stop_event)
+
+        self.assertEqual(
+            output.getvalue().splitlines(),
+            ["Campaign V2 10 preparation published"],
+        )
+        self.assertEqual(run_pending.call_count, 2)
+
     def test_video_group_gets_are_catalog_snapshots_and_thumbnail_is_lazy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ,

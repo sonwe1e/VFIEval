@@ -4611,6 +4611,27 @@ def blind_payload(
     lease_seconds: int = 300,
 ) -> dict[str, Any]:
     campaign = _campaign_by_token(db, campaign_token)
+    campaign_status = str(campaign["status"])
+    if campaign_status not in {"published", "closed", "archived"}:
+        # A browser-wide evaluator id may outlive an older Campaign.  Keep an
+        # unpublished Campaign explicitly incomplete even when it currently has
+        # zero tasks, so the participant page never mistakes preparation failure
+        # for successful completion and attempts to open review results.
+        return {
+            "campaign": {
+                "title": str(campaign["public_title"]),
+                "status": campaign_status,
+            },
+            "progress": {
+                "completed": 0,
+                "total": 0,
+                "campaign_tasks": 0,
+                "remaining": 0,
+                "complete": False,
+                "waiting": campaign_status == "preparing",
+            },
+            "task": None,
+        }
     if not str(evaluator_id or "").strip():
         task_count = db.get(
             "SELECT COUNT(*) AS count FROM evaluation_tasks_v2 WHERE campaign_id = ?",

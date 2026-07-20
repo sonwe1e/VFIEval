@@ -4,6 +4,8 @@ import errno
 import io
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from http import HTTPStatus
@@ -154,6 +156,64 @@ class ServerClientDisconnectTests(unittest.TestCase):
         )
 
         self.assertTrue(handler.close_connection)
+
+    def test_campaign_publish_persists_before_response_disconnect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            wake_event = threading.Event()
+            handler_type = _make_handler(
+                db,
+                workspace,
+                preparation_wake_event=wake_event,
+            )
+            now = time.time()
+            with db.connection() as conn:
+                campaign_id = int(
+                    conn.execute(
+                        """
+                        INSERT INTO evaluation_campaigns_v2(
+                            public_token, name, public_title, status,
+                            target_votes, seed, config_json, created_at, updated_at
+                        ) VALUES (?, ?, ?, 'draft', 1, 17, '{}', ?, ?)
+                        """,
+                        ("disconnect-publish", "Disconnect", "Disconnect", now, now),
+                    ).lastrowid
+                )
+
+            handler = object.__new__(handler_type)
+            handler.close_connection = False
+            handler.command = "POST"
+            handler.path = f"/api/evaluation-campaigns/v2/{campaign_id}/publish"
+            handler.headers = {"Content-Length": "0"}
+            handler.send_response = mock.Mock()
+            handler.send_header = mock.Mock()
+            handler.end_headers = mock.Mock()
+            handler.wfile = _DisconnectingWriter(
+                BrokenPipeError(errno.EPIPE, "broken pipe")
+            )
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self._run_at_request_boundary(
+                    handler,
+                    lambda request_handler: request_handler.do_POST(),
+                )
+
+            campaign = db.get(
+                "SELECT status FROM evaluation_campaigns_v2 WHERE id = ?",
+                (campaign_id,),
+            )
+            preparation = db.get(
+                "SELECT state, error_json FROM evaluation_preparations_v2 "
+                "WHERE campaign_id = ?",
+                (campaign_id,),
+            )
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(campaign["status"], "preparing")
+            self.assertEqual(preparation["state"], "queued")
+            self.assertEqual(preparation["error_json"], "{}")
+            self.assertTrue(wake_event.is_set())
+            self.assertTrue(handler.close_connection)
 
     def test_file_and_range_disconnects_are_suppressed_at_request_boundary(self) -> None:
         payload_path = Path(self._temporary_directory.name) / "response.bin"

@@ -1071,11 +1071,59 @@ async function leaveReview() {
   await loadBlindPayload();
 }
 
+function campaignParticipantAvailable(campaign) {
+  return ["published", "closed", "archived"].includes(
+    String(campaign && campaign.status || ""),
+  );
+}
+
+function unavailableCampaignMessage(campaign) {
+  const status = String(campaign && campaign.status || "");
+  if (status === "preparing") {
+    return {
+      progress: "盲测发布准备中",
+      message: "盲测正在发布准备中，请稍候；页面会自动刷新。",
+      retry: true,
+    };
+  }
+  if (status === "failed") {
+    return {
+      progress: "盲测暂不可用",
+      message: "盲测暂时无法参与，可能是发布未完成；请联系组织者确认发布状态。",
+      retry: false,
+    };
+  }
+  if (status === "draft") {
+    return {
+      progress: "盲测尚未发布",
+      message: "盲测尚未发布，请稍后再试或联系组织者。",
+      retry: false,
+    };
+  }
+  return null;
+}
+
 function renderPayload(payload) {
   blindState.payload = payload;
   const campaign = payload.campaign || {};
   const progress = payload.progress || {};
   byId("campaign-title").textContent = campaign.public_title || campaign.title || "匿名视频质量评测";
+  const unavailable = unavailableCampaignMessage(campaign);
+  if (unavailable) {
+    byId("progress").textContent = unavailable.progress;
+    setHidden("session-panel", true);
+    renderTask(null);
+    setHidden("complete-panel", true);
+    const message = byId("message-panel");
+    message.textContent = unavailable.message;
+    message.classList.remove("hidden");
+    if (unavailable.retry) scheduleTaskRetry();
+    else {
+      if (blindState.retryTimer) clearTimeout(blindState.retryTimer);
+      blindState.retryTimer = null;
+    }
+    return;
+  }
   byId("progress").textContent = `${Number(progress.completed || 0)}/${Number(progress.total || 0)} 已完成`;
   setHidden("session-panel", Boolean(blindState.evaluatorName));
   renderTask(payload.task || payload.next_task || null);
@@ -1114,8 +1162,11 @@ function scheduleTaskRetry() {
 async function loadBlindPayload() {
   if (!blindState.token) throw new Error("无效的盲评链接");
   if (!blindState.evaluatorName) {
-    renderPayload(await blindApi(`/api/blind/${encodeURIComponent(blindState.token)}`));
-    byId("progress").textContent = "等待加入";
+    const payload = await blindApi(`/api/blind/${encodeURIComponent(blindState.token)}`);
+    renderPayload(payload);
+    if (campaignParticipantAvailable(payload.campaign)) {
+      byId("progress").textContent = "等待加入";
+    }
     return;
   }
   try {
@@ -2418,8 +2469,13 @@ function initializeBlindPage() {
     if (document.hidden) return;
     if (blindState.payload && blindState.payload.task) startLeaseHeartbeat(blindState.payload.task);
     else if (
-      blindState.evaluatorName
-      && !(blindState.payload && blindState.payload.progress && blindState.payload.progress.complete)
+      String(
+        blindState.payload && blindState.payload.campaign
+          ? blindState.payload.campaign.status || ""
+          : "",
+      ) === "preparing"
+      || (blindState.evaluatorName
+        && !(blindState.payload && blindState.payload.progress && blindState.payload.progress.complete))
     ) loadBlindPayload().catch(showError);
   });
   loadBlindPayload().catch(showError);

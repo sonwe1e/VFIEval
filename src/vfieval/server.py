@@ -267,7 +267,8 @@ def _run_evaluation_preparations_forever(
 ) -> None:
     while not stop_event.is_set():
         try:
-            run_pending_preparations(db, workspace, limit=1)
+            results = run_pending_preparations(db, workspace, limit=1)
+            _log_evaluation_preparation_results(db, workspace, results)
         except Exception as exc:
             print(f"evaluation preparation loop failed: {type(exc).__name__}: {exc}")
         try:
@@ -279,6 +280,118 @@ def _run_evaluation_preparations_forever(
         else:
             wake_event.wait(1.0)
             wake_event.clear()
+
+
+def _log_evaluation_preparation_results(
+    db: Database,
+    workspace: WorkspaceConfig,
+    results: list[dict[str, Any]],
+) -> None:
+    """Log one sanitized terminal line per claimed Campaign preparation."""
+
+    for result in results:
+        try:
+            campaign_id = int(result.get("campaign_id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if campaign_id <= 0:
+            continue
+        status = str(result.get("status") or "").strip().lower()
+        if status == "published":
+            print(f"Campaign V2 {campaign_id} preparation published")
+            continue
+        if status != "failed":
+            continue
+        error = result.get("error") if isinstance(result.get("error"), dict) else {}
+        error_type = re.sub(
+            r"[^A-Za-z0-9_.-]",
+            "",
+            str(error.get("type") or "Error"),
+        )[:80] or "Error"
+        message = _sanitize_evaluation_preparation_log_message(
+            db,
+            workspace,
+            campaign_id,
+            error.get("message"),
+        )
+        print(
+            f"Campaign V2 {campaign_id} preparation failed: "
+            f"{error_type}: {message}"
+        )
+
+
+def _sanitize_evaluation_preparation_log_message(
+    db: Database,
+    workspace: WorkspaceConfig,
+    campaign_id: int,
+    value: Any,
+) -> str:
+    message = str(value or "unknown error")
+    sensitive_values: list[tuple[str, str]] = []
+    for root in sorted(
+        {workspace.root.resolve(), workspace.root.parent.resolve()},
+        key=lambda path: len(str(path)),
+        reverse=True,
+    ):
+        sensitive_values.append((str(root), "<path>"))
+    try:
+        rows = db.query(
+            """
+            SELECT c.public_token, m.label_snapshot, m.source_track_label
+            FROM evaluation_campaigns_v2 c
+            LEFT JOIN evaluation_methods_v2 m ON m.campaign_id = c.id
+            WHERE c.id = ?
+            """,
+            (int(campaign_id),),
+        )
+    except Exception:
+        rows = []
+    for row in rows:
+        sensitive_values.extend(
+            (
+                (str(row.get("public_token") or ""), "<token>"),
+                (str(row.get("label_snapshot") or ""), "<method>"),
+                (str(row.get("source_track_label") or ""), "<method>"),
+            )
+        )
+    for raw, replacement in sensitive_values:
+        if not raw:
+            continue
+        for variant in {raw, raw.replace("\\", "/"), raw.replace("/", "\\")}:
+            if variant:
+                pattern = re.escape(variant)
+                if variant[0].isalnum() or variant[0] == "_":
+                    pattern = rf"(?<![A-Za-z0-9_]){pattern}"
+                if replacement == "<path>":
+                    pattern = rf"{pattern}(?:[\\/][^\r\n,;:()]*)*"
+                if variant[-1].isalnum() or variant[-1] == "_":
+                    pattern = rf"{pattern}(?![A-Za-z0-9_])"
+                message = re.sub(pattern, replacement, message, flags=re.IGNORECASE)
+    message = re.sub(r"https?://\S+", "<url>", message, flags=re.IGNORECASE)
+    message = re.sub(
+        r"([\"'])(?:[A-Za-z]:[\\/]|/)[^\"']+\1",
+        '"<path>"',
+        message,
+    )
+    message = re.sub(
+        r"(?i)(?<![A-Za-z0-9_])(?:[A-Z]:[\\/]|\\\\)[^\s,;]+",
+        "<path>",
+        message,
+    )
+    message = re.sub(
+        r"(?<![A-Za-z0-9_])/(?:[^/\s]+/)+[^\s,;]*",
+        "<path>",
+        message,
+    )
+    message = re.sub(
+        r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{24,}(?![A-Za-z0-9_-])",
+        "<redacted>",
+        message,
+    )
+    message = " ".join(message.split())
+    if len(message) > 1200:
+        message = message[:1197] + "..."
+    return message or "unknown error"
 
 
 def _make_handler(

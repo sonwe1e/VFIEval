@@ -596,6 +596,10 @@
     }
   }
 
+  function campaignParticipantAvailable(campaign) {
+    return ["published", "closed", "archived"].includes(String(campaign?.status || ""));
+  }
+
   function isLoopbackOrigin() {
     const host = String(location.hostname || "").toLowerCase();
     return host === "localhost" || host === "127.0.0.1" || host === "0.0.0.0" || host === "::1" || host === "[::1]";
@@ -664,7 +668,9 @@
     const coverage = payload.coverage || campaign.coverage || {};
     const analysis = payload.analysis || null;
     const ranking = analysisRanking(analysis);
-    const shareUrl = participantShareUrl(payload.share_url || campaign.share_url, campaign);
+    const shareUrl = campaignParticipantAvailable(campaign)
+      ? participantShareUrl(payload.share_url || campaign.share_url, campaign)
+      : "";
     const legacy = Number(campaign.schema_version || 1) < 2;
     const objective = objectiveMetrics(analysis, legacy);
     host.innerHTML = `

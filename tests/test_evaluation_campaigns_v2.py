@@ -1688,6 +1688,39 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             self.assertEqual(len(exported["tasks"]), 1)
             self.assertEqual(len(exported["votes"]), 1)
 
+    def test_unpublished_campaign_stays_incomplete_for_existing_evaluator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _run_a, _run_b, body, _paths = self._two_runs(workspace, db)
+            campaign = create_campaign_v2(db, workspace, body)
+            with db.connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO evaluators(
+                        id, display_name, metadata_json, created_at, updated_at, last_seen_at
+                    ) VALUES ('returning-browser', 'Returning evaluator', '{}', 1, 1, 1)
+                    """
+                )
+
+            token = str(campaign["public_token"])
+            for status in ("draft", "preparing", "failed"):
+                with db.connection() as conn:
+                    conn.execute(
+                        "UPDATE evaluation_campaigns_v2 SET status = ? WHERE id = ?",
+                        (status, int(campaign["id"])),
+                    )
+                payload = blind_payload(db, token, "returning-browser")
+                self.assertEqual(payload["campaign"]["status"], status)
+                self.assertFalse(payload["progress"]["complete"])
+                self.assertEqual(payload["progress"]["campaign_tasks"], 0)
+                self.assertEqual(payload["progress"]["waiting"], status == "preparing")
+                self.assertIsNone(payload["task"])
+                self.assertNotIn("results", payload)
+
+            serialized = json.dumps(payload)
+            for forbidden in ("run_id", "method_id", "asset_id", "storage_path", "Method Alpha"):
+                self.assertNotIn(forbidden, serialized)
+
     def test_frozen_package_is_a_private_snapshot_not_a_hard_link(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace, db = make_workspace(tmp)
