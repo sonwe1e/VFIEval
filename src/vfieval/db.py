@@ -4,6 +4,7 @@ from contextlib import contextmanager
 import json
 import shutil
 import sqlite3
+import stat as stat_module
 import time
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -23,6 +24,46 @@ def _loads(text: str | None) -> Any:
     if not text:
         return {}
     return json.loads(text)
+
+
+def artifact_storage_metadata(
+    path: str | Path,
+    metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Capture artifact bytes once, at the existing publication boundary.
+
+    Run Detail can then compare the estimate with stored summary data without
+    walking the Run directory.  Bulk artifact publication happens on the save
+    workers; video artifacts are published by the finalize worker after encode.
+    """
+
+    result = dict(metadata or {})
+    if "storage_bytes" in result and "storage_size_complete" in result:
+        return result
+    candidates: list[tuple[str, str]] = []
+    canonical = str(path or "").strip()
+    if canonical:
+        candidates.append(("artifact_file_size_bytes", canonical))
+    preview = str(result.get("preview_path") or "").strip()
+    if preview and preview != canonical:
+        candidates.append(("preview_file_size_bytes", preview))
+
+    total = 0
+    complete = True
+    for field, candidate_text in candidates:
+        try:
+            file_stat = Path(candidate_text).stat()
+            if not stat_module.S_ISREG(file_stat.st_mode):
+                raise OSError("artifact path is not a regular file")
+        except OSError:
+            complete = False
+            continue
+        size_bytes = max(0, int(file_stat.st_size))
+        result[field] = size_bytes
+        total += size_bytes
+    result["storage_bytes"] = total
+    result["storage_size_complete"] = complete
+    return result
 
 
 LATEST_SCHEMA_VERSION = "2026-07-media-items-v2-cache-build-locks"
@@ -1736,6 +1777,110 @@ class Database:
             row["purge_request"] = self.get_run_purge_request(int(row["id"]))
         return rows
 
+    def list_runs_page(
+        self,
+        *,
+        page: int = 1,
+        page_size: int = 50,
+        query: str = "",
+        status: str = "",
+        run_type: str = "",
+        model: str = "",
+        include_deleted: bool = False,
+    ) -> dict[str, Any]:
+        page = max(1, int(page or 1))
+        page_size = max(1, min(200, int(page_size or 50)))
+        clauses = [] if include_deleted else ["r.deleted_at IS NULL"]
+        params: list[Any] = []
+        query = str(query or "").strip()
+        if query:
+            pattern = f"%{query}%"
+            clauses.append(
+                "(r.name LIKE ? OR m.name LIKE ? OR d.name LIKE ? "
+                "OR CAST(r.id AS TEXT) = ?)"
+            )
+            params.extend((pattern, pattern, pattern, query.lstrip("#")))
+        status = str(status or "").strip()
+        if status:
+            clauses.append("r.status = ?")
+            params.append(status)
+        run_type = str(run_type or "").strip()
+        if run_type:
+            clauses.append(
+                "COALESCE(json_extract(r.metadata_json, '$.run_type'), 'model_inference') = ?"
+            )
+            params.append(run_type)
+        model = str(model or "").strip()
+        if model:
+            clauses.append("m.name = ?")
+            params.append(model)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        total_row = self.get(
+            f"""
+            SELECT COUNT(*) AS total
+            FROM runs r
+            JOIN models m ON m.id = r.model_id
+            JOIN datasets d ON d.id = r.dataset_id
+            {where}
+            """,
+            tuple(params),
+        ) or {"total": 0}
+        total = int(total_row["total"] or 0)
+        active_row = self.get(
+            """
+            SELECT COUNT(*) AS total
+            FROM runs r
+            WHERE r.deleted_at IS NULL
+              AND (
+                    r.status NOT IN ('completed', 'failed', 'canceled')
+                    OR EXISTS (
+                        SELECT 1
+                        FROM run_purge_requests pr
+                        WHERE pr.run_id = r.id
+                          AND pr.status IN ('requested', 'canceling', 'purging')
+                    )
+                  )
+            """
+        ) or {"total": 0}
+        page_count = max(1, (total + page_size - 1) // page_size)
+        page = min(page, page_count)
+        rows = self.query(
+            f"""
+            SELECT
+                r.*,
+                e.name AS experiment_name,
+                m.name AS model_name,
+                d.name AS dataset_name
+            FROM runs r
+            LEFT JOIN experiments e ON e.id = r.experiment_id
+            JOIN models m ON m.id = r.model_id
+            JOIN datasets d ON d.id = r.dataset_id
+            {where}
+            ORDER BY r.id DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple([*params, page_size, (page - 1) * page_size]),
+        )
+        for row in rows:
+            self._decode_run(row)
+            row["purge_request"] = self.get_run_purge_request(int(row["id"]))
+        return {
+            "runs": rows,
+            "page": page,
+            "page_size": page_size,
+            "page_count": page_count,
+            "total": total,
+            # This deliberately ignores the current page and filters so the UI
+            # keeps its fast poll while background work exists elsewhere.
+            "active_total": int(active_row["total"] or 0),
+            "query": query,
+            "filters": {
+                "status": status,
+                "run_type": run_type,
+                "model": model,
+            },
+        }
+
     def list_run_associated_jobs(
         self,
         run_id: int,
@@ -3312,7 +3457,21 @@ class Database:
                     updated_at = ?
                 WHERE id = ?
                 """,
-                (now, _json({"total": 0, "by_kind": {}}), now, run_id),
+                (
+                    now,
+                    _json(
+                        {
+                            "total": 0,
+                            "by_kind": {},
+                            "storage_bytes": 0,
+                            "storage_bytes_by_kind": {},
+                            "storage_size_known": 0,
+                            "storage_size_unknown": 0,
+                        }
+                    ),
+                    now,
+                    run_id,
+                ),
             )
 
     def mark_run_deleted_after_purge(self, run_id: int) -> None:
@@ -3419,6 +3578,56 @@ class Database:
         for row in rows:
             self._decode_run_purge_request(row)
         return rows
+
+    def cleanup_backlog_counts(self) -> dict[str, Any]:
+        """Return durable cleanup queue counts without claiming or retrying work."""
+
+        run_statuses = ("requested", "canceling", "purging", "failed")
+        campaign_statuses = ("requested", "running", "failed")
+        with self.connection() as conn:
+            run_rows = conn.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM run_purge_requests
+                WHERE status != 'completed'
+                GROUP BY status
+                """
+            ).fetchall()
+            campaign_table = conn.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'evaluation_purge_requests_v2'
+                """
+            ).fetchone()
+            campaign_rows = (
+                conn.execute(
+                    """
+                    SELECT status, COUNT(*) AS count
+                    FROM evaluation_purge_requests_v2
+                    WHERE status != 'completed'
+                    GROUP BY status
+                    """
+                ).fetchall()
+                if campaign_table is not None
+                else []
+            )
+
+        run_by_status = {status: 0 for status in run_statuses}
+        for row in run_rows:
+            run_by_status[str(row["status"])] = int(row["count"] or 0)
+        campaign_by_status = {status: 0 for status in campaign_statuses}
+        for row in campaign_rows:
+            campaign_by_status[str(row["status"])] = int(row["count"] or 0)
+        return {
+            "run_cleanup": {
+                "backlog": sum(run_by_status.values()),
+                "by_status": run_by_status,
+            },
+            "campaign_cleanup": {
+                "backlog": sum(campaign_by_status.values()),
+                "by_status": campaign_by_status,
+            },
+        }
 
     def recover_stale_run_purge_requests(self, stale_before: float) -> int:
         """Return abandoned purge claims to the durable queue after a crash."""
@@ -4082,7 +4291,19 @@ class Database:
     def summarize_artifacts(self, job_id: int) -> dict[str, Any]:
         rows = self.query(
             """
-            SELECT kind, COUNT(*) AS count
+            SELECT kind,
+                   COUNT(*) AS count,
+                   SUM(CAST(COALESCE(json_extract(metadata_json, '$.storage_bytes'), 0) AS INTEGER))
+                       AS storage_bytes,
+                   SUM(
+                       CASE
+                           WHEN COALESCE(
+                               json_extract(metadata_json, '$.storage_size_complete'),
+                               0
+                           ) = 1 THEN 1
+                           ELSE 0
+                       END
+                   ) AS storage_size_known
             FROM artifacts
             WHERE job_id = ?
             GROUP BY kind
@@ -4091,7 +4312,19 @@ class Database:
             (job_id,),
         )
         by_kind = {row["kind"]: int(row["count"]) for row in rows}
-        return {"total": sum(by_kind.values()), "by_kind": by_kind}
+        storage_bytes_by_kind = {
+            row["kind"]: int(row["storage_bytes"] or 0) for row in rows
+        }
+        storage_size_known = sum(int(row["storage_size_known"] or 0) for row in rows)
+        total = sum(by_kind.values())
+        return {
+            "total": total,
+            "by_kind": by_kind,
+            "storage_bytes": sum(storage_bytes_by_kind.values()),
+            "storage_bytes_by_kind": storage_bytes_by_kind,
+            "storage_size_known": storage_size_known,
+            "storage_size_unknown": max(0, total - storage_size_known),
+        }
 
     def run_inference_job_ids(self, run_id: int) -> list[int]:
         job_ids = [int(row["job_id"]) for row in self.list_run_jobs(run_id, "inference")]
@@ -4108,11 +4341,27 @@ class Database:
 
     def summarize_run_artifacts(self, run_id: int) -> dict[str, Any]:
         by_kind: dict[str, int] = {}
+        storage_bytes_by_kind: dict[str, int] = {}
+        storage_size_known = 0
+        storage_size_unknown = 0
         for job_id in self.run_inference_job_ids(run_id):
             summary = self.summarize_artifacts(job_id)
             for kind, count in (summary.get("by_kind") or {}).items():
                 by_kind[kind] = by_kind.get(kind, 0) + int(count)
-        return {"total": sum(by_kind.values()), "by_kind": by_kind}
+            for kind, size_bytes in (summary.get("storage_bytes_by_kind") or {}).items():
+                storage_bytes_by_kind[kind] = (
+                    storage_bytes_by_kind.get(kind, 0) + int(size_bytes)
+                )
+            storage_size_known += int(summary.get("storage_size_known") or 0)
+            storage_size_unknown += int(summary.get("storage_size_unknown") or 0)
+        return {
+            "total": sum(by_kind.values()),
+            "by_kind": by_kind,
+            "storage_bytes": sum(storage_bytes_by_kind.values()),
+            "storage_bytes_by_kind": storage_bytes_by_kind,
+            "storage_size_known": storage_size_known,
+            "storage_size_unknown": storage_size_unknown,
+        }
 
     def maybe_complete_multi_run_inference(
         self,
@@ -4925,19 +5174,37 @@ class Database:
         metadata: dict[str, Any] | None = None,
     ) -> int:
         now = utc_ts()
+        stored_metadata = artifact_storage_metadata(path, metadata)
         with self.connection() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO artifacts(job_id, sample_id, kind, path, mime_type, metadata_json, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (job_id, sample_id, kind, str(Path(path).resolve()), mime_type, _json(metadata), now),
+                (
+                    job_id,
+                    sample_id,
+                    kind,
+                    str(Path(path).resolve()),
+                    mime_type,
+                    _json(stored_metadata),
+                    now,
+                ),
             )
             self._bump_run_revision_for_result_publish(conn, (int(job_id),), now)
             return int(cur.lastrowid)
 
     def add_artifacts_bulk(self, job_id: int, records: Iterable[dict[str, Any]]) -> list[int]:
-        rows = list(records)
+        rows = [
+            {
+                **dict(record),
+                "metadata": artifact_storage_metadata(
+                    str(record.get("path") or ""),
+                    record.get("metadata") or {},
+                ),
+            }
+            for record in records
+        ]
         if not rows:
             return []
         now = utc_ts()

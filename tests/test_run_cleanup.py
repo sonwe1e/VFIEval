@@ -711,6 +711,40 @@ class RunCleanupTests(unittest.TestCase):
             thread.join(timeout=2)
             self.assertFalse(thread.is_alive())
 
+    def test_cleanup_loop_processes_pending_without_http_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = _workspace(tmp)
+            run_id = _run(db, workspace, "background-loop")
+            run_dir = workspace.runs_dir / str(run_id)
+            run_dir.mkdir(parents=True)
+            (run_dir / "artifact").write_bytes(b"x")
+
+            service = RunCleanupService(db, workspace)
+            request = service.request_delete(run_id)
+            stop = threading.Event()
+            thread = threading.Thread(
+                target=service.run_forever,
+                args=(stop, 0.01),
+                daemon=True,
+            )
+            thread.start()
+            try:
+                poll_wait = threading.Event()
+                for _ in range(200):
+                    current = db.get_run_purge_request_by_id(int(request["id"]))
+                    if current["status"] in {"completed", "failed"}:
+                        break
+                    poll_wait.wait(0.01)
+                else:
+                    self.fail("background cleanup loop did not process the purge request")
+            finally:
+                stop.set()
+                thread.join(timeout=2)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(current["status"], "completed", current)
+            self.assertFalse(run_dir.exists())
+
     def test_delete_and_storage_gc_http_contracts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace, db = _workspace(tmp)
@@ -718,20 +752,62 @@ class RunCleanupTests(unittest.TestCase):
             run_dir = workspace.runs_dir / str(run_id)
             run_dir.mkdir(parents=True)
             (run_dir / "artifact").write_bytes(b"x")
-            server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(db, workspace))
+            service = RunCleanupService(db, workspace)
+            cleanup_stop = threading.Event()
+            cleanup_thread = threading.Thread(
+                target=service.run_forever,
+                args=(cleanup_stop, 0.01),
+                daemon=True,
+            )
+            server = ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                _make_handler(db, workspace, cleanup_service=service),
+            )
             thread = threading.Thread(target=server.serve_forever, daemon=True)
+            cleanup_thread.start()
             thread.start()
             base = f"http://127.0.0.1:{server.server_address[1]}"
             try:
-                request = urllib.request.Request(f"{base}/api/runs/{run_id}", method="DELETE")
+                missing_preview = urllib.request.Request(
+                    f"{base}/api/runs/{run_id}",
+                    method="DELETE",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as missing_context:
+                    urllib.request.urlopen(missing_preview, timeout=10)
+                self.assertEqual(missing_context.exception.code, 409)
+                missing_payload = json.loads(
+                    missing_context.exception.read().decode("utf-8")
+                )
+                self.assertEqual(missing_payload["error"]["code"], "missing_preview")
+                preview_request = urllib.request.Request(
+                    f"{base}/api/run-purge/preview",
+                    data=json.dumps(
+                        {"request_type": "delete_run", "run_ids": [run_id]}
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(preview_request, timeout=10) as response:
+                    run_preview = json.loads(response.read().decode("utf-8"))
+                request = urllib.request.Request(
+                    f"{base}/api/runs/{run_id}?preview_token={run_preview['preview_token']}",
+                    method="DELETE",
+                )
                 with urllib.request.urlopen(request, timeout=10) as response:
                     self.assertEqual(response.status, 202)
                     payload = json.loads(response.read().decode("utf-8"))
                 self.assertFalse(payload["deleted"])
-                with urllib.request.urlopen(
-                    f"{base}/api/run-purge-requests/{payload['request_id']}", timeout=10
-                ) as response:
-                    purge = json.loads(response.read().decode("utf-8"))
+                poll_wait = threading.Event()
+                for _ in range(200):
+                    with urllib.request.urlopen(
+                        f"{base}/api/run-purge-requests/{payload['request_id']}", timeout=10
+                    ) as response:
+                        purge = json.loads(response.read().decode("utf-8"))
+                    if purge["status"] in {"completed", "failed"}:
+                        break
+                    poll_wait.wait(0.01)
+                else:
+                    self.fail("background cleanup loop did not finish the HTTP purge request")
                 self.assertEqual(purge["status"], "completed")
 
                 with urllib.request.urlopen(f"{base}/api/storage/gc/preview", timeout=10) as response:
@@ -768,9 +844,11 @@ class RunCleanupTests(unittest.TestCase):
                 with urllib.request.urlopen(confirmed_request, timeout=10) as response:
                     self.assertEqual(response.status, 200)
             finally:
+                cleanup_stop.set()
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=5)
+                cleanup_thread.join(timeout=5)
 
 
 if __name__ == "__main__":

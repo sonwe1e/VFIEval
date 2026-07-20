@@ -20,7 +20,7 @@ import torch
 from PIL import Image, ImageChops
 
 from vfieval.config import WorkspaceConfig
-from vfieval.db import Database
+from vfieval.db import Database, artifact_storage_metadata
 from vfieval.devices import autocast_context, resolve_torch_device, tune_for_inference
 from vfieval.models import load_flow_mask_model
 from vfieval.pipeline.artifact_integrity import (
@@ -521,6 +521,7 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
         run_id=run_id,
         is_shard=is_shard,
         run_dir=run_dir,
+        decode_cache_root=workspace.root / "decode_cache",
         save_workers=save_workers,
         max_inflight=max_save_inflight,
         artifact_batch_size=int(payload.get("artifact_db_batch_size") or 128),
@@ -1279,7 +1280,10 @@ def _image_artifact_record(
         "kind": str(kind),
         "path": str(path),
         "mime_type": "image/png",
-        "metadata": preview_metadata,
+        # This runs inside the bounded save pool for model inference, so the
+        # eventual batched SQLite publication does not add filesystem stats to
+        # the accelerator's main compute thread.
+        "metadata": artifact_storage_metadata(path, preview_metadata),
     }
 
 
@@ -2435,6 +2439,90 @@ def _iter_prefetched_batches(
         pool.shutdown(wait=clean_exit, cancel_futures=not clean_exit)
 
 
+def _materialize_gt_artifact(
+    tensor: torch.Tensor,
+    destination: Path,
+    *,
+    source_path: Path,
+    source_cache_key: str,
+    decode_cache_root: Path | None,
+    expected_height: int,
+    expected_width: int,
+) -> dict[str, Any]:
+    """Publish one canonical GT image, reusing immutable decode bytes when safe.
+
+    A hard link keeps the artifact path inside the Run, so integrity checks,
+    streaming, and Run deletion retain their existing ownership model.  It
+    also remains readable if the cache entry is later garbage-collected.  Any
+    uncertainty (unmanaged source, resized inference, non-PNG input, or a
+    filesystem without hard-link support) falls back to the established PNG
+    encoder.
+    """
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    cache_source = _trusted_native_decode_gt(
+        source_path,
+        cache_key=source_cache_key,
+        decode_cache_root=decode_cache_root,
+        expected_height=expected_height,
+        expected_width=expected_width,
+    )
+    if cache_source is not None:
+        try:
+            if destination.exists() or destination.is_symlink():
+                destination.unlink()
+            os.link(cache_source, destination)
+            return {
+                "storage_mode": "hardlink",
+                "storage_source": "decode_cache",
+                "deduplicated": True,
+                "source_cache_key": source_cache_key,
+            }
+        except OSError:
+            # Cross-volume workspaces and filesystems without hard-link support
+            # keep the exact historical behavior.
+            pass
+
+    save_rgb_tensor(tensor, destination)
+    return {
+        "storage_mode": "run_copy",
+        "storage_source": "generated",
+        "deduplicated": False,
+    }
+
+
+def _trusted_native_decode_gt(
+    source_path: Path,
+    *,
+    cache_key: str,
+    decode_cache_root: Path | None,
+    expected_height: int,
+    expected_width: int,
+) -> Path | None:
+    if decode_cache_root is None or not cache_key:
+        return None
+    raw_source = Path(source_path)
+    if raw_source.is_symlink():
+        return None
+    try:
+        root = Path(decode_cache_root).resolve(strict=True)
+        source = raw_source.resolve(strict=True)
+        relative = source.relative_to(root)
+    except (OSError, ValueError):
+        return None
+    if len(relative.parts) != 2 or relative.parts[0] != cache_key:
+        return None
+    if source.parent.name != cache_key or source.suffix.lower() != ".png" or not source.is_file():
+        return None
+    try:
+        with Image.open(source) as image:
+            if image.format != "PNG" or image.size != (int(expected_width), int(expected_height)):
+                return None
+    except (OSError, ValueError):
+        return None
+    return source
+
+
 class _AsyncSavePipeline:
     """Background PNG-encoding + DB-insert pool for inference artifacts.
 
@@ -2451,6 +2539,7 @@ class _AsyncSavePipeline:
         run_id: int | None,
         is_shard: bool,
         run_dir: Path,
+        decode_cache_root: Path | None = None,
         save_workers: int,
         max_inflight: int,
         artifact_batch_size: int,
@@ -2462,6 +2551,9 @@ class _AsyncSavePipeline:
         self._run_id = run_id
         self._is_shard = is_shard
         self._run_dir = run_dir
+        self._decode_cache_root = (
+            Path(decode_cache_root).resolve() if decode_cache_root is not None else None
+        )
         self._pool = ThreadPoolExecutor(max_workers=save_workers, thread_name_prefix="vfi-save")
         self._slots = threading.Semaphore(max(1, int(max_inflight)))
         self._pending: list[Future] = []
@@ -2674,11 +2766,20 @@ class _AsyncSavePipeline:
                 if tuple(gt_tensor.shape[-2:]) != (pred_h, pred_w):
                     gt_tensor = _resize_chw(gt_tensor, pred_h, pred_w)
                 gt_path = sample_dir / "gt.png"
-                save_rgb_tensor(gt_tensor, gt_path)
+                gt_storage = _materialize_gt_artifact(
+                    gt_tensor,
+                    gt_path,
+                    source_path=Path(str(row["gt_path"])),
+                    source_cache_key=str((row.get("metadata") or {}).get("cache_key") or ""),
+                    decode_cache_root=self._decode_cache_root,
+                    expected_height=pred_h,
+                    expected_width=pred_w,
+                )
                 canonical_metadata = {
                     **base_artifact_metadata,
                     "canonical_height": pred_h,
                     "canonical_width": pred_w,
+                    **gt_storage,
                 }
                 make_canonical_preview = (pred_h, pred_w) != (
                     self._preview_height,

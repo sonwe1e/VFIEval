@@ -8,6 +8,8 @@ import subprocess
 import hashlib
 import sys
 import tempfile
+import threading
+import time
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -24,6 +26,10 @@ STATUS_MISSING_WEIGHTS = "missing_weights"
 STATUS_MISSING_EVALUATOR = "missing_evaluator"
 STATUS_MISSING_DEPENDENCY = "missing_dependency"
 PLACEHOLDER_STATUS = "placeholder"
+
+_HEALTH_CACHE_TTL_SECONDS = 30.0
+_HEALTH_CACHE_LOCK = threading.Lock()
+_HEALTH_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 
 DINO_REPO_URL = "https://github.com/facebookresearch/dinov2/archive/refs/heads/main.zip"
 DINO_VITS14_REG_WEIGHTS_URL = "https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_reg4_pretrain.pth"
@@ -103,17 +109,46 @@ def metric_manifest_path(workspace: WorkspaceConfig, metric_name: str) -> Path:
     return metric_assets_dir(workspace) / metric_name / "manifest.json"
 
 
-def metrics_health(workspace: WorkspaceConfig) -> dict[str, Any]:
+def metrics_health(workspace: WorkspaceConfig, *, refresh: bool = False) -> dict[str, Any]:
     return {
         "asset_root": str(metric_assets_dir(workspace)),
         "metrics": {
-            name: metric_health(workspace, name)
+            name: metric_health(workspace, name, refresh=refresh)
             for name in METRIC_NAMES
         },
     }
 
 
-def metric_health(workspace: WorkspaceConfig, metric_name: str) -> dict[str, Any]:
+def metric_health(
+    workspace: WorkspaceConfig,
+    metric_name: str,
+    *,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    cache_key = (str(metric_assets_dir(workspace)), str(metric_name))
+    fingerprint = _metric_health_input_fingerprint(workspace, metric_name)
+    now = time.monotonic()
+    if not refresh:
+        with _HEALTH_CACHE_LOCK:
+            cached = _HEALTH_CACHE.get(cache_key)
+            if (
+                cached is not None
+                and cached.get("fingerprint") == fingerprint
+                and now - float(cached.get("created_at") or 0.0) < _HEALTH_CACHE_TTL_SECONDS
+            ):
+                return json.loads(json.dumps(cached["payload"], default=str))
+
+    payload = _metric_health_uncached(workspace, metric_name)
+    with _HEALTH_CACHE_LOCK:
+        _HEALTH_CACHE[cache_key] = {
+            "fingerprint": fingerprint,
+            "created_at": now,
+            "payload": json.loads(json.dumps(payload, default=str)),
+        }
+    return payload
+
+
+def _metric_health_uncached(workspace: WorkspaceConfig, metric_name: str) -> dict[str, Any]:
     requirement = METRIC_REQUIREMENTS[metric_name]
     manifest_path = metric_manifest_path(workspace, metric_name)
     manifest, manifest_error = _load_manifest(manifest_path)
@@ -124,6 +159,69 @@ def metric_health(workspace: WorkspaceConfig, metric_name: str) -> dict[str, Any
     if metric_name == "cgvqm":
         return _cgvqm_health(metric_name, requirement, manifest_path, manifest, manifest_error)
     return _manifest_command_health(metric_name, requirement, manifest_path, manifest, manifest_error)
+
+
+def _metric_health_input_fingerprint(workspace: WorkspaceConfig, metric_name: str) -> str:
+    """Fingerprint cheap health inputs without executing third-party probes.
+
+    The short TTL covers environment-only changes (for example installing a
+    Python package in the running interpreter). File changes invalidate the
+    cache immediately, including a project-local ffmpeg replacement.
+    """
+
+    manifest_path = metric_manifest_path(workspace, metric_name)
+    signatures: list[dict[str, Any]] = [_health_path_signature(manifest_path)]
+    manifest, _error = _load_manifest(manifest_path)
+    if isinstance(manifest, dict):
+        for field, raw_value in manifest.items():
+            if field not in {"weights_path", "repo_dir", "ffmpeg_path"} and not str(field).endswith(
+                ("_path", "_file")
+            ):
+                continue
+            value = str(raw_value or "").strip()
+            if value:
+                signatures.append(
+                    _health_path_signature(
+                        _resolve_manifest_file_path(manifest_path.parent, value)
+                    )
+                )
+        driver = manifest.get("driver")
+        command = driver.get("command") if isinstance(driver, dict) else None
+        tokens = command if isinstance(command, list) else []
+        if tokens:
+            for token in _resolve_driver_command(
+                manifest_path.parent,
+                [str(value or "") for value in tokens],
+            ):
+                candidate = Path(token)
+                if candidate.is_absolute() and candidate.exists():
+                    signatures.append(_health_path_signature(candidate))
+    if metric_name == "vmaf":
+        for candidate in (
+            manifest_path.parent / "ffmpeg.exe",
+            manifest_path.parent / "ffmpeg",
+        ):
+            signatures.append(_health_path_signature(candidate))
+        resolved = shutil.which("ffmpeg")
+        if resolved:
+            signatures.append(_health_path_signature(Path(resolved)))
+    return hashlib.sha256(
+        json.dumps(signatures, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
+def _health_path_signature(path: Path) -> dict[str, Any]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return {"path": str(path.resolve()), "exists": False}
+    return {
+        "path": str(path.resolve()),
+        "exists": True,
+        "is_dir": path.is_dir(),
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
 
 
 def metric_requires_video_input(metric_name: str) -> bool:

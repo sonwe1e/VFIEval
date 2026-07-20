@@ -182,6 +182,21 @@ CREATE TABLE IF NOT EXISTS evaluation_analysis_cache_v2 (
     PRIMARY KEY(campaign_id, cache_key)
 );
 
+CREATE TABLE IF NOT EXISTS evaluation_purge_requests_v2 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    campaign_id INTEGER NOT NULL UNIQUE,
+    status TEXT NOT NULL CHECK(status IN ('requested', 'running', 'failed', 'completed')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    claim_token TEXT NOT NULL DEFAULT '',
+    reclaimed_bytes INTEGER NOT NULL DEFAULT 0,
+    report_json TEXT NOT NULL DEFAULT '{}',
+    error_json TEXT NOT NULL DEFAULT '{}',
+    requested_at REAL NOT NULL,
+    started_at REAL,
+    completed_at REAL,
+    updated_at REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_eval_methods_v2_run
 ON evaluation_methods_v2(source_run_id, source_track_label);
 CREATE INDEX IF NOT EXISTS idx_eval_items_v2_campaign
@@ -196,6 +211,8 @@ CREATE INDEX IF NOT EXISTS idx_eval_votes_v2_task
 ON evaluation_votes_v2(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_eval_votes_v2_evaluator
 ON evaluation_votes_v2(evaluator_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_eval_purge_requests_v2_status
+ON evaluation_purge_requests_v2(status, updated_at);
 """
 
 
@@ -224,6 +241,7 @@ class CampaignDependencyError(ValueError):
 
 
 PREPARATION_CLAIM_STALE_SECONDS = 10 * 60
+CAMPAIGN_PURGE_CLAIM_STALE_SECONDS = 10 * 60
 _PREPARATION_RUNNER_LOCK = threading.Lock()
 
 
@@ -258,6 +276,14 @@ def ensure_v2_schema(db: Database) -> None:
         if "claim_token" not in preparation_columns:
             conn.execute(
                 "ALTER TABLE evaluation_preparations_v2 ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''"
+            )
+        purge_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(evaluation_purge_requests_v2)").fetchall()
+        }
+        if "claim_token" not in purge_columns:
+            conn.execute(
+                "ALTER TABLE evaluation_purge_requests_v2 ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''"
             )
         item_columns = {
             str(row["name"])
@@ -2110,6 +2136,20 @@ def _path_size(path: Path) -> int:
     return sum(child.stat().st_size for child in path.rglob("*") if child.is_file())
 
 
+def _best_effort_path_size(path: Path) -> int:
+    """Measure removable data without making cleanup depend on accounting."""
+
+    try:
+        junction_check = getattr(path, "is_junction", None)
+        if path.is_symlink() or (
+            callable(junction_check) and bool(junction_check())
+        ):
+            return max(0, int(path.lstat().st_size))
+        return max(0, int(_path_size(path)))
+    except OSError:
+        return 0
+
+
 def _frozen_target(directory: Path, role: str, source: Path) -> Path:
     suffix = source.suffix if source.is_file() else ""
     return directory / f"{role}{suffix}"
@@ -3346,6 +3386,330 @@ def archive_campaign_v2(db: Database, campaign_id: int) -> dict[str, Any]:
     return get_campaign_v2(db, int(campaign_id))
 
 
+def _campaign_purge_request(
+    db: Database,
+    campaign_id: int,
+    status: str,
+    *,
+    report: dict[str, Any] | None = None,
+    error: dict[str, Any] | None = None,
+    reclaimed_bytes: int = 0,
+) -> dict[str, Any]:
+    ensure_v2_schema(db)
+    now = utc_ts()
+    started_at = now if status == "running" else None
+    completed_at = now if status == "completed" else None
+    claim_token = uuid.uuid4().hex if status == "running" else ""
+    with db.connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO evaluation_purge_requests_v2(
+                campaign_id, status, attempt_count, claim_token, reclaimed_bytes,
+                report_json, error_json, requested_at, started_at,
+                completed_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(campaign_id) DO UPDATE SET
+                status = excluded.status,
+                attempt_count = evaluation_purge_requests_v2.attempt_count
+                    + CASE WHEN excluded.status = 'running' THEN 1 ELSE 0 END,
+                claim_token = excluded.claim_token,
+                reclaimed_bytes = excluded.reclaimed_bytes,
+                report_json = excluded.report_json,
+                error_json = excluded.error_json,
+                started_at = CASE
+                    WHEN excluded.status = 'running' THEN excluded.started_at
+                    ELSE evaluation_purge_requests_v2.started_at
+                END,
+                completed_at = excluded.completed_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                int(campaign_id),
+                str(status),
+                1 if status == "running" else 0,
+                claim_token,
+                max(0, int(reclaimed_bytes or 0)),
+                _json(report or {}),
+                _json(error or {}),
+                now,
+                started_at,
+                completed_at,
+                now,
+            ),
+        )
+    row = db.get(
+        "SELECT * FROM evaluation_purge_requests_v2 WHERE campaign_id = ?",
+        (int(campaign_id),),
+    )
+    assert row is not None
+    return _decode_campaign_purge_request(row)
+
+
+def _decode_campaign_purge_request(row: dict[str, Any]) -> dict[str, Any]:
+    decoded = dict(row)
+    decoded["report"] = _loads(decoded.pop("report_json", None))
+    decoded["error"] = _loads(decoded.pop("error_json", None))
+    return decoded
+
+
+def _get_campaign_purge_request(
+    db: Database,
+    campaign_id: int,
+) -> dict[str, Any] | None:
+    row = db.get(
+        "SELECT * FROM evaluation_purge_requests_v2 WHERE campaign_id = ?",
+        (int(campaign_id),),
+    )
+    return None if row is None else _decode_campaign_purge_request(row)
+
+
+def _claim_campaign_purge_request(
+    db: Database,
+    campaign_id: int,
+    *,
+    stale_before: float,
+) -> str | None:
+    """Atomically claim a requested, failed, or restart-stale purge."""
+
+    token = uuid.uuid4().hex
+    now = utc_ts()
+    with db.connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT status, updated_at
+            FROM evaluation_purge_requests_v2
+            WHERE campaign_id = ?
+            """,
+            (int(campaign_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        if str(row["status"]) not in {"requested", "failed"} and not (
+            str(row["status"]) == "running"
+            and float(row["updated_at"]) < float(stale_before)
+        ):
+            return None
+        cursor = conn.execute(
+            """
+            UPDATE evaluation_purge_requests_v2
+            SET status = 'running', attempt_count = attempt_count + 1,
+                claim_token = ?, reclaimed_bytes = 0,
+                report_json = '{}', error_json = '{}',
+                started_at = ?, completed_at = NULL, updated_at = ?
+            WHERE campaign_id = ?
+              AND (
+                status IN ('requested', 'failed')
+                OR (status = 'running' AND updated_at < ?)
+              )
+            """,
+            (token, now, now, int(campaign_id), float(stale_before)),
+        )
+        if cursor.rowcount != 1:
+            return None
+    return token
+
+
+def _touch_campaign_purge_claim(
+    db: Database,
+    campaign_id: int,
+    claim_token: str,
+) -> bool:
+    with db.connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE evaluation_purge_requests_v2
+            SET updated_at = ?
+            WHERE campaign_id = ? AND status = 'running' AND claim_token = ?
+            """,
+            (utc_ts(), int(campaign_id), str(claim_token)),
+        )
+    return cursor.rowcount == 1
+
+
+def _finish_campaign_purge_claim(
+    db: Database,
+    campaign_id: int,
+    claim_token: str,
+    status: str,
+    *,
+    report: dict[str, Any] | None = None,
+    error: dict[str, Any] | None = None,
+    reclaimed_bytes: int = 0,
+) -> dict[str, Any] | None:
+    """Publish a purge result only while this worker still owns the claim."""
+
+    if status not in {"requested", "failed", "completed"}:
+        raise ValueError(f"invalid Campaign purge completion status: {status}")
+    now = utc_ts()
+    completed_at = now if status == "completed" else None
+    with db.connection() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE evaluation_purge_requests_v2
+            SET status = ?, claim_token = '', reclaimed_bytes = ?,
+                report_json = ?, error_json = ?, completed_at = ?, updated_at = ?
+            WHERE campaign_id = ? AND status = 'running' AND claim_token = ?
+            """,
+            (
+                str(status),
+                max(0, int(reclaimed_bytes or 0)),
+                _json(report or {}),
+                _json(error or {}),
+                completed_at,
+                now,
+                int(campaign_id),
+                str(claim_token),
+            ),
+        )
+    if cursor.rowcount != 1:
+        return None
+    return _get_campaign_purge_request(db, int(campaign_id))
+
+
+def list_campaign_purge_requests_v2(
+    db: Database,
+    *,
+    include_completed: bool = False,
+) -> list[dict[str, Any]]:
+    ensure_v2_schema(db)
+    where = "" if include_completed else "WHERE status != 'completed'"
+    rows = db.query(
+        f"SELECT * FROM evaluation_purge_requests_v2 {where} ORDER BY updated_at DESC, id DESC"
+    )
+    return [_decode_campaign_purge_request(row) for row in rows]
+
+
+def process_campaign_purge_requests_v2(
+    db: Database,
+    workspace: WorkspaceConfig,
+    *,
+    limit: int = 20,
+    stale_after_seconds: int = CAMPAIGN_PURGE_CLAIM_STALE_SECONDS,
+) -> list[dict[str, Any]]:
+    """Claim and retry deterministic Campaign tombstones after failures or restarts."""
+
+    ensure_v2_schema(db)
+    workspace_root = workspace.root.resolve()
+    evaluations_root = workspace.evaluations_dir.resolve()
+    if evaluations_root != workspace_root / "evaluations":
+        raise ValueError("the evaluations directory is not the trusted workspace path")
+    staging_root = evaluations_root / ".delete-staging"
+    if staging_root.is_symlink() or (
+        callable(getattr(staging_root, "is_junction", None)) and staging_root.is_junction()
+    ):
+        raise ValueError("Campaign V2 delete staging is not a trusted directory")
+    stale_before = utc_ts() - max(60, int(stale_after_seconds))
+    requests = db.query(
+        """
+        SELECT campaign_id FROM evaluation_purge_requests_v2
+        WHERE status IN ('requested', 'failed')
+           OR (status = 'running' AND updated_at < ?)
+        ORDER BY updated_at, id LIMIT ?
+        """,
+        (stale_before, max(1, min(100, int(limit)))),
+    )
+    results: list[dict[str, Any]] = []
+    for request in requests:
+        campaign_id = int(request["campaign_id"])
+        claim_token = _claim_campaign_purge_request(
+            db,
+            campaign_id,
+            stale_before=stale_before,
+        )
+        if claim_token is None:
+            continue
+        quarantine = staging_root / str(campaign_id)
+        reclaimed = 0
+        residual_paths: list[str] = []
+        try:
+            if not _touch_campaign_purge_claim(db, campaign_id, claim_token):
+                continue
+            campaign_exists = db.get(
+                "SELECT id FROM evaluation_campaigns_v2 WHERE id = ?",
+                (campaign_id,),
+            )
+            if campaign_exists is not None:
+                package = evaluations_root / str(campaign_id)
+                if quarantine.exists() or quarantine.is_symlink():
+                    if package.exists() or package.is_symlink():
+                        raise EvaluationConflict(
+                            "interrupted Campaign deletion left both package and quarantine paths"
+                        )
+                    os.replace(quarantine, package)
+                recovered = _finish_campaign_purge_claim(
+                    db,
+                    campaign_id,
+                    claim_token,
+                    "completed",
+                    report={
+                        "residual_paths": [],
+                        "recovered_interrupted_delete": True,
+                        "campaign_preserved": True,
+                    },
+                )
+                if recovered is not None:
+                    results.append(recovered)
+                continue
+            if quarantine.exists() or quarantine.is_symlink():
+                if quarantine.parent != staging_root:
+                    raise ValueError("Campaign V2 delete target escaped its staging directory")
+                reclaimed = _best_effort_path_size(quarantine)
+                if quarantine.is_symlink() or quarantine.is_file():
+                    quarantine.unlink()
+                elif callable(getattr(quarantine, "is_junction", None)) and quarantine.is_junction():
+                    quarantine.rmdir()
+                else:
+                    shutil.rmtree(quarantine)
+            preparation_root = evaluations_root / ".staging"
+            if (
+                preparation_root.is_dir()
+                and not preparation_root.is_symlink()
+                and not (
+                    callable(getattr(preparation_root, "is_junction", None))
+                    and preparation_root.is_junction()
+                )
+            ):
+                for candidate in preparation_root.glob(f"{campaign_id}-*"):
+                    if not _touch_campaign_purge_claim(db, campaign_id, claim_token):
+                        raise EvaluationConflict("Campaign V2 purge claim was superseded")
+                    if candidate.parent != preparation_root:
+                        continue
+                    candidate_bytes = _best_effort_path_size(candidate)
+                    if candidate.is_symlink() or candidate.is_file():
+                        candidate.unlink()
+                    elif callable(getattr(candidate, "is_junction", None)) and candidate.is_junction():
+                        candidate.rmdir()
+                    else:
+                        shutil.rmtree(candidate)
+                    reclaimed += candidate_bytes
+        except Exception as exc:
+            if quarantine.exists() or quarantine.is_symlink():
+                residual_paths.append(str(quarantine))
+            failed = _finish_campaign_purge_claim(
+                db,
+                campaign_id,
+                claim_token,
+                "failed",
+                error={"type": type(exc).__name__, "message": str(exc)},
+                report={"residual_paths": residual_paths},
+            )
+            if failed is not None:
+                results.append(failed)
+            continue
+        completed = _finish_campaign_purge_claim(
+            db,
+            campaign_id,
+            claim_token,
+            "completed",
+            reclaimed_bytes=reclaimed,
+            report={"residual_paths": []},
+        )
+        if completed is not None:
+            results.append(completed)
+    return results
+
+
 def delete_campaign_v2(
     db: Database,
     workspace: WorkspaceConfig,
@@ -3419,11 +3783,25 @@ def delete_campaign_v2(
     if existing_campaign is None:
         validate_quarantine_root(create=False)
         if quarantine.exists() or quarantine.is_symlink():
+            purge_request = _campaign_purge_request(db, int(campaign_id), "running")
+            purge_claim_token = str(purge_request["claim_token"])
             cleaned = remove_quarantine()
+            purge_request = _finish_campaign_purge_claim(
+                db,
+                int(campaign_id),
+                purge_claim_token,
+                "completed" if cleaned else "requested",
+                report={"residual_paths": [] if cleaned else [str(quarantine)]},
+            )
+            if purge_request is None:
+                purge_request = _get_campaign_purge_request(db, int(campaign_id))
+            assert purge_request is not None
             return {
                 "campaign_id": int(campaign_id),
                 "deleted": True,
                 "already_deleted": True,
+                "cleanup_request_id": int(purge_request["id"]),
+                "cleanup_status": str(purge_request["status"]),
                 "reclaimed_bytes": 0,
                 "cleanup_pending": not cleaned,
                 "residual_paths": [] if cleaned else [str(quarantine)],
@@ -3432,6 +3810,28 @@ def delete_campaign_v2(
             }
         raise KeyError(f"evaluation campaign V2 {campaign_id} not found")
 
+    preliminary_vote = db.get(
+        """
+        SELECT COUNT(*) AS votes
+        FROM evaluation_votes_v2 v
+        JOIN evaluation_tasks_v2 t ON t.id = v.task_id
+        WHERE t.campaign_id = ?
+        """,
+        (int(campaign_id),),
+    ) or {"votes": 0}
+    preliminary_destructive = (
+        str(existing_campaign.get("status") or "")
+        in {"preparing", "published", "closed", "archived"}
+        or int(preliminary_vote.get("votes") or 0) > 0
+    )
+    if preliminary_destructive and not destructive_confirmed:
+        raise ValueError(
+            "confirm_destructive=true is required to delete a preparing, published, "
+            "closed, archived, or voted Campaign V2"
+        )
+
+    purge_request = _campaign_purge_request(db, int(campaign_id), "running")
+    purge_claim_token = str(purge_request["claim_token"])
     moved = False
     package_bytes = 0
     frozen_asset_ids: list[int] = []
@@ -3597,6 +3997,7 @@ def delete_campaign_v2(
                 """,
                 tuple(candidate_params),
             ).fetchall()
+            candidate_asset_ids = {int(row["id"]) for row in candidate_rows}
             owned_asset_ids: set[int] = set()
             for asset_row in candidate_rows:
                 try:
@@ -3615,7 +4016,9 @@ def delete_campaign_v2(
                     owned_asset_ids.add(int(asset_row["id"]))
             frozen_asset_ids = sorted(owned_asset_ids)
             collection_ids = sorted(set(collection_ids))
-            skipped_asset_ids = sorted(direct_asset_ids - owned_asset_ids)
+            skipped_asset_ids = sorted(
+                (direct_asset_ids | candidate_asset_ids) - owned_asset_ids
+            )
             if frozen_asset_ids:
                 placeholders = ",".join("?" for _ in frozen_asset_ids)
                 member_rows = conn.execute(
@@ -3643,14 +4046,7 @@ def delete_campaign_v2(
             elif quarantine.exists() or quarantine.is_symlink():
                 moved = True
             if moved:
-                try:
-                    package_bytes = (
-                        int(quarantine.lstat().st_size)
-                        if quarantine.is_symlink() or is_junction(quarantine)
-                        else _path_size(quarantine)
-                    )
-                except OSError:
-                    package_bytes = 0
+                package_bytes = _best_effort_path_size(quarantine)
 
             # Explicit child-first deletion keeps the operation readable and
             # avoids relying on SQLite's cascade ordering around RESTRICT FKs.
@@ -3700,6 +4096,13 @@ def delete_campaign_v2(
         if moved and (quarantine.exists() or quarantine.is_symlink()) and not package.exists():
             package.parent.mkdir(parents=True, exist_ok=True)
             os.replace(quarantine, package)
+        _finish_campaign_purge_claim(
+            db,
+            int(campaign_id),
+            purge_claim_token,
+            "failed",
+            error={"type": type(exc).__name__, "message": str(exc)},
+        )
         if isinstance(exc, sqlite3.IntegrityError):
             raise EvaluationConflict(
                 "Campaign V2 deletion is blocked by an external reference"
@@ -3732,21 +4135,35 @@ def delete_campaign_v2(
             except OSError:
                 residual_paths.append(str(candidate))
 
+    cleanup_pending = bool(residual_paths)
+    purge_request = _finish_campaign_purge_claim(
+        db,
+        int(campaign_id),
+        purge_claim_token,
+        "requested" if cleanup_pending else "completed",
+        reclaimed_bytes=0 if moved and str(quarantine) in residual_paths else int(package_bytes),
+        report={"residual_paths": residual_paths},
+    )
+    if purge_request is None:
+        purge_request = _get_campaign_purge_request(db, int(campaign_id))
+    assert purge_request is not None
     return {
         "campaign_id": int(campaign_id),
         "deleted": True,
+        "cleanup_request_id": int(purge_request["id"]),
+        "cleanup_status": str(purge_request["status"]),
         "previous_status": status,
         "deleted_tasks": task_count,
         "deleted_votes": vote_count,
         "deleted_assets": len(frozen_asset_ids),
         "deleted_members": len(frozen_member_ids),
         "reclaimed_bytes": 0 if moved and str(quarantine) in residual_paths else int(package_bytes),
-        "cleanup_pending": bool(residual_paths),
+        "cleanup_pending": cleanup_pending,
         "residual_paths": residual_paths,
         "cleanup_warnings": (
             [
-                "Campaign frozen pointers referenced assets whose evaluation-package "
-                "ownership could not be verified; those asset rows were preserved"
+                "Campaign package candidates whose evaluation-package ownership "
+                "could not be verified were preserved"
             ]
             if skipped_asset_ids
             else []
@@ -4632,6 +5049,7 @@ def _ratings_by_method(
 
 
 FRAME_OBJECTIVE_METRICS = {"lpips_vit_patch", "lpips_convnext"}
+CAMPAIGN_ANALYSIS_CACHE_VERSION = 2
 
 
 def _objective_metric_snapshot(
@@ -5575,7 +5993,7 @@ def campaign_analysis_v2(
     objective_snapshot = _objective_metric_snapshot(db, bindings, methods)
     cache_key = _json(
         {
-            "analysis_version": 2,
+            "analysis_version": CAMPAIGN_ANALYSIS_CACHE_VERSION,
             "bootstrap_samples": samples,
             "video": str(video or ""),
             "objective_fingerprint": str(objective_snapshot["fingerprint"]),

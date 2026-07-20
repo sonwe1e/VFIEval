@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import mimetypes
@@ -16,17 +17,18 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from vfieval.catalog_sync import CatalogSyncCoordinator
 from vfieval.config import WorkspaceConfig
 from vfieval.datasets import _sample_token, scan_dataset
 from vfieval.db import Database
 from vfieval.file_inputs import (
     DECODE_STRATEGY_VERSION,
     VIDEO_SUFFIXES,
+    checkpoints_dir,
+    ensure_video_thumbnail,
     inspect_video,
     list_checkpoints,
-    list_video_group_videos,
     list_model_files,
-    list_video_groups,
     models_dir,
     normalize_device_precision,
     preflight_run,
@@ -36,24 +38,39 @@ from vfieval.file_inputs import (
     resolve_video_group,
     resolve_video_selection,
     thumbnail_path,
+    video_thumbnail_key,
     video_summary,
     videos_dir,
 )
 from vfieval.metrics import METRIC_NAMES
 from vfieval.metrics.health import metrics_health
+from vfieval.input_identity import (
+    InputIdentityChanged,
+    assert_input_identity_files_available,
+    assert_input_identity_matches,
+    build_checkpoint_identity,
+    build_file_identity,
+    build_file_identity_from_values,
+    build_run_input_identity,
+    build_source_identity,
+    compare_input_identities,
+    normalize_request_identity,
+    resolved_checkpoint_relative_path,
+    validate_input_identity,
+)
 from vfieval.media_assets import (
     bind_run_asset,
     create_collection,
-    folder_asset_id_map,
+    ensure_folder_asset,
     get_asset,
     list_assets,
     list_collections,
+    list_folder_group_videos,
+    list_folder_groups,
     media_audit,
     resolve_asset_path,
     soft_delete_asset,
     source_assets_to_video_payload,
-    sync_catalog,
-    sync_folder_assets,
     sync_run_assets,
 )
 from vfieval.media_items import (
@@ -71,10 +88,9 @@ from vfieval.media_items import (
     resolve_media_item_compare,
     resolve_item_member,
     resolve_item_reference,
-    sync_canonical_gt_items,
 )
 from vfieval.orchestration import start_decode_worker
-from vfieval.run_cleanup import RunCleanupService, register_run_cache_refs
+from vfieval.run_cleanup import RunCleanupService, RunPurgePreviewError, register_run_cache_refs
 from vfieval.pipeline.inference import DEFAULT_VISUALIZE_HEIGHT, DEFAULT_VISUALIZE_WIDTH
 from vfieval.performance import recommend_execution_profile
 from vfieval.worker import WorkerOptions, detect_capabilities, run_worker
@@ -129,11 +145,14 @@ from vfieval.evaluations_v2 import (
     get_preparation_v2,
     legacy_campaigns_readonly,
     list_campaigns_v2,
+    list_campaign_purge_requests_v2,
     list_run_outputs,
     preview_campaign_v2,
+    process_campaign_purge_requests_v2,
     request_publish_campaign_v2,
     run_pending_preparations,
 )
+from vfieval.workload import estimate_workload, workload_confirmation_scope_fingerprint
 
 
 CANONICAL_ARTIFACT_CONTRACT = "canonical-v1"
@@ -141,21 +160,72 @@ TERMINAL_RUN_STATUSES = {"completed", "failed", "canceled"}
 COMPARE_SOURCE_RUN_STATUSES = {"completed", "metric_queued", "metric_running"}
 MAX_REQUEST_BODY_BYTES = 10 * 1024 * 1024
 
+_CLIENT_DISCONNECT_ERRNOS = frozenset(
+    {
+        errno.EPIPE,
+        errno.ECONNABORTED,
+        errno.ECONNRESET,
+        errno.ENOTCONN,
+        errno.ESHUTDOWN,
+    }
+)
+_CLIENT_DISCONNECT_WINERRORS = frozenset(
+    {
+        109,  # ERROR_BROKEN_PIPE
+        10053,  # WSAECONNABORTED
+        10054,  # WSAECONNRESET
+        10057,  # WSAENOTCONN
+        10058,  # WSAESHUTDOWN
+    }
+)
+_CLONE_RISK_ACK_TTL_SECONDS = 600.0
+_CLONE_RISK_ACK_LOCK = threading.Lock()
+_CLONE_RISK_ACK_CHALLENGES: dict[tuple[str, int, str], dict[str, Any]] = {}
+
 
 class _RequestBodyTooLarge(ValueError):
     pass
+
+
+class _WorkloadRiskConfirmationRequired(ValueError):
+    def __init__(self, workload: dict[str, Any]):
+        self.workload = dict(workload)
+        super().__init__("high-risk workload requires explicit confirmation")
+
+    def public_payload(self) -> dict[str, Any]:
+        return {
+            "type": type(self).__name__.lstrip("_"),
+            "message": str(self),
+            "workload": self.workload,
+        }
+
+
+def _is_client_disconnect(exc: BaseException) -> bool:
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    error_number = getattr(exc, "errno", None)
+    winerror = getattr(exc, "winerror", None)
+    return (
+        error_number in _CLIENT_DISCONNECT_ERRNOS
+        or error_number in _CLIENT_DISCONNECT_WINERRORS
+        or winerror in _CLIENT_DISCONNECT_WINERRORS
+    )
 
 
 def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -> None:
     cleanup_stale_uploads(db, workspace)
     ensure_v2_schema(db)
     cleanup_service = RunCleanupService(db, workspace)
+    catalog_sync = CatalogSyncCoordinator(db, workspace)
     preparation_stop = threading.Event()
     preparation_wake = threading.Event()
     handler = _make_handler(
         db,
         workspace,
         cleanup_service=cleanup_service,
+        catalog_sync=catalog_sync,
         preparation_wake_event=preparation_wake,
     )
     server = ThreadingHTTPServer((host, port), handler)
@@ -174,6 +244,7 @@ def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -
         daemon=True,
     )
     preparation_thread.start()
+    catalog_sync.request_sync(include_runs=True)
     print(f"VFIEval listening on http://{host}:{port}")
     try:
         server.serve_forever()
@@ -185,6 +256,7 @@ def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -
         preparation_wake.set()
         cleanup_thread.join(timeout=5)
         preparation_thread.join(timeout=5)
+        catalog_sync.wait(timeout=5)
 
 
 def _run_evaluation_preparations_forever(
@@ -198,6 +270,10 @@ def _run_evaluation_preparations_forever(
             run_pending_preparations(db, workspace, limit=1)
         except Exception as exc:
             print(f"evaluation preparation loop failed: {type(exc).__name__}: {exc}")
+        try:
+            process_campaign_purge_requests_v2(db, workspace, limit=20)
+        except Exception as exc:
+            print(f"evaluation cleanup loop failed: {type(exc).__name__}: {exc}")
         if wake_event is None:
             stop_event.wait(1.0)
         else:
@@ -209,27 +285,102 @@ def _make_handler(
     db: Database,
     workspace: WorkspaceConfig,
     cleanup_service: RunCleanupService | None = None,
+    catalog_sync: CatalogSyncCoordinator | None = None,
     preparation_wake_event: threading.Event | None = None,
 ):
-    # Idempotent startup backfill keeps legacy folder/run resources addressable
-    # by stable asset IDs. Subsequent asset-list requests only rescan folders;
-    # workers synchronize new Run artifacts when they are finalized.
+    # Schema/backfill is cheap and idempotent. Catalog reconciliation itself is
+    # owned by the coordinator: production starts it in the background and all
+    # catalog GET routes remain read-only SQLite snapshots.
     ensure_v2_schema(db)
-    sync_catalog(db, workspace, include_runs=True)
-    sync_canonical_gt_items(db)
+    if catalog_sync is None:
+        # Direct handler construction is primarily used by deterministic test
+        # servers. Production passes a coordinator and schedules this work in
+        # the background from ``run_server``.
+        catalog_sync = CatalogSyncCoordinator(db, workspace)
+        catalog_sync.request_sync(include_runs=True)
+        catalog_sync.wait()
     cleanup_service = cleanup_service or RunCleanupService(db, workspace)
     cleanup_service.ensure_backfilled()
-    cleanup_service.process_pending()
+    preflight_cache_lock = threading.Lock()
+    preflight_cache: dict[str, dict[str, Any]] = {}
+
+    def store_preflight(request: dict[str, Any], result: dict[str, Any]) -> str:
+        token = uuid.uuid4().hex
+        now = time.time()
+        physical_inputs = _physical_inputs_from_deep_preflight(request, result)
+        if physical_inputs is not None:
+            result["input_fingerprint"] = hashlib.sha256(
+                json.dumps(
+                    physical_inputs,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+        with preflight_cache_lock:
+            expired = [
+                key
+                for key, row in preflight_cache.items()
+                if now - float(row.get("created_at") or 0.0) > 600.0
+            ]
+            for key in expired:
+                preflight_cache.pop(key, None)
+            preflight_cache[token] = {
+                "created_at": now,
+                "request_fingerprint": _preflight_request_fingerprint(request),
+                "result": json.loads(json.dumps(result, default=str)),
+                "physical_inputs": physical_inputs,
+            }
+        return token
+
+    def cached_preflight(request: dict[str, Any]) -> dict[str, Any] | None:
+        token = str(request.get("preflight_token") or "").strip()
+        if not token:
+            return None
+        with preflight_cache_lock:
+            row = preflight_cache.get(token)
+        if row is None or time.time() - float(row.get("created_at") or 0.0) > 600.0:
+            raise ValueError("preflight token expired; run preflight again")
+        if row.get("request_fingerprint") != _preflight_request_fingerprint(request):
+            raise ValueError("Run configuration changed after preflight; run preflight again")
+        physical_inputs = row.get("physical_inputs")
+        if isinstance(physical_inputs, dict):
+            request["_preflight_physical_inputs"] = _revalidate_preflight_physical_inputs(
+                workspace,
+                request,
+                physical_inputs,
+            )
+        result = json.loads(json.dumps(row["result"], default=str))
+        result["preflight_cache_hit"] = True
+        return result
 
     class VFIEvalHandler(BaseHTTPRequestHandler):
         server_version = "VFIEval/0.1"
 
+        def handle_one_request(self) -> None:
+            try:
+                super().handle_one_request()
+            except OSError as exc:
+                if not self._ignore_client_disconnect(exc):
+                    raise
+
+        def _ignore_client_disconnect(self, exc: BaseException) -> bool:
+            if not _is_client_disconnect(exc):
+                return False
+            self.close_connection = True
+            return True
+
+        def _client_io(self, operation: Any, *args: Any) -> bool:
+            try:
+                operation(*args)
+            except OSError as exc:
+                if not self._ignore_client_disconnect(exc):
+                    raise
+                return False
+            return True
+
         def do_GET(self) -> None:
             try:
-                # The production server has a dedicated cleanup loop. This
-                # lightweight pump also makes embedded/test servers converge
-                # without requiring their own lifecycle thread.
-                cleanup_service.process_pending(limit=20)
                 parsed = urlparse(self.path)
                 path = parsed.path
                 query = parse_qs(parsed.query)
@@ -240,7 +391,16 @@ def _make_handler(
                 if path in {"/app.js", "/styles.css", "/studio.js", "/studio.css", "/blind.js", "/blind.css"}:
                     return self._send_static(path.lstrip("/"))
                 if path == "/api/health":
-                    return self._json({"ok": True, "metrics": list(METRIC_NAMES)})
+                    return self._json(
+                        {
+                            "ok": True,
+                            "metrics": list(METRIC_NAMES),
+                            "maintenance": {
+                                "catalog": catalog_sync.status(),
+                                **db.cleanup_backlog_counts(),
+                            },
+                        }
+                    )
                 if path == "/api/storage/gc/preview":
                     return self._json(
                         cleanup_service.gc_preview(
@@ -259,12 +419,11 @@ def _make_handler(
                     return self._json(list_checkpoints(workspace, query.get("model_file", [None])[0]))
                 if path == "/api/devices":
                     return self._json(detect_capabilities())
+                if path == "/api/media/sync/status":
+                    return self._json(catalog_sync.status())
                 if path == "/api/media/collections":
-                    sync_folder_assets(db, workspace)
                     return self._json({"collections": list_collections(db)})
                 if path == "/api/media/assets":
-                    if query.get("sync", ["1"])[0] not in {"0", "false", "no"}:
-                        sync_folder_assets(db, workspace)
                     collection_id = _optional_int(query.get("collection_id", [None])[0])
                     requested_source_kind = query.get("source_kind", [None])[0] or None
                     return self._json(
@@ -281,8 +440,6 @@ def _make_handler(
                         )
                     )
                 if path == "/api/media/sources":
-                    if query.get("sync", ["1"])[0] not in {"0", "false", "no"}:
-                        sync_folder_assets(db, workspace)
                     return self._json(
                         list_assets(
                             db,
@@ -301,12 +458,8 @@ def _make_handler(
                 if path == "/api/media/item-groups":
                     if query.get("role", ["gt"])[0] not in {"", "gt"}:
                         raise ValueError("media item groups currently support role=gt only")
-                    sync_folder_assets(db, workspace)
-                    sync_canonical_gt_items(db)
                     return self._json(list_item_groups(db))
                 if path == "/api/media/items":
-                    sync_folder_assets(db, workspace)
-                    sync_canonical_gt_items(db)
                     group_id = _optional_int(query.get("group_id", [None])[0])
                     if group_id is None:
                         raise ValueError("group_id is required")
@@ -354,6 +507,20 @@ def _make_handler(
                     campaigns = [*list_campaigns_v2(db), *legacy_campaigns_readonly(db)]
                     campaigns.sort(key=lambda row: float(row.get("created_at") or 0), reverse=True)
                     return self._json({"campaigns": campaigns})
+                if path == "/api/evaluation-cleanup-requests":
+                    include_completed = query.get("include_completed", ["0"])[0] in {
+                        "1",
+                        "true",
+                        "yes",
+                    }
+                    return self._json(
+                        {
+                            "requests": list_campaign_purge_requests_v2(
+                                db,
+                                include_completed=include_completed,
+                            )
+                        }
+                    )
                 match = re.fullmatch(
                     r"/api/evaluation-campaigns/v2/(\d+)(?:/(analysis|export|preparation|objective-curve))?",
                     path,
@@ -477,32 +644,48 @@ def _make_handler(
                     )
                 if path == "/api/video-groups":
                     summary = query.get("summary", ["0"])[0] in {"1", "true", "yes"}
-                    return self._json(list_video_groups(workspace, include_videos=not summary))
+                    groups = list_folder_groups(db)
+                    if not summary:
+                        for group in groups:
+                            group["videos"] = list_folder_group_videos(
+                                db,
+                                str(group["name"]),
+                                page=1,
+                                page_size=200,
+                            )["videos"]
+                    return self._json(groups)
                 match = re.fullmatch(r"/api/video-groups/([^/]+)/videos", path)
                 if match:
                     group_name = unquote(match.group(1))
                     frame_step = max(1, int(query.get("frame_step", ["1"])[0] or 1))
                     max_frames = _optional_int(query.get("max_frames", [None])[0])
-                    payload = list_video_group_videos(
-                        workspace,
+                    payload = list_folder_group_videos(
+                        db,
                         group_name,
-                        frame_step,
-                        max_frames,
+                        frame_step=frame_step,
+                        max_frames=max_frames,
                         page=int(query.get("page", ["1"])[0] or 1),
                         page_size=int(query.get("page_size", ["50"])[0] or 50),
                         query=query.get("q", [""])[0],
                         sort=query.get("sort", ["name"])[0],
                     )
-                    sync_folder_assets(db, workspace)
-                    payload["asset_ids"] = folder_asset_id_map(db, group_name)
-                    for video in payload.get("videos") or []:
-                        video["asset_id"] = payload["asset_ids"].get(str(video.get("name") or ""))
                     return self._json(payload)
+                match = re.fullmatch(r"/api/media/assets/(\d+)/thumbnail", path)
+                if match:
+                    asset, source_path = resolve_asset_path(db, workspace, int(match.group(1)))
+                    if asset.get("source_kind") != "folder" or source_path.suffix.lower() not in VIDEO_SUFFIXES:
+                        return self._error(HTTPStatus.NOT_FOUND, "folder video thumbnail not found")
+                    key = video_thumbnail_key(source_path)
+                    generated = ensure_video_thumbnail(workspace, source_path, key)
+                    if generated is None:
+                        return self._error(HTTPStatus.NOT_FOUND, "video thumbnail could not be generated")
+                    return self._send_file(generated, cache_control="public, max-age=31536000, immutable")
                 match = re.fullmatch(r"/api/video-thumbnails/([a-f0-9]{64})", path)
                 if match:
                     return self._send_file(thumbnail_path(workspace, match.group(1)))
                 if path == "/api/metrics/health":
-                    return self._json(metrics_health(workspace))
+                    refresh = query.get("refresh", ["0"])[0] in {"1", "true", "yes"}
+                    return self._json(metrics_health(workspace, refresh=refresh))
                 if path == "/api/models":
                     return self._json(db.list_models())
                 if path == "/api/datasets":
@@ -513,6 +696,22 @@ def _make_handler(
                 if path == "/api/experiments":
                     return self._json(db.list_experiments())
                 if path == "/api/runs":
+                    if any(
+                        key in query
+                        for key in ("page", "page_size", "q", "status", "run_type", "model")
+                    ):
+                        return self._json(
+                            db.list_runs_page(
+                                page=int(query.get("page", ["1"])[0] or 1),
+                                page_size=int(query.get("page_size", ["50"])[0] or 50),
+                                query=query.get("q", [""])[0],
+                                status=query.get("status", [""])[0],
+                                run_type=query.get("run_type", [""])[0],
+                                model=query.get("model", [""])[0],
+                                include_deleted=query.get("include_deleted", ["0"])[0]
+                                in {"1", "true", "yes"},
+                            )
+                        )
                     return self._json(
                         db.list_runs(
                             limit=int(query.get("limit", ["100"])[0]),
@@ -648,6 +847,15 @@ def _make_handler(
                     body = self._read_json()
                 except _RequestBodyTooLarge as exc:
                     return self._error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, str(exc), "RequestBodyTooLarge")
+                if path == "/api/run-purge/preview":
+                    raw_ids = body.get("run_ids") or []
+                    if not isinstance(raw_ids, list):
+                        return self._error(HTTPStatus.BAD_REQUEST, "run_ids must be a list")
+                    preview = cleanup_service.preview_run_purge(
+                        str(body.get("request_type") or ""),
+                        raw_ids,
+                    )
+                    return self._json(preview)
                 if path == "/api/storage/gc":
                     try:
                         result = cleanup_service.garbage_collect(
@@ -660,6 +868,11 @@ def _make_handler(
                     except ValueError as exc:
                         return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
                     return self._json(result)
+                if path == "/api/media/sync":
+                    requested = catalog_sync.request_sync(
+                        include_runs=body.get("include_runs", True) is not False
+                    )
+                    return self._json(requested, status=HTTPStatus.ACCEPTED)
                 if path == "/api/media/collections":
                     try:
                         collection = create_collection(
@@ -758,6 +971,31 @@ def _make_handler(
                         return self._error(HTTPStatus.CONFLICT, str(exc), type(exc).__name__)
                     except ValueError as exc:
                         return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
+                match = re.fullmatch(r"/api/evaluation-cleanup-requests/(\d+)/retry", path)
+                if match:
+                    request_id = int(match.group(1))
+                    existing = db.get(
+                        "SELECT id FROM evaluation_purge_requests_v2 WHERE id = ?",
+                        (request_id,),
+                    )
+                    if existing is None:
+                        return self._error(HTTPStatus.NOT_FOUND, "cleanup request not found")
+                    processed = process_campaign_purge_requests_v2(db, workspace, limit=20)
+                    request = next(
+                        (row for row in processed if int(row.get("id") or 0) == request_id),
+                        next(
+                            (
+                                row
+                                for row in list_campaign_purge_requests_v2(
+                                    db,
+                                    include_completed=True,
+                                )
+                                if int(row.get("id") or 0) == request_id
+                            ),
+                            None,
+                        ),
+                    )
+                    return self._json({"request": request})
                 match = re.fullmatch(r"/api/evaluation-campaigns/(\d+)/(archive|discard)", path)
                 if match:
                     campaign_id = int(match.group(1))
@@ -858,10 +1096,30 @@ def _make_handler(
                     role = body.get("role", "remote")
                     db.register_worker(worker_id, role, body.get("capabilities") or {})
                     return self._json({"worker_id": worker_id, "worker": db.get_worker(worker_id)})
-                if path == "/api/preflight":
+                if path in {"/api/preflight", "/api/preflight/quick"}:
+                    if path == "/api/preflight/quick":
+                        body = dict(body)
+                        body["preflight_level"] = "quick"
                     prepared = source_assets_to_video_payload(db, workspace, body)
                     prepared = _prepare_media_item_compare_payload(db, workspace, prepared)
+                    preflight_level = str(prepared.get("preflight_level") or "deep").strip().lower()
+                    if preflight_level not in {"quick", "deep"}:
+                        return self._error(
+                            HTTPStatus.BAD_REQUEST,
+                            "preflight_level must be quick or deep",
+                        )
+                    if (
+                        preflight_level == "quick"
+                        and str(prepared.get("run_type") or "model_inference") == "video_compare"
+                    ):
+                        return self._error(
+                            HTTPStatus.BAD_REQUEST,
+                            "quick preflight is available only for model-inference Runs",
+                        )
+                    prepared["preflight_level"] = preflight_level
                     result = preflight_run(db, workspace, prepared)
+                    result["preflight_cache_hit"] = False
+                    _attach_workload_estimate(result, prepared)
                     profile_request = dict(prepared)
                     profile_request.update(
                         {
@@ -871,10 +1129,20 @@ def _make_handler(
                         }
                     )
                     result["execution_profile"] = recommend_execution_profile(db, workspace, profile_request)
+                    if preflight_level == "deep" and bool(result.get("ok")):
+                        result["preflight_token"] = store_preflight(prepared, result)
                     return self._json(result)
                 if path == "/api/runs":
                     body = source_assets_to_video_payload(db, workspace, body)
                     body = _prepare_media_item_compare_payload(db, workspace, body)
+                    # These fields are server-owned trust material.  A client
+                    # may present only the opaque token; validated signatures
+                    # are injected below after the token is checked.
+                    body.pop("_preflight_result", None)
+                    body.pop("_preflight_physical_inputs", None)
+                    stored_preflight = cached_preflight(body)
+                    if stored_preflight is not None:
+                        body["_preflight_result"] = stored_preflight
                     run_type = str(body.get("run_type") or "")
                     if run_type == "video_compare":
                         created = _create_video_compare_run(db, workspace, body)
@@ -908,24 +1176,45 @@ def _make_handler(
                     dataset_id = int(match.group(1))
                     samples = scan_dataset(db, workspace, dataset_id)
                     return self._json({"dataset_id": dataset_id, "samples": samples})
-                match = re.fullmatch(r"/api/runs/(\d+)/(cancel|retry)", path)
+                match = re.fullmatch(r"/api/runs/(\d+)/(cancel|retry|clone)", path)
                 if match:
                     run_id = int(match.group(1))
                     action = match.group(2)
                     if action == "cancel":
                         db.request_run_cancel(run_id)
                         return self._json({"run_id": run_id, "run": db.get_run(run_id)})
-                    retry = _retry_run(db, workspace, run_id)
-                    return self._json(retry, status=HTTPStatus.CREATED)
+                    created = (
+                        _retry_run(db, workspace, run_id)
+                        if action == "retry"
+                        else _clone_run(
+                            db,
+                            workspace,
+                            run_id,
+                            risk_ack_fingerprint=body.get("risk_ack_fingerprint"),
+                        )
+                    )
+                    return self._json(created, status=HTTPStatus.CREATED)
                 match = re.fullmatch(r"/api/runs/(\d+)/(hide|cleanup-artifacts)", path)
                 if match:
                     run_id = int(match.group(1))
                     action = match.group(2)
                     if action == "hide":
+                        cleanup_service.consume_run_purge_preview(
+                            body.get("preview_token"),
+                            request_type="delete_run",
+                            run_ids=[run_id],
+                        )
                         request = cleanup_service.request_delete(run_id)
                         return self._json(_purge_response(request), status=HTTPStatus.ACCEPTED)
                     try:
+                        cleanup_service.consume_run_purge_preview(
+                            body.get("preview_token"),
+                            request_type="cleanup_artifacts",
+                            run_ids=[run_id],
+                        )
                         request = cleanup_service.request_artifact_cleanup(run_id)
+                    except RunPurgePreviewError:
+                        raise
                     except ValueError as exc:
                         return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
                     return self._json(_purge_response(request), status=HTTPStatus.ACCEPTED)
@@ -965,6 +1254,11 @@ def _make_handler(
                     raw_ids = body.get("run_ids") or []
                     if not isinstance(raw_ids, list) or not raw_ids:
                         return self._error(HTTPStatus.BAD_REQUEST, "run_ids must be a non-empty list")
+                    cleanup_service.consume_run_purge_preview(
+                        body.get("preview_token"),
+                        request_type="delete_run",
+                        run_ids=raw_ids,
+                    )
                     accepted = []
                     failures = []
                     for raw in raw_ids:
@@ -1030,6 +1324,21 @@ def _make_handler(
                 self._error(HTTPStatus.NOT_FOUND, "not found")
             except EvaluationConflict as exc:
                 self._error(HTTPStatus.CONFLICT, str(exc), type(exc).__name__)
+            except RunPurgePreviewError as exc:
+                self._json(
+                    {
+                        "error": {
+                            "type": type(exc).__name__,
+                            "code": exc.code,
+                            "message": str(exc),
+                        }
+                    },
+                    status=HTTPStatus.CONFLICT,
+                )
+            except InputIdentityChanged as exc:
+                self._json(exc.public_payload(), status=HTTPStatus.CONFLICT)
+            except _WorkloadRiskConfirmationRequired as exc:
+                self._json(exc.public_payload(), status=HTTPStatus.CONFLICT)
             except ValueError as exc:
                 self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
             except KeyError as exc:
@@ -1124,12 +1433,29 @@ def _make_handler(
                 if not match:
                     return self._error(HTTPStatus.NOT_FOUND, "not found")
                 run_id = int(match.group(1))
+                query = parse_qs(parsed.query)
+                cleanup_service.consume_run_purge_preview(
+                    query.get("preview_token", [""])[0],
+                    request_type="delete_run",
+                    run_ids=[run_id],
+                )
                 request = cleanup_service.request_delete(run_id)
                 return self._json(_purge_response(request), status=HTTPStatus.ACCEPTED)
             except KeyError as exc:
                 self._error(HTTPStatus.NOT_FOUND, str(exc), type(exc).__name__)
             except EvaluationConflict as exc:
                 self._error(HTTPStatus.CONFLICT, str(exc), type(exc).__name__)
+            except RunPurgePreviewError as exc:
+                self._json(
+                    {
+                        "error": {
+                            "type": type(exc).__name__,
+                            "code": exc.code,
+                            "message": str(exc),
+                        }
+                    },
+                    status=HTTPStatus.CONFLICT,
+                )
             except ValueError as exc:
                 self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
             except Exception as exc:
@@ -1156,8 +1482,9 @@ def _make_handler(
             self.send_header("Cache-Control", "no-store")
             for key, value in (headers or {}).items():
                 self.send_header(key, value)
-            self.end_headers()
-            self.wfile.write(payload)
+            if not self._client_io(self.end_headers):
+                return
+            self._client_io(self.wfile.write, payload)
 
         def _send_bytes(self, payload: bytes, content_type: str, filename: str | None = None) -> None:
             self.send_response(HTTPStatus.OK)
@@ -1166,8 +1493,9 @@ def _make_handler(
             self.send_header("Cache-Control", "no-store")
             if filename:
                 self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-            self.end_headers()
-            self.wfile.write(payload)
+            if not self._client_io(self.end_headers):
+                return
+            self._client_io(self.wfile.write, payload)
 
         def _error(self, status: HTTPStatus, message: str, error_type: str = "Error") -> None:
             self._json({"error": {"type": error_type, "message": message}}, status=status)
@@ -1229,7 +1557,7 @@ def _make_handler(
                 self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
                 self.send_header("Content-Range", f"bytes */{file_size}")
                 self.send_header("Accept-Ranges", "bytes")
-                self.end_headers()
+                self._client_io(self.end_headers)
                 return
             if byte_range is None:
                 self.send_response(HTTPStatus.OK)
@@ -1238,13 +1566,15 @@ def _make_handler(
                 self.send_header("Accept-Ranges", "bytes")
                 if cache_control:
                     self.send_header("Cache-Control", cache_control)
-                self.end_headers()
+                if not self._client_io(self.end_headers):
+                    return
                 with path.open("rb") as handle:
                     while True:
                         chunk = handle.read(4 * 1024 * 1024)
                         if not chunk:
                             break
-                        self.wfile.write(chunk)
+                        if not self._client_io(self.wfile.write, chunk):
+                            return
             else:
                 start, end = byte_range
                 content_length = end - start + 1
@@ -1255,7 +1585,8 @@ def _make_handler(
                 self.send_header("Accept-Ranges", "bytes")
                 if cache_control:
                     self.send_header("Cache-Control", cache_control)
-                self.end_headers()
+                if not self._client_io(self.end_headers):
+                    return
                 with path.open("rb") as handle:
                     handle.seek(start)
                     remaining = content_length
@@ -1263,7 +1594,8 @@ def _make_handler(
                         chunk = handle.read(min(remaining, 4 * 1024 * 1024))
                         if not chunk:
                             break
-                        self.wfile.write(chunk)
+                        if not self._client_io(self.wfile.write, chunk):
+                            return
                         remaining -= len(chunk)
 
     return VFIEvalHandler
@@ -1871,9 +2203,35 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
     artifact_profile = str(body.get("artifact_profile") or "evaluation")
     if artifact_profile not in {"evaluation", "diagnostic", "benchmark"}:
         raise ValueError("artifact_profile must be evaluation, diagnostic, or benchmark")
-    preflight = preflight_run(db, workspace, body)
+    cached = body.get("_preflight_result")
+    preflight_payload = dict(body)
+    if "_exact_checkpoint" in body:
+        preflight_payload["checkpoint"] = body.get("_exact_checkpoint")
+    preflight = (
+        json.loads(json.dumps(cached, default=str))
+        if isinstance(cached, dict)
+        else preflight_run(db, workspace, preflight_payload)
+    )
+    workload = preflight.get("workload") or _attach_workload_estimate(preflight, body)
     if not preflight["ok"]:
         raise ValueError(_preflight_error_message(preflight))
+    acknowledged_scope = str(
+        body.get("_workload_risk_ack_scope_fingerprint") or ""
+    ).strip()
+    current_scope = (
+        workload_confirmation_scope_fingerprint(workload)
+        if workload is not None
+        else ""
+    )
+    if (
+        workload is not None
+        and workload.get("risk_level") == "high"
+        and body.get("_confirm_current_workload") is not True
+        and acknowledged_scope != current_scope
+        and str(body.get("risk_ack_fingerprint") or "")
+        != str(workload.get("risk_fingerprint") or "")
+    ):
+        raise _WorkloadRiskConfirmationRequired(workload)
     metrics = list(body.get("metrics") or [])
     if artifact_profile == "benchmark" and metrics:
         raise ValueError("benchmark artifact_profile does not run metrics")
@@ -1909,10 +2267,10 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
     requested_device = str(body.get("device") or "auto")
     is_multi = execution_mode in {"multi_cuda", "multi_npu"}
     device, precision = normalize_device_precision(devices[0] if is_multi else requested_device, str(body.get("precision") or "fp32"))
-    checkpoint_path = resolve_checkpoint(workspace, body.get("checkpoint"), model_path.name)
+    checkpoint_selector = body.get("_exact_checkpoint", body.get("checkpoint"))
+    checkpoint_path = resolve_checkpoint(workspace, checkpoint_selector, model_path.name)
     checkpoint_relative = _checkpoint_relative(workspace, checkpoint_path)
-    selection_hash = _selection_hash(selected_videos, frame_step, max_frames)
-    model_record_name = model_path.name if checkpoint_relative is None else f"{model_path.name} [{checkpoint_relative}]"
+    model_record_base = model_path.name if checkpoint_relative is None else f"{model_path.name} [{checkpoint_relative}]"
     reference_config = _reference_config(
         video_group=group_label,
         selected_videos=selected_videos,
@@ -1922,8 +2280,146 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         height=height,
         width=width,
     )
+    trusted_preflight_inputs = body.get("_preflight_physical_inputs")
+    if not isinstance(trusted_preflight_inputs, dict) and not isinstance(cached, dict):
+        try:
+            trusted_preflight_inputs = _physical_inputs_from_deep_preflight(
+                preflight_payload,
+                preflight,
+            )
+        except (TypeError, ValueError):
+            # Tests and legacy internal callers may provide a synthetic
+            # preflight without physical signatures.  They receive the normal
+            # hashing path below; opaque HTTP tokens always carry signatures.
+            trusted_preflight_inputs = None
+    trusted_source_files = {
+        str(row.get("relative_path") or ""): row
+        for row in (
+            (trusted_preflight_inputs or {}).get("sources")
+            if isinstance(trusted_preflight_inputs, dict)
+            else []
+        )
+        if isinstance(row, dict)
+    }
+    preflight_video_infos = {
+        (str(row.get("group") or ""), str(row.get("video_file") or "")): row
+        for row in video_infos
+        if isinstance(row, dict)
+    }
+    # Bind every selected source clip to its exact canonical Item before the
+    # Run starts.  This is deliberately based on the resolved group/file
+    # selection, never a stem/hash guess, so a later pred can be reusable only
+    # for the GT Item it actually came from.
+    source_bindings: list[dict[str, Any]] = []
+    for selected_video in selected_videos:
+        if multi_group:
+            group_name, separator, file_name = selected_video.partition("/")
+            if not separator or not group_name or not file_name:
+                raise ValueError(f"invalid qualified source video selection: {selected_video}")
+            timeline_name = f"{group_name}/{Path(file_name).stem}"
+        else:
+            group_name = groups[0]
+            file_name = selected_video
+            timeline_name = Path(file_name).stem
+        asset = ensure_folder_asset(
+            db,
+            workspace,
+            group_name,
+            file_name,
+            media_info=preflight_video_infos.get((group_name, file_name)),
+            trusted_content_identity=trusted_source_files.get(f"{group_name}/{file_name}"),
+        )
+        asset_id = int(asset["id"])
+        item = ensure_canonical_gt_item(db, int(asset_id))
+        source_bindings.append(
+            {
+                "asset_id": int(asset_id),
+                "item_id": int(item["id"]),
+                "video_name": timeline_name,
+                "group": group_name,
+                "file_name": file_name,
+            }
+        )
+    request_metadata = {
+        "run_type": "model_inference",
+        "artifact_contract": CANONICAL_ARTIFACT_CONTRACT,
+        "model_file": model_path.name,
+        "video_group": group_label,
+        "video_groups": groups,
+        "resolution_mode": body.get("resolution_mode") or "original",
+        "height": height,
+        "width": width,
+        "visualize_height": visualize_height,
+        "visualize_width": visualize_width,
+        "batch_size": int(body.get("batch_size") or 1),
+        "batch_size_per_device": int(body.get("batch_size_per_device") or body.get("batch_size") or 1),
+        "metric_batch_size_per_device": metric_batch_size,
+        "device": body.get("device") or "auto",
+        "devices": devices,
+        "execution_mode": execution_mode,
+        "precision": body.get("precision") or "fp32",
+        "checkpoint": body.get("checkpoint") or "none",
+        "frame_step": frame_step,
+        "max_frames": max_frames,
+        "selected_videos": selected_videos,
+        "source_assets": body.get("source_assets") or [],
+        "metrics": metrics,
+        "artifact_profile": artifact_profile,
+        "prefetch_workers": body.get("prefetch_workers"),
+        "save_workers": body.get("save_workers"),
+        "max_save_inflight": body.get("max_save_inflight"),
+        "artifact_db_batch_size": body.get("artifact_db_batch_size"),
+        "sample_npu_smi": body.get("sample_npu_smi", True),
+        "benchmark_warmup_batches": int(body.get("benchmark_warmup_batches") or 10),
+        "benchmark_samples": int(body.get("benchmark_samples") or 200),
+    }
+    input_identity = _build_model_run_input_identity(
+        db,
+        workspace,
+        model_path=model_path,
+        checkpoint_path=checkpoint_path,
+        checkpoint_requested=body.get("checkpoint") or "none",
+        source_bindings=source_bindings,
+        request=request_metadata,
+        refresh_source_hashes=body.get("input_identity") is not None,
+        trusted_preflight_inputs=(
+            trusted_preflight_inputs
+            if isinstance(trusted_preflight_inputs, dict)
+            else None
+        ),
+    )
+    expected_identity = body.get("input_identity")
+    if expected_identity is not None:
+        validate_input_identity(expected_identity)
+        assert_input_identity_matches(expected_identity, input_identity)
+    clone_identity_comparison = None
+    clone_source_identity = body.get("_clone_input_identity")
+    if isinstance(clone_source_identity, dict):
+        validate_input_identity(clone_source_identity)
+        clone_identity_comparison = compare_input_identities(
+            clone_source_identity,
+            input_identity,
+        )
+    reference_config = {
+        **reference_config,
+        "source_identities": [
+            {
+                "item_id": int(row["item_id"]),
+                "asset_id": int(row["asset_id"]),
+                "qualified_name": str(row["qualified_name"]),
+                "content": dict(row["content"]),
+            }
+            for row in input_identity["sources"]
+        ],
+    }
     reference_key = _reference_key(reference_config)
-
+    physical_model_fingerprint = _reference_key(
+        {
+            "model": input_identity["model"],
+            "checkpoint": input_identity["checkpoint"].get("resolved"),
+        }
+    )
+    model_record_name = f"{model_record_base} @{physical_model_fingerprint[:12]}"
     model_id = db.upsert_model(
         name=model_record_name,
         adapter=f"file:{model_path}",
@@ -1936,10 +2432,13 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
             "model_path": str(model_path),
             "checkpoint": checkpoint_relative,
             "contract": "Model.infer(img0, img1)",
+            "physical_fingerprint": physical_model_fingerprint,
+            "model_identity": input_identity["model"],
+            "checkpoint_identity": input_identity["checkpoint"],
         },
     )
     dataset_id = db.upsert_dataset(
-        name=f"video:{group_label}:{selection_hash}",
+        name=f"video:{group_label}:{reference_key[:20]}",
         root_path=dataset_root,
         has_gt=True,
         source_type="video",
@@ -1954,74 +2453,14 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
             "video_glob": "*",
             "selected_videos": selected_videos,
             "source_assets": body.get("source_assets") or [],
+            "reference_key": reference_key,
+            "source_identities": reference_config["source_identities"],
         },
     )
-    # Bind every selected source clip to its exact canonical Item before the
-    # Run starts.  This is deliberately based on the resolved group/file
-    # selection, never a stem/hash guess, so a later pred can be reusable only
-    # for the GT Item it actually came from.
-    sync_folder_assets(db, workspace)
-    source_bindings: list[dict[str, Any]] = []
-    source_maps = {group: folder_asset_id_map(db, group) for group in groups}
-    for selected_video in selected_videos:
-        if multi_group:
-            group_name, separator, file_name = selected_video.partition("/")
-            if not separator or not group_name or not file_name:
-                raise ValueError(f"invalid qualified source video selection: {selected_video}")
-            timeline_name = f"{group_name}/{Path(file_name).stem}"
-        else:
-            group_name = groups[0]
-            file_name = selected_video
-            timeline_name = Path(file_name).stem
-        asset_id = source_maps.get(group_name, {}).get(file_name)
-        if asset_id is None:
-            raise ValueError(f"selected source media was not cataloged: {group_name}/{file_name}")
-        item = ensure_canonical_gt_item(db, int(asset_id))
-        source_bindings.append(
-            {
-                "asset_id": int(asset_id),
-                "item_id": int(item["id"]),
-                "video_name": timeline_name,
-                "group": group_name,
-                "file_name": file_name,
-            }
-        )
     metadata = {
         "run_type": "model_inference",
         "source": "folder_flow",
-        "request": {
-            "run_type": "model_inference",
-            "artifact_contract": CANONICAL_ARTIFACT_CONTRACT,
-            "model_file": model_path.name,
-            "video_group": group_label,
-            "video_groups": groups,
-            "resolution_mode": body.get("resolution_mode") or "original",
-            "height": height,
-            "width": width,
-            "visualize_height": visualize_height,
-            "visualize_width": visualize_width,
-            "batch_size": int(body.get("batch_size") or 1),
-            "batch_size_per_device": int(body.get("batch_size_per_device") or body.get("batch_size") or 1),
-            "metric_batch_size_per_device": metric_batch_size,
-            "device": body.get("device") or "auto",
-            "devices": devices,
-            "execution_mode": execution_mode,
-            "precision": body.get("precision") or "fp32",
-            "checkpoint": body.get("checkpoint") or "none",
-            "frame_step": frame_step,
-            "max_frames": max_frames,
-            "selected_videos": selected_videos,
-            "source_assets": body.get("source_assets") or [],
-            "metrics": metrics,
-            "artifact_profile": artifact_profile,
-            "prefetch_workers": body.get("prefetch_workers"),
-            "save_workers": body.get("save_workers"),
-            "max_save_inflight": body.get("max_save_inflight"),
-            "artifact_db_batch_size": body.get("artifact_db_batch_size"),
-            "sample_npu_smi": body.get("sample_npu_smi", True),
-            "benchmark_warmup_batches": int(body.get("benchmark_warmup_batches") or 10),
-            "benchmark_samples": int(body.get("benchmark_samples") or 200),
-        },
+        "request": request_metadata,
         "model_file": model_path.name,
         "artifact_contract": CANONICAL_ARTIFACT_CONTRACT,
         "checkpoint": checkpoint_relative,
@@ -2040,9 +2479,14 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         "metric_health": preflight.get("metrics", {}).get("health", {}),
         "preflight": preflight,
         "artifact_profile": artifact_profile,
+        "workload": workload,
+        "input_identity": input_identity,
     }
     if body.get("retry_of_run_id") is not None:
         metadata["retry_of_run_id"] = int(body["retry_of_run_id"])
+    if body.get("clone_of_run_id") is not None:
+        metadata["clone_of_run_id"] = int(body["clone_of_run_id"])
+        metadata["clone_identity_comparison"] = clone_identity_comparison or {}
     name = body.get("name") or _default_run_name(model_path, checkpoint_relative, body.get("checkpoint"), group_label)
     output_dir = str(workspace.runs_dir / str(db.next_run_id()))
     run_id = db.create_run(
@@ -2231,7 +2675,6 @@ def _infer_legacy_compare_item_ids(
     descriptors = distorted if isinstance(distorted, list) else [distorted]
     if not descriptors or any(not isinstance(descriptor, dict) for descriptor in descriptors):
         return None
-    sync_folder_assets(db, workspace)
     reference_kind = str(reference.get("kind") or "")
     if reference_kind == "media_item":
         reference_item_id = int(reference.get("item_id") or 0)
@@ -2583,16 +3026,489 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
     return {"run_id": run_id, "run": db.get_run(run_id), "preflight": preflight}
 
 
+def _normalize_preflight_file_identity(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("deep preflight file identity is missing")
+    return build_file_identity_from_values(
+        relative_path=str(value.get("relative_path") or ""),
+        display_path=str(value.get("display_path") or ""),
+        size_bytes=value.get("size_bytes"),
+        mtime_ns=value.get("mtime_ns"),
+        sha256=str(value.get("sha256") or ""),
+    )
+
+
+def _physical_inputs_from_deep_preflight(
+    request: dict[str, Any],
+    result: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Extract only portable, content-bound trust material from deep preflight."""
+
+    if (
+        str(result.get("run_type") or request.get("run_type") or "model_inference")
+        != "model_inference"
+        or str(result.get("preflight_level") or request.get("preflight_level") or "deep")
+        != "deep"
+        or not bool(result.get("ok"))
+    ):
+        return None
+    model = result.get("model") or {}
+    videos = (result.get("video_group") or {}).get("videos") or []
+    model_identity = _normalize_preflight_file_identity(model.get("physical_identity"))
+    checkpoint_identity = model.get("checkpoint_identity")
+    normalized_checkpoint = (
+        _normalize_preflight_file_identity(checkpoint_identity)
+        if checkpoint_identity is not None
+        else None
+    )
+    normalized_sources = []
+    for video in videos:
+        if not isinstance(video, dict):
+            raise ValueError("deep preflight video identity is invalid")
+        normalized_sources.append(
+            _normalize_preflight_file_identity(video.get("physical_identity"))
+        )
+    if not normalized_sources:
+        raise ValueError("deep preflight contains no source identities")
+    return {
+        "schema": "deep-preflight-physical-inputs-v1",
+        "model": model_identity,
+        "checkpoint": normalized_checkpoint,
+        "sources": normalized_sources,
+    }
+
+
+def _revalidate_preflight_physical_inputs(
+    workspace: WorkspaceConfig,
+    request: dict[str, Any],
+    expected: dict[str, Any],
+) -> dict[str, Any]:
+    """Re-hash token-bound files and reject any stat, content, or selection drift."""
+
+    if str(expected.get("schema") or "") != "deep-preflight-physical-inputs-v1":
+        raise ValueError("preflight token input identity is invalid; run preflight again")
+    expected_model = _normalize_preflight_file_identity(expected.get("model"))
+    expected_checkpoint_raw = expected.get("checkpoint")
+    expected_checkpoint = (
+        _normalize_preflight_file_identity(expected_checkpoint_raw)
+        if expected_checkpoint_raw is not None
+        else None
+    )
+    expected_sources = [
+        _normalize_preflight_file_identity(row)
+        for row in (expected.get("sources") or [])
+    ]
+    try:
+        model_path = resolve_model_file(workspace, str(request.get("model_file") or ""))
+        checkpoint_path = resolve_checkpoint(
+            workspace,
+            request.get("_exact_checkpoint", request.get("checkpoint")),
+            model_path.name,
+        )
+        selection = resolve_video_selection(workspace, request)
+        source_paths = [Path(str(entry["path"])).resolve() for entry in selection["entries"]]
+
+        if model_path.relative_to(models_dir(workspace)).as_posix() != expected_model["relative_path"]:
+            raise ValueError("resolved model changed")
+        if (checkpoint_path is None) != (expected_checkpoint is None):
+            raise ValueError("resolved checkpoint changed")
+        if checkpoint_path is not None and expected_checkpoint is not None:
+            if (
+                checkpoint_path.relative_to(checkpoints_dir(workspace)).as_posix()
+                != expected_checkpoint["relative_path"]
+            ):
+                raise ValueError("resolved checkpoint changed")
+        source_relatives = [
+            path.relative_to(videos_dir(workspace)).as_posix()
+            for path in source_paths
+        ]
+        if source_relatives != [row["relative_path"] for row in expected_sources]:
+            raise ValueError("selected source videos changed")
+
+        current_model = build_file_identity(
+            model_path,
+            trusted_root=models_dir(workspace),
+            display_path=expected_model["display_path"],
+        )
+        current_checkpoint = (
+            build_file_identity(
+                checkpoint_path,
+                trusted_root=checkpoints_dir(workspace),
+                display_path=expected_checkpoint["display_path"],
+            )
+            if checkpoint_path is not None and expected_checkpoint is not None
+            else None
+        )
+        current_sources = [
+            build_file_identity(
+                path,
+                trusted_root=videos_dir(workspace),
+                display_path=expected_row["display_path"],
+            )
+            for path, expected_row in zip(source_paths, expected_sources, strict=True)
+        ]
+    except Exception as exc:
+        raise ValueError(
+            f"Run inputs changed after preflight; run preflight again ({exc})"
+        ) from exc
+
+    current = {
+        "schema": "deep-preflight-physical-inputs-v1",
+        "model": current_model,
+        "checkpoint": current_checkpoint,
+        "sources": current_sources,
+    }
+    if current != {
+        "schema": "deep-preflight-physical-inputs-v1",
+        "model": expected_model,
+        "checkpoint": expected_checkpoint,
+        "sources": expected_sources,
+    }:
+        raise ValueError("Run inputs changed after preflight; run preflight again")
+    return current
+
+
+def _preflight_request_fingerprint(request: dict[str, Any]) -> str:
+    identity_request = dict(request)
+    identity_request.pop("preflight_level", None)
+    normalized = normalize_request_identity(identity_request)
+    encoded = json.dumps(
+        normalized,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _attach_workload_estimate(
+    preflight: dict[str, Any],
+    request: dict[str, Any],
+) -> dict[str, Any] | None:
+    if str(preflight.get("run_type") or request.get("run_type") or "model_inference") != "model_inference":
+        return None
+    resolution = preflight.get("resolution") or {}
+    height = int(resolution.get("height") or request.get("height") or 0)
+    width = int(resolution.get("width") or request.get("width") or 0)
+    if height <= 0 or width <= 0:
+        return None
+    device_info = preflight.get("device") or {}
+    effective_devices = [
+        str(value)
+        for value in (device_info.get("effective_devices") or [])
+        if str(value or "").strip()
+    ]
+    if not effective_devices:
+        effective_devices = [str(device_info.get("effective_device") or request.get("device") or "cpu")]
+    capabilities = detect_capabilities()
+    memory_by_device = {
+        str(row.get("id") or ""): int(row["memory_bytes"])
+        for kind in ("cuda", "npu")
+        for row in (capabilities.get(kind) or [])
+        if isinstance(row, dict) and row.get("memory_bytes")
+    }
+    known_device_memory = [
+        memory_by_device[device]
+        for device in effective_devices
+        if device in memory_by_device
+    ]
+    device_memory = min(known_device_memory) if known_device_memory else None
+    workload = estimate_workload(
+        device=effective_devices[0],
+        precision=str(device_info.get("effective_precision") or request.get("precision") or "fp32"),
+        device_memory_bytes=device_memory,
+        host_available_memory_bytes=_host_available_memory_bytes(),
+        batch_size_per_device=int(
+            request.get("batch_size_per_device") or request.get("batch_size") or 1
+        ),
+        height=height,
+        width=width,
+        sample_count=int((preflight.get("video_group") or {}).get("triplets") or 0),
+        artifact_profile=str(request.get("artifact_profile") or "evaluation"),
+        prefetch_depth=3,
+    )
+    preflight["workload"] = workload
+    if workload["risk_level"] == "high" and not any(
+        row.get("type") == "WorkloadRisk"
+        for row in (preflight.get("warnings") or [])
+        if isinstance(row, dict)
+    ):
+        preflight.setdefault("warnings", []).append(
+            {
+                "title": "High resource workload",
+                "message": "Review memory and artifact estimates before publishing this Run.",
+                "type": "WorkloadRisk",
+                "details": {"reasons": workload["risk_reasons"]},
+            }
+        )
+    return workload
+
+
+def _host_available_memory_bytes() -> int | None:
+    try:
+        import psutil
+
+        return int(psutil.virtual_memory().available)
+    except (ImportError, OSError, ValueError):
+        return None
+
+
+def _trusted_preflight_sha256(
+    value: Any,
+    path: Path,
+    trusted_root: Path,
+) -> str | None:
+    """Reuse a server-validated digest only while its exact stat still matches."""
+
+    if not isinstance(value, dict):
+        return None
+    try:
+        identity = _normalize_preflight_file_identity(value)
+        relative = path.resolve().relative_to(trusted_root.resolve()).as_posix()
+        stat_result = path.stat()
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "Run inputs changed after preflight; run preflight again"
+        ) from exc
+    if (
+        relative != identity["relative_path"]
+        or int(stat_result.st_size) != int(identity["size_bytes"])
+        or int(stat_result.st_mtime_ns) != int(identity["mtime_ns"])
+    ):
+        raise ValueError("Run inputs changed after preflight; run preflight again")
+    return str(identity["sha256"])
+
+
+def _build_model_run_input_identity(
+    db: Database,
+    workspace: WorkspaceConfig,
+    *,
+    model_path: Path,
+    checkpoint_path: Path | None,
+    checkpoint_requested: Any,
+    source_bindings: list[dict[str, Any]],
+    request: dict[str, Any],
+    refresh_source_hashes: bool,
+    trusted_preflight_inputs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    trusted_preflight_inputs = (
+        trusted_preflight_inputs
+        if isinstance(trusted_preflight_inputs, dict)
+        and trusted_preflight_inputs.get("schema") == "deep-preflight-physical-inputs-v1"
+        else {}
+    )
+    trusted_model_sha = _trusted_preflight_sha256(
+        trusted_preflight_inputs.get("model"),
+        model_path,
+        models_dir(workspace),
+    )
+    model_identity = build_file_identity(
+        model_path,
+        trusted_root=models_dir(workspace),
+        display_path=model_path.name,
+        content_sha256=trusted_model_sha,
+    )
+    checkpoint_file_identity = None
+    if checkpoint_path is not None:
+        trusted_checkpoint_sha = _trusted_preflight_sha256(
+            trusted_preflight_inputs.get("checkpoint"),
+            checkpoint_path,
+            checkpoints_dir(workspace),
+        )
+        checkpoint_file_identity = build_file_identity(
+            checkpoint_path,
+            trusted_root=checkpoints_dir(workspace),
+            display_path=checkpoint_path.relative_to(checkpoints_dir(workspace)).as_posix(),
+            content_sha256=trusted_checkpoint_sha,
+        )
+    source_identities: list[dict[str, Any]] = []
+    trusted_videos = videos_dir(workspace)
+    trusted_sources = {
+        str(row.get("relative_path") or ""): row
+        for row in (trusted_preflight_inputs.get("sources") or [])
+        if isinstance(row, dict)
+    }
+    for binding in source_bindings:
+        asset = get_asset(db, int(binding["asset_id"]))
+        source_path = Path(str(asset.get("storage_path") or "")).resolve()
+        qualified_name = f"{binding['group']}/{binding['file_name']}"
+        try:
+            catalog_relative = source_path.relative_to(trusted_videos).as_posix()
+        except ValueError as exc:
+            raise ValueError("cataloged source media is outside videos/") from exc
+        if catalog_relative != qualified_name:
+            raise ValueError(
+                f"catalog source identity mismatch: expected {qualified_name}, got {catalog_relative}"
+            )
+        stat_result = source_path.stat()
+        asset_metadata = asset.get("metadata") or {}
+        catalog_digest = None
+        if (
+            not refresh_source_hashes
+            and int(asset.get("size_bytes") or 0) == int(stat_result.st_size)
+            and int(asset_metadata.get("source_mtime_ns") or 0) == int(stat_result.st_mtime_ns)
+        ):
+            catalog_digest = str(asset.get("content_sha256") or "") or None
+        file_identity = build_file_identity(
+            source_path,
+            trusted_root=trusted_videos,
+            display_path=qualified_name,
+            content_sha256=(
+                _trusted_preflight_sha256(
+                    trusted_sources.get(catalog_relative),
+                    source_path,
+                    trusted_videos,
+                )
+                or catalog_digest
+            ),
+        )
+        source_identities.append(
+            build_source_identity(
+                item_id=int(binding["item_id"]),
+                asset_id=int(binding["asset_id"]),
+                qualified_name=qualified_name,
+                file_identity=file_identity,
+            )
+        )
+    return build_run_input_identity(
+        model=model_identity,
+        checkpoint=build_checkpoint_identity(
+            checkpoint_requested,
+            resolved=checkpoint_file_identity,
+        ),
+        sources=source_identities,
+        request=request,
+    )
+
+
 def _retry_run(db: Database, workspace: WorkspaceConfig, run_id: int) -> dict:
     run = db.get_run(run_id)
-    request = dict((run.get("metadata") or {}).get("request") or {})
+    metadata = run.get("metadata") or {}
+    request = dict(metadata.get("request") or {})
     if not request:
-        raise ValueError("这个 Run 没有可重试的文件夹入口配置")
+        raise ValueError("this Run does not contain a retryable file-input request")
     request["retry_of_run_id"] = run_id
     request["name"] = f"{run['name']} retry"
     if str(request.get("run_type") or "model_inference") == "video_compare":
         return _create_video_compare_run(db, workspace, request)
+    identity = metadata.get("input_identity")
+    if not isinstance(identity, dict):
+        raise ValueError("this legacy Run has no exact input identity; use Clone instead")
+    validate_input_identity(identity)
+    assert_input_identity_files_available(
+        identity,
+        models_root=models_dir(workspace),
+        checkpoints_root=checkpoints_dir(workspace),
+        videos_root=videos_dir(workspace),
+    )
+    request["input_identity"] = identity
+    request["_exact_checkpoint"] = resolved_checkpoint_relative_path(identity) or "none"
+    # Clicking Retry explicitly confirms repeating the stored workload. Exact
+    # identity validation below still fences model, checkpoint, and media drift.
+    request["_confirm_current_workload"] = True
     return _create_run_from_files(db, workspace, request)
+
+
+def _clone_run(
+    db: Database,
+    workspace: WorkspaceConfig,
+    run_id: int,
+    *,
+    risk_ack_fingerprint: Any = None,
+) -> dict:
+    run = db.get_run(run_id)
+    source_metadata = run.get("metadata") or {}
+    request = dict(source_metadata.get("request") or {})
+    if not request:
+        raise ValueError("this Run does not contain a cloneable file-input request")
+    request.pop("retry_of_run_id", None)
+    request["clone_of_run_id"] = run_id
+    request["name"] = f"{run['name']} clone"
+    if str(request.get("run_type") or "model_inference") == "video_compare":
+        return _create_video_compare_run(db, workspace, request)
+    if isinstance(source_metadata.get("input_identity"), dict):
+        request["_clone_input_identity"] = source_metadata["input_identity"]
+    request_fingerprint = _preflight_request_fingerprint(request)
+    acknowledged = str(risk_ack_fingerprint or "").strip()
+    if risk_ack_fingerprint is not None and not isinstance(risk_ack_fingerprint, str):
+        raise ValueError("risk_ack_fingerprint must be a string")
+    acknowledged_scope = None
+    if acknowledged:
+        acknowledged_scope = _consume_clone_risk_ack(
+            workspace,
+            run_id,
+            acknowledged,
+            request_fingerprint,
+        )
+    if acknowledged_scope:
+        # The acknowledgement binds the exact workload returned by the prior
+        # 409. _create_run_from_files still requires its stable execution scope
+        # to match after re-reading current files and device availability.
+        request["_workload_risk_ack_scope_fingerprint"] = acknowledged_scope
+    try:
+        return _create_run_from_files(db, workspace, request)
+    except _WorkloadRiskConfirmationRequired as exc:
+        challenge = str(exc.workload.get("risk_fingerprint") or "").strip()
+        if challenge:
+            _remember_clone_risk_ack(
+                workspace,
+                run_id,
+                challenge,
+                request_fingerprint,
+                workload_confirmation_scope_fingerprint(exc.workload),
+            )
+        raise
+
+
+def _clone_risk_ack_scope(workspace: WorkspaceConfig) -> str:
+    return str(workspace.db_path.resolve())
+
+
+def _remember_clone_risk_ack(
+    workspace: WorkspaceConfig,
+    run_id: int,
+    risk_fingerprint: str,
+    request_fingerprint: str,
+    workload_scope_fingerprint: str,
+) -> None:
+    now = time.monotonic()
+    key = (_clone_risk_ack_scope(workspace), int(run_id), str(risk_fingerprint))
+    with _CLONE_RISK_ACK_LOCK:
+        expired = [
+            row_key
+            for row_key, row in _CLONE_RISK_ACK_CHALLENGES.items()
+            if float(row.get("expires_at") or 0.0) <= now
+        ]
+        for row_key in expired:
+            _CLONE_RISK_ACK_CHALLENGES.pop(row_key, None)
+        _CLONE_RISK_ACK_CHALLENGES[key] = {
+            "expires_at": now + _CLONE_RISK_ACK_TTL_SECONDS,
+            "request_fingerprint": str(request_fingerprint),
+            "workload_scope_fingerprint": str(workload_scope_fingerprint),
+        }
+
+
+def _consume_clone_risk_ack(
+    workspace: WorkspaceConfig,
+    run_id: int,
+    risk_fingerprint: str,
+    request_fingerprint: str,
+) -> str | None:
+    now = time.monotonic()
+    key = (_clone_risk_ack_scope(workspace), int(run_id), str(risk_fingerprint))
+    with _CLONE_RISK_ACK_LOCK:
+        row = _CLONE_RISK_ACK_CHALLENGES.get(key)
+        if row is None:
+            return None
+        if (
+            float(row.get("expires_at") or 0.0) <= now
+            or str(row.get("request_fingerprint") or "") != str(request_fingerprint)
+        ):
+            _CLONE_RISK_ACK_CHALLENGES.pop(key, None)
+            return None
+        _CLONE_RISK_ACK_CHALLENGES.pop(key, None)
+        scope_fingerprint = str(row.get("workload_scope_fingerprint") or "")
+        return scope_fingerprint or None
 
 
 def _reference_config(
@@ -2913,7 +3829,59 @@ def _run_detail(db: Database, run_id: int) -> dict:
     run = db.get_run(run_id)
     run["jobs"] = db.list_run_jobs(run_id)
     run["feedback"] = db.list_run_feedback(run_id)
+    run["artifact_storage"] = _artifact_storage_diagnostic(run)
     return run
+
+
+def _artifact_storage_diagnostic(run: dict[str, Any]) -> dict[str, Any]:
+    """Compare stored preflight budget with the completion-time byte summary."""
+
+    workload = (run.get("metadata") or {}).get("workload") or {}
+    summary = run.get("artifact_summary") or {}
+    predicted_raw = workload.get("artifact_budget_bytes")
+    try:
+        predicted = max(0, int(predicted_raw)) if predicted_raw is not None else None
+    except (TypeError, ValueError):
+        predicted = None
+    has_actual = "storage_bytes" in summary
+    try:
+        actual = max(0, int(summary.get("storage_bytes") or 0)) if has_actual else None
+    except (TypeError, ValueError):
+        actual = None
+        has_actual = False
+    try:
+        unknown = max(0, int(summary.get("storage_size_unknown") or 0))
+    except (TypeError, ValueError):
+        unknown = 0
+    try:
+        known = max(0, int(summary.get("storage_size_known") or 0))
+    except (TypeError, ValueError):
+        known = 0
+    if not has_actual:
+        measurement = "unavailable"
+    elif unknown:
+        measurement = "partial"
+    elif run.get("artifact_cleaned_at") is not None:
+        measurement = "cleaned"
+    elif str(run.get("status") or "") in TERMINAL_RUN_STATUSES:
+        measurement = "complete"
+    else:
+        measurement = "in_progress"
+    comparable = predicted is not None and predicted > 0 and actual is not None
+    return {
+        "predicted_artifact_budget_bytes": predicted,
+        "actual_artifact_bytes": actual,
+        "actual_size_known_artifacts": known,
+        "actual_size_unknown_artifacts": unknown,
+        "measurement": measurement,
+        "actual_minus_predicted_bytes": (
+            int(actual - predicted) if comparable else None
+        ),
+        "budget_utilization_ratio": (
+            float(actual / predicted) if comparable else None
+        ),
+        "source": "artifact_summary",
+    }
 
 
 def _parse_feedback_rating(rating_raw: Any) -> float | None:

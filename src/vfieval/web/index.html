@@ -20,7 +20,7 @@
           <button class="nav-item" data-view="media" type="button">Media Library</button>
           <button class="nav-item" data-view="evaluations" type="button">Evaluation Studio</button>
           <button class="nav-item" data-view="runs" type="button">运行记录</button>
-          <button class="nav-item" data-view="stats" type="button">评分统计</button>
+          <button class="nav-item" data-view="stats" type="button">主观反馈统计</button>
         </nav>
       </aside>
 
@@ -259,6 +259,7 @@
               <label><span>Uploaded Pred</span><select id="external-pred-asset" name="asset_id" required></select></label>
               <label><span>Method key</span><input name="method_key" maxlength="240" required placeholder="e.g. external:model-a"></label>
             </div>
+            <div id="external-pred-item-pager" class="pager"></div>
             <details class="advanced">
               <summary>Temporal / spatial provenance (advanced)</summary>
               <p class="muted">Use a JSON object only when this Pred has an explicit source-frame mapping or known spatial origin. Without a mapping, strict exact temporal validation still applies.</p>
@@ -297,8 +298,8 @@
         <section class="panel">
           <div class="panel-head">
             <div>
-              <h2>评分统计</h2>
-              <p class="muted">汇总各运行记录的用户评分与提出的问题。</p>
+              <h2>主观反馈统计</h2>
+              <p class="muted">仅汇总 Run 的人工评分与问题反馈；Campaign 客观指标和 LPIPS 曲线在 Evaluation Studio 单独展示。</p>
             </div>
             <button id="refresh-stats" class="secondary" type="button">刷新</button>
           </div>

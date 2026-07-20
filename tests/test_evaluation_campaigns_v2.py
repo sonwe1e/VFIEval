@@ -45,11 +45,13 @@ from vfieval.evaluations_v2 import (
     get_preparation_v2,
     list_run_outputs,
     preview_campaign_v2,
+    process_campaign_purge_requests_v2,
     publish_campaign_v2,
     request_publish_campaign_v2,
     run_pending_preparations,
 )
 from vfieval.evaluations import add_candidate, create_campaign, publish_campaign
+from vfieval.db import Database
 from vfieval.media_assets import (
     bind_metric_result,
     create_collection,
@@ -498,6 +500,94 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
                     int(evaluation_item["id"]),
                     "vmaf",
                 )
+
+    def test_analysis_cache_version_ignores_legacy_objective_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _media_item, body, _paths = self._item_campaign(workspace, db)
+            campaign = create_campaign_v2(db, workspace, body)
+            detail = get_campaign_v2(db, int(campaign["id"]))
+            evaluation_item_id = int(detail["items"][0]["id"])
+            with db.connection() as conn:
+                for method in detail["methods"]:
+                    conn.execute(
+                        "UPDATE runs SET metrics_json = ? WHERE id = ?",
+                        (
+                            json.dumps(["lpips_vit_patch"]),
+                            int(method["source_run_id"]),
+                        ),
+                    )
+
+            fresh = campaign_analysis_v2(
+                db,
+                int(campaign["id"]),
+                bootstrap_samples=0,
+            )
+            fingerprint = str(fresh["objective"]["metric_fingerprint"])
+            legacy_cache_key = json.dumps(
+                {
+                    "bootstrap_samples": 0,
+                    "video": "",
+                    "objective_fingerprint": fingerprint,
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            legacy_payload = {
+                "sentinel": "legacy-objective-cache",
+                "objective": {
+                    "items": [
+                        {
+                            "video_name": "clip",
+                            "metric_name": "lpips_vit_patch",
+                        }
+                    ]
+                },
+            }
+            with db.connection() as conn:
+                conn.execute(
+                    "DELETE FROM evaluation_analysis_cache_v2 WHERE campaign_id = ?",
+                    (int(campaign["id"]),),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO evaluation_analysis_cache_v2(
+                        campaign_id, cache_key, vote_revision, payload_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(campaign["id"]),
+                        legacy_cache_key,
+                        int(detail["vote_revision"]),
+                        json.dumps(legacy_payload),
+                        time.time(),
+                    ),
+                )
+
+            rebuilt = campaign_analysis_v2(
+                db,
+                int(campaign["id"]),
+                bootstrap_samples=0,
+            )
+            self.assertNotIn("sentinel", rebuilt)
+            self.assertEqual(
+                {
+                    int(row["item_id"])
+                    for row in rebuilt["objective"]["items"]
+                },
+                {evaluation_item_id},
+            )
+            cache_keys = {
+                str(row["cache_key"])
+                for row in db.query(
+                    "SELECT cache_key FROM evaluation_analysis_cache_v2 WHERE campaign_id = ?",
+                    (int(campaign["id"]),),
+                )
+            }
+            self.assertIn(legacy_cache_key, cache_keys)
+            self.assertTrue(
+                any('"analysis_version": 2' in key for key in cache_keys)
+            )
 
     def _upload_asset(self, db, collection_id, path, role, name):
         return upsert_asset(
@@ -2009,6 +2099,218 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             self.assertEqual(completed["status"], "completed")
             self.assertIsNotNone(db.get_run(run_a)["deleted_at"])
 
+    def test_campaign_delete_preserves_ambiguous_collection_asset_when_size_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _run_a, _run_b, body, _paths = self._two_runs(workspace, db)
+            campaign = create_campaign_v2(db, workspace, body)
+            campaign_id = int(campaign["id"])
+            package = workspace.evaluations_dir / str(campaign_id)
+            package.mkdir(parents=True)
+            (package / "unreadable.partial").write_bytes(b"partial")
+            collection = ensure_collection(
+                db,
+                f"Evaluation Package {campaign_id}",
+                f"evaluation-package-{campaign_id}",
+                {"source_kind": "evaluation_package", "campaign_id": campaign_id},
+            )
+            ambiguous_path = workspace.media_dir / "ambiguous-package-asset.mp4"
+            ambiguous_path.write_bytes(b"belongs elsewhere")
+            ambiguous = upsert_asset(
+                db,
+                collection_id=int(collection["id"]),
+                source_key=f"evaluation_package:{campaign_id + 1000}:1:a",
+                source_kind="evaluation_package",
+                media_kind="video",
+                role="pred",
+                display_name="ambiguous package asset",
+                original_name=ambiguous_path.name,
+                storage_path=ambiguous_path,
+                size_bytes=ambiguous_path.stat().st_size,
+                provenance={"campaign_id": campaign_id + 1000},
+            )
+
+            with patch(
+                "vfieval.evaluations_v2._path_size",
+                side_effect=OSError("package accounting unavailable"),
+            ):
+                deleted = delete_campaign_v2(
+                    db,
+                    workspace,
+                    campaign_id,
+                    confirmed=True,
+                )
+
+            self.assertTrue(deleted["deleted"])
+            self.assertEqual(deleted["reclaimed_bytes"], 0)
+            self.assertFalse(deleted["cleanup_pending"])
+            self.assertFalse(package.exists())
+            self.assertEqual(deleted["skipped_asset_ids"], [int(ambiguous["id"])])
+            self.assertTrue(deleted["cleanup_warnings"])
+            self.assertIsNotNone(
+                db.get("SELECT id FROM media_assets WHERE id = ?", (int(ambiguous["id"]),))
+            )
+            self.assertIsNotNone(
+                db.get("SELECT id FROM media_collections WHERE id = ?", (int(collection["id"]),))
+            )
+
+    def test_campaign_delete_rejects_cross_campaign_task_binding_and_vote_references(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _run_a, _run_b, body, _paths = self._two_runs(workspace, db)
+            target = create_campaign_v2(db, workspace, body)
+            other = create_campaign_v2(db, workspace, body)
+            target_id = int(target["id"])
+            other_id = int(other["id"])
+            target_item = db.get(
+                "SELECT id FROM evaluation_items_v2 WHERE campaign_id = ?",
+                (target_id,),
+            )
+            target_bindings = db.query(
+                "SELECT id, source_asset_id FROM evaluation_bindings_v2 "
+                "WHERE item_id = ? ORDER BY id",
+                (int(target_item["id"]),),
+            )
+            now = time.time()
+            with db.connection() as conn:
+                task_cursor = conn.execute(
+                    """
+                    INSERT INTO evaluation_tasks_v2(
+                        task_token, campaign_id, item_id, binding_a_id,
+                        binding_b_id, state, created_at
+                    ) VALUES (?, ?, ?, ?, ?, 'ready', ?)
+                    """,
+                    (
+                        "cross-campaign-delete-task",
+                        other_id,
+                        int(target_item["id"]),
+                        int(target_bindings[0]["id"]),
+                        int(target_bindings[1]["id"]),
+                        now,
+                    ),
+                )
+                cross_task_id = int(task_cursor.lastrowid)
+
+            with self.assertRaisesRegex(EvaluationConflict, "cross-Campaign reference"):
+                delete_campaign_v2(db, workspace, target_id, confirmed=True)
+            self.assertIsNotNone(
+                db.get("SELECT id FROM evaluation_tasks_v2 WHERE id = ?", (cross_task_id,))
+            )
+            self.assertIsNotNone(
+                db.get("SELECT id FROM evaluation_campaigns_v2 WHERE id = ?", (target_id,))
+            )
+
+            with db.connection() as conn:
+                conn.execute("DELETE FROM evaluation_tasks_v2 WHERE id = ?", (cross_task_id,))
+            other_item = db.get(
+                "SELECT id FROM evaluation_items_v2 WHERE campaign_id = ?",
+                (other_id,),
+            )
+            target_method = db.get(
+                "SELECT id FROM evaluation_methods_v2 WHERE campaign_id = ? ORDER BY id LIMIT 1",
+                (target_id,),
+            )
+            with db.connection() as conn:
+                binding_cursor = conn.execute(
+                    """
+                    INSERT INTO evaluation_bindings_v2(
+                        item_id, method_id, source_asset_id, state,
+                        alignment_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'selected', '{}', ?, ?)
+                    """,
+                    (
+                        int(other_item["id"]),
+                        int(target_method["id"]),
+                        int(target_bindings[0]["source_asset_id"]),
+                        now,
+                        now,
+                    ),
+                )
+                cross_binding_id = int(binding_cursor.lastrowid)
+
+            with self.assertRaisesRegex(EvaluationConflict, "cross-Campaign reference"):
+                delete_campaign_v2(db, workspace, target_id, confirmed=True)
+            self.assertIsNotNone(
+                db.get(
+                    "SELECT id FROM evaluation_bindings_v2 WHERE id = ?",
+                    (cross_binding_id,),
+                )
+            )
+            self.assertIsNotNone(
+                db.get("SELECT id FROM evaluation_campaigns_v2 WHERE id = ?", (target_id,))
+            )
+
+            with db.connection() as conn:
+                conn.execute(
+                    "DELETE FROM evaluation_bindings_v2 WHERE id = ?",
+                    (cross_binding_id,),
+                )
+            other_bindings = db.query(
+                "SELECT id FROM evaluation_bindings_v2 WHERE item_id = ? ORDER BY id",
+                (int(other_item["id"]),),
+            )
+            with db.connection() as conn:
+                task_cursor = conn.execute(
+                    """
+                    INSERT INTO evaluation_tasks_v2(
+                        task_token, campaign_id, item_id, binding_a_id,
+                        binding_b_id, state, created_at
+                    ) VALUES (?, ?, ?, ?, ?, 'ready', ?)
+                    """,
+                    (
+                        "cross-campaign-vote-task",
+                        other_id,
+                        int(other_item["id"]),
+                        int(other_bindings[0]["id"]),
+                        int(other_bindings[1]["id"]),
+                        now,
+                    ),
+                )
+                vote_task_id = int(task_cursor.lastrowid)
+                conn.execute(
+                    """
+                    INSERT INTO evaluators(
+                        id, display_name, metadata_json, created_at, updated_at, last_seen_at
+                    ) VALUES ('cross-campaign-voter', 'Cross Campaign', '{}', ?, ?, ?)
+                    """,
+                    (now, now, now),
+                )
+                assignment_cursor = conn.execute(
+                    """
+                    INSERT INTO evaluation_assignments_v2(
+                        assignment_token, task_id, evaluator_id, state, side_swap,
+                        lease_expires_at, created_at, updated_at
+                    ) VALUES (?, ?, 'cross-campaign-voter', 'voted', 0, ?, ?, ?)
+                    """,
+                    ("cross-campaign-assignment", vote_task_id, now + 60, now, now),
+                )
+                assignment_id = int(assignment_cursor.lastrowid)
+                vote_cursor = conn.execute(
+                    """
+                    INSERT INTO evaluation_votes_v2(
+                        task_id, evaluator_id, assignment_id, choice,
+                        preferred_method_id, reasons_json, confidence, note,
+                        presentation_json, created_at, updated_at
+                    ) VALUES (?, 'cross-campaign-voter', ?, 'left', ?, '[]', '', '', '{}', ?, ?)
+                    """,
+                    (vote_task_id, assignment_id, int(target_method["id"]), now, now),
+                )
+                cross_vote_id = int(vote_cursor.lastrowid)
+
+            with self.assertRaisesRegex(EvaluationConflict, "cross-Campaign reference"):
+                delete_campaign_v2(db, workspace, target_id, confirmed=True)
+            cross_vote = db.get(
+                "SELECT preferred_method_id FROM evaluation_votes_v2 WHERE id = ?",
+                (cross_vote_id,),
+            )
+            self.assertEqual(
+                int(cross_vote["preferred_method_id"]),
+                int(target_method["id"]),
+            )
+            self.assertIsNotNone(
+                db.get("SELECT id FROM evaluation_campaigns_v2 WHERE id = ?", (target_id,))
+            )
+
     def test_campaign_delete_tombstone_cleanup_is_retryable_after_file_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace, db = make_workspace(tmp)
@@ -2034,17 +2336,98 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
                     confirmed=True,
                 )
             self.assertTrue(deleted["cleanup_pending"])
+            self.assertEqual(deleted["cleanup_status"], "requested")
+            self.assertGreater(int(deleted["cleanup_request_id"]), 0)
             self.assertTrue(tombstone.exists())
 
-            retried = delete_campaign_v2(
-                db,
-                workspace,
-                campaign_id,
-                confirmed=True,
+            with db.connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE evaluation_purge_requests_v2
+                    SET status = 'running', claim_token = 'crashed-process', updated_at = ?
+                    WHERE campaign_id = ?
+                    """,
+                    (time.time(), campaign_id),
+                )
+            self.assertEqual(
+                process_campaign_purge_requests_v2(
+                    db,
+                    workspace,
+                    stale_after_seconds=60,
+                ),
+                [],
             )
-            self.assertTrue(retried["already_deleted"])
-            self.assertFalse(retried["cleanup_pending"])
+            self.assertTrue(tombstone.exists())
+            with db.connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE evaluation_purge_requests_v2
+                    SET updated_at = ?
+                    WHERE campaign_id = ? AND claim_token = 'crashed-process'
+                    """,
+                    (time.time() - 120, campaign_id),
+                )
+            restarted_db = Database(workspace.db_path)
+            restarted_db.init()
+            with patch(
+                "vfieval.evaluations_v2._path_size",
+                side_effect=OSError("package accounting unavailable"),
+            ):
+                retried = process_campaign_purge_requests_v2(
+                    restarted_db,
+                    workspace,
+                    stale_after_seconds=60,
+                )
+            self.assertEqual(len(retried), 1)
+            self.assertEqual(retried[0]["status"], "completed")
+            self.assertEqual(retried[0]["claim_token"], "")
+            self.assertGreaterEqual(int(retried[0]["attempt_count"]), 2)
             self.assertFalse(tombstone.exists())
+
+    def test_stale_campaign_purge_restores_quarantine_when_campaign_survived(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _run_a, _run_b, body, _paths = self._two_runs(workspace, db)
+            campaign = create_campaign_v2(db, workspace, body)
+            campaign_id = int(campaign["id"])
+            package = workspace.evaluations_dir / str(campaign_id)
+            package.mkdir(parents=True)
+            (package / "manifest.partial").write_bytes(b"preserve me")
+            tombstone = workspace.evaluations_dir / ".delete-staging" / str(campaign_id)
+            tombstone.parent.mkdir(parents=True)
+            os.replace(package, tombstone)
+            now = time.time()
+            with db.connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO evaluation_purge_requests_v2(
+                        campaign_id, status, attempt_count, claim_token,
+                        requested_at, started_at, updated_at
+                    ) VALUES (?, 'running', 1, 'crashed-before-commit', ?, ?, ?)
+                    """,
+                    (campaign_id, now - 180, now - 180, now - 180),
+                )
+
+            restarted_db = Database(workspace.db_path)
+            restarted_db.init()
+            recovered = process_campaign_purge_requests_v2(
+                restarted_db,
+                workspace,
+                stale_after_seconds=60,
+            )
+
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(recovered[0]["status"], "completed")
+            self.assertTrue(recovered[0]["report"]["campaign_preserved"])
+            self.assertTrue(package.is_dir())
+            self.assertFalse(tombstone.exists())
+            self.assertEqual((package / "manifest.partial").read_bytes(), b"preserve me")
+            self.assertIsNotNone(
+                restarted_db.get(
+                    "SELECT id FROM evaluation_campaigns_v2 WHERE id = ?",
+                    (campaign_id,),
+                )
+            )
 
     def test_run_purge_freezes_readable_published_v1_campaign_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

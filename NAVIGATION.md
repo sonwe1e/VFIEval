@@ -76,11 +76,13 @@ User rating (1–5, 0.25 step) + free-text issue per run; content-scoped (video/
 
 ### 4. Standard inference run creation
 - **API:** `server.py` `_create_run_from_files` (L843), `_default_run_name` (L1254), `_reference_config` (L1191), `_resolve_execution_devices` (L1289), `_create_inference_shards` (L1305), `_partition_samples_by_video` (L1349)
-- **Routes:** `POST /api/runs` (default), `POST /api/preflight`
-- **Preflight/scan:** `file_inputs.py` `preflight_run` (L346), `resolve_video_selection` (L232), `_dry_run_model_file` (L926)
+- **Exact input identity:** `input_identity.py` builds portable model/checkpoint/source signatures, normalized request fingerprints, and public structured retry differences
+- **Routes:** `POST /api/runs` (default), `POST /api/preflight` with `preflight_level=quick|deep`, and `POST /api/preflight/quick`; deep preflight returns `input_fingerprint` and mints a short-lived request-and-physical-input-bound token reused by matching Run creation
+- **Preflight/scan:** `file_inputs.py` `preflight_run` (L346), `resolve_video_selection` (L232), `_dry_run_model_file` (L926); quick preflight skips model construction/full cache identity, deep preflight owns the model contract check
+- **Workload guard:** `workload.py` `estimate_workload` (pure JSON-safe memory/artifact estimate, risk reasons/fingerprint)
 - **Dataset:** `datasets.py` `_resolve_video_entries` (L659), `VideoEntry` (L71)
-- **Frontend:** `app.js` `payloadFromForm` (L673), `startRun` (L1277), `runPreflight` (L766), `renderPreflight` (L955)
-- **Tests:** `tests/test_v2_runs.py`, `tests/test_v3_file_flow.py`, `tests/test_video_datasets.py`
+- **Frontend:** `app.js` `payloadFromForm` (L673), `startRun` (deep/token/risk acknowledgement), `runPreflight` (automatic quick vs forced deep), `renderPreflight`/`renderWorkloadEstimate`
+- **Tests:** `tests/test_v2_runs.py`, `tests/test_v3_file_flow.py`, `tests/test_video_datasets.py`, `tests/test_two_level_preflight.py`, `tests/test_run_reproducibility.py`, `tests/test_experiment_experience_ui.py`, `tests/test_workload.py`, `tests/test_input_identity.py`
 
 ### 5. Multi-group inference
 - **Backing:** `datasets._resolve_video_entries` (single `video_group` vs `video_groups` list), `file_inputs.resolve_video_selection` (L232)
@@ -118,17 +120,20 @@ User rating (1–5, 0.25 step) + free-text issue per run; content-scoped (video/
 - **Indices:** `idx_artifacts_sample(sample_id, kind)`, `idx_metric_results_sample(sample_id, metric_name)`, `idx_run_jobs_device(device)`
 - **Rule:** these handlers must NOT call `_run_timeline` or iterate the whole run.
 - **Freshness:** `runs.content_revision`; `db.bump_run_content_revision`. Artifact publication, metric completion, and artifact cleanup increment it; list/detail payloads expose it.
-- **Frontend:** `app.js` `runContentRevisionChanged`, `invalidateRunResultCache`, `refreshRunsOnce`, `refreshRunResults`, `selectRun`, `loadRunVideoTimeline`, `loadSampleDetail`; requests carry generation/abort guards and preserve the current selection on refresh.
+- **Storage diagnostic:** artifact publication records canonical/preview byte sizes in artifact metadata; completion summaries expose actual bytes and `_run_detail` compares them with the preflight workload budget without filesystem reads.
+- **Frontend:** `app.js` `runContentRevisionChanged`, `invalidateRunResultCache`, `refreshRunsOnce`, `refreshRunResults`, `selectRun`, `loadRunVideoTimeline`, `loadSampleDetail`; requests carry generation/abort guards and preserve the current selection on refresh. Paged Run payloads include a global `active_total`, keeping the two-second poll active even when work is outside the visible page/filter.
 - **Tests:** `tests/test_sample_api_scope.py`, `tests/test_db_indices.py`, `tests/test_run_result_freshness_ui.py`
+- **Runtime health:** `GET /api/health` reads `CatalogSyncCoordinator.status()` plus durable Run/Campaign cleanup backlog counts; it never claims work or walks storage. Covered by `tests/test_runtime_diagnostics.py`.
 
 ### 10. Run lifecycle (retry / cancel / delete / cleanup)
-- **Service:** `run_cleanup.py` `RunCleanupService.request_delete`, `request_artifact_cleanup`, `process_pending`, `_purge_run`, `gc_preview`, `garbage_collect`; `register_run_cache_refs`, `cache_lease`
+- **Service:** `run_cleanup.py` `RunCleanupService.preview_run_purge`, `consume_run_purge_preview`, `request_delete`, `request_artifact_cleanup`, `process_pending`, `_purge_run`, `gc_preview`, `garbage_collect`; `register_run_cache_refs`, `cache_lease`
 - **Data:** `db.py` purge request CRUD/claim/recovery methods, `mark_run_deleted_after_purge`, cache entry/ref/lease helpers, `bump_run_content_revision`
-- **Routes:** `DELETE /api/runs/{id}` and legacy `/hide` return `202`; `POST /api/runs/{id}/cleanup-artifacts`, `/api/runs/batch-delete`; `GET /api/run-purge-requests/{id}`, `/api/storage/gc/preview`; `POST /api/storage/gc`
-- **Loop:** `server.py` starts `RunCleanupService.run_forever`; embedded handlers pump pending requests so restart/test servers converge.
-- **Frontend:** `app.js` `runPurgeState`, `renderRunPurgeNotice`, `deleteRun`, `batchDeleteRuns`, `cleanupRunArtifacts`; Campaign dependency failures expose a Studio entry; `studio.js` `previewStorageGc`, `executeStorageGc`
-- **Invariants:** only `.vfieval/runs/{id}` is deleted; `deleted_at` is written after successful purge; shared cache needs zero active refs, zero leases, and expired grace; storage GC requires preview + `confirm=true`.
-- **Tests:** `tests/test_run_cleanup.py`, `tests/test_v3_file_flow.py`
+- **Retry/Clone:** `server.py` `_retry_run` performs exact identity validation and freezes the resolved checkpoint; `_clone_run` deliberately resolves current files and records identity differences
+- **Routes:** `POST /api/runs/{id}/{retry,clone}`; `POST /api/run-purge/preview`; confirmed `DELETE /api/runs/{id}` and legacy `/hide` return `202`; confirmed `POST /api/runs/{id}/cleanup-artifacts`, `/api/runs/batch-delete`; `GET /api/run-purge-requests/{id}`, `/api/storage/gc/preview`; `POST /api/storage/gc`
+- **Loop:** production `server.py` and embedded test harnesses explicitly start `RunCleanupService.run_forever`; HTTP request handlers never pump pending cleanup work.
+- **Frontend:** `app.js` `cloneRunWithCurrentInputs`, `requestRunPurgePreview`, `withRunPurgePreview`, `deleteRun`, `batchDeleteRuns`, `cleanupRunArtifacts`, `runPurgeState`, `renderRunPurgeNotice`; Campaign dependency failures expose a Studio entry; `studio.js` `previewStorageGc`, `executeStorageGc`
+- **Invariants:** Run deletion/artifact cleanup requires a fresh one-use preview token bound to operation, exact Run IDs, lifecycle/dependency/cache state; only `.vfieval/runs/{id}` is deleted; `deleted_at` is written after successful purge; shared cache needs zero active refs, zero leases, and expired grace; storage GC requires preview + `confirm=true`.
+- **Tests:** `tests/test_run_cleanup.py`, `tests/test_run_purge_preview.py`, `tests/test_run_reproducibility.py`, `tests/test_v3_file_flow.py`
 
 ### 11. Artifact / file streaming
 - **API:** `server.py` `_send_artifact` (L477), `_send_sample_file` (L491), `_send_file` (L504), `_parse_range_header` (L554)
@@ -143,12 +148,13 @@ User rating (1–5, 0.25 step) + free-text issue per run; content-scoped (video/
 
 ### 13. Unified media catalog + resolver
 - **Data/model:** `media_assets.py` `create_collection`, `upsert_asset`, `sync_folder_assets`, `sync_run_assets`, `resolve_asset_path`, `source_assets_to_video_payload`, `soft_delete_asset`, `media_audit`
+- **Coordination:** `catalog_sync.py` `CatalogSyncCoordinator` coalesces startup/explicit background reconciliation and exposes status/revision; catalog GET routes consume read-only SQLite snapshots
 - **Tables:** `media_collections`, `media_assets`, `media_asset_relations`, `run_media_assets`, `metric_asset_bindings`, `schema_migrations`; frozen Campaign media uses `source_kind='evaluation_package'`
-- **Routes:** `GET/POST /api/media/collections`, `GET /api/media/assets`, `GET /api/media/sources`, `GET /api/media/run-outputs`, `GET/DELETE /api/media/assets/{id}`, `GET /api/media/assets/{id}/content`, `GET /api/media/audit`
-- **Frontend:** `app.js` owns Sources/Uploads; `studio.js` `loadRunOutputs`, `renderDerivedRuns`, `renderPackages` owns Derived Runs and Evaluation Packages; `#view-media`
+- **Routes:** `POST /api/media/sync`, `GET /api/media/sync/status`; `GET/POST /api/media/collections`, `GET /api/media/assets`, `GET /api/media/sources`, `GET /api/media/run-outputs`, `GET/DELETE /api/media/assets/{id}`, `GET /api/media/assets/{id}/content`, `GET /api/media/assets/{id}/thumbnail` (lazy generation), `GET /api/media/audit`
+- **Frontend:** `app.js` `syncCatalogAndRefresh`/`waitForCatalogSync` plus Sources/Uploads; `studio.js` `loadRunOutputs`, `renderDerivedRuns`, `renderPackages` owns Derived Runs and Evaluation Packages; `#view-media`
 - **Visibility:** internal Run/evaluation collections are not user collections; deleted/cleaned Run outputs stay unavailable and must not be resurrected by catalog sync.
 - **Compare:** `compare_inputs.resolve_compare_descriptor(kind="media_asset")`; primary picker submits asset ids
-- **Tests:** `tests/test_media_catalog_uploads.py`, `tests/test_compare_multitrack.py`
+- **Tests:** `tests/test_catalog_sync.py`, `tests/test_server_request_maintenance.py`, `tests/test_media_catalog_uploads.py`, `tests/test_compare_multitrack.py`
 
 ### 14. External resumable uploads
 - **Runner:** `uploads.py` `create_upload_session`, `receive_upload_part`, `complete_upload_session`, `delete_upload_session`, `cleanup_stale_uploads`, `_extract_frame_zip`

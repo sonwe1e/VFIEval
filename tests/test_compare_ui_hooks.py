@@ -159,5 +159,27 @@ class CompareUiHookTests(unittest.TestCase):
         self.assertNotIn("浏览器无法播放此视频格式", app_js)
 
 
+    def test_single_run_delete_and_artifact_cleanup_require_preview_confirmation(self) -> None:
+        app_js = (ROOT / "src" / "vfieval" / "web" / "app.js").read_text(encoding="utf-8")
+        delete_source = app_js.split("async function deleteRun", 1)[1].split(
+            "async function renameRun", 1
+        )[0]
+        cleanup_source = app_js.split("async function cleanupRunArtifacts", 1)[1].split(
+            "async function submitRunFeedback", 1
+        )[0]
+        confirmation_source = app_js.split("function confirmRunPurgePreview", 1)[1].split(
+            "async function withRunPurgePreview", 1
+        )[0]
+
+        self.assertIn('withRunPurgePreview("delete_run", [runId]', delete_source)
+        self.assertIn("preview_token=${encodeURIComponent(previewToken)}", delete_source)
+        self.assertLess(delete_source.index("withRunPurgePreview"), delete_source.index('method: "DELETE"'))
+        self.assertIn('withRunPurgePreview("cleanup_artifacts", [runId]', cleanup_source)
+        self.assertIn("JSON.stringify({ preview_token: previewToken })", cleanup_source)
+        self.assertIn("window.confirm", confirmation_source)
+        self.assertIn("此操作不可撤销", confirmation_source)
+        self.assertIn("原图、视频和 Diff 将不再可查看", confirmation_source)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -710,6 +710,233 @@ def sync_folder_assets(db: Database, workspace: WorkspaceConfig) -> int:
     return count
 
 
+def ensure_folder_asset(
+    db: Database,
+    workspace: WorkspaceConfig,
+    group_name: str,
+    video_name: str,
+    *,
+    media_info: dict[str, Any] | None = None,
+    trusted_content_identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Catalog one server-resolved ``videos/<group>/<file>`` input.
+
+    Run creation uses this targeted path so a missing/stale catalog row does
+    not force a full-library scan (including unrelated hashes/thumbnails) after
+    deep preflight. The caller supplies names, never an arbitrary filesystem
+    path; containment and the supported video suffix are revalidated here.
+    """
+
+    group = str(group_name or "").strip()
+    name = str(video_name or "").strip()
+    if not group or Path(group).name != group:
+        raise ValueError("video group must be one folder name under videos/")
+    if not name or Path(name).name != name or Path(name).suffix.lower() not in VIDEO_SUFFIXES:
+        raise ValueError("video must be a supported file name under its video group")
+    root = videos_dir(workspace).resolve()
+    path = (root / group / name).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("folder media resolved outside videos/") from exc
+    if not path.is_file():
+        raise FileNotFoundError(f"selected video is unavailable: {group}/{name}")
+
+    info = dict(media_info or inspect_video(path, workspace, exact=False))
+    if not info.get("decodable"):
+        raise ValueError(str(info.get("error") or f"video is not decodable: {group}/{name}"))
+    collection = ensure_collection(
+        db,
+        f"videos/{group}",
+        _folder_collection_slug(db, group),
+        {"source_kind": "folder", "video_group": group},
+    )
+    source_key = f"folder:{group}/{name}"
+    stat_result = path.stat()
+    content_sha256: str
+    if trusted_content_identity is not None:
+        trusted = dict(trusted_content_identity)
+        trusted_relative = str(trusted.get("relative_path") or "").replace("\\", "/")
+        trusted_sha256 = str(trusted.get("sha256") or "").strip().lower()
+        try:
+            trusted_size = int(trusted.get("size_bytes"))
+            trusted_mtime_ns = int(trusted.get("mtime_ns"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("deep preflight source identity is invalid") from exc
+        if (
+            trusted_relative != f"{group}/{name}"
+            or not re.fullmatch(r"[0-9a-f]{64}", trusted_sha256)
+            or trusted_size != int(stat_result.st_size)
+            or trusted_mtime_ns != int(stat_result.st_mtime_ns)
+        ):
+            raise ValueError(
+                "Run inputs changed after preflight; run preflight again"
+            )
+        content_sha256 = trusted_sha256
+    else:
+        content_sha256 = _file_sha256(db, source_key, path)
+    asset = upsert_asset(
+        db,
+        collection_id=int(collection["id"]),
+        source_key=source_key,
+        source_kind="folder",
+        media_kind="video",
+        role="gt",
+        display_name=name,
+        original_name=name,
+        storage_path=path,
+        state="ready",
+        content_sha256=content_sha256,
+        size_bytes=int(stat_result.st_size),
+        frame_count=int(info.get("frame_count") or 0),
+        width=int(info.get("width") or 0),
+        height=int(info.get("height") or 0),
+        fps=info.get("fps"),
+        provenance={"video_group": group, "video": name},
+        metadata={
+            "duration_seconds": info.get("duration_seconds"),
+            "frame_count_source": info.get("frame_count_source"),
+            "metadata_source": info.get("metadata_source"),
+            "source_mtime_ns": int(stat_result.st_mtime_ns),
+        },
+    )
+    return asset
+
+
+def list_folder_groups(db: Database) -> list[dict[str, Any]]:
+    """Return folder-backed video groups from the catalog snapshot only."""
+
+    rows = db.query(
+        """
+        SELECT c.id, c.name, c.metadata_json, COUNT(a.id) AS video_count
+        FROM media_collections c
+        LEFT JOIN media_assets a
+          ON a.collection_id = c.id
+         AND a.source_kind = 'folder'
+         AND a.state = 'ready'
+         AND a.deleted_at IS NULL
+        WHERE json_extract(c.metadata_json, '$.source_kind') = 'folder'
+        GROUP BY c.id, c.name, c.metadata_json
+        ORDER BY json_extract(c.metadata_json, '$.video_group'), c.id
+        """
+    )
+    result = []
+    for row in rows:
+        metadata = _loads(row.get("metadata_json"))
+        group_name = str(metadata.get("video_group") or "")
+        if not group_name:
+            continue
+        result.append(
+            {
+                "name": group_name,
+                "path": None,
+                "video_count": int(row.get("video_count") or 0),
+                "collection_id": int(row["id"]),
+            }
+        )
+    return result
+
+
+def list_folder_group_videos(
+    db: Database,
+    group_name: str,
+    *,
+    frame_step: int = 1,
+    max_frames: int | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    query: str = "",
+    sort: str = "name",
+) -> dict[str, Any]:
+    """Page one folder group without touching source files or thumbnails."""
+
+    group = str(group_name or "").strip()
+    rows = db.query(
+        """
+        SELECT a.* FROM media_assets a
+        JOIN media_collections c ON c.id = a.collection_id
+        WHERE a.source_kind = 'folder'
+          AND a.state = 'ready'
+          AND a.deleted_at IS NULL
+          AND json_extract(c.metadata_json, '$.video_group') = ?
+        ORDER BY a.display_name, a.id
+        """,
+        (group,),
+    )
+    decoded = [_decode_asset(row) for row in rows]
+    all_names = [str(row.get("display_name") or row.get("original_name") or "") for row in decoded]
+    needle = str(query or "").strip().lower()
+    filtered = [
+        row
+        for row in decoded
+        if not needle
+        or needle in str(row.get("display_name") or row.get("original_name") or "").lower()
+    ]
+    step = max(1, int(frame_step or 1))
+    limit = int(max_frames) if max_frames not in {None, ""} else None
+
+    def triplets(row: dict[str, Any]) -> int:
+        frame_count = int(row.get("frame_count") or 0)
+        effective = min(frame_count, limit) if limit is not None else frame_count
+        return max(0, (effective - 2 * step + step - 1) // step)
+
+    key_name = str(sort or "name").lstrip("-")
+    sort_keys = {
+        "name": lambda row: str(row.get("display_name") or "").lower(),
+        "duration": lambda row: float((row.get("metadata") or {}).get("duration_seconds") or 0.0),
+        "frame_count": lambda row: int(row.get("frame_count") or 0),
+        "resolution": lambda row: int(row.get("width") or 0) * int(row.get("height") or 0),
+        "triplets": triplets,
+    }
+    filtered.sort(key=sort_keys.get(key_name, sort_keys["name"]), reverse=str(sort).startswith("-"))
+    page_size = min(200, max(1, int(page_size or 50)))
+    page = max(1, int(page or 1))
+    total = len(filtered)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = min(page, total_pages)
+    start = (page - 1) * page_size
+    visible = filtered[start : start + page_size]
+    videos = []
+    for row in visible:
+        metadata = row.get("metadata") or {}
+        name = str(row.get("display_name") or row.get("original_name") or "")
+        videos.append(
+            {
+                "name": name,
+                "frame_count": int(row.get("frame_count") or 0),
+                "container_frame_count": int(row.get("frame_count") or 0),
+                "frame_count_source": metadata.get("frame_count_source") or "catalog",
+                "duration_seconds": float(metadata.get("duration_seconds") or 0.0),
+                "fps": row.get("fps"),
+                "width": int(row.get("width") or 0),
+                "height": int(row.get("height") or 0),
+                "decodable": True,
+                "error": None,
+                "valid_triplets": triplets(row),
+                "cache_status": "深度预检时检查",
+                "metadata_source": metadata.get("metadata_source") or "catalog",
+                "thumbnail_url": f"/api/media/assets/{int(row['id'])}/thumbnail",
+                "asset_id": int(row["id"]),
+            }
+        )
+    filtered_names = [str(row.get("display_name") or row.get("original_name") or "") for row in filtered]
+    return {
+        "name": group,
+        "path": None,
+        "video_count": len(decoded),
+        "filtered_count": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "query": query,
+        "sort": sort,
+        "all_video_names": all_names,
+        "filtered_video_names": filtered_names,
+        "asset_ids": {str(row.get("display_name") or row.get("original_name") or ""): int(row["id"]) for row in decoded},
+        "videos": videos,
+    }
+
+
 def folder_asset_id_map(db: Database, group_name: str) -> dict[str, int]:
     prefix = f"folder:{str(group_name)}/"
     rows = db.query(
@@ -1286,9 +1513,14 @@ def _sync_run_assets(
 
 def sync_catalog(db: Database, workspace: WorkspaceConfig, include_runs: bool = True) -> dict[str, int]:
     folders = sync_folder_assets(db, workspace)
-    from vfieval.media_items import sync_canonical_gt_items
-
-    item_sync = sync_canonical_gt_items(db)
+    item_count = db.get(
+        """
+        SELECT COUNT(*) AS total
+        FROM media_items mi
+        JOIN media_assets a ON a.id = mi.canonical_gt_asset_id
+        WHERE a.source_kind IN ('folder', 'upload') AND a.role = 'gt'
+        """
+    ) or {"total": 0}
     run_assets = 0
     if include_runs:
         for run in db.list_runs(limit=10000, include_deleted=False):
@@ -1302,7 +1534,7 @@ def sync_catalog(db: Database, workspace: WorkspaceConfig, include_runs: bool = 
     return {
         "folder_assets": folders,
         "run_assets": run_assets,
-        "media_items": int(item_sync["total"]),
+        "media_items": int(item_count["total"] or 0),
     }
 
 

@@ -740,6 +740,18 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
                 )
         return result
 
+    # The default remains the full preflight used for Run creation.  The quick
+    # level is intentionally limited to model-inference form feedback: it
+    # validates trusted paths, selection, device metadata, and container video
+    # metadata without constructing a model on an accelerator or decoding every
+    # frame solely to count it.
+    preflight_level = (
+        "quick"
+        if str(payload.get("preflight_level") or "deep").strip().lower() == "quick"
+        else "deep"
+    )
+    quick_preflight = preflight_level == "quick"
+
     model_file = str(payload.get("model_file") or "")
     video_group = str(payload.get("video_group") or "")
     frame_step = max(1, int(payload.get("frame_step") or 1))
@@ -752,6 +764,7 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
     result: dict[str, Any] = {
         "ok": True,
         "run_type": "model_inference",
+        "preflight_level": preflight_level,
         "errors": [],
         "warnings": [],
         "model": {},
@@ -782,24 +795,56 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
     try:
         model_path = resolve_model_file(workspace, model_file)
         checkpoint_path = resolve_checkpoint(workspace, checkpoint_request, model_path.name)
-        for dry_run_device in _dry_run_devices(device_info):
-            try:
-                last_diagnostics = _cached_dry_run_model_file(
-                    model_path,
+        model_physical_identity = None
+        checkpoint_physical_identity = None
+        if not quick_preflight:
+            model_physical_identity = _preflight_file_identity(
+                model_path,
+                models_dir(workspace),
+                model_path.name,
+            )
+            checkpoint_physical_identity = (
+                _preflight_file_identity(
                     checkpoint_path,
-                    dry_run_device,
-                    str(device_info.get("effective_precision") or "fp32"),
+                    checkpoints_dir(workspace),
+                    checkpoint_path.relative_to(checkpoints_dir(workspace)).as_posix(),
                 )
-            except Exception as exc:
-                raise RuntimeError(f"model dry-run failed on {dry_run_device}: {exc}") from exc
-            tested_devices.append(dry_run_device)
+                if checkpoint_path is not None
+                else None
+            )
+        if not quick_preflight:
+            for dry_run_device in _dry_run_devices(device_info):
+                try:
+                    last_diagnostics = _cached_dry_run_model_file(
+                        model_path,
+                        checkpoint_path,
+                        dry_run_device,
+                        str(device_info.get("effective_precision") or "fp32"),
+                    )
+                except Exception as exc:
+                    raise RuntimeError(f"model dry-run failed on {dry_run_device}: {exc}") from exc
+                tested_devices.append(dry_run_device)
+            if not _preflight_file_stat_matches(model_path, model_physical_identity):
+                raise RuntimeError("model file changed during deep preflight")
+            if checkpoint_path is not None and not _preflight_file_stat_matches(
+                checkpoint_path,
+                checkpoint_physical_identity,
+            ):
+                raise RuntimeError("checkpoint file changed during deep preflight")
         model_row: dict[str, Any] = {
             "name": model_path.name,
             "path": str(model_path),
             "checkpoint": str(checkpoint_path) if checkpoint_path else None,
-            "interface_ok": True,
+            "interface_ok": None if quick_preflight else True,
+            "interface_checked": not quick_preflight,
             "tested_devices": tested_devices,
         }
+        if not quick_preflight:
+            # Deep preflight owns the expensive content read.  The HTTP layer
+            # binds these portable signatures to its token and can reuse the
+            # digests after it revalidates the files at Run creation time.
+            model_row["physical_identity"] = model_physical_identity
+            model_row["checkpoint_identity"] = checkpoint_physical_identity
         if last_diagnostics is not None:
             health = last_diagnostics.get("output_health") or {}
             model_row["output_health"] = health
@@ -844,7 +889,11 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
             raise FileNotFoundError("视频集中没有支持的视频文件")
         for entry in entries:
             video_path = entry["path"]
-            info = inspect_video(video_path, workspace, exact=True)
+            # Ordinary model-inference preflight never decodes an entire video
+            # just to count frames.  A completed decode manifest is exact; in
+            # its absence ffprobe/OpenCV container metadata is a visible
+            # estimate that the decode Job verifies before inference starts.
+            info = inspect_video(video_path, workspace, exact=False)
             # Carry the qualified identity so multi-group selections stay
             # unambiguous in the preflight table (same file name in two groups).
             info["name"] = entry["display_name"]
@@ -852,8 +901,49 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
             info["video_file"] = entry["video_file"]
             info["valid_triplets"] = _valid_triplets(info["frame_count"], frame_step, max_frames)
             info["triplets"] = info["valid_triplets"]
-            info["cache_key"] = decode_cache_key(video_path, "video_gt_triplets", frame_step, max_frames)
-            info["cache_status"] = decode_cache_status(workspace, info["cache_key"])
+            if quick_preflight:
+                # The canonical decode key includes a full content hash.  Leave
+                # that filesystem scan to the deep gate instead of repeating it
+                # after every form edit.
+                info["cache_key"] = None
+                info["cache_status"] = "not_checked"
+            else:
+                physical_identity = _preflight_file_identity(
+                    video_path,
+                    videos_dir(workspace),
+                    entry["qualified"],
+                )
+                info["physical_identity"] = physical_identity
+                info["cache_key"] = decode_cache_key(
+                    video_path,
+                    "video_gt_triplets",
+                    frame_step,
+                    max_frames,
+                    content_sha256=physical_identity["sha256"],
+                )
+                info["cache_status"] = decode_cache_status(workspace, info["cache_key"])
+                manifest = _read_completed_decode_manifest(workspace, info["cache_key"])
+                if manifest is not None:
+                    info = _merge_manifest_info(info, manifest)
+                else:
+                    info["frame_count_warning"] = (
+                        "No completed decode manifest is available; frame count uses "
+                        "container metadata and will be verified by the decode Job."
+                    )
+                    result["warnings"].append(
+                        {
+                            "title": "Frame count uses container metadata",
+                            "message": (
+                                f"{entry['display_name']}: no completed decode manifest is available; "
+                                "the decode Job will verify the exact frame count before inference."
+                            ),
+                            "type": "FrameCountNotDecoded",
+                            "details": {
+                                "video": entry["qualified"],
+                                "frame_count_source": info.get("frame_count_source") or "container",
+                            },
+                        }
+                    )
             video_infos.append(info)
         short = [info["name"] for info in video_infos if info["triplets"] <= 0]
         bad = [info["name"] for info in video_infos if not info["decodable"]]
@@ -1192,6 +1282,48 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _preflight_file_identity(
+    path: Path,
+    trusted_root: Path,
+    display_path: str,
+) -> dict[str, Any]:
+    """Hash one trusted input and fence mutations during the content read."""
+
+    root = trusted_root.resolve()
+    resolved = path.resolve()
+    try:
+        relative_path = resolved.relative_to(root).as_posix()
+    except ValueError as exc:
+        raise ValueError("preflight input is outside its trusted root") from exc
+    before = resolved.stat()
+    digest = file_sha256(resolved)
+    after = resolved.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise RuntimeError(
+            f"preflight input changed while it was being read: {display_path}"
+        )
+    return {
+        "relative_path": relative_path,
+        "display_path": str(display_path).replace("\\", "/"),
+        "size_bytes": int(after.st_size),
+        "mtime_ns": int(after.st_mtime_ns),
+        "sha256": digest,
+    }
+
+
+def _preflight_file_stat_matches(path: Path, identity: Any) -> bool:
+    if not isinstance(identity, dict):
+        return False
+    try:
+        stat_result = path.stat()
+        return (
+            int(stat_result.st_size) == int(identity.get("size_bytes"))
+            and int(stat_result.st_mtime_ns) == int(identity.get("mtime_ns"))
+        )
+    except (OSError, TypeError, ValueError):
+        return False
 
 
 def normalize_device_precision(device: str, precision: str) -> tuple[str, str]:
@@ -1567,6 +1699,38 @@ def _read_decode_manifest(workspace: WorkspaceConfig, cache_key: str) -> dict[st
         return json.loads(manifest_path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _read_completed_decode_manifest(
+    workspace: WorkspaceConfig,
+    cache_key: str,
+) -> dict[str, Any] | None:
+    """Return exact metadata only for a complete, internally consistent cache."""
+
+    manifest = _read_decode_manifest(workspace, cache_key)
+    if not isinstance(manifest, dict):
+        return None
+    if (
+        str(manifest.get("cache_key") or "") != str(cache_key)
+        or str(manifest.get("decode_status") or "") != "completed"
+    ):
+        return None
+    frames = manifest.get("frames")
+    timestamps = manifest.get("timestamps")
+    if not isinstance(frames, list) or not isinstance(timestamps, list) or not frames:
+        return None
+    try:
+        if int(manifest.get("frame_count") or 0) != len(frames) or len(timestamps) != len(frames):
+            return None
+        root = decode_cache_dir(workspace, cache_key).resolve()
+        for raw_path in frames:
+            frame = Path(str(raw_path)).resolve()
+            frame.relative_to(root)
+            if not frame.is_file():
+                return None
+    except (OSError, TypeError, ValueError):
+        return None
+    return manifest
 
 
 def _merge_manifest_info(info: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:

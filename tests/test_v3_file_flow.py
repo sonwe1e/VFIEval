@@ -181,10 +181,13 @@ class Model:
             first_video = test_style["videos"][0]["name"]
             self.assertIn("test_4k", [row["name"] for row in video_groups])
             test_4k = next(row for row in video_groups if row["name"] == "test_4k")
-            self.assertEqual(test_4k["video_count"], 1)
-            self.assertEqual(test_4k["videos"][0]["width"], 3840)
-            self.assertEqual(test_4k["videos"][0]["height"], 2160)
-            four_k_video = test_4k["videos"][0]["name"]
+            self.assertGreaterEqual(test_4k["video_count"], 1)
+            fixture_4k = next(
+                row
+                for row in test_4k["videos"]
+                if int(row["width"]) == 3840 and int(row["height"]) == 2160
+            )
+            four_k_video = fixture_4k["name"]
             self.assertIn(
                 test_style["videos"][0]["frame_count_source"],
                 {"container", "exact", "estimated", "ffprobe_nb_frames", "ffprobe_duration"},
@@ -237,7 +240,16 @@ class Model:
             self.assertTrue(selected["ok"], selected)
             self.assertEqual(selected["video_group"]["video_count"], 1)
             self.assertEqual(selected["video_group"]["selected_videos"], [first_video])
-            self.assertEqual(selected["video_group"]["videos"][0]["frame_count_source"], "exact")
+            self.assertNotEqual(
+                selected["video_group"]["videos"][0]["frame_count_source"],
+                "exact",
+            )
+            self.assertTrue(
+                any(
+                    warning.get("type") == "FrameCountNotDecoded"
+                    for warning in selected["warnings"]
+                )
+            )
 
             four_k = preflight_run(
                 db,
@@ -372,10 +384,7 @@ class Model:
             workspace.ensure()
             db = Database(workspace.db_path)
             db.init()
-            server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(db, workspace))
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            server, thread, base_url = start_server(db, workspace)
             try:
                 group = next(row for row in list_video_groups(workspace) if row["name"] == "test_style")
                 selected_video = group["videos"][0]["name"]
@@ -591,7 +600,7 @@ class Model:
                 self.assertEqual(heartbeat["status"], "heartbeat")
 
                 cleanup = _post(base_url, f"/api/runs/{run_id}/cleanup-artifacts", {})
-                self.assertEqual(cleanup["purge_status"], "requested")
+                self.assertIn(cleanup["purge_status"], {"requested", "purging"})
                 cleanup_request = _wait_for_purge(base_url, int(cleanup["request_id"]))
                 self.assertEqual(cleanup_request["status"], "completed")
                 self.assertTrue(cleanup_request["report"]["artifact_cleaned"])
@@ -612,9 +621,7 @@ class Model:
                 all_runs = _get(base_url, "/api/runs?include_deleted=1")
                 self.assertIn(run_id, [int(item["id"]) for item in all_runs])
             finally:
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=5)
+                stop_server(server, thread)
 
     def test_server_marks_static_and_json_responses_uncacheable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1479,10 +1486,7 @@ class Model:
             workspace.ensure()
             db = Database(workspace.db_path)
             db.init()
-            server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(db, workspace))
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            server, thread, base_url = start_server(db, workspace)
             try:
                 group = next(row for row in list_video_groups(workspace) if row["name"] == "test_style")
                 selected_video = group["videos"][0]["name"]
@@ -1555,9 +1559,7 @@ class Model:
                     self.assertEqual(inference_job["status"], "canceled")
             finally:
                 release_shutdown.set()
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=5)
+                stop_server(server, thread)
 
     def test_cleanup_artifacts_rejects_running_run(self) -> None:
         import torch
@@ -1580,10 +1582,7 @@ class Model:
             workspace.ensure()
             db = Database(workspace.db_path)
             db.init()
-            server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(db, workspace))
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            server, thread, base_url = start_server(db, workspace)
             try:
                 group = next(row for row in list_video_groups(workspace) if row["name"] == "test_style")
                 selected_video = group["videos"][0]["name"]
@@ -1614,9 +1613,16 @@ class Model:
 
                     output_dir = Path(str(running_run["metadata"]["output_dir"]))
                     self.assertTrue(output_dir.exists())
+                    cleanup_preview = _post(
+                        base_url,
+                        "/api/run-purge/preview",
+                        {"request_type": "cleanup_artifacts", "run_ids": [run_id]},
+                    )
                     request = urllib.request.Request(
                         f"{base_url}/api/runs/{run_id}/cleanup-artifacts",
-                        data=b"{}",
+                        data=json.dumps(
+                            {"preview_token": cleanup_preview["preview_token"]}
+                        ).encode("utf-8"),
                         headers={"Content-Type": "application/json"},
                         method="POST",
                     )
@@ -1638,9 +1644,7 @@ class Model:
                         "completed",
                     )
             finally:
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=5)
+                stop_server(server, thread)
 
     def test_cleanup_artifacts_only_removes_current_run_directory_even_if_metadata_output_dir_is_tampered(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1689,13 +1693,10 @@ class Model:
             sibling_marker = sibling_dir / "keep.txt"
             sibling_marker.write_text("sibling", encoding="utf-8")
 
-            server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(db, workspace))
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            base_url = f"http://127.0.0.1:{server.server_address[1]}"
+            server, thread, base_url = start_server(db, workspace)
             try:
                 cleanup = _post(base_url, f"/api/runs/{run_id}/cleanup-artifacts", {})
-                self.assertEqual(cleanup["purge_status"], "requested")
+                self.assertIn(cleanup["purge_status"], {"requested", "purging"})
                 cleanup_request = _wait_for_purge(base_url, int(cleanup["request_id"]))
                 self.assertEqual(cleanup_request["status"], "completed")
                 self.assertTrue(cleanup_request["report"]["artifact_cleaned"])
@@ -1707,9 +1708,7 @@ class Model:
                 self.assertEqual(source_marker.read_text(encoding="utf-8"), "keep")
                 self.assertIsNotNone(db.get_run(run_id).get("artifact_cleaned_at"))
             finally:
-                server.shutdown()
-                server.server_close()
-                thread.join(timeout=5)
+                stop_server(server, thread)
 
     def test_api_video_compare_run_generates_gt_pred_diff(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": tmp}, clear=False):
@@ -3099,6 +3098,22 @@ class Model:
 
 
 def _post(base_url: str, path: str, payload: dict) -> dict:
+    payload = dict(payload)
+    if path.startswith("/api/runs/") and path.endswith("/cleanup-artifacts") and not payload.get("preview_token"):
+        run_id = int(path.split("/")[3])
+        preview = _post(
+            base_url,
+            "/api/run-purge/preview",
+            {"request_type": "cleanup_artifacts", "run_ids": [run_id]},
+        )
+        payload["preview_token"] = preview["preview_token"]
+    if path == "/api/runs/batch-delete" and not payload.get("preview_token"):
+        preview = _post(
+            base_url,
+            "/api/run-purge/preview",
+            {"request_type": "delete_run", "run_ids": payload.get("run_ids") or []},
+        )
+        payload["preview_token"] = preview["preview_token"]
     request = urllib.request.Request(
         f"{base_url}{path}",
         data=json.dumps(payload).encode("utf-8"),
@@ -3115,6 +3130,14 @@ def _get(base_url: str, path: str) -> dict:
 
 
 def _delete(base_url: str, path: str) -> dict:
+    parts = path.strip("/").split("/")
+    if len(parts) == 3 and parts[:2] == ["api", "runs"] and parts[2].isdigit():
+        preview = _post(
+            base_url,
+            "/api/run-purge/preview",
+            {"request_type": "delete_run", "run_ids": [int(parts[2])]},
+        )
+        path = f"{path}?preview_token={urllib.parse.quote(preview['preview_token'])}"
     request = urllib.request.Request(f"{base_url}{path}", method="DELETE")
     with urllib.request.urlopen(request, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))

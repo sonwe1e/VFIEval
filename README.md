@@ -52,13 +52,15 @@ videos/
     002.mp4
 ```
 
-Web UI 会自动扫描：
+Web UI 仍以文件夹为入口，并把耗时检查拆成目录同步、快速预检和启动前深度预检：
 
 - `models/*.py` 作为模型下拉框。
 - `checkpoints/{model_stem}/*` 作为权重下拉框，可选择不加载、自动最新或具体文件。
-- `videos/*/` 作为视频集下拉框；首屏只读取分组摘要，具体视频、缩略图和缓存状态会在选择视频集后按页加载。
-- 点击 `刷新文件列表` 后会重新扫描模型、权重、视频集和设备，不需要刷新浏览器页面。
-- 选择稳定后自动预检查模型接口、已选视频、真实帧数、triplets、缓存状态和设备/精度；重复的模型 dry-run 会复用缓存，提交任务前仍会强制检查一次。
+- `videos/*/` 作为视频集下拉框；首屏只读取分组摘要，具体视频在选择视频集后按页加载，缩略图只在浏览器实际请求对应图片 URL 时生成。
+- 服务启动时会在后台协调一次 Media Catalog 回填；Media、Compare 和 Campaign 的普通列表、搜索和分页只读当前快照，不会在每次 GET 时重新扫描目录。点击 `刷新文件列表` 只同步文件入口；Media 页的 `刷新` 还会显式纳入历史 Run 资产。两者都会加入已在运行的同步、等待完成后原地刷新，不需要刷新浏览器页面。
+- 表单变化只执行快速预检：校验受信任路径、选择、设备/精度和容器媒体信息，并给出样本量及工作量估算；它不会加载模型做 dry-run，也不会返回可用于创建 Run 的令牌。
+- 点击开始时强制执行深度预检，检查模型输出契约、解码缓存和媒体容器信息，并为模型、权重和所选视频生成内容签名。响应中的 `input_fingerprint` 标识这组物理输入；短期有效的 `preflight_token` 同时绑定配置与这些输入。`POST /api/runs` 会重新校验并复用已验证哈希，任一文件变化、配置变化或令牌过期都必须重新预检。已完成的解码清单提供精确帧数；否则显示容器帧数估算警告，并由解码任务在推理前复核。
+- 预检会显示有效设备/精度、单设备 batch、分辨率、输入张量下界、主机预取下界和产物空间预算。数字是资源规划下界，不包含模型参数、激活和分配器工作区；高风险配置必须在看过具体数值后确认，提交时携带匹配的 `risk_ack_fingerprint`。
 - 视频列表默认全选，支持服务端分页、按文件名搜索、排序和缩略图，也可以只勾选本次要推理的视频。
 - “开始对比”提交期间会立即锁定为单次请求，并显示预检查、创建 Run 和打开详情三个阶段；无需重复点击。
 
@@ -144,13 +146,19 @@ Run 的产物、指标或清理状态发生变化时，服务端会递增 `conte
 
 删除 Run 是持久化的异步清理流程，而不是只隐藏一行记录：
 
-- `DELETE /api/runs/{id}` 返回 `202 Accepted` 并创建 `run_purge_requests`。运行中的 Run 会先请求取消，worker 停止后才删除受信任的 `.vfieval/runs/{id}`、清理产物索引与 Run feedback，并把对应 Run 媒体标记为不可用。
+- 删除、批量删除和“只清产物”都会先调用 `POST /api/run-purge/preview`，展示 Campaign/Compare/活动 Job 依赖、Run 目录占用、共享缓存和预计可回收空间。预览返回的 `preview_token` 短期有效、一次性使用，并绑定操作类型、精确 Run 集合及当前状态；状态变化、令牌过期或选择变化时必须重新预览。
+- `DELETE /api/runs/{id}?preview_token=...` 返回 `202 Accepted` 并创建 `run_purge_requests`。运行中的 Run 会先请求取消，worker 停止后才删除受信任的 `.vfieval/runs/{id}`、清理产物索引与 Run feedback，并把对应 Run 媒体标记为不可用。
 - 只有全部步骤成功后才写入 `deleted_at`。失败请求保留错误与清理报告，可重试；服务重启后会继续处理 `requested/canceling/purging` 请求。
-- `cleanup-artifacts` 走同一套幂等服务，但保留 Run 记录。批量删除逐 Run 建立请求，单项失败不会中断其它项。
+- `cleanup-artifacts` 走同一套幂等服务，但保留 Run 记录；它和批量删除都在 JSON body 中提交预览令牌。批量删除逐 Run 建立请求，单项失败不会中断其它项。
 - `decode_cache` 与 `compare_cache` 通过 `cache_entries`、`run_cache_refs` 和活动 lease 管理。共享缓存只有在最后一个有效 Run 引用释放、没有活动 lease 且超过默认 10 分钟宽限期后才可回收。
 - 指标缓存、视频元数据与缩略图缓存不会随单个 Run 删除。历史残留和孤儿缓存必须先在 Media 页生成存储清理预览，再显式确认 GC。
 
 已发布的 Campaign 媒体会在破坏性清理前冻结到独立评测包，因此删除来源 Run 不会破坏正式盲评播放、投票或分析历史。
+
+文件入口的模型推理 Run 提供两种重新执行语义：
+
+- `重试` 是精确复现：固定使用原 Run 当时解析出的 checkpoint，并重新校验模型、checkpoint、所选 Item/Asset、源视频内容及执行配置。任一输入缺失或变化时返回 `409 InputIdentityChanged` 和结构化差异，不会悄悄改用当前文件；没有输入身份记录的旧 Run 应使用 Clone。
+- `按当前输入 Clone` 重新解析磁盘上的当前模型、`auto` checkpoint 和源文件，创建新 Run，并记录来源 Run 及输入身份差异。需要测试最新文件时使用 Clone，不要把它当作精确重试。
 
 ## Direct GT/Pred Compare
 
@@ -244,7 +252,7 @@ Media 页按用途分成三块：
 - `Derived Runs`：按 `Run → 视频 → Track` 分组折叠显示有效 Pred 输出；已删除或已清产物的 Run 不会重新出现在目录、Compare 或 Campaign 来源中。
 - `Evaluation Packages`：已发布 Campaign 的冻结评测包。自动生成的内部 Run Collection 不作为用户目录展示。
 
-Media Catalog 以稳定 `asset_id` 统一索引源文件、上传、Run 视频产物和评测包。目录扫描与历史 Run 会幂等回填；原文件不移动，Catalog 只保存服务端路径、SHA-256、媒体信息和 provenance。Run 清理把对应 `run_artifact` 标记为 `unavailable`，冻结的 `evaluation_package` 仍可播放。
+Media Catalog 以稳定 `asset_id` 统一索引源文件、上传、Run 视频产物和评测包。服务启动和用户显式刷新会通过一个进程内协调器幂等回填目录与历史 Run；并发刷新会合并为同一后台任务。常规资产、Compare 和 Campaign 列表只读 SQLite 快照，不触发隐式重扫。原文件不移动，Catalog 只保存服务端路径、SHA-256、媒体信息和 provenance。Run 清理把对应 `run_artifact` 标记为 `unavailable`，冻结的 `evaluation_package` 仍可播放。
 
 External 视频和帧序列通过浏览器分片上传：
 
@@ -318,10 +326,12 @@ python -m vfieval.cli --workspace .vfieval serve --host 0.0.0.0 --port 8765
 - `GET /api/devices`
 - `GET /api/video-groups`，支持 `summary=1` 只返回分组和数量
 - `GET /api/video-groups/{name}/videos?page=&page_size=&q=&sort=`
+- `POST /api/media/sync` 启动或加入后台目录同步；`GET /api/media/sync/status` 返回阶段、错误和 `catalog_revision`
 - `GET/POST /api/media/collections`
 - `GET /api/media/assets?collection_id=&role=&source_kind=&q=&page=`
 - `GET /api/media/assets/{id}`
 - `GET /api/media/assets/{id}/content`，支持 HTTP Range
+- `GET /api/media/assets/{id}/thumbnail`，按需生成文件目录视频缩略图
 - `GET /api/media/sources?role=gt|pred`，只返回 source/upload 资产
 - `GET /api/media/run-outputs`，按 Run、视频和 Track 返回有效 Pred
 - `GET /api/media/audit`
@@ -339,14 +349,18 @@ python -m vfieval.cli --workspace .vfieval serve --host 0.0.0.0 --port 8765
 - `GET /api/compare-sources/pred?page=&page_size=&q=&video=&run_id=`
 - `GET /api/video-thumbnails/{key}`
 - `GET /api/metrics/health`
-- `POST /api/preflight`
-- `POST /api/runs`，支持 `model_file + video_group`
+- `GET /api/health`，只读返回目录同步状态和 Run/Campaign 清理积压
+- `POST /api/preflight`，通过 `preflight_level=quick|deep` 选择层级；`POST /api/preflight/quick` 是强制 quick 的别名；只有 deep 返回 `preflight_token`
+- `POST /api/runs`，支持 `model_file + video_group`、可选 `preflight_token` 和高风险确认 `risk_ack_fingerprint`
 - `POST /api/runs` 支持 `checkpoint`、`execution_mode=single|multi_cuda|multi_npu`、`devices=["cuda:0"]` / `devices=["npu:0"]`、`batch_size_per_device`
 - `POST /api/runs/{id}/cancel`
-- `POST /api/runs/{id}/retry`
-- `DELETE /api/runs/{id}` 创建持久化清理请求并返回 `202`
+- `POST /api/runs/{id}/retry` 精确复现已记录输入；输入变化时返回 `409 InputIdentityChanged`
+- `POST /api/runs/{id}/clone` 使用当前文件创建新 Run
+- `POST /api/run-purge/preview`，body 为 `request_type=delete_run|cleanup_artifacts` 与精确 `run_ids`
+- `DELETE /api/runs/{id}?preview_token=...` 创建持久化清理请求并返回 `202`
 - `GET /api/run-purge-requests/{request_id}`
-- `POST /api/runs/{id}/cleanup-artifacts` 使用同一幂等清理服务但保留 Run
+- `POST /api/runs/{id}/cleanup-artifacts` 在 body 中携带 `preview_token`，使用同一幂等清理服务但保留 Run
+- `POST /api/runs/batch-delete` 在 body 中携带精确 `run_ids` 及对应 `preview_token`
 - `GET /api/storage/gc/preview`、`POST /api/storage/gc`（必须 `confirm=true`）
 - `GET /api/runs`
 - `GET /api/runs/{id}`
@@ -369,7 +383,7 @@ python -m vfieval.cli --workspace .vfieval serve --host 0.0.0.0 --port 8765
 - 多卡 NPU 使用 `torch_npu`，设备名为 `npu:0`、`npu:1` 等；`/api/devices` 会返回检测到的 NPU 列表。
 - `execution_mode=multi_npu` 优先按视频拆分；视频数量不足或负载明显不均时把长视频切为连续 sample segment。每个 shard 绑定一个 NPU，只写帧与 manifest，随后由 `finalize` job 合并视频并启动指标。
 - 手动启动 worker 时可以使用 `python -m vfieval.cli --workspace .vfieval worker --role inference --device-filter npu:0 --idle-timeout 120`，绑定后的 worker 只领取对应 NPU 的 shard。
-- 预检查会在最终 device/dtype 上执行模型 dry-run，能提前暴露 CPU/NPU tensor 不匹配。
+- 启动前深度预检查会在最终 device/dtype 上执行模型 dry-run，能提前暴露 CPU/NPU tensor 不匹配；表单自动快速预检不会构造模型。
 - 新建任务页首屏只读取模型/视频分组摘要、Run 摘要、设备和指标健康；视频列表、Compare 来源和预检查会在用户加载或选择后再请求。
 - Run Detail 默认加载 `512px` 预览图，原图只在点击预览时打开；核心产物按 `图像 / Flow / Mask / Warp` 分组，避免一次性加载十张 4K 图。
 - 删除 Run 会同时进入产物清理队列；若只想释放产物并保留记录，使用 `只清产物`。详情页会显示取消、清理、失败或完成状态。

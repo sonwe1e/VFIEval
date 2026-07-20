@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,7 @@ from vfieval.pipeline.inference import (
     _AsyncSavePipeline,
     _NpuSmiSampler,
     _compose_canonical_chunks,
+    _materialize_gt_artifact,
     _postprocess_chunk_size,
     _resolve_visualize_size,
 )
@@ -27,10 +29,74 @@ from vfieval.performance import (
     record_execution_profile,
     recommend_execution_profile,
 )
+from vfieval.run_cleanup import _path_reclaimable_size
 from vfieval.worker import WorkerOptions, run_worker
 
 
 class ArtifactProfileTests(unittest.TestCase):
+    def test_native_decode_gt_uses_run_local_hardlink_with_copy_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            decode_root = workspace.root / "decode_cache"
+            cache_key = "native-gt-cache"
+            cache_dir = decode_root / cache_key
+            cache_dir.mkdir(parents=True)
+            source = cache_dir / "000001.png"
+            Image.new("RGB", (16, 12), (10, 20, 30)).save(source)
+            destination = workspace.runs_dir / "1" / "sample" / "gt.png"
+            tensor = torch.zeros((3, 12, 16))
+
+            metadata = _materialize_gt_artifact(
+                tensor,
+                destination,
+                source_path=source,
+                source_cache_key=cache_key,
+                decode_cache_root=decode_root,
+                expected_height=12,
+                expected_width=16,
+            )
+            if metadata["storage_mode"] != "hardlink":
+                self.skipTest("test filesystem does not support hard links")
+            self.assertTrue(metadata["deduplicated"])
+            self.assertTrue(os.path.samefile(source, destination))
+
+            # The Run artifact owns its directory entry. Removing the cache
+            # entry cannot make the already-published GT disappear.
+            source.unlink()
+            with Image.open(destination) as image:
+                self.assertEqual(image.size, (16, 12))
+
+            resized = workspace.runs_dir / "2" / "sample" / "gt.png"
+            resized_metadata = _materialize_gt_artifact(
+                torch.zeros((3, 6, 8)),
+                resized,
+                source_path=destination,
+                source_cache_key=cache_key,
+                decode_cache_root=decode_root,
+                expected_height=6,
+                expected_width=8,
+            )
+            self.assertEqual(resized_metadata["storage_mode"], "run_copy")
+            with Image.open(resized) as image:
+                self.assertEqual(image.size, (8, 6))
+
+    def test_run_cleanup_reclaimed_size_excludes_shared_hardlink_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "cache.bin"
+            source.write_bytes(b"shared-ground-truth")
+            run_dir = root / "run"
+            run_dir.mkdir()
+            artifact = run_dir / "gt.png"
+            try:
+                os.link(source, artifact)
+            except OSError:
+                self.skipTest("test filesystem does not support hard links")
+            self.assertEqual(_path_reclaimable_size(run_dir), 0)
+            source.unlink()
+            self.assertEqual(_path_reclaimable_size(run_dir), len(b"shared-ground-truth"))
+
     def test_execution_profile_fingerprint_and_fastest_recommendation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")

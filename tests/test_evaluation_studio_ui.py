@@ -37,6 +37,22 @@ class EvaluationStudioUiTests(unittest.TestCase):
         end = match.end() + following.start() if following is not None else len(self.blind_js)
         return self.blind_js[match.start():end]
 
+    def _studio_function_source(self, name: str) -> str:
+        match = re.search(
+            rf"^  (?:async\s+)?function\s+{re.escape(name)}\s*\(",
+            self.studio_js,
+            flags=re.MULTILINE,
+        )
+        self.assertIsNotNone(match, f"studio.js is missing function {name}")
+        assert match is not None
+        following = re.search(
+            r"^  (?:async\s+)?function\s+[A-Za-z_$][\w$]*\s*\(",
+            self.studio_js[match.end():],
+            flags=re.MULTILINE,
+        )
+        end = match.end() + following.start() if following is not None else len(self.studio_js)
+        return self.studio_js[match.start():end]
+
     def test_literal_dom_dependencies_exist(self) -> None:
         index_ids = set(re.findall(r'id="([^"]+)"', self.index_html))
         studio_ids = set(re.findall(r'el\("([^"]+)"\)', self.studio_js))
@@ -520,6 +536,30 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn("data-objective-curve-retry", self.studio_js)
         self.assertIn(".objective-curve-plot", self.studio_css)
 
+        load_curve = self._studio_function_source("loadObjectiveCurve")
+        before_request = load_curve[:load_curve.index("const curve = await request(")]
+        self.assertNotIn("renderCampaignDetail", before_request)
+        self.assertIn(
+            "if (studioState.objectiveCurveInFlight?.key === key) return",
+            load_curve,
+        )
+        self.assertIn(
+            "studioState.objectiveCurveInFlight !== requestToken",
+            load_curve,
+        )
+        self.assertIn(
+            "generation !== studioState.objectiveCurveRequestGeneration) return",
+            load_curve,
+        )
+        supersede = self._studio_function_source("supersedeObjectiveCurveRequest")
+        self.assertIn("studioState.objectiveCurveInFlight = null", supersede)
+        self.assertIn("studioState.objectiveCurveLoadingKey = \"\"", supersede)
+
+        render_chart = self._studio_function_source("renderObjectiveCurveChart")
+        reason_index = render_chart.index("Object.keys(series.reason_counts || {})")
+        no_completed_index = render_chart.index("if (!completed.length)")
+        self.assertLess(reason_index, no_completed_index)
+
     def test_v2_campaign_permanent_delete_and_dependency_entry_are_exposed(self) -> None:
         self.assertIn("data-studio-delete", self.studio_js)
         self.assertIn('method: "DELETE"', self.studio_js)
@@ -606,6 +646,84 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn('r"/api/evaluation-campaigns/v2/', self.server_py)
         self.assertIn('r"/api/blind/', self.server_py)
 
+    def test_studio_campaign_preparation_poll_is_serialized_and_cancellable(self) -> None:
+        start_poll = self._studio_function_source("startPreparationPoll")
+        stop_poll = self._studio_function_source("stopPreparationPoll")
+
+        self.assertIn("setTimeout(pollOnce, 2000)", start_poll)
+        self.assertNotIn("setInterval", start_poll)
+        self.assertIn("const pollOnce = async () =>", start_poll)
+        self.assertIn("await request(`/api/evaluation-campaigns/v2/", start_poll)
+        self.assertIn("scheduleNext();", start_poll)
+        self.assertIn("preparationPollGeneration", start_poll)
+        self.assertIn("stillCurrent()", start_poll)
+        self.assertIn("clearTimeout(studioState.preparationPoll)", stop_poll)
+        self.assertIn("studioState.preparationPollGeneration += 1", stop_poll)
+        self.assertIn('window.addEventListener("pagehide", stopPreparationPoll)', self.studio_js)
+        self.assertIn('window.addEventListener("pageshow", (event) => {', self.studio_js)
+        self.assertIn("if (!event.persisted || !studioState.selectedCampaignKey) return", self.studio_js)
+        self.assertIn("openCampaign(studioState.selectedCampaignKey, false)", self.studio_js)
+
+    def test_studio_publish_reconciles_only_lost_responses_and_adopts_created_campaign(self) -> None:
+        request_source = self._studio_function_source("request")
+        publish_request = self._studio_function_source("requestCampaignPublish")
+        committed = self._studio_function_source("campaignPublishCommitted")
+        create = self._studio_function_source("createCampaign")
+
+        self.assertIn("error.status = response.status", request_source)
+        self.assertIn("if (publishError.status != null) throw publishError", publish_request)
+        self.assertIn("await readCampaignTruth(campaignId)", publish_request)
+        self.assertIn("campaignPublishCommitted(campaign)", publish_request)
+        for status in ("preparing", "published", "completed", "failed"):
+            self.assertIn(f'"{status}"', committed)
+        publish = self._studio_function_source("publishCampaign")
+        poll_start = publish.index("startPreparationPoll(key, campaignId)")
+        best_effort_refresh = publish.index("await loadCampaigns({ preserveMissingKey: key })")
+        self.assertLess(poll_start, best_effort_refresh)
+        self.assertIn("The publish result is authoritative", publish)
+        selection = 'studioState.selectedCampaignKey = `v2:${campaignId}`'
+        self.assertIn(selection, create)
+        self.assertLess(create.index(selection), create.index("await publishCampaign(campaignId)"))
+
+    def test_studio_delete_clears_then_reconciles_campaign_state(self) -> None:
+        read_truth = self._studio_function_source("readCampaignTruth")
+        delete_campaign = self._studio_function_source("deleteCampaign")
+
+        self.assertIn("Number(error.status) === 404", read_truth)
+        delete_request = delete_campaign.index('method: "DELETE"')
+        self.assertLess(delete_campaign.index("stopPreparationPoll();"), delete_request)
+        self.assertLess(delete_campaign.index("studioState.selectedCampaignKey = null;"), delete_request)
+        self.assertIn("truth = await readCampaignTruth(campaignId)", delete_campaign)
+        self.assertIn("if (truth.exists)", delete_campaign)
+        self.assertIn("studioState.selectedCampaignKey = deletingKey", delete_campaign)
+        self.assertIn("startPreparationPoll(deletingKey, campaignId)", delete_campaign)
+        self.assertIn("response_recovered: true", delete_campaign)
+        local_removal = delete_campaign.index(
+            "studioState.campaigns = studioState.campaigns.filter((row) => campaignKey(row) !== deletingKey)",
+        )
+        confirmed_refresh = delete_campaign.index("await loadCampaigns();", local_removal)
+        self.assertLess(local_removal, confirmed_refresh)
+        self.assertIn("DELETE response or reconciliation GET already confirmed deletion", delete_campaign)
+        self.assertLess(confirmed_refresh, delete_campaign.index("notify(result.cleanup_pending"))
+
+    def test_studio_surfaces_persistent_campaign_cleanup_and_retry(self) -> None:
+        load_requests = self._studio_function_source("loadCleanupRequests")
+        retry_request = self._studio_function_source("retryCleanupRequest")
+        remember_request = self._studio_function_source("rememberCleanupRequest")
+        delete_campaign = self._studio_function_source("deleteCampaign")
+
+        self.assertIn('request("/api/evaluation-cleanup-requests")', load_requests)
+        self.assertIn("payload.requests || []", load_requests)
+        self.assertIn("cleanup_request_id", remember_request)
+        self.assertIn("cleanup_status", remember_request)
+        self.assertIn("rememberCleanupRequest(result, campaignId)", delete_campaign)
+        self.assertIn("await loadCleanupRequests()", delete_campaign)
+        self.assertIn("data-evaluation-cleanup-panel", self.studio_js)
+        self.assertIn("data-evaluation-cleanup-retry", self.studio_js)
+        self.assertIn("/api/evaluation-cleanup-requests/${Number(requestId)}/retry", retry_request)
+        self.assertIn('method: "POST"', retry_request)
+        self.assertIn("loadCleanupRequests()", self._studio_function_source("load"))
+
     def test_studio_renders_and_copies_an_absolute_participant_link(self) -> None:
         self.assertIn("function participantShareUrl(shareUrl, campaign)", self.studio_js)
         self.assertIn("new URL(rawUrl, location.origin).href", self.studio_js)
@@ -663,6 +781,25 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertNotIn("reference_asset_id", self.studio_js)
         self.assertNotIn("video_name: videoName", self.studio_js)
         self.assertNotIn("storage_path", self.studio_js)
+
+    def test_campaign_item_picker_uses_one_server_page_and_preserves_selection(self) -> None:
+        loader = self.studio_js.split("async function loadItems", 1)[1].split(
+            "function methodOptions", 1
+        )[0]
+        render = self.studio_js.split("function renderItems", 1)[1].split(
+            "async function loadItemGroups", 1
+        )[0]
+        pager = self.studio_js.split("function itemPagerMarkup", 1)[1].split(
+            "function renderItems", 1
+        )[0]
+
+        self.assertIn("requestedPage", loader)
+        self.assertIn("studioState.itemPage", loader)
+        self.assertIn("payload.items || []", loader)
+        self.assertNotIn("Promise.all", loader)
+        self.assertNotIn("selectedItemIds.delete", loader)
+        self.assertIn("data-studio-item-page", pager)
+        self.assertIn("翻页和搜索不会取消已选视频", render)
 
     def test_coverage_matrix_surfaces_spatial_alignment_without_weakening_time(self) -> None:
         self.assertIn("时间映射严格验证", self.studio_js)

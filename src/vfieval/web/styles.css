@@ -1279,14 +1279,24 @@ th {
 .runs-toolbar {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 12px;
   margin-bottom: 12px;
+}
+
+.runs-toolbar > label:not(.runs-select-all) {
+  flex: 1 1 150px;
+  max-width: 260px;
 }
 
 .runs-select-all {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+.runs-select-all input {
+  width: auto;
 }
 
 .sample-meta {

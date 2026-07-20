@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -174,7 +175,26 @@ class RunFeedbackTests(unittest.TestCase):
             try:
                 post_json(base_url, f"/api/runs/{run_id}/feedback", {"username": "a", "rating": 4, "issue": "", "video": "c.mp4"})
                 self.assertEqual(get_json(base_url, "/api/feedback")["total"], 1)
-                post_json(base_url, f"/api/runs/{run_id}/cleanup-artifacts", {})
+                preview = post_json(
+                    base_url,
+                    "/api/run-purge/preview",
+                    {"request_type": "cleanup_artifacts", "run_ids": [run_id]},
+                )
+                cleanup = post_json(
+                    base_url,
+                    f"/api/runs/{run_id}/cleanup-artifacts",
+                    {"preview_token": preview["preview_token"]},
+                )
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    request = get_json(
+                        base_url,
+                        f"/api/run-purge-requests/{cleanup['request_id']}",
+                    )
+                    if request["status"] in {"completed", "failed"}:
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(request["status"], "completed", request)
                 self.assertEqual(len(get_json(base_url, f"/api/runs/{run_id}")["feedback"]), 0)
                 self.assertEqual(get_json(base_url, "/api/feedback")["total"], 0)
             finally:
@@ -190,7 +210,26 @@ class RunFeedbackTests(unittest.TestCase):
             try:
                 post_json(base_url, f"/api/runs/{run_id}/feedback", {"username": "a", "rating": 4, "issue": "", "video": "c.mp4"})
                 self.assertEqual(get_json(base_url, "/api/feedback")["total"], 1)
-                post_json(base_url, f"/api/runs/{run_id}/hide", {})
+                preview = post_json(
+                    base_url,
+                    "/api/run-purge/preview",
+                    {"request_type": "delete_run", "run_ids": [run_id]},
+                )
+                deletion = post_json(
+                    base_url,
+                    f"/api/runs/{run_id}/hide",
+                    {"preview_token": preview["preview_token"]},
+                )
+                request = deletion
+                for _attempt in range(100):
+                    request = get_json(
+                        base_url,
+                        f"/api/run-purge-requests/{deletion['request_id']}",
+                    )
+                    if request["status"] in {"completed", "failed"}:
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(request["status"], "completed", request)
                 self.assertEqual(get_json(base_url, "/api/feedback")["total"], 0)
             finally:
                 from v13_test_utils import stop_server

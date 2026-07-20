@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
 from vfieval.pipeline.inference import _write_mp4
+from vfieval.run_cleanup import RunCleanupService
 from vfieval.server import _make_handler
 from vfieval.media_assets import bind_run_asset, sync_folder_assets, sync_run_assets
 from vfieval.media_items import bind_run_source, ensure_canonical_gt_item
@@ -158,16 +159,35 @@ def add_completed_pred_run(
 
 
 def start_server(db: Database, workspace: WorkspaceConfig):
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(db, workspace))
+    cleanup_service = RunCleanupService(db, workspace)
+    cleanup_stop = threading.Event()
+    cleanup_thread = threading.Thread(
+        target=cleanup_service.run_forever,
+        args=(cleanup_stop, 0.01),
+        daemon=True,
+    )
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        _make_handler(db, workspace, cleanup_service=cleanup_service),
+    )
+    server.vfieval_cleanup_stop = cleanup_stop
+    server.vfieval_cleanup_thread = cleanup_thread
     thread = threading.Thread(target=server.serve_forever, daemon=True)
+    cleanup_thread.start()
     thread.start()
     return server, thread, f"http://127.0.0.1:{server.server_address[1]}"
 
 
 def stop_server(server: ThreadingHTTPServer, thread: threading.Thread) -> None:
+    cleanup_stop = getattr(server, "vfieval_cleanup_stop", None)
+    cleanup_thread = getattr(server, "vfieval_cleanup_thread", None)
+    if cleanup_stop is not None:
+        cleanup_stop.set()
     server.shutdown()
     server.server_close()
     thread.join(timeout=5)
+    if cleanup_thread is not None:
+        cleanup_thread.join(timeout=5)
 
 
 def get_json(base_url: str, path: str) -> dict:

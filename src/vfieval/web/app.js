@@ -29,9 +29,25 @@ const state = {
   modelFiles: [],
   videoGroups: [],
   checkpoints: [],
+  checkpointsByModel: {},
+  checkpointRequestsByModel: {},
   devices: null,
+  executionDefaultsResolved: false,
   runs: [],
+  runsPage: {
+    page: 1,
+    page_size: 30,
+    page_count: 1,
+    total: 0,
+    active_total: 0,
+  },
+  runFilters: { q: "", status: "", run_type: "", model: "" },
+  runFilterTimer: null,
   metricHealth: null,
+  catalogSync: null,
+  catalogSyncPromise: null,
+  catalogRefreshPromise: null,
+  catalogRefreshIncludeMedia: false,
   preflight: null,
   preflightTimer: null,
   selectedRun: null,
@@ -66,10 +82,12 @@ const state = {
   compareItemPage: 1,
   selectedCompareGroupId: "",
   selectedCompareItemId: null,
+  selectedCompareItemSnapshot: null,
   selectedComparePredMembers: new Set(),
   compareSourceRequestGeneration: 0,
   preflightAbortController: null,
   preflightPayloadKey: "",
+  preflightLevel: "",
   comparePreflight: null,
   comparePreflightTimer: null,
   comparePreflightPayloadKey: "",
@@ -89,20 +107,27 @@ const state = {
   runsRefreshPromise: null,
   runsRefreshQueued: false,
   runsRefreshPendingForce: false,
+  runsRefreshPendingPage: null,
   runsRefreshGeneration: 0,
   compareGridColumns: 3,
   slotSelectionBySample: {},
   compareSlotLayout: "side",
   selectedRunIds: new Set(),
+  runPurgeSubmitting: false,
   feedbackUsername: "",
   feedbackStats: null,
   editingFeedback: null,
   statsFilters: { dataset: "", model: "", checkpoint: "", video: "" },
   mediaCollections: [],
   mediaAssets: [],
+  mediaAssetsPage: { page: 1, page_size: 200, page_count: 1, total: 0 },
+  mediaLibraryRequestGeneration: 0,
   externalPredItemGroups: [],
   externalPredItems: [],
   selectedExternalPredGroupId: "",
+  selectedExternalPredItem: null,
+  selectedExternalPredAsset: null,
+  externalPredItemsPage: { page: 1, page_size: 100, page_count: 1, total: 0 },
   externalPredItemRequestGeneration: 0,
   activeUpload: null,
   uploadPaused: false,
@@ -130,7 +155,10 @@ async function api(path, options = {}) {
   });
   const data = await response.json();
   if (!response.ok) {
-    throw new Error(data.error?.message || response.statusText);
+    const error = new Error(data.error?.message || data.message || response.statusText);
+    error.status = response.status;
+    error.payload = data;
+    throw error;
   }
   return data;
 }
@@ -207,6 +235,12 @@ function groupByName(name) {
 
 function isCompareRun(run) {
   return (run?.metadata?.run_type || "model_inference") === "video_compare";
+}
+
+function isFileInputRun(run) {
+  return !isCompareRun(run) && Boolean(
+    run?.metadata?.request?.model_file || run?.metadata?.model_file,
+  );
 }
 
 function previewGroupsForRun(run) {
@@ -341,8 +375,10 @@ function renderOptions() {
     state.selectedGroups.add(initial);
   }
 
+  state.checkpoints = state.checkpointsByModel[form.elements.model_file.value] || [];
   renderCheckpointOptions(previousCheckpoint);
-  renderSingleDeviceOptions(previousDevice);
+  const fallbackDevice = resolveInitialExecutionDefaults();
+  renderSingleDeviceOptions(fallbackDevice || previousDevice);
   renderDeviceOptions();
   renderGroupPicker();
   for (const name of selectedGroupNames()) ensureVideoSelection(name);
@@ -379,6 +415,50 @@ function renderCheckpointOptions(previousValue = null) {
   form.elements.checkpoint.value = rows.some((item) => item.relative_path === desired) || ["none", "auto"].includes(desired)
     ? desired
     : "none";
+}
+
+async function loadCheckpointsForModel(modelFile, options = {}) {
+  const normalizedModel = String(modelFile || "").trim();
+  const form = $("infer-form");
+  if (!normalizedModel) {
+    state.checkpoints = [];
+    renderCheckpointOptions("none");
+    return [];
+  }
+  const cached = state.checkpointsByModel[normalizedModel];
+  if (!options.force && Array.isArray(cached)) {
+    if (form.elements.model_file.value === normalizedModel) {
+      const previous = form.elements.checkpoint?.value || "none";
+      state.checkpoints = cached;
+      renderCheckpointOptions(previous);
+    }
+    return cached;
+  }
+  if (state.checkpointRequestsByModel[normalizedModel]) {
+    return state.checkpointRequestsByModel[normalizedModel];
+  }
+
+  if (!Array.isArray(cached) && form.elements.model_file.value === normalizedModel) {
+    const previous = form.elements.checkpoint?.value || "none";
+    state.checkpoints = [];
+    renderCheckpointOptions(previous);
+  }
+  const request = api(`/api/checkpoints?model_file=${encodeURIComponent(normalizedModel)}`)
+    .then((rows) => {
+      const normalizedRows = Array.isArray(rows) ? rows : [];
+      state.checkpointsByModel[normalizedModel] = normalizedRows;
+      if (form.elements.model_file.value === normalizedModel) {
+        const previous = form.elements.checkpoint?.value || "none";
+        state.checkpoints = normalizedRows;
+        renderCheckpointOptions(previous);
+      }
+      return normalizedRows;
+    })
+    .finally(() => {
+      delete state.checkpointRequestsByModel[normalizedModel];
+    });
+  state.checkpointRequestsByModel[normalizedModel] = request;
+  return request;
 }
 
 function renderSingleDeviceOptions(previousValue = null) {
@@ -491,6 +571,27 @@ function selectedVideoNames() {
   return qualified;
 }
 
+function resolveInitialExecutionDefaults() {
+  if (state.executionDefaultsResolved || !state.devices) return null;
+  state.executionDefaultsResolved = true;
+  const form = $("infer-form");
+  const mode = form.elements.execution_mode.value || "single";
+  const cuda = state.devices.cuda || [];
+  const npu = state.devices.npu || [];
+  if (mode === "multi_npu" && npu.length) return null;
+  if (mode === "multi_cuda" && cuda.length) return null;
+  if (npu.length) {
+    form.elements.execution_mode.value = "multi_npu";
+    return npu[0].id;
+  }
+  if (cuda.length > 1) {
+    form.elements.execution_mode.value = "multi_cuda";
+    return cuda[0].id;
+  }
+  form.elements.execution_mode.value = "single";
+  return cuda[0]?.id || "cpu";
+}
+
 function selectedSourceAssets() {
   const result = [];
   for (const groupName of selectedGroupNames()) {
@@ -534,7 +635,10 @@ function compareMemberId(row) {
 }
 
 function selectedCompareGt() {
-  return (state.compareItems || []).find((row) => compareItemId(row) === Number(state.selectedCompareItemId)) || null;
+  return (state.compareItems || []).find((row) => compareItemId(row) === Number(state.selectedCompareItemId))
+    || (compareItemId(state.selectedCompareItemSnapshot) === Number(state.selectedCompareItemId)
+      ? state.selectedCompareItemSnapshot
+      : null);
 }
 
 function selectedComparePredRows() {
@@ -589,11 +693,10 @@ function compareSpatialTarget(predRows = selectedComparePredRows()) {
 }
 
 function ensureCompareSelection() {
-  const itemIds = new Set((state.compareItems || []).map(compareItemId));
-  if (state.selectedCompareItemId && !itemIds.has(Number(state.selectedCompareItemId))) {
-    state.selectedCompareItemId = null;
-    state.selectedComparePredMembers.clear();
-  }
+  const selectedOnPage = (state.compareItems || []).find(
+    (row) => compareItemId(row) === Number(state.selectedCompareItemId),
+  );
+  if (selectedOnPage) state.selectedCompareItemSnapshot = selectedOnPage;
   const available = new Set();
   for (const row of state.comparePredictions || []) {
     const memberId = compareMemberId(row);
@@ -625,6 +728,7 @@ async function loadCompareSources(options = {}) {
   if (options.reset) {
     state.selectedCompareGroupId = "";
     state.selectedCompareItemId = null;
+    state.selectedCompareItemSnapshot = null;
     state.selectedComparePredMembers.clear();
   }
   const groupPayload = await api("/api/media/item-groups?role=gt");
@@ -634,6 +738,7 @@ async function loadCompareSources(options = {}) {
   if (!groupIds.has(String(state.selectedCompareGroupId))) {
     state.selectedCompareGroupId = String(state.compareItemGroups[0]?.group_id || state.compareItemGroups[0]?.collection_id || state.compareItemGroups[0]?.id || "");
     state.selectedCompareItemId = null;
+    state.selectedCompareItemSnapshot = null;
     state.selectedComparePredMembers.clear();
   }
   if (!state.selectedCompareGroupId) {
@@ -834,9 +939,11 @@ function schedulePreflight(delay = 600) {
 
 async function runPreflight(options = {}) {
   const payload = payloadFromForm();
+  const level = options.level === "deep" ? "deep" : "quick";
   if (!payload) {
     state.preflight = null;
     state.preflightPayloadKey = "";
+    state.preflightLevel = "";
     renderPreflight();
     return;
   }
@@ -844,6 +951,7 @@ async function runPreflight(options = {}) {
   if (!payload.model_file || !groups.length) {
     state.preflight = null;
     state.preflightPayloadKey = "";
+    state.preflightLevel = "";
     renderPreflight();
     return;
   }
@@ -852,11 +960,17 @@ async function runPreflight(options = {}) {
   if (groups.some((name) => !state.videoPages[name])) {
     state.preflight = null;
     state.preflightPayloadKey = "";
+    state.preflightLevel = "";
     renderPreflight();
     return;
   }
   const payloadKey = stableStringify(payload);
-  if (!options.force && state.preflight && state.preflightPayloadKey === payloadKey) {
+  if (
+    !options.force
+    && state.preflight
+    && state.preflightPayloadKey === payloadKey
+    && (level === "quick" || state.preflightLevel === "deep")
+  ) {
     renderPreflight();
     return;
   }
@@ -866,14 +980,19 @@ async function runPreflight(options = {}) {
   const controller = new AbortController();
   state.preflightAbortController = controller;
   try {
+    const requestPayload = { ...payload, preflight_level: level };
     const result = await api("/api/preflight", {
       method: "POST",
-      body: JSON.stringify(payload),
+      body: JSON.stringify(requestPayload),
       signal: controller.signal,
     });
     if (state.preflightAbortController !== controller) return;
+    // Quick preflight is advisory. Never let an older server response make it
+    // authoritative for Run creation by carrying a deep-preflight token.
+    if (level !== "deep") delete result.preflight_token;
     state.preflight = result;
     state.preflightPayloadKey = payloadKey;
+    state.preflightLevel = level;
     renderPreflight();
   } catch (error) {
     if (error.name === "AbortError") return;
@@ -1021,6 +1140,68 @@ function renderMessages(kind, items) {
   return `<div class="${cls}">${items.map((item) => `<p><strong>${escapeHtml(item.title || "提示")}</strong>: ${escapeHtml(item.message || item)}</p>`).join("")}</div>`;
 }
 
+function workloadRiskReasonLabel(reason) {
+  const row = reason && typeof reason === "object" ? reason : { code: String(reason || "unknown") };
+  const labels = {
+    input_pair_device_memory_ge_5_percent: "单设备输入张量下界已达到显存的 5%",
+    prefetch_host_memory_ge_25_percent: "预取输入下界已达到可用主机内存的 25%",
+    unknown_device_memory_batch_pixels_gt_16000000: "无法读取设备显存，且单设备批次像素数超过 1600 万",
+  };
+  const label = labels[row.code] || row.code || "未知风险";
+  if (row.actual_bytes && row.available_bytes) {
+    return `${label}（${formatBytes(row.actual_bytes)} / ${formatBytes(row.available_bytes)}）`;
+  }
+  if (row.batch_pixels_per_device) {
+    return `${label}（${Number(row.batch_pixels_per_device).toLocaleString()} 像素）`;
+  }
+  return label;
+}
+
+function renderWorkloadEstimate(workload) {
+  if (!workload || typeof workload !== "object") return "";
+  const effective = workload.effective || {};
+  const risks = Array.isArray(workload.risk_reasons) ? workload.risk_reasons : [];
+  const highRisk = workload.risk_level === "high";
+  return `
+    <section class="workload-estimate ${highRisk ? "message warn" : ""}">
+      <div class="panel-head">
+        <h3>工作量与资源下界</h3>
+        <span class="${highRisk ? "bad-text" : "ok-text"}">${highRisk ? "高风险，启动时需确认" : "常规"}</span>
+      </div>
+      <div class="summary-grid">
+        <div><span>单设备批次</span><strong>${escapeHtml(effective.batch_size_per_device ?? "-")}</strong></div>
+        <div><span>有效分辨率</span><strong>${escapeHtml(effective.width ?? "-")}×${escapeHtml(effective.height ?? "-")}</strong></div>
+        <div><span>输入张量下界</span><strong>${escapeHtml(formatBytes(workload.input_tensor_bytes_lower_bound))}</strong></div>
+        <div><span>主机预取下界</span><strong>${escapeHtml(formatBytes(workload.prefetch_host_bytes_lower_bound))}</strong></div>
+        <div><span>产物空间预算</span><strong>${escapeHtml(formatBytes(workload.artifact_budget_bytes))}</strong></div>
+        <div><span>样本数</span><strong>${escapeHtml(effective.sample_count ?? "-")}</strong></div>
+      </div>
+      ${risks.length ? `<ul>${risks.map((reason) => `<li>${escapeHtml(workloadRiskReasonLabel(reason))}</li>`).join("")}</ul>` : ""}
+      <p class="muted">内存数字是可解释的下界，不包含模型参数、激活、输出及分配器工作区；产物数字是规划预算。</p>
+    </section>
+  `;
+}
+
+function highRiskWorkloadConfirmation(workload) {
+  if (workload?.risk_level !== "high") return true;
+  const fingerprint = String(workload.risk_fingerprint || "").trim();
+  if (!fingerprint) {
+    throw new Error("高风险预检查没有返回风险指纹，请刷新后重试");
+  }
+  const reasons = (Array.isArray(workload.risk_reasons) ? workload.risk_reasons : [])
+    .map((reason) => `• ${workloadRiskReasonLabel(reason)}`)
+    .join("\n");
+  const effective = workload.effective || {};
+  const summary = [
+    `设备：${effective.device || "-"} / ${effective.precision || "-"}`,
+    `单设备批次：${effective.batch_size_per_device ?? "-"}，分辨率：${effective.width ?? "-"}×${effective.height ?? "-"}`,
+    `输入张量下界：${formatBytes(workload.input_tensor_bytes_lower_bound)}`,
+    `主机预取下界：${formatBytes(workload.prefetch_host_bytes_lower_bound)}`,
+    `产物空间预算：${formatBytes(workload.artifact_budget_bytes)}`,
+  ].join("\n");
+  return window.confirm(`当前配置被判定为高风险：\n\n${reasons || "• 资源风险阈值已触发"}\n\n${summary}\n\n确认仍按当前吞吐配置启动？`);
+}
+
 function renderPreflight() {
   const result = state.preflight;
   const start = $("start-run");
@@ -1045,24 +1226,30 @@ function renderPreflight() {
   start.disabled = !result.ok;
 
   const videos = result.video_group?.videos || [];
+  const isQuick = String(result.preflight_level || state.preflightLevel) === "quick";
+  const interfaceStatus = isQuick
+    ? "启动前深度检查"
+    : (result.model?.interface_ok ? "通过" : "失败");
+  const cacheStatus = isQuick ? "启动前深度检查" : (result.cache?.status || "-");
   $("preflight").innerHTML = `
     <div class="panel-head">
-      <h2>运行前预检查</h2>
+      <h2>${isQuick ? "快速预检查" : "运行前深度预检查"}</h2>
       ${result.ok ? "<span class=\"ok-text\">通过</span>" : "<span class=\"bad-text\">未通过</span>"}
     </div>
     <div class="summary-grid">
       <div><span>模型</span><strong>${escapeHtml(result.model?.name || "-")}</strong></div>
-      <div><span>接口检查</span><strong>${result.model?.interface_ok ? "通过" : "失败"}</strong></div>
+      <div><span>接口检查</span><strong>${interfaceStatus}</strong></div>
       <div><span>已选视频</span><strong>${escapeHtml(result.video_group?.video_count ?? 0)}</strong></div>
       <div><span>真实总帧数</span><strong>${escapeHtml(result.video_group?.frame_count ?? 0)}</strong></div>
       <div><span>总时长</span><strong>${formatDuration(result.video_group?.duration_seconds)}</strong></div>
       <div><span>Triplets</span><strong>${escapeHtml(result.video_group?.triplets ?? 0)}</strong></div>
-      <div><span>缓存状态</span><strong>${escapeHtml(result.cache?.status || "-")}</strong></div>
+      <div><span>缓存状态</span><strong>${escapeHtml(cacheStatus)}</strong></div>
       <div><span>设备/精度</span><strong>${escapeHtml(`${result.device?.effective_device || "-"} / ${result.device?.effective_precision || "-"}`)}</strong></div>
       <div><span>支持精度</span><strong>${escapeHtml((result.device?.supported_precisions || []).join(" / ") || "-")}</strong></div>
     </div>
     ${renderMessages("errors", result.errors || [])}
     ${renderMessages("warnings", result.warnings || [])}
+    ${renderWorkloadEstimate(result.workload)}
     ${renderExecutionProfileRecommendation(result)}
     ${renderPortableMetricHealthTable(result.metrics?.health || {})}
     ${renderDecodeBackendNotice()}
@@ -1074,7 +1261,7 @@ function renderPreflight() {
       { label: "Triplets", render: (row) => escapeHtml(row.triplets ?? 0) },
       { label: "分辨率", render: (row) => `${escapeHtml(row.width)}x${escapeHtml(row.height)}` },
       { label: "FPS", render: (row) => formatNumber(row.fps) },
-      { label: "缓存", render: (row) => escapeHtml(row.cache_status || "-") },
+      { label: "缓存", render: (row) => escapeHtml(row.cache_status === "not_checked" ? "待深度检查" : (row.cache_status || "-")) },
     ])}</div>
   `;
 }
@@ -1511,11 +1698,30 @@ async function startRun(event) {
     toast("请先选择至少一个视频");
     return;
   }
-  const payload = payloadFromForm();
-  await runPreflight({ force: true });
-  if (!state.preflight?.ok) {
+  clearTimeout(state.preflightTimer);
+  await runPreflight({ force: true, level: "deep" });
+  let payload = payloadFromForm();
+  if (state.preflightPayloadKey !== stableStringify(payload)) {
+    await runPreflight({ force: true, level: "deep" });
+    payload = payloadFromForm();
+  }
+  if (!state.preflight?.ok || state.preflightLevel !== "deep") {
     toast("预检查未通过");
     return;
+  }
+  if (state.preflightPayloadKey !== stableStringify(payload)) {
+    throw new Error("运行配置在预检查期间发生变化，请重新点击开始任务");
+  }
+  const workload = state.preflight.workload;
+  if (!highRiskWorkloadConfirmation(workload)) {
+    toast("已取消启动，当前配置保持不变");
+    return;
+  }
+  if (state.preflightLevel === "deep" && state.preflight.preflight_token) {
+    payload.preflight_token = String(state.preflight.preflight_token);
+  }
+  if (workload?.risk_level === "high") {
+    payload.risk_ack_fingerprint = String(workload.risk_fingerprint);
   }
   const created = await api("/api/runs", {
     method: "POST",
@@ -1523,7 +1729,9 @@ async function startRun(event) {
   });
   toast(`Run #${created.run_id} 已开始`);
   switchView("runs");
-  await refreshRunsOnly();
+  state.runsPage.page = 1;
+  state.runFilters = { q: "", status: "", run_type: "", model: "" };
+  await refreshRunsOnly({ page: 1 });
   await selectRun(created.run_id);
 }
 
@@ -1623,11 +1831,57 @@ function shouldRefreshSelectedRun(nextRun) {
     || Number(nextRun.progress_total || 0) !== Number(state.selectedRun.progress_total || 0);
 }
 
+function runListPath(options = {}) {
+  const page = Math.max(1, Number(options.page || state.runsPage.page || 1));
+  const pageSize = Math.max(1, Math.min(200, Number(state.runsPage.page_size || 30)));
+  const params = new URLSearchParams({ page: String(page), page_size: String(pageSize) });
+  for (const [key, value] of Object.entries(state.runFilters || {})) {
+    const normalized = String(value || "").trim();
+    if (normalized) params.set(key, normalized);
+  }
+  return `/api/runs?${params.toString()}`;
+}
+
+function applyRunListPayload(payload) {
+  if (Array.isArray(payload)) {
+    state.runs = payload;
+    state.runsPage = {
+      ...state.runsPage,
+      page: 1,
+      page_count: 1,
+      total: payload.length,
+      active_total: payload.filter((run) =>
+        !TERMINAL_STATUSES.has(run.status)
+        || ["requested", "canceling", "purging"].includes(runPurgeState(run))).length,
+    };
+    return;
+  }
+  state.runs = Array.isArray(payload?.runs) ? payload.runs : [];
+  state.runsPage = {
+    ...state.runsPage,
+    page: Math.max(1, Number(payload?.page || 1)),
+    page_size: Math.max(1, Number(payload?.page_size || state.runsPage.page_size || 30)),
+    page_count: Math.max(1, Number(payload?.page_count || 1)),
+    total: Math.max(0, Number(payload?.total || 0)),
+    active_total: Math.max(0, Number(payload?.active_total || 0)),
+  };
+}
+
+async function requestRunsPage(options = {}) {
+  return api(runListPath(options));
+}
+
 async function refreshRunsOnce(options = {}) {
   const requestGeneration = ++state.runsRefreshGeneration;
-  const nextRuns = await api("/api/runs");
+  let payload = await requestRunsPage(options);
   if (requestGeneration !== state.runsRefreshGeneration) return;
-  state.runs = nextRuns;
+  const rows = Array.isArray(payload) ? payload : (payload?.runs || []);
+  const page = Number(Array.isArray(payload) ? 1 : payload?.page || options.page || state.runsPage.page || 1);
+  if (!rows.length && page > 1) {
+    payload = await requestRunsPage({ page: page - 1 });
+    if (requestGeneration !== state.runsRefreshGeneration) return;
+  }
+  applyRunListPayload(payload);
   renderRuns();
   if (!isRunsViewActive()) {
     return;
@@ -1635,10 +1889,25 @@ async function refreshRunsOnce(options = {}) {
   if (state.selectedRun) {
     const nextRun = state.runs.find((item) => Number(item.id) === Number(state.selectedRun.id));
     if (!nextRun) {
-      abortRunDetailRequests(state.selectedRun.id);
-      state.selectedRun = null;
-      state.runVideosPage = null;
-      renderEmptyRunDetail();
+      // Paging and filters only change the history slice. Keep an already
+      // selected detail visible, and keep polling it by ID while it is active.
+      const selectedNeedsRefresh = !!options.forceSelected
+        || !TERMINAL_STATUSES.has(state.selectedRun.status)
+        || ["requested", "canceling", "purging"].includes(runPurgeState(state.selectedRun));
+      if (selectedNeedsRefresh) {
+        try {
+          await selectRun(state.selectedRun.id, {
+            quiet: true,
+            invalidateResults: !!options.forceSelected,
+          });
+        } catch (error) {
+          if (Number(error.status || 0) !== 404) throw error;
+          abortRunDetailRequests(state.selectedRun.id);
+          state.selectedRun = null;
+          state.runVideosPage = null;
+          renderEmptyRunDetail();
+        }
+      }
     } else {
       const becameTerminal = !TERMINAL_STATUSES.has(state.selectedRun.status)
         && TERMINAL_STATUSES.has(nextRun.status);
@@ -1668,14 +1937,19 @@ function refreshRunsOnly(options = {}) {
   }
   state.runsRefreshQueued = true;
   state.runsRefreshPendingForce = state.runsRefreshPendingForce || !!options.forceSelected;
+  if (options.page !== undefined && options.page !== null) {
+    state.runsRefreshPendingPage = Math.max(1, Number(options.page || 1));
+  }
   if (state.runsRefreshPromise) return state.runsRefreshPromise;
 
   const refreshLoop = async () => {
     while (state.runsRefreshQueued) {
       const forceSelected = state.runsRefreshPendingForce;
+      const page = state.runsRefreshPendingPage;
       state.runsRefreshQueued = false;
       state.runsRefreshPendingForce = false;
-      await refreshRunsOnce({ forceSelected });
+      state.runsRefreshPendingPage = null;
+      await refreshRunsOnce({ forceSelected, page });
     }
   };
   const promise = refreshLoop().finally(() => {
@@ -1683,6 +1957,14 @@ function refreshRunsOnly(options = {}) {
   });
   state.runsRefreshPromise = promise;
   return promise;
+}
+
+function scheduleRunFilterRefresh(delay = 300) {
+  clearTimeout(state.runFilterTimer);
+  state.runFilterTimer = setTimeout(() => {
+    state.runFilterTimer = null;
+    refreshRunsOnly({ page: 1 }).catch((error) => toast(error.message));
+  }, delay);
 }
 
 function runSourceLabel(run) {
@@ -1705,6 +1987,10 @@ function pathBasename(value) {
 }
 
 function renderRuns() {
+  const activeFilter = document.activeElement?.dataset?.runFilter || "";
+  const activeSelection = activeFilter && typeof document.activeElement.selectionStart === "number"
+    ? [document.activeElement.selectionStart, document.activeElement.selectionEnd]
+    : null;
   // Drop selections for runs that are no longer in the list (e.g. refreshed away).
   const liveIds = new Set(state.runs.map((run) => Number(run.id)));
   for (const id of Array.from(state.selectedRunIds)) {
@@ -1712,13 +1998,42 @@ function renderRuns() {
   }
   const allSelected = state.runs.length > 0 && state.runs.every((run) => state.selectedRunIds.has(Number(run.id)));
   const selectedCount = state.selectedRunIds.size;
+  const statusOptions = [
+    ["", "全部状态"],
+    ["decoding", "Decoding"],
+    ["queued", "排队中"],
+    ["running", "推理中"],
+    ["completed", "已完成"],
+    ["failed", "失败"],
+    ["canceled", "已取消"],
+  ];
+  const typeOptions = [["", "全部类型"], ["model_inference", "模型推理"], ["video_compare", "视频对比"]];
+  const filterOptionHtml = (rows, current) => rows.map(([value, label]) =>
+    `<option value="${escapeHtml(value)}" ${String(current || "") === value ? "selected" : ""}>${escapeHtml(label)}</option>`).join("");
   const toolbar = `
     <div class="runs-toolbar">
       <label class="runs-select-all">
         <input type="checkbox" data-runs-select-all ${allSelected ? "checked" : ""}>
-        <span>全选</span>
+        <span>全选本页</span>
       </label>
       <button class="secondary danger" data-runs-batch-delete type="button" ${selectedCount ? "" : "disabled"}>批量删除${selectedCount ? ` (${selectedCount})` : ""}</button>
+      <label>
+        <span class="muted">搜索</span>
+        <input data-run-filter="q" value="${escapeHtml(state.runFilters.q)}" placeholder="名称、Run ID 或来源">
+      </label>
+      <label>
+        <span class="muted">状态</span>
+        <select data-run-filter="status">${filterOptionHtml(statusOptions, state.runFilters.status)}</select>
+      </label>
+      <label>
+        <span class="muted">类型</span>
+        <select data-run-filter="run_type">${filterOptionHtml(typeOptions, state.runFilters.run_type)}</select>
+      </label>
+      <label>
+        <span class="muted">模型</span>
+        <input data-run-filter="model" value="${escapeHtml(state.runFilters.model)}" placeholder="模型文件">
+      </label>
+      <button class="secondary" data-runs-filter-reset type="button">清除筛选</button>
     </div>
   `;
   const rows = table(state.runs, [
@@ -1734,7 +2049,21 @@ function renderRuns() {
     { label: "进度", render: (run) => `${escapeHtml(run.progress_current || 0)}/${escapeHtml(run.progress_total || 0)}` },
     { label: "操作", render: (run) => `<button class="view-detail-btn" data-run-id="${run.id}" type="button">查看详情 →</button>` },
   ], { rowAttrs: (run) => `data-run-id="${run.id}" class="clickable-row"` });
-  $("runs-table").innerHTML = toolbar + rows;
+  const pager = `
+    <div class="pager runs-pager">
+      <button class="secondary" data-runs-page="${state.runsPage.page - 1}" ${state.runsPage.page <= 1 ? "disabled" : ""} type="button">上一页</button>
+      <span class="muted">第 ${escapeHtml(state.runsPage.page)} / ${escapeHtml(state.runsPage.page_count)} 页，共 ${escapeHtml(state.runsPage.total)} 条</span>
+      <button class="secondary" data-runs-page="${state.runsPage.page + 1}" ${state.runsPage.page >= state.runsPage.page_count ? "disabled" : ""} type="button">下一页</button>
+    </div>
+  `;
+  $("runs-table").innerHTML = toolbar + rows + pager;
+  if (activeFilter) {
+    const nextActive = $("runs-table").querySelector(`[data-run-filter="${activeFilter}"]`);
+    nextActive?.focus();
+    if (activeSelection && typeof nextActive?.setSelectionRange === "function") {
+      nextActive.setSelectionRange(activeSelection[0], activeSelection[1]);
+    }
+  }
 }
 
 async function loadRunVideosPage(runId, page = 1) {
@@ -1848,6 +2177,9 @@ function renderMetricPhase(run) {
 
 function renderRunError(run) {
   if (!run.error || !Object.keys(run.error).length) return "";
+  const cloneAction = isFileInputRun(run)
+    ? `<button class="secondary" data-clone-run="${escapeHtml(run.id)}" type="button">Clone with current inputs</button>`
+    : "";
   const parts = [];
   if (run.error.device) parts.push(`Device ${run.error.device}`);
   if (run.error.shard_index !== undefined && run.error.shard_index !== null) {
@@ -1858,9 +2190,9 @@ function renderRunError(run) {
   if (run.error.job_id) parts.push(`Job ${run.error.job_id}`);
   if (parts.length) {
     const meta = `<p class="muted">${escapeHtml(parts.join(" | "))}</p>`;
-    return `<div class="message error run-error-banner"><p><strong>${escapeHtml(run.error.type || "Error")}</strong>: ${escapeHtml(run.error.message || JSON.stringify(run.error))}</p>${meta}<button class="secondary" data-retry-run="${escapeHtml(run.id)}" type="button">Retry this Run</button></div>`;
+    return `<div class="message error run-error-banner"><p><strong>${escapeHtml(run.error.type || "Error")}</strong>: ${escapeHtml(run.error.message || JSON.stringify(run.error))}</p>${meta}<button class="secondary" data-retry-run="${escapeHtml(run.id)}" type="button">Retry this Run</button>${cloneAction}</div>`;
   }
-  return `<div class="message error run-error-banner"><p><strong>${escapeHtml(run.error.type || "Error")}</strong>: ${escapeHtml(run.error.message || JSON.stringify(run.error))}</p><button class="secondary" data-retry-run="${escapeHtml(run.id)}" type="button">Retry this Run</button></div>`;
+  return `<div class="message error run-error-banner"><p><strong>${escapeHtml(run.error.type || "Error")}</strong>: ${escapeHtml(run.error.message || JSON.stringify(run.error))}</p><button class="secondary" data-retry-run="${escapeHtml(run.id)}" type="button">Retry this Run</button>${cloneAction}</div>`;
   return `<div class="message error"><p><strong>${escapeHtml(run.error.type || "错误")}</strong>: ${escapeHtml(run.error.message || JSON.stringify(run.error))}</p></div>`;
 }
 
@@ -2301,6 +2633,33 @@ function retriableMetricCount(runId) {
   );
 }
 
+function renderArtifactStorageDiagnostic(diagnostic) {
+  if (!diagnostic || typeof diagnostic !== "object") return "";
+  const predicted = Number(diagnostic.predicted_artifact_budget_bytes);
+  const actual = Number(diagnostic.actual_artifact_bytes);
+  const hasPredicted = diagnostic.predicted_artifact_budget_bytes != null
+    && Number.isFinite(predicted) && predicted >= 0;
+  const hasActual = diagnostic.actual_artifact_bytes != null
+    && Number.isFinite(actual) && actual >= 0;
+  if (!hasPredicted && !hasActual) return "";
+  const ratio = Number(diagnostic.budget_utilization_ratio);
+  const ratioText = Number.isFinite(ratio) ? ` · ${(ratio * 100).toFixed(1)}%` : "";
+  const measurement = diagnostic.measurement === "partial"
+    ? "（部分产物尚无字节记录）"
+    : diagnostic.measurement === "in_progress"
+      ? "（生成中）"
+      : diagnostic.measurement === "cleaned"
+        ? "（产物已清理）"
+        : "";
+  return `
+    <div>
+      <span>产物空间（实际 / 预算）</span>
+      <strong>${escapeHtml(hasActual ? formatBytes(actual) : "-")} / ${escapeHtml(hasPredicted ? formatBytes(predicted) : "-")}${escapeHtml(ratioText)}</strong>
+      ${measurement ? `<small class="muted">${escapeHtml(measurement)}</small>` : ""}
+    </div>
+  `;
+}
+
 function renderRunDetail() {
   const run = state.selectedRun;
   if (!run) {
@@ -2323,6 +2682,7 @@ function renderRunDetail() {
         <button class="secondary" data-rename-run="${run.id}" type="button">重命名</button>
         <button class="secondary" data-cancel-run="${run.id}" ${TERMINAL_STATUSES.has(run.status) ? "disabled" : ""} type="button">取消</button>
         <button class="secondary" data-retry-run="${run.id}" type="button">重试</button>
+        ${isFileInputRun(run) ? `<button class="secondary" data-clone-run="${run.id}" type="button">按当前输入克隆</button>` : ""}
         <button class="secondary danger" data-delete-run="${run.id}" ${["requested", "canceling", "purging"].includes(runPurgeState(run)) ? "disabled" : ""} type="button">${runPurgeState(run) === "failed" && runPurgeDeletesRecord(run) ? "重试删除" : "删除记录"}</button>
         <button class="secondary" data-cleanup-run="${run.id}" ${TERMINAL_STATUSES.has(run.status) && !run.artifact_cleaned_at && !["requested", "canceling", "purging"].includes(runPurgeState(run)) ? "" : "disabled"} type="button">清理产物</button>
       </div>
@@ -2336,6 +2696,7 @@ function renderRunDetail() {
         <div><span>评测阶段</span><strong>${escapeHtml(renderMetricPhase(run))}</strong></div>
         <div><span>输出目录</span><strong>${escapeHtml(run.metadata?.output_dir || run.result?.output_dir || "-")}</strong></div>
         <div><span>产物数</span><strong>${escapeHtml(run.artifact_summary?.total || 0)}</strong></div>
+        ${renderArtifactStorageDiagnostic(run.artifact_storage)}
       </div>
       ${renderRunError(run)}
       ${renderRunPurgeNotice(run)}
@@ -3392,14 +3753,154 @@ async function retryRun(runId) {
   await selectRun(created.run_id);
 }
 
+async function cloneRunWithCurrentInputs(runId) {
+  let created;
+  let requestBody = {};
+  for (let attempt = 0; attempt < 3 && !created; attempt += 1) {
+    try {
+      created = await api(`/api/runs/${runId}/clone`, {
+        method: "POST",
+        body: JSON.stringify(requestBody),
+      });
+    } catch (error) {
+      const payload = error.payload || {};
+      const workload = payload.workload;
+      if (
+        Number(error.status) !== 409
+        || String(payload.type || payload.error?.type || "") !== "WorkloadRiskConfirmationRequired"
+        || workload?.risk_level !== "high"
+      ) {
+        throw error;
+      }
+      if (!highRiskWorkloadConfirmation(workload)) {
+        toast("已取消 Clone，当前文件与配置保持不变");
+        return;
+      }
+      requestBody = {
+        risk_ack_fingerprint: String(workload.risk_fingerprint),
+      };
+    }
+  }
+  if (!created) {
+    throw new Error("Clone 工作量在确认期间连续变化，请检查当前输入后重试");
+  }
+  toast(`已按当前输入启动 Clone Run #${created.run_id}`);
+  await refreshRunsOnly();
+  await selectRun(created.run_id);
+}
+
 async function retryRunMetrics(runId) {
   await api(`/api/runs/${runId}/metrics/retry`, { method: "POST", body: "{}" });
   toast(`Run #${runId} 的失败/不可用指标已重新排队`);
   await refreshRunsOnly({ forceSelected: Number(state.selectedRun?.id) === Number(runId) });
 }
 
+function runPurgeBytes(value) {
+  const bytes = Number(value || 0);
+  return bytes > 0 ? formatBytes(bytes) : "0 B";
+}
+
+function runPurgeDependencyText(dependencies) {
+  const rows = dependencies && typeof dependencies === "object" ? dependencies : {};
+  const sections = [
+    ["Campaign", rows.campaign_ids],
+    ["Compare Run", rows.compare_run_ids],
+    ["活动 Job", rows.active_job_ids],
+  ];
+  const visible = sections.flatMap(([label, values]) => {
+    const ids = Array.isArray(values) ? values.map(Number).filter((value) => value > 0) : [];
+    if (!ids.length) return [];
+    const shown = ids.slice(0, 10).map((value) => `#${value}`).join(", ");
+    return [`${label}: ${shown}${ids.length > 10 ? ` 等 ${ids.length} 项` : ""}`];
+  });
+  return visible.length ? visible.join("；") : "无已知依赖";
+}
+
+function runPurgeReasonLabel(reason) {
+  const labels = {
+    ready: "可执行",
+    run_not_terminal: "Run 尚未结束",
+    active_worker: "仍有活动 Worker/Job",
+    artifacts_already_cleaned: "产物已清理",
+    run_already_deleted: "Run 已删除",
+  };
+  return labels[String(reason || "")] || String(reason || "未知原因");
+}
+
+function runPurgePreviewMessage(preview) {
+  const requestType = String(preview?.request_type || "");
+  const operation = requestType === "cleanup_artifacts" ? "清理可视产物" : "永久删除 Run";
+  const summary = preview?.summary || {};
+  const runs = Array.isArray(preview?.runs) ? preview.runs : [];
+  const runLines = runs.slice(0, 12).map((run) => {
+    const bytes = run.bytes || {};
+    const status = run.allowed ? "可执行" : `阻止：${runPurgeReasonLabel(run.reason)}`;
+    const name = String(run.name || "").replaceAll(/\s+/g, " ").slice(0, 80);
+    return `• #${Number(run.run_id)}${name ? ` “${name}”` : ""} · ${run.status || "-"} · ${status} · 目录 ${runPurgeBytes(bytes.exclusive_run_bytes)}`;
+  });
+  if (runs.length > 12) runLines.push(`• 另有 ${runs.length - 12} 条 Run（已计入汇总）`);
+  const immediate = summary.estimated_reclaimable_bytes ?? summary.exclusive_run_bytes;
+  return [
+    `${operation}影响预览`,
+    "",
+    ...runLines,
+    "",
+    `预计可回收（Run 目录）：${runPurgeBytes(immediate)}`,
+    `引用缓存总量：${runPurgeBytes(summary.referenced_cache_bytes)}`,
+    `共享缓存（保留）：${runPurgeBytes(summary.shared_cache_bytes)}`,
+    `仅由本次选择持有的缓存：${runPurgeBytes(summary.exclusive_cache_bytes)}`,
+    `缓存宽限期后潜在可回收：${runPurgeBytes(summary.potential_cache_bytes_after_grace)}`,
+    `依赖：${runPurgeDependencyText(summary.dependencies)}`,
+  ].join("\n");
+}
+
+async function requestRunPurgePreview(requestType, runIds) {
+  const normalizedIds = Array.from(new Set((runIds || []).map(Number).filter((value) => value > 0))).sort((a, b) => a - b);
+  if (!normalizedIds.length) throw new Error("请选择至少一条 Run 记录");
+  const preview = await api("/api/run-purge/preview", {
+    method: "POST",
+    body: JSON.stringify({ request_type: requestType, run_ids: normalizedIds }),
+  });
+  if (!preview?.preview_token) throw new Error("删除影响预览未返回确认令牌，请重试");
+  return preview;
+}
+
+function confirmRunPurgePreview(preview) {
+  const message = runPurgePreviewMessage(preview);
+  const blocked = (preview.runs || []).filter((run) => !run.allowed);
+  if (blocked.length) {
+    window.alert(`${message}\n\n当前有 ${blocked.length} 条 Run 不允许执行，请先处理上面的阻止原因。`);
+    return false;
+  }
+  const consequence = preview.request_type === "cleanup_artifacts"
+    ? "Run 记录会保留，但原图、视频和 Diff 将不再可查看。"
+    : "任务记录与可视产物会进入持久清理队列。此操作不可撤销。";
+  return window.confirm(`${message}\n\n${consequence}\n\n确认继续？`);
+}
+
+async function withRunPurgePreview(requestType, runIds, mutation) {
+  if (state.runPurgeSubmitting) {
+    toast("正在生成或提交删除影响预览，请勿重复点击");
+    return null;
+  }
+  state.runPurgeSubmitting = true;
+  try {
+    toast("正在生成删除影响预览…");
+    const preview = await requestRunPurgePreview(requestType, runIds);
+    if (!confirmRunPurgePreview(preview)) return null;
+    return await mutation(String(preview.preview_token));
+  } catch (error) {
+    toast(error.message || String(error));
+    return null;
+  } finally {
+    state.runPurgeSubmitting = false;
+  }
+}
+
 async function deleteRun(runId) {
-  const result = await api(`/api/runs/${runId}`, { method: "DELETE" });
+  const result = await withRunPurgePreview("delete_run", [runId], (previewToken) =>
+    api(`/api/runs/${runId}?preview_token=${encodeURIComponent(previewToken)}`, { method: "DELETE" }));
+  if (!result) return;
   toast(result.deleted ? `Run #${runId} 已清理并删除` : `Run #${runId} 已进入删除队列`);
   await refreshRunsOnly();
 }
@@ -3426,11 +3927,12 @@ async function renameRun(runId) {
 async function batchDeleteRuns() {
   const ids = Array.from(state.selectedRunIds);
   if (!ids.length) return;
-  if (!window.confirm(`确认删除选中的 ${ids.length} 条运行记录？`)) return;
-  const result = await api(`/api/runs/batch-delete`, {
-    method: "POST",
-    body: JSON.stringify({ run_ids: ids }),
-  });
+  const result = await withRunPurgePreview("delete_run", ids, (previewToken) =>
+    api(`/api/runs/batch-delete`, {
+      method: "POST",
+      body: JSON.stringify({ run_ids: ids, preview_token: previewToken }),
+    }));
+  if (!result) return;
   const accepted = new Set((result.accepted || result.deleted || []).map(Number));
   const deleted = new Set((result.deleted || []).map(Number));
   if (state.selectedRun && deleted.has(Number(state.selectedRun.id))) {
@@ -3443,7 +3945,12 @@ async function batchDeleteRuns() {
 }
 
 async function cleanupRunArtifacts(runId) {
-  const result = await api(`/api/runs/${runId}/cleanup-artifacts`, { method: "POST", body: "{}" });
+  const result = await withRunPurgePreview("cleanup_artifacts", [runId], (previewToken) =>
+    api(`/api/runs/${runId}/cleanup-artifacts`, {
+      method: "POST",
+      body: JSON.stringify({ preview_token: previewToken }),
+    }));
+  if (!result) return;
   toast(result.artifact_cleaned ? `Run #${runId} 产物已清理` : `Run #${runId} 已进入清理队列`);
   await refreshRunsOnly({ forceSelected: Number(state.selectedRun?.id) === Number(runId) });
 }
@@ -3707,8 +4214,18 @@ function renderExternalPredictionBinding() {
   const assetSelect = form.elements.asset_id;
   const submit = $("bind-external-pred");
   const status = $("external-pred-binding-status");
-  const previousItem = String(itemSelect.value || "");
-  const previousAsset = String(assetSelect.value || "");
+  const currentItem = (state.externalPredItems || []).find((item) =>
+    String(compareItemId(item)) === String(itemSelect.value || ""));
+  if (currentItem) state.selectedExternalPredItem = currentItem;
+  const currentAsset = externalPredictionAssets().find((asset) =>
+    String(asset.id) === String(assetSelect.value || ""));
+  if (currentAsset) state.selectedExternalPredAsset = currentAsset;
+  const previousItem = String(
+    itemSelect.value
+    || compareItemId(state.selectedExternalPredItem)
+    || "",
+  );
+  const previousAsset = String(assetSelect.value || state.selectedExternalPredAsset?.id || "");
   groupSelect.innerHTML = groups.length
     ? groups.map((group) => {
         const id = String(group.group_id || group.collection_id || group.id || "");
@@ -3716,8 +4233,13 @@ function renderExternalPredictionBinding() {
       }).join("")
     : '<option value="">No canonical GT Collection</option>';
   const items = state.externalPredItems || [];
-  itemSelect.innerHTML = items.length
-    ? items.map((item) => {
+  const selectedSnapshot = state.selectedExternalPredItem;
+  const itemOptions = selectedSnapshot
+    && !items.some((item) => compareItemId(item) === compareItemId(selectedSnapshot))
+    ? [selectedSnapshot, ...items]
+    : items;
+  itemSelect.innerHTML = itemOptions.length
+    ? itemOptions.map((item) => {
         const id = compareItemId(item);
         const metadata = [
           item.width && item.height ? `${item.width}×${item.height}` : "",
@@ -3727,10 +4249,26 @@ function renderExternalPredictionBinding() {
         return `<option value="${id}">${escapeHtml(compareItemTitle(item))}${metadata ? ` · ${escapeHtml(metadata)}` : ""}</option>`;
       }).join("")
     : '<option value="">No canonical GT Item</option>';
-  if (items.some((item) => String(compareItemId(item)) === previousItem)) itemSelect.value = previousItem;
+  if (itemOptions.some((item) => String(compareItemId(item)) === previousItem)) itemSelect.value = previousItem;
+  const itemPager = $("external-pred-item-pager");
+  if (itemPager) {
+    const meta = state.externalPredItemsPage || {};
+    const page = Math.max(1, Number(meta.page || 1));
+    const pageCount = Math.max(1, Number(meta.page_count || 1));
+    itemPager.innerHTML = `
+      <span class="muted">GT Items ${Number(meta.total || items.length)} · 第 ${page}/${pageCount} 页</span>
+      <button class="secondary" data-external-pred-item-page="${page - 1}" type="button" ${page <= 1 ? "disabled" : ""}>上一页</button>
+      <button class="secondary" data-external-pred-item-page="${page + 1}" type="button" ${page >= pageCount ? "disabled" : ""}>下一页</button>
+    `;
+  }
   const assets = externalPredictionAssets();
-  assetSelect.innerHTML = assets.length
-    ? assets.map((asset) => {
+  const selectedAssetSnapshot = state.selectedExternalPredAsset;
+  const assetOptions = selectedAssetSnapshot
+    && !assets.some((asset) => Number(asset.id) === Number(selectedAssetSnapshot.id))
+    ? [selectedAssetSnapshot, ...assets]
+    : assets;
+  assetSelect.innerHTML = assetOptions.length
+    ? assetOptions.map((asset) => {
         const metadata = [
           asset.width && asset.height ? `${asset.width}×${asset.height}` : "",
           asset.frame_count ? `${asset.frame_count} frames` : "",
@@ -3740,40 +4278,42 @@ function renderExternalPredictionBinding() {
         return `<option value="${Number(asset.id)}">${escapeHtml(asset.display_name || asset.original_name || `Uploaded Pred #${asset.id}`)}${metadata ? ` · ${escapeHtml(metadata)}` : ""}</option>`;
       }).join("")
     : '<option value="">Upload an External Pred first</option>';
-  if (assets.some((asset) => String(asset.id) === previousAsset)) assetSelect.value = previousAsset;
-  const ready = Boolean(groups.length && items.length && assets.length);
+  if (assetOptions.some((asset) => String(asset.id) === previousAsset)) assetSelect.value = previousAsset;
+  const ready = Boolean(groups.length && itemOptions.length && assetOptions.length);
   if (submit) submit.disabled = !ready;
   if (status) {
     status.textContent = ready
       ? "This is an explicit GT Item binding. It does not make unbound or Compare-derived media reusable."
       : (!groups.length
         ? "Create or sync a Collection with a canonical GT Item first."
-        : (!items.length
+        : (!itemOptions.length
           ? "The selected Collection has no ready canonical GT Item."
           : "Upload a ready External Pred before binding it."));
   }
 }
 
-async function loadExternalPredictionBindingItems() {
+async function loadExternalPredictionBindingItems(options = {}) {
   const generation = ++state.externalPredItemRequestGeneration;
   const groupId = Number(state.selectedExternalPredGroupId || 0);
   if (!groupId) {
     state.externalPredItems = [];
+    state.externalPredItemsPage = { page: 1, page_size: 100, page_count: 1, total: 0 };
     renderExternalPredictionBinding();
     return;
   }
-  const first = await api(`/api/media/items?group_id=${encodeURIComponent(groupId)}&page=1&page_size=200`);
-  const pageCount = Math.max(1, Number(first.total_pages || first.page_count || 1));
-  const pages = pageCount > 1
-    ? await Promise.all(Array.from({ length: pageCount - 1 }, (_row, index) =>
-      api(`/api/media/items?group_id=${encodeURIComponent(groupId)}&page=${index + 2}&page_size=200`)))
-    : [];
+  const requestedPage = Math.max(1, Number(options.page || state.externalPredItemsPage.page || 1));
+  const pageSize = Math.max(1, Number(state.externalPredItemsPage.page_size || 100));
+  const payload = await api(`/api/media/items?group_id=${encodeURIComponent(groupId)}&page=${requestedPage}&page_size=${pageSize}`);
   if (generation !== state.externalPredItemRequestGeneration) return;
-  const byId = new Map();
-  for (const item of [first, ...pages].flatMap((page) => page.items || [])) {
-    byId.set(compareItemId(item), item);
-  }
-  state.externalPredItems = Array.from(byId.values());
+  const pageCount = Math.max(1, Number(payload.page_count || payload.total_pages || 1));
+  if (requestedPage > pageCount) return loadExternalPredictionBindingItems({ page: pageCount });
+  state.externalPredItems = payload.items || [];
+  state.externalPredItemsPage = {
+    page: Math.max(1, Number(payload.page || requestedPage)),
+    page_size: Math.max(1, Number(payload.page_size || pageSize)),
+    page_count: pageCount,
+    total: Math.max(0, Number(payload.total || 0)),
+  };
   renderExternalPredictionBinding();
 }
 
@@ -3788,6 +4328,9 @@ function renderMediaLibrary() {
   }
   const host = $("media-content");
   if (!host) return;
+  const mediaMeta = state.mediaAssetsPage || {};
+  const mediaTotal = Math.max(Number(mediaMeta.total || 0), state.mediaAssets.length);
+  const hasMoreMedia = Number(mediaMeta.page || 1) < Number(mediaMeta.page_count || 1);
   host.innerHTML = `<div class="table compact-table">${table(state.mediaAssets, [
     { label: "预览", render: (asset) => mediaAssetContent(asset) },
     { label: "别名", render: (asset) => `<strong>${escapeHtml(asset.display_name)}</strong><br><span class="muted">${escapeHtml(asset.original_name || "-")}</span>` },
@@ -3797,31 +4340,81 @@ function renderMediaLibrary() {
     { label: "大小", render: (asset) => formatBytes(asset.size_bytes) },
     { label: "状态", render: (asset) => statusBadge(asset.state || "ready") },
     { label: "操作", render: (asset) => asset.source_kind === "upload" ? `<button class="danger secondary" data-media-delete="${Number(asset.id)}" type="button">软删除</button>` : "-" },
-  ])}</div>`;
+  ])}</div>
+    <div class="pager">
+      <span class="muted">已显示 ${state.mediaAssets.length}/${mediaTotal} 个媒体源</span>
+      ${hasMoreMedia ? '<button class="secondary" data-media-load-more type="button">加载更多</button>' : ""}
+    </div>`;
   renderExternalPredictionBinding();
 }
 
 async function loadMediaLibrary() {
-  const [collectionsPayload, assetsPayload, groupsPayload] = await Promise.all([
-    api("/api/media/collections"),
-    api("/api/media/sources?page_size=200&state="),
-    api("/api/media/item-groups?role=gt"),
-  ]);
-  state.mediaCollections = collectionsPayload.collections || [];
-  state.mediaAssets = assetsPayload.assets || [];
-  state.externalPredItemGroups = groupsPayload.groups || groupsPayload.item_groups || [];
-  const groupIds = new Set(state.externalPredItemGroups.map((group) =>
-    String(group.group_id || group.collection_id || group.id || ""),
-  ));
-  if (!groupIds.has(String(state.selectedExternalPredGroupId))) {
-    state.selectedExternalPredGroupId = String(
-      state.externalPredItemGroups[0]?.group_id
-      || state.externalPredItemGroups[0]?.collection_id
-      || state.externalPredItemGroups[0]?.id
-      || "",
-    );
+  const generation = ++state.mediaLibraryRequestGeneration;
+  const requests = [
+    ["Collections", api("/api/media/collections")],
+    ["媒体资产", api("/api/media/sources?page=1&page_size=200&state=")],
+    ["GT Item Groups", api("/api/media/item-groups?role=gt")],
+  ];
+  const results = await Promise.allSettled(requests.map((row) => row[1]));
+  if (generation !== state.mediaLibraryRequestGeneration) return { failures: [] };
+  const failures = [];
+  const collectionsResult = results[0];
+  const assetsResult = results[1];
+  const groupsResult = results[2];
+  if (collectionsResult.status === "fulfilled") {
+    state.mediaCollections = collectionsResult.value.collections || [];
+  } else failures.push(`${requests[0][0]}: ${collectionsResult.reason?.message || collectionsResult.reason}`);
+  if (assetsResult.status === "fulfilled") {
+    state.mediaAssets = assetsResult.value.assets || [];
+    state.mediaAssetsPage = {
+      page: Math.max(1, Number(assetsResult.value.page || 1)),
+      page_size: Math.max(1, Number(assetsResult.value.page_size || 200)),
+      page_count: Math.max(1, Number(assetsResult.value.page_count || 1)),
+      total: Math.max(0, Number(assetsResult.value.total || 0)),
+    };
+  } else failures.push(`${requests[1][0]}: ${assetsResult.reason?.message || assetsResult.reason}`);
+  if (groupsResult.status === "fulfilled") {
+    state.externalPredItemGroups = groupsResult.value.groups || groupsResult.value.item_groups || [];
+    const groupIds = new Set(state.externalPredItemGroups.map((group) =>
+      String(group.group_id || group.collection_id || group.id || ""),
+    ));
+    if (!groupIds.has(String(state.selectedExternalPredGroupId))) {
+      state.selectedExternalPredGroupId = String(
+        state.externalPredItemGroups[0]?.group_id
+        || state.externalPredItemGroups[0]?.collection_id
+        || state.externalPredItemGroups[0]?.id
+        || "",
+      );
+      state.selectedExternalPredItem = null;
+      state.externalPredItemsPage = { page: 1, page_size: 100, page_count: 1, total: 0 };
+    }
+  } else failures.push(`${requests[2][0]}: ${groupsResult.reason?.message || groupsResult.reason}`);
+  try {
+    await loadExternalPredictionBindingItems();
+  } catch (error) {
+    failures.push(`External Pred Items: ${error.message}`);
   }
-  await loadExternalPredictionBindingItems();
+  renderMediaLibrary();
+  return { failures };
+}
+
+async function loadMoreMediaSources() {
+  const current = state.mediaAssetsPage || {};
+  const nextPage = Math.max(1, Number(current.page || 1) + 1);
+  if (nextPage > Math.max(1, Number(current.page_count || 1))) return;
+  const generation = ++state.mediaLibraryRequestGeneration;
+  const pageSize = Math.max(1, Number(current.page_size || 200));
+  const payload = await api(`/api/media/sources?page=${nextPage}&page_size=${pageSize}&state=`);
+  if (generation !== state.mediaLibraryRequestGeneration) return;
+  const byId = new Map(state.mediaAssets.map((asset) => [Number(asset.id), asset]));
+  for (const asset of payload.assets || []) byId.set(Number(asset.id), asset);
+  state.mediaAssets = Array.from(byId.values());
+  state.mediaAssetsPage = {
+    page: Math.max(1, Number(payload.page || nextPage)),
+    page_size: Math.max(1, Number(payload.page_size || pageSize)),
+    page_count: Math.max(1, Number(payload.page_count || 1)),
+    total: Math.max(0, Number(payload.total || state.mediaAssets.length)),
+  };
   renderMediaLibrary();
 }
 
@@ -3978,14 +4571,19 @@ async function bindExternalPrediction(event) {
 
 async function selectExternalPredictionBindingGroup(event) {
   state.selectedExternalPredGroupId = event.target.value || "";
+  state.selectedExternalPredItem = null;
   state.externalPredItems = [];
+  state.externalPredItemsPage = { page: 1, page_size: 100, page_count: 1, total: 0 };
   renderExternalPredictionBinding();
-  await loadExternalPredictionBindingItems();
+  await loadExternalPredictionBindingItems({ page: 1 });
 }
 
 async function deleteMediaAsset(assetId) {
   if (!window.confirm("软删除该媒体资产？历史 Campaign、投票和统计不会被删除。")) return;
   await api(`/api/media/assets/${Number(assetId)}`, { method: "DELETE" });
+  if (Number(state.selectedExternalPredAsset?.id || 0) === Number(assetId)) {
+    state.selectedExternalPredAsset = null;
+  }
   await loadMediaLibrary();
   await loadCompareSources({ gtPage: 1, predPage: 1 });
   toast("媒体资产已软删除");
@@ -4290,33 +4888,182 @@ async function submitEvaluationVote(choice) {
   toast("投票已保存");
 }
 
-async function refreshCatalog() {
-  const [modelFiles, videoGroups, runs, metricHealth, checkpoints, devices] = await Promise.all([
-    api("/api/model-files"),
-    api("/api/video-groups?summary=1"),
-    api("/api/runs"),
-    api("/api/metrics/health"),
-    api("/api/checkpoints"),
-    api("/api/devices"),
-  ]);
-  Object.assign(state, { modelFiles, videoGroups, runs, metricHealth, checkpoints, devices });
+function catalogSyncPayload(payload) {
+  return payload?.sync && typeof payload.sync === "object" ? payload.sync : payload;
+}
+
+async function waitForCatalogSync(initial) {
+  let status = catalogSyncPayload(initial) || {};
+  const deadline = Date.now() + (5 * 60 * 1000);
+  while (["requested", "running"].includes(String(status.state || status.status || ""))) {
+    if (Date.now() >= deadline) throw new Error("目录同步仍在后台运行，请稍后再次刷新");
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    status = catalogSyncPayload(await api("/api/media/sync/status")) || {};
+    state.catalogSync = status;
+  }
+  state.catalogSync = status;
+  if (String(status.state || status.status || "") === "failed") {
+    throw new Error(status.error?.message || status.error || "目录同步失败");
+  }
+  return status;
+}
+
+function shareCatalogSync(operation) {
+  if (state.catalogSyncPromise) return state.catalogSyncPromise;
+  const shared = Promise.resolve().then(operation);
+  state.catalogSyncPromise = shared;
+  shared.finally(() => {
+    if (state.catalogSyncPromise === shared) state.catalogSyncPromise = null;
+  }).catch(() => {});
+  return shared;
+}
+
+function joinRunningCatalogSync() {
+  return shareCatalogSync(async () => {
+    const current = catalogSyncPayload(await api("/api/media/sync/status")) || {};
+    state.catalogSync = current;
+    if (String(current.state || current.status || "") === "failed") {
+      throw new Error(current.error?.message || current.error || "目录同步失败");
+    }
+    return ["requested", "running"].includes(String(current.state || current.status || ""))
+      ? waitForCatalogSync(current)
+      : current;
+  });
+}
+
+function requestCatalogSync(includeRuns = false) {
+  return shareCatalogSync(async () => {
+    const current = catalogSyncPayload(await api("/api/media/sync/status")) || {};
+    state.catalogSync = current;
+    if (["requested", "running"].includes(String(current.state || current.status || ""))) {
+      return waitForCatalogSync(current);
+    }
+    const started = await api("/api/media/sync", {
+      method: "POST",
+      body: JSON.stringify({ include_runs: Boolean(includeRuns) }),
+    });
+    state.catalogSync = catalogSyncPayload(started);
+    return waitForCatalogSync(started);
+  });
+}
+
+async function syncCatalogAndRefresh(options = {}) {
+  if (options.includeMedia) state.catalogRefreshIncludeMedia = true;
+  if (state.catalogRefreshPromise) return state.catalogRefreshPromise;
+  const shared = (async () => {
+    await requestCatalogSync(Boolean(options.includeRuns));
+    const catalog = await refreshCatalogData({ refreshMetricHealth: true, refreshCheckpoints: true });
+    const failures = [...(catalog.failures || [])];
+    if (state.catalogRefreshIncludeMedia) {
+      const mediaResults = await Promise.allSettled([
+        loadMediaLibrary(),
+        window.VFIEvalStudio?.load?.(),
+      ]);
+      if (mediaResults[0].status === "fulfilled") {
+        failures.push(...(mediaResults[0].value?.failures || []));
+      } else failures.push(`媒体资产: ${mediaResults[0].reason?.message || mediaResults[0].reason}`);
+      if (mediaResults[1].status === "rejected") {
+        failures.push(`Evaluation Studio: ${mediaResults[1].reason?.message || mediaResults[1].reason}`);
+      }
+    }
+    return { failures };
+  })();
+  state.catalogRefreshPromise = shared;
+  try {
+    return await shared;
+  } finally {
+    if (state.catalogRefreshPromise === shared) state.catalogRefreshPromise = null;
+    state.catalogRefreshIncludeMedia = false;
+  }
+}
+
+async function runCatalogRefresh(button, options = {}) {
+  const originalLabel = button?.textContent || "刷新";
+  if (button) {
+    button.disabled = true;
+    button.textContent = "正在同步…";
+  }
+  try {
+    const result = await syncCatalogAndRefresh(options);
+    if (result.failures.length) {
+      toast(`目录已同步，但 ${result.failures.length} 个面板刷新失败`);
+    } else {
+      toast(options.includeMedia ? "媒体目录已同步" : "文件目录已同步");
+    }
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalLabel;
+    }
+  }
+}
+
+async function refreshCatalogData(options = {}) {
+  const runsRequestGeneration = ++state.runsRefreshGeneration;
+  const requests = [
+    ["模型", "modelFiles", api("/api/model-files")],
+    ["视频集", "videoGroups", api("/api/video-groups?summary=1")],
+    ["运行记录", "runs", requestRunsPage()],
+    ["指标环境", "metricHealth", api(options.refreshMetricHealth ? "/api/metrics/health?refresh=1" : "/api/metrics/health")],
+    ["设备", "devices", api("/api/devices")],
+  ];
+  const results = await Promise.allSettled(requests.map((row) => row[2]));
+  const failures = [];
+  let runsUpdated = false;
+  results.forEach((result, index) => {
+    const [label, key] = requests[index];
+    if (result.status === "rejected") {
+      failures.push(`${label}: ${result.reason?.message || result.reason}`);
+      return;
+    }
+    if (key === "runs") {
+      if (runsRequestGeneration === state.runsRefreshGeneration) {
+        applyRunListPayload(result.value);
+        runsUpdated = true;
+      }
+    } else {
+      state[key] = result.value;
+    }
+  });
   renderMetricOptions();
   renderOptions();
+  try {
+    await loadCheckpointsForModel($("infer-form").elements.model_file.value, {
+      force: Boolean(options.refreshCheckpoints),
+    });
+  } catch (error) {
+    failures.push(`Checkpoint: ${error.message || error}`);
+  }
   renderMetricEnvironmentPanel();
   renderVideoSelection();
   renderRuns();
   schedulePreflight(0);
-  if (isRunsViewActive()) {
-    if (!state.selectedRun && runs.length) {
-      await selectRun(runs[0].id, { quiet: true });
+  if (runsUpdated && isRunsViewActive()) {
+    if (!state.selectedRun && state.runs.length) {
+      await selectRun(state.runs[0].id, { quiet: true });
     } else if (state.selectedRun) {
-      const exists = runs.some((item) => Number(item.id) === Number(state.selectedRun.id));
+      const exists = state.runs.some((item) => Number(item.id) === Number(state.selectedRun.id));
       if (exists) await selectRun(state.selectedRun.id, { quiet: true });
-      else renderEmptyRunDetail();
+      else {
+        state.selectedRun = null;
+        renderEmptyRunDetail();
+      }
     } else {
       renderEmptyRunDetail();
     }
   }
+  return { failures };
+}
+
+async function refreshCatalog() {
+  const failures = [];
+  try {
+    await joinRunningCatalogSync();
+  } catch (error) {
+    failures.push(`目录同步: ${error.message || error}`);
+  }
+  const result = await refreshCatalogData();
+  return { failures: [...failures, ...(result.failures || [])] };
 }
 
 document.addEventListener("click", (event) => {
@@ -4401,16 +5148,27 @@ $("collection-form").addEventListener("submit", (event) => createMediaCollection
 $("upload-form").addEventListener("submit", (event) => uploadExternalMedia(event).catch((error) => toast(error.message)));
 $("external-pred-binding-form").addEventListener("submit", (event) => bindExternalPrediction(event).catch((error) => toast(error.message)));
 $("external-pred-item-group").addEventListener("change", (event) => selectExternalPredictionBindingGroup(event).catch((error) => toast(error.message)));
+$("external-pred-item").addEventListener("change", (event) => {
+  state.selectedExternalPredItem = state.externalPredItems.find((item) =>
+    String(compareItemId(item)) === String(event.target.value || "")) || state.selectedExternalPredItem;
+});
+$("external-pred-asset").addEventListener("change", (event) => {
+  state.selectedExternalPredAsset = externalPredictionAssets().find((asset) =>
+    String(asset.id) === String(event.target.value || "")) || state.selectedExternalPredAsset;
+});
 $("evaluator-form").addEventListener("submit", (event) => saveEvaluator(event).catch((error) => toast(error.message)));
 $("campaign-form").addEventListener("submit", (event) => createEvaluationCampaign(event).catch((error) => toast(error.message)));
 $("candidate-form").addEventListener("submit", (event) => addEvaluationCandidate(event).catch((error) => toast(error.message)));
 $("refresh").addEventListener("click", () => refreshRunResults().catch((error) => toast(error.message)));
-$("refresh-files").addEventListener("click", () => refreshCatalog().then(() => toast("文件列表已刷新")).catch((error) => toast(error.message)));
+$("refresh-files").addEventListener("click", (event) => runCatalogRefresh(event.currentTarget).catch((error) => toast(error.message)));
 $("refresh-compare-sources").addEventListener("click", () => loadCompareSources({ gtPage: 1, predPage: 1 }).then(() => scheduleComparePreflight(0)).then(() => toast("对比来源已刷新")).catch((error) => toast(error.message)));
 $("refresh-stats").addEventListener("click", () => loadStats().then(() => toast("统计数据已刷新")).catch((error) => toast(error.message)));
 $("infer-form").addEventListener("input", () => schedulePreflight());
 $("compare-form").addEventListener("input", () => scheduleComparePreflight());
-$("refresh-media").addEventListener("click", () => Promise.all([loadMediaLibrary(), window.VFIEvalStudio?.load?.()]).then(() => toast("媒体资产已刷新")).catch((error) => toast(error.message)));
+$("refresh-media").addEventListener("click", (event) => runCatalogRefresh(event.currentTarget, {
+  includeMedia: true,
+  includeRuns: true,
+}).catch((error) => toast(error.message)));
 $("pause-upload").addEventListener("click", () => {
   state.uploadPaused = true;
   toast(state.activeUpload ? "将在当前分片完成后暂停" : "当前没有进行中的上传");
@@ -4420,7 +5178,11 @@ $("refresh-evaluations").addEventListener("click", () => loadEvaluations().then(
 $("infer-form").addEventListener("change", async (event) => {
   renderCustomSizeVisibility();
   if (event.target.name === "model_file") {
-    renderCheckpointOptions();
+    try {
+      await loadCheckpointsForModel(event.target.value);
+    } catch (error) {
+      toast(`Checkpoint: ${error.message || error}`);
+    }
   }
   if (event.target.name === "execution_mode") {
     renderSingleDeviceOptions($("infer-form").elements.device.value || "auto");
@@ -4429,7 +5191,22 @@ $("infer-form").addEventListener("change", async (event) => {
   schedulePreflight(0);
 });
 
+document.addEventListener("input", (event) => {
+  const filter = event.target.closest?.("[data-run-filter]");
+  if (!filter) return;
+  state.runFilters[filter.dataset.runFilter] = filter.value || "";
+  state.runsPage.page = 1;
+  scheduleRunFilterRefresh(["q", "model"].includes(filter.dataset.runFilter) ? 300 : 0);
+});
+
 document.addEventListener("change", (event) => {
+  const runFilter = event.target.closest("[data-run-filter]");
+  if (runFilter) {
+    state.runFilters[runFilter.dataset.runFilter] = runFilter.value || "";
+    state.runsPage.page = 1;
+    scheduleRunFilterRefresh(0);
+    return;
+  }
   const evaluationFrame = event.target.closest("[data-evaluation-frame]");
   if (evaluationFrame && state.currentEvaluationTask) {
     state.evaluationFrameIndex = Number(evaluationFrame.value || 0);
@@ -4466,6 +5243,7 @@ document.addEventListener("change", (event) => {
   if (compareGroup) {
     state.selectedCompareGroupId = compareGroup.value || "";
     state.selectedCompareItemId = null;
+    state.selectedCompareItemSnapshot = null;
     state.selectedComparePredMembers.clear();
     state.compareItemQuery = "";
     state.compareItemPage = 1;
@@ -4475,6 +5253,9 @@ document.addEventListener("change", (event) => {
   const compareItem = event.target.closest("[data-compare-item]");
   if (compareItem) {
     state.selectedCompareItemId = Number(compareItem.dataset.compareItem);
+    state.selectedCompareItemSnapshot = (state.compareItems || []).find(
+      (row) => compareItemId(row) === state.selectedCompareItemId,
+    ) || null;
     state.selectedComparePredMembers.clear();
     loadCompareSources().then(() => scheduleComparePreflight(0)).catch((error) => toast(error.message));
     return;
@@ -4498,8 +5279,6 @@ document.addEventListener("change", (event) => {
   if (compareQuery) {
     state.compareItemQuery = compareQuery.value || "";
     state.compareItemPage = 1;
-    state.selectedCompareItemId = null;
-    state.selectedComparePredMembers.clear();
     loadCompareSources().then(() => scheduleComparePreflight(0)).catch((error) => toast(error.message));
     return;
   }
@@ -4628,6 +5407,19 @@ document.addEventListener("click", async (event) => {
     await submitEvaluationVote(evaluationVote.dataset.evaluationVote);
     return;
   }
+  const externalPredItemPage = event.target.closest("[data-external-pred-item-page]");
+  if (externalPredItemPage) {
+    const selected = state.externalPredItems.find((item) =>
+      String(compareItemId(item)) === String($("external-pred-item")?.value || ""));
+    if (selected) state.selectedExternalPredItem = selected;
+    await loadExternalPredictionBindingItems({ page: Number(externalPredItemPage.dataset.externalPredItemPage || 1) });
+    return;
+  }
+  const mediaLoadMore = event.target.closest("[data-media-load-more]");
+  if (mediaLoadMore) {
+    await loadMoreMediaSources();
+    return;
+  }
   const mediaDelete = event.target.closest("[data-media-delete]");
   if (mediaDelete) {
     await deleteMediaAsset(Number(mediaDelete.dataset.mediaDelete));
@@ -4675,16 +5467,9 @@ document.addEventListener("click", async (event) => {
     scheduleComparePreflight(0);
     return;
   }
-  if (event.target.closest("[data-refresh-compare-sources]")) {
-    await loadCompareSources({ gtPage: 1, predPage: 1 });
-    scheduleComparePreflight(0);
-    return;
-  }
   const comparePage = event.target.closest("[data-compare-page]");
   if (comparePage) {
     const page = Number(comparePage.dataset.page || 1);
-    state.selectedCompareItemId = null;
-    state.selectedComparePredMembers.clear();
     await loadCompareSources({ page });
     scheduleComparePreflight(0);
     return;
@@ -4741,6 +5526,20 @@ document.addEventListener("click", async (event) => {
     await batchDeleteRuns();
     return;
   }
+  const runsPage = event.target.closest("[data-runs-page]");
+  if (runsPage) {
+    state.runsPage.page = Math.max(1, Number(runsPage.dataset.runsPage || 1));
+    state.selectedRunIds.clear();
+    await refreshRunsOnly({ page: state.runsPage.page });
+    return;
+  }
+  if (event.target.closest("[data-runs-filter-reset]")) {
+    state.runFilters = { q: "", status: "", run_type: "", model: "" };
+    state.runsPage.page = 1;
+    state.selectedRunIds.clear();
+    await refreshRunsOnly({ page: 1 });
+    return;
+  }
   const runButton = event.target.closest("[data-run-id]");
   if (runButton) {
     await selectRun(Number(runButton.dataset.runId));
@@ -4764,6 +5563,11 @@ document.addEventListener("click", async (event) => {
   const retryButton = event.target.closest("[data-retry-run]");
   if (retryButton) {
     await retryRun(Number(retryButton.dataset.retryRun));
+    return;
+  }
+  const cloneButton = event.target.closest("[data-clone-run]");
+  if (cloneButton) {
+    await cloneRunWithCurrentInputs(Number(cloneButton.dataset.cloneRun));
     return;
   }
   const deleteButton = event.target.closest("[data-delete-run]");
@@ -4953,15 +5757,16 @@ document.addEventListener("toggle", (event) => {
 
 function startRunsPoll() {
   let timer = null;
+  const hasActiveRunWork = () => Number(state.runsPage.active_total || 0) > 0
+    || state.runs.some((run) =>
+      !TERMINAL_STATUSES.has(run.status)
+      || ["requested", "canceling", "purging"].includes(runPurgeState(run)));
   const schedule = (delay = 2000) => {
     if (timer !== null) clearTimeout(timer);
     timer = setTimeout(async () => {
       timer = null;
       if (!document.hidden) await refreshRunsOnly().catch(() => {});
-      const hasActiveRun = state.runs.some((run) =>
-        !TERMINAL_STATUSES.has(run.status)
-        || ["requested", "canceling", "purging"].includes(runPurgeState(run)));
-      schedule(hasActiveRun ? 2000 : 10000);
+      schedule(hasActiveRunWork() ? 2000 : 10000);
     }, delay);
   };
   schedule();
@@ -4972,9 +5777,13 @@ function startRunsPoll() {
       return;
     }
     refreshRunsOnly().catch(() => {});
-    schedule(state.runs.some((run) => !TERMINAL_STATUSES.has(run.status)) ? 2000 : 10000);
+    schedule(hasActiveRunWork() ? 2000 : 10000);
   });
 }
 
-refreshCatalog().catch((error) => toast(error.message));
+refreshCatalog()
+  .then((result) => {
+    if (result.failures?.length) toast(`启动时有 ${result.failures.length} 个数据面板未能加载`);
+  })
+  .catch((error) => toast(error.message));
 startRunsPoll();

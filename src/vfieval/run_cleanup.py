@@ -22,9 +22,18 @@ CACHE_BUILD_LOCK_TTL_SECONDS = 5 * 60
 CACHE_BUILD_LOCK_WAIT_SECONDS = 15 * 60.0
 CACHE_BUILD_LOCK_POLL_SECONDS = 0.1
 PURGE_CLAIM_STALE_SECONDS = 5 * 60
+RUN_PURGE_PREVIEW_TTL_SECONDS = 5 * 60
 _BACKFILL_LOCK = threading.Lock()
 _BACKFILLED_DATABASES: set[str] = set()
 _SAFE_SNAPSHOT_SLOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
+
+
+class RunPurgePreviewError(ValueError):
+    """A stable, API-friendly failure raised by Run purge preview validation."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = str(code)
 
 
 class DecodeCacheBuildLock:
@@ -109,6 +118,106 @@ def _path_size(path: Path) -> int:
             except OSError:
                 continue
     return total
+
+
+def _path_reclaimable_size(path: Path) -> int:
+    """Estimate bytes released by unlinking this exact path tree.
+
+    Run-local GT hard links share their data blocks with the managed decode
+    cache.  Their logical size still belongs in ordinary inventory totals, but
+    deleting one Run link does not reclaim those blocks while another link
+    exists.  Keep purge reports honest without changing cache size accounting.
+    """
+
+    try:
+        if path.is_symlink():
+            return int(path.lstat().st_size)
+        if path.is_file():
+            stat = path.stat()
+            return int(stat.st_size) if int(getattr(stat, "st_nlink", 1)) <= 1 else 0
+        if not path.is_dir():
+            return 0
+    except OSError:
+        return 0
+    total = 0
+    for root, dirs, files in os.walk(path, followlinks=False):
+        root_path = Path(root)
+        dirs[:] = [name for name in dirs if not (root_path / name).is_symlink()]
+        for name in files:
+            child = root_path / name
+            try:
+                stat = child.lstat()
+                if int(getattr(stat, "st_nlink", 1)) <= 1:
+                    total += int(stat.st_size)
+            except OSError:
+                continue
+    return total
+
+
+def _path_state(path: Path) -> dict[str, Any]:
+    """Return a cheap, deterministic tree signature plus conservative byte totals."""
+
+    digest = hashlib.sha256()
+    logical_bytes = 0
+    reclaimable_bytes = 0
+    exists = path.exists() or path.is_symlink()
+    if not exists:
+        digest.update(b"missing")
+        return {
+            "exists": False,
+            "logical_bytes": 0,
+            "reclaimable_bytes": 0,
+            "fingerprint": digest.hexdigest(),
+        }
+
+    def record(child: Path, relative: str) -> None:
+        nonlocal logical_bytes, reclaimable_bytes
+        try:
+            stat = child.lstat()
+        except OSError as exc:
+            digest.update(f"error:{relative}:{type(exc).__name__}".encode("utf-8"))
+            return
+        is_link = child.is_symlink()
+        is_file = child.is_file() and not is_link
+        size = int(stat.st_size) if is_file or is_link else 0
+        links = int(getattr(stat, "st_nlink", 1))
+        logical_bytes += size
+        if is_link or (is_file and links <= 1):
+            reclaimable_bytes += size
+        digest.update(
+            json.dumps(
+                {
+                    "path": relative,
+                    "mode": int(stat.st_mode),
+                    "size": size,
+                    "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))),
+                    "links": links,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+
+    record(path, ".")
+    if path.is_dir() and not path.is_symlink():
+        for root, dirs, files in os.walk(path, followlinks=False):
+            root_path = Path(root)
+            dirs.sort()
+            files.sort()
+            symlink_dirs = [name for name in dirs if (root_path / name).is_symlink()]
+            dirs[:] = [name for name in dirs if name not in symlink_dirs]
+            for name in symlink_dirs:
+                child = root_path / name
+                record(child, child.relative_to(path).as_posix())
+            for name in files:
+                child = root_path / name
+                record(child, child.relative_to(path).as_posix())
+    return {
+        "exists": True,
+        "logical_bytes": logical_bytes,
+        "reclaimable_bytes": reclaimable_bytes,
+        "fingerprint": digest.hexdigest(),
+    }
 
 
 def _path_content_digest(path: Path) -> str:
@@ -503,12 +612,16 @@ class RunCleanupService:
         workspace: WorkspaceConfig,
         *,
         cache_grace_seconds: float = CACHE_GRACE_SECONDS,
+        purge_preview_ttl_seconds: float = RUN_PURGE_PREVIEW_TTL_SECONDS,
     ) -> None:
         self.db = db
         self.workspace = workspace
         self.cache_grace_seconds = max(0.0, float(cache_grace_seconds))
+        self.purge_preview_ttl_seconds = max(1.0, float(purge_preview_ttl_seconds))
         self._gc_preview_lock = threading.Lock()
         self._gc_preview_tokens: dict[str, dict[str, Any]] = {}
+        self._run_purge_preview_lock = threading.Lock()
+        self._run_purge_preview_tokens: dict[str, dict[str, Any]] = {}
 
     def ensure_backfilled(self) -> dict[str, int]:
         key = str(self.db.db_path.resolve())
@@ -635,6 +748,525 @@ class RunCleanupService:
             "run_refs": run_refs,
             "released_refs": released_refs,
         }
+
+    def preview_run_purge(
+        self,
+        request_type: str,
+        run_ids: Iterable[int],
+    ) -> dict[str, Any]:
+        """Preview one exact Run deletion/cleanup selection and mint a one-use token.
+
+        The token is process-local and deliberately short lived.  It binds the
+        normalized Run ID set, operation type, Run lifecycle rows, active Jobs,
+        dependency bindings, cache references, and exact managed Run-directory
+        metadata observed here.
+        """
+
+        operation = self._normalize_run_purge_type(request_type)
+        selected_ids = self._normalize_run_ids(run_ids)
+        self.ensure_backfilled()
+        for run_id in selected_ids:
+            # Keep the cache accounting exact even for historical databases
+            # whose Run references predate the cache catalog.
+            register_run_cache_refs(
+                self.db,
+                self.workspace,
+                run_id,
+                grace_seconds=self.cache_grace_seconds,
+            )
+        preview, state_fingerprint = self._build_run_purge_preview(operation, selected_ids)
+        now = utc_ts()
+        expires_at = now + self.purge_preview_ttl_seconds
+        token = uuid.uuid4().hex
+        preview.update(
+            {
+                "generated_at": now,
+                "expires_at": expires_at,
+                "preview_token": token,
+            }
+        )
+        with self._run_purge_preview_lock:
+            # Retain recently expired entries long enough for callers to get a
+            # specific ``expired_preview`` response instead of an ambiguous miss.
+            cutoff = now - self.purge_preview_ttl_seconds
+            self._run_purge_preview_tokens = {
+                key: value
+                for key, value in self._run_purge_preview_tokens.items()
+                if float(value.get("expires_at") or 0) >= cutoff
+            }
+            self._run_purge_preview_tokens[token] = {
+                "request_type": operation,
+                "run_ids": selected_ids,
+                "state_fingerprint": state_fingerprint,
+                "expires_at": expires_at,
+                "preview": preview,
+            }
+        return preview
+
+    def consume_run_purge_preview(
+        self,
+        preview_token: str | None,
+        *,
+        request_type: str,
+        run_ids: Iterable[int],
+    ) -> dict[str, Any]:
+        """Consume and validate a Run purge preview immediately before mutation."""
+
+        token = str(preview_token or "").strip()
+        if not token:
+            raise RunPurgePreviewError(
+                "missing_preview",
+                "Run deletion or artifact cleanup requires a fresh preview token",
+            )
+        operation = self._normalize_run_purge_type(request_type)
+        selected_ids = self._normalize_run_ids(run_ids)
+        with self._run_purge_preview_lock:
+            snapshot = self._run_purge_preview_tokens.pop(token, None)
+        if snapshot is None:
+            raise RunPurgePreviewError(
+                "missing_preview",
+                "Run purge preview token is missing or was already consumed; preview again",
+            )
+        if float(snapshot.get("expires_at") or 0) < utc_ts():
+            raise RunPurgePreviewError(
+                "expired_preview",
+                "Run purge preview token expired; preview the current Run state again",
+            )
+        if str(snapshot.get("request_type") or "") != operation:
+            raise RunPurgePreviewError(
+                "preview_mismatch",
+                "Run purge preview was created for a different operation",
+            )
+        if tuple(snapshot.get("run_ids") or ()) != selected_ids:
+            raise RunPurgePreviewError(
+                "preview_mismatch",
+                "Run purge preview does not match the exact selected Run IDs",
+            )
+        current_preview, current_fingerprint = self._build_run_purge_preview(
+            operation, selected_ids
+        )
+        state_changed = current_fingerprint != str(snapshot.get("state_fingerprint") or "")
+        if state_changed and not self._active_delete_preview_compatible(
+            snapshot.get("preview") or {}, current_preview
+        ):
+            raise RunPurgePreviewError(
+                "stale_preview",
+                "Run, dependency, artifact, or cache state changed after preview; preview again",
+            )
+        return {
+            "validated": True,
+            "validated_at": utc_ts(),
+            "preview_token": token,
+            "request_type": operation,
+            "run_ids": list(selected_ids),
+            "preview": current_preview if state_changed else snapshot["preview"],
+            "state_changed_after_preview": state_changed,
+        }
+
+    @staticmethod
+    def _active_delete_preview_compatible(
+        previous: dict[str, Any],
+        current: dict[str, Any],
+    ) -> bool:
+        """Allow expected progress drift while deleting an active Run.
+
+        Active workers update the Run row, Job heartbeat, and managed output
+        tree continuously. Requiring those volatile values to remain byte-for-
+        byte identical makes a preview token impossible to consume, even when
+        the user confirms immediately. The relaxed path is intentionally
+        narrow: it applies only when every originally previewed Run was active,
+        keeps the exact operation and Run IDs, and still rejects any Campaign
+        or Compare dependency change. Cleanup scope remains the trusted
+        ``runs/{id}`` directory, and the deletion service rechecks workers and
+        preserves dependencies before unlinking anything.
+        """
+
+        if (
+            str(previous.get("request_type") or "") != "delete_run"
+            or str(current.get("request_type") or "") != "delete_run"
+        ):
+            return False
+        previous_ids = [int(value) for value in previous.get("run_ids") or []]
+        current_ids = [int(value) for value in current.get("run_ids") or []]
+        if not previous_ids or previous_ids != current_ids:
+            return False
+        previous_runs = {
+            int(row.get("run_id") or 0): row for row in previous.get("runs") or []
+        }
+        current_runs = {
+            int(row.get("run_id") or 0): row for row in current.get("runs") or []
+        }
+        if set(previous_runs) != set(previous_ids) or set(current_runs) != set(previous_ids):
+            return False
+        for run_id in previous_ids:
+            before = previous_runs[run_id]
+            after = current_runs[run_id]
+            if (
+                str(before.get("status") or "") in TERMINAL_RUN_STATUSES
+                or bool(before.get("deleted"))
+                or bool(after.get("deleted"))
+                or not bool(before.get("allowed"))
+                or not bool(after.get("allowed"))
+            ):
+                return False
+            before_dependencies = dict(before.get("dependencies") or {})
+            after_dependencies = dict(after.get("dependencies") or {})
+            # Job IDs and their heartbeat/status are expected to change while
+            # cancellation races inference/finalization. Semantic dependencies
+            # are not expected to change and still fence the token.
+            before_dependencies.pop("active_job_ids", None)
+            after_dependencies.pop("active_job_ids", None)
+            if before_dependencies != after_dependencies:
+                return False
+        return True
+
+    @staticmethod
+    def _normalize_run_purge_type(request_type: str) -> str:
+        operation = str(request_type or "").strip()
+        if operation not in {"delete_run", "cleanup_artifacts"}:
+            raise ValueError("request_type must be delete_run or cleanup_artifacts")
+        return operation
+
+    @staticmethod
+    def _normalize_run_ids(run_ids: Iterable[int]) -> tuple[int, ...]:
+        try:
+            selected = tuple(sorted({int(value) for value in run_ids}))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("run_ids must contain exact integer Run IDs") from exc
+        if not selected or selected[0] <= 0:
+            raise ValueError("run_ids must contain at least one positive Run ID")
+        return selected
+
+    def _trusted_preview_run_dir(self, run_id: int) -> Path:
+        runs_root = self.workspace.runs_dir.resolve()
+        lexical = self.workspace.runs_dir / str(int(run_id))
+        if lexical.is_symlink():
+            raise ValueError(f"Run {run_id} output directory is a symbolic link")
+        resolved = lexical.resolve()
+        if (
+            not _is_relative_to(resolved, runs_root)
+            or resolved.parent != runs_root
+            or resolved.name != str(int(run_id))
+        ):
+            raise ValueError(f"Run {run_id} output directory is outside the managed runs root")
+        return resolved
+
+    def _build_run_purge_preview(
+        self,
+        request_type: str,
+        run_ids: tuple[int, ...],
+    ) -> tuple[dict[str, Any], str]:
+        placeholders = ",".join("?" for _ in run_ids)
+        run_rows = self.db.query(
+            f"""
+            SELECT id, name, status, content_revision, deleted_at,
+                   artifact_cleaned_at, updated_at
+            FROM runs
+            WHERE id IN ({placeholders})
+            ORDER BY id
+            """,
+            run_ids,
+        )
+        found_ids = {int(row["id"]) for row in run_rows}
+        missing = [run_id for run_id in run_ids if run_id not in found_ids]
+        if missing:
+            raise KeyError(f"run {missing[0]} not found")
+
+        cache_rows = self.db.query(
+            f"""
+            SELECT rcr.run_id, ce.id, ce.cache_type, ce.cache_key,
+                   ce.storage_path, ce.state, ce.size_bytes, ce.updated_at,
+                   ce.gc_after, ce.deleted_at
+            FROM run_cache_refs rcr
+            JOIN cache_entries ce ON ce.id = rcr.cache_entry_id
+            WHERE rcr.run_id IN ({placeholders})
+              AND rcr.released_at IS NULL
+              AND ce.deleted_at IS NULL AND ce.state != 'deleted'
+            ORDER BY rcr.run_id, ce.id
+            """,
+            run_ids,
+        )
+        cache_entry_ids = sorted({int(row["id"]) for row in cache_rows})
+        all_refs: dict[int, set[int]] = {entry_id: set() for entry_id in cache_entry_ids}
+        active_leases: dict[int, list[dict[str, Any]]] = {entry_id: [] for entry_id in cache_entry_ids}
+        if cache_entry_ids:
+            cache_placeholders = ",".join("?" for _ in cache_entry_ids)
+            for row in self.db.query(
+                f"""
+                SELECT cache_entry_id, run_id
+                FROM run_cache_refs
+                WHERE cache_entry_id IN ({cache_placeholders}) AND released_at IS NULL
+                ORDER BY cache_entry_id, run_id
+                """,
+                cache_entry_ids,
+            ):
+                all_refs[int(row["cache_entry_id"])].add(int(row["run_id"]))
+            now = utc_ts()
+            for row in self.db.query(
+                f"""
+                SELECT cache_entry_id, lease_id, expires_at
+                FROM cache_leases
+                WHERE cache_entry_id IN ({cache_placeholders}) AND expires_at > ?
+                ORDER BY cache_entry_id, lease_id
+                """,
+                (*cache_entry_ids, now),
+            ):
+                active_leases[int(row["cache_entry_id"])].append(
+                    {
+                        "lease_id": str(row["lease_id"]),
+                        "expires_at": float(row["expires_at"]),
+                    }
+                )
+
+        selected_set = set(run_ids)
+        cache_by_run: dict[int, list[dict[str, Any]]] = {run_id: [] for run_id in run_ids}
+        unique_caches: dict[int, dict[str, Any]] = {}
+        for raw in cache_rows:
+            row = dict(raw)
+            entry_id = int(row["id"])
+            refs = sorted(all_refs.get(entry_id) or set())
+            cache = {
+                "id": entry_id,
+                "cache_type": str(row.get("cache_type") or ""),
+                "cache_key": str(row.get("cache_key") or ""),
+                "state": str(row.get("state") or ""),
+                "size_bytes": int(row.get("size_bytes") or 0),
+                "active_run_refs": refs,
+                "active_leases": len(active_leases.get(entry_id) or []),
+                "shared": len(refs) > 1,
+                "shared_with_unselected": bool(set(refs) - selected_set),
+            }
+            cache_by_run[int(row["run_id"])].append(cache)
+            unique_caches[entry_id] = {
+                **cache,
+                "storage_path": str(row.get("storage_path") or ""),
+                "updated_at": row.get("updated_at"),
+                "gc_after": row.get("gc_after"),
+                "deleted_at": row.get("deleted_at"),
+                "leases": active_leases.get(entry_id) or [],
+            }
+
+        public_runs: list[dict[str, Any]] = []
+        state_runs: list[dict[str, Any]] = []
+        campaign_ids: set[int] = set()
+        compare_run_ids: set[int] = set()
+        active_job_ids: set[int] = set()
+        for raw_run in run_rows:
+            run = dict(raw_run)
+            run_id = int(run["id"])
+            run_dir = self._trusted_preview_run_dir(run_id)
+            directory = _path_state(run_dir)
+            dependencies, dependency_state = self._run_purge_dependencies(run_id)
+            campaign_ids.update(int(value) for value in dependencies["campaign_ids"])
+            compare_run_ids.update(int(value) for value in dependencies["compare_run_ids"])
+            active_job_ids.update(int(value) for value in dependencies["active_job_ids"])
+            referenced_caches = cache_by_run[run_id]
+            referenced_cache_bytes = sum(int(row["size_bytes"]) for row in referenced_caches)
+            shared_cache_bytes = sum(
+                int(row["size_bytes"]) for row in referenced_caches if row["shared"]
+            )
+            exclusive_cache_bytes = sum(
+                int(row["size_bytes"]) for row in referenced_caches if not row["shared"]
+            )
+            reason = "ready"
+            allowed = True
+            if request_type == "cleanup_artifacts" and str(run.get("status") or "") not in TERMINAL_RUN_STATUSES:
+                allowed = False
+                reason = "run_not_terminal"
+            elif request_type == "cleanup_artifacts" and dependencies["active_job_ids"]:
+                allowed = False
+                reason = "active_worker"
+            elif request_type == "cleanup_artifacts" and run.get("artifact_cleaned_at") is not None:
+                allowed = False
+                reason = "artifacts_already_cleaned"
+            elif request_type == "delete_run" and run.get("deleted_at") is not None:
+                allowed = False
+                reason = "run_already_deleted"
+            public_runs.append(
+                {
+                    "run_id": run_id,
+                    "name": str(run.get("name") or ""),
+                    "status": str(run.get("status") or ""),
+                    "allowed": allowed,
+                    "reason": reason,
+                    "artifact_cleaned": run.get("artifact_cleaned_at") is not None,
+                    "deleted": run.get("deleted_at") is not None,
+                    "dependencies": dependencies,
+                    "cache_entry_ids": [int(row["id"]) for row in referenced_caches],
+                    "bytes": {
+                        "run_directory_bytes": int(directory["logical_bytes"]),
+                        "exclusive_run_bytes": int(directory["reclaimable_bytes"]),
+                        "referenced_cache_bytes": referenced_cache_bytes,
+                        "shared_cache_bytes": shared_cache_bytes,
+                        "exclusive_cache_bytes": exclusive_cache_bytes,
+                        # Purging a Run only unlinks its managed directory. Cache
+                        # bytes remain protected until refs, leases, and grace all clear.
+                        "estimated_reclaimable_bytes": int(directory["reclaimable_bytes"]),
+                    },
+                }
+            )
+            state_runs.append(
+                {
+                    **run,
+                    "directory": directory,
+                    "dependencies": dependency_state,
+                    "cache_entry_ids": [int(row["id"]) for row in referenced_caches],
+                }
+            )
+
+        unique_cache_rows = list(unique_caches.values())
+        referenced_cache_bytes = sum(int(row["size_bytes"]) for row in unique_cache_rows)
+        shared_cache_bytes = sum(
+            int(row["size_bytes"]) for row in unique_cache_rows if row["shared"]
+        )
+        external_shared_cache_bytes = sum(
+            int(row["size_bytes"])
+            for row in unique_cache_rows
+            if row["shared_with_unselected"]
+        )
+        exclusive_cache_bytes = sum(
+            int(row["size_bytes"])
+            for row in unique_cache_rows
+            if not row["shared_with_unselected"]
+        )
+        exclusive_run_bytes = sum(int(row["bytes"]["exclusive_run_bytes"]) for row in public_runs)
+        preview = {
+            "request_type": request_type,
+            "run_ids": list(run_ids),
+            "runs": public_runs,
+            "summary": {
+                "run_count": len(public_runs),
+                "allowed_run_count": sum(1 for row in public_runs if row["allowed"]),
+                "run_directory_bytes": sum(
+                    int(row["bytes"]["run_directory_bytes"]) for row in public_runs
+                ),
+                "exclusive_run_bytes": exclusive_run_bytes,
+                "referenced_cache_bytes": referenced_cache_bytes,
+                "shared_cache_bytes": shared_cache_bytes,
+                "shared_with_unselected_cache_bytes": external_shared_cache_bytes,
+                "exclusive_cache_bytes": exclusive_cache_bytes,
+                "estimated_reclaimable_bytes": exclusive_run_bytes,
+                "potential_cache_bytes_after_grace": exclusive_cache_bytes,
+                "dependencies": {
+                    "campaign_ids": sorted(campaign_ids),
+                    "compare_run_ids": sorted(compare_run_ids),
+                    "active_job_ids": sorted(active_job_ids),
+                },
+            },
+        }
+        state = {
+            "request_type": request_type,
+            "run_ids": run_ids,
+            "runs": state_runs,
+            "caches": sorted(unique_cache_rows, key=lambda row: int(row["id"])),
+        }
+        state_fingerprint = hashlib.sha256(
+            json.dumps(state, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return preview, state_fingerprint
+
+    def _run_purge_dependencies(
+        self,
+        run_id: int,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        jobs = self._active_jobs(run_id)
+        active_jobs = [
+            {
+                "job_id": int(row["job_id"]),
+                "kind": str(row.get("kind") or ""),
+                "status": str(row.get("status") or ""),
+                "updated_at": row.get("updated_at"),
+            }
+            for row in jobs
+        ]
+        campaign_ids = self._run_campaign_ids(run_id)
+        preparing_campaign_ids = self._preparing_campaign_ids(run_id)
+        campaign_state = [
+            {
+                "version": "v1",
+                "campaign_id": int(row["campaign_id"]),
+                "status": str(row.get("status") or ""),
+                "updated_at": row.get("updated_at"),
+            }
+            for row in self.db.query(
+                """
+                SELECT DISTINCT c.id AS campaign_id, c.status, c.updated_at
+                FROM run_media_assets rma
+                JOIN evaluation_candidates ec
+                  ON ec.asset_id = rma.asset_id OR ec.reference_asset_id = rma.asset_id
+                JOIN evaluation_campaigns c ON c.id = ec.campaign_id
+                WHERE rma.run_id = ?
+                ORDER BY c.id
+                """,
+                (int(run_id),),
+            )
+        ]
+        if self.db.get(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'evaluation_methods_v2'"
+        ) is not None:
+            campaign_state.extend(
+                {
+                    "version": "v2",
+                    "campaign_id": int(row["campaign_id"]),
+                    "status": str(row.get("status") or ""),
+                    "updated_at": row.get("updated_at"),
+                }
+                for row in self.db.query(
+                    """
+                    SELECT DISTINCT c.id AS campaign_id, c.status, c.updated_at
+                    FROM evaluation_methods_v2 m
+                    JOIN evaluation_campaigns_v2 c ON c.id = m.campaign_id
+                    WHERE m.source_run_id = ?
+                    ORDER BY c.id
+                    """,
+                    (int(run_id),),
+                )
+            )
+        purge_requests = self.db.query(
+            """
+            SELECT id, request_type, status, attempt_count, updated_at
+            FROM run_purge_requests
+            WHERE run_id = ?
+            ORDER BY id
+            """,
+            (int(run_id),),
+        )
+        compare_bindings: list[dict[str, Any]] = []
+        if self.db.get(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_media_item_bindings'"
+        ) is not None:
+            compare_bindings = self.db.query(
+                """
+                SELECT rib.id AS binding_id, rib.run_id AS compare_run_id,
+                       rib.item_id, rib.slot, rib.active_member_id,
+                       rib.updated_at
+                FROM run_media_item_bindings rib
+                JOIN media_item_members mim ON mim.id = rib.active_member_id
+                JOIN runs dependent ON dependent.id = rib.run_id
+                WHERE mim.producer_run_id = ?
+                  AND rib.binding_role = 'compare_pred'
+                  AND dependent.deleted_at IS NULL
+                  AND dependent.artifact_cleaned_at IS NULL
+                ORDER BY rib.run_id, rib.id
+                """,
+                (int(run_id),),
+            )
+        compare_run_ids = sorted({int(row["compare_run_id"]) for row in compare_bindings})
+        public = {
+            "campaign_ids": campaign_ids,
+            "preparing_campaign_ids": preparing_campaign_ids,
+            "compare_run_ids": compare_run_ids,
+            "compare_binding_count": len(compare_bindings),
+            "active_job_ids": [int(row["job_id"]) for row in active_jobs],
+        }
+        state = {
+            **public,
+            "active_jobs": active_jobs,
+            "campaigns": campaign_state,
+            "compare_bindings": compare_bindings,
+            "purge_requests": purge_requests,
+        }
+        return public, state
 
     def request_delete(self, run_id: int) -> dict[str, Any]:
         self.ensure_backfilled()
@@ -1196,7 +1828,7 @@ class RunCleanupService:
         run_dir = (runs_root / str(int(run_id))).resolve()
         if not _is_relative_to(run_dir, runs_root) or run_dir.parent != runs_root:
             raise ValueError("run output directory is outside workspace runs directory")
-        reclaimed_bytes = _path_size(run_dir)
+        reclaimed_bytes = _path_reclaimable_size(run_dir)
         if run_dir.exists():
             shutil.rmtree(run_dir)
 
