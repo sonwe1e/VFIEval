@@ -32,7 +32,10 @@ from vfieval.file_inputs import decode_cache_dir, list_checkpoints, list_model_f
 from vfieval.job_errors import describe_job_failure
 from vfieval.metrics.health import metric_assets_dir, metric_health, metrics_health
 from vfieval.models import load_flow_mask_model
-from vfieval.orchestration import _start_local_npu_worker_processes
+from vfieval.orchestration import (
+    _start_local_npu_worker_processes,
+    worker_process_command as _worker_process_command,
+)
 from vfieval.pipeline.finalize_runner import run_finalize_job
 from vfieval.pipeline.inference import run_inference_job
 from vfieval.pipeline.postprocess import validate_model_outputs
@@ -45,7 +48,6 @@ from vfieval.server import (
     _run_metric_summary,
     _run_timeline,
     _timeline_buckets,
-    _worker_process_command,
 )
 from vfieval.worker import WorkerOptions, detect_capabilities, run_worker
 
@@ -429,8 +431,8 @@ class Model:
                 run = _wait_for_run(base_url, run_id)
                 self.assertEqual(run["status"], "completed", run)
                 output_health = run["result"]["output_health"]
-                # N - frame_step = 4 - 1 = 3 samples after the triplet count fix.
-                self.assertEqual(output_health["samples"], 3)
+                # midpoint-triplet-v2: N - 2*frame_step = 4 - 2 = 2 samples.
+                self.assertEqual(output_health["samples"], 2)
                 self.assertTrue(output_health["flow_flat"])
                 self.assertTrue(output_health["mask_flat"])
                 self.assertTrue(output_health["warnings"])
@@ -534,8 +536,8 @@ class Model:
                 )
                 timeline = _get(base_url, f"/api/runs/{run_id}/timeline")
                 self.assertEqual(len(timeline["videos"]), 1)
-                # N - frame_step = 4 - 1 = 3 samples after the triplet count fix.
-                self.assertEqual(len(timeline["videos"][0]["samples"]), 3)
+                # midpoint-triplet-v2 keeps only two real symmetric triples.
+                self.assertEqual(len(timeline["videos"][0]["samples"]), 2)
                 first_sample = timeline["videos"][0]["samples"][0]
                 self.assertNotIn("artifacts", first_sample)
                 self.assertNotIn("sample_files", first_sample)
@@ -563,8 +565,8 @@ class Model:
                 self.assertEqual(summary["metrics"]["lpips_vit_patch"]["worst_sample_id"], int(sample["id"]))
 
                 run_videos = _get(base_url, f"/api/runs/{run_id}/videos")
-                # N - frame_step = 4 - 1 = 3 samples after the triplet count fix.
-                self.assertEqual(run_videos["videos"][0]["sample_count"], 3)
+                # midpoint-triplet-v2 keeps only two real symmetric triples.
+                self.assertEqual(run_videos["videos"][0]["sample_count"], 2)
                 run_video_name = run_videos["videos"][0]["video_name"]
                 video_timeline = _get(base_url, f"/api/runs/{run_id}/videos/{urllib.parse.quote(run_video_name)}/timeline?bucket_count=2&window_size=1")
                 self.assertEqual(len(video_timeline["samples"]), 1)
@@ -596,8 +598,17 @@ class Model:
                     {"worker_id": "remote-test", "role": "inference", "capabilities": {"cpu": True}},
                 )
                 self.assertEqual(worker["worker"]["id"], "remote-test")
-                heartbeat = _post(base_url, f"/api/jobs/{int(run['inference_job_id'])}/heartbeat", {"worker_id": "remote-test"})
-                self.assertEqual(heartbeat["status"], "heartbeat")
+                with self.assertRaises(urllib.error.HTTPError) as heartbeat_error:
+                    _post(
+                        base_url,
+                        f"/api/jobs/{int(run['inference_job_id'])}/heartbeat",
+                        {"worker_id": "remote-test"},
+                    )
+                self.assertEqual(heartbeat_error.exception.code, 409)
+                heartbeat_payload = json.loads(
+                    heartbeat_error.exception.read().decode("utf-8")
+                )
+                self.assertEqual(heartbeat_payload["error"]["type"], "JobLeaseLost")
 
                 cleanup = _post(base_url, f"/api/runs/{run_id}/cleanup-artifacts", {})
                 self.assertIn(cleanup["purge_status"], {"requested", "purging"})
@@ -743,9 +754,8 @@ class Model:
                 self.assertTrue(run["metadata"]["metric_health"]["lpips_vit_patch"]["manifest_path"].endswith("lpips_vit_patch\\manifest.json"))
 
                 summary = _get(base_url, f"/api/runs/{run_id}/metric-summary")
-                # N - frame_step = 4 - 1 = 3 samples after the triplet count fix
-                # (one interpolated frame per adjacent source pair).
-                self.assertEqual(summary["metrics"]["lpips_vit_patch"]["unavailable"], 3)
+                # midpoint-triplet-v2 keeps only two real symmetric triples.
+                self.assertEqual(summary["metrics"]["lpips_vit_patch"]["unavailable"], 2)
                 self.assertIn("lpips_vit_patch metric is missing_weights", summary["metrics"]["lpips_vit_patch"]["reasons"][0])
 
                 timeline = _get(base_url, f"/api/runs/{run_id}/timeline")
@@ -753,7 +763,7 @@ class Model:
                     sample["metrics"]["lpips_vit_patch"]["status"]
                     for sample in timeline["videos"][0]["samples"]
                 ]
-                self.assertEqual(statuses, ["unavailable", "unavailable", "unavailable"])
+                self.assertEqual(statuses, ["unavailable", "unavailable"])
             finally:
                 server.shutdown()
                 server.server_close()

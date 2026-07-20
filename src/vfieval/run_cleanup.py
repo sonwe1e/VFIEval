@@ -14,6 +14,7 @@ from typing import Any, Callable, Iterable, Iterator
 
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database, utc_ts
+from vfieval.runtime_logging import runtime_logger
 
 
 TERMINAL_RUN_STATUSES = {"completed", "failed", "canceled"}
@@ -642,7 +643,13 @@ class RunCleanupService:
                 # Individual purge failures are persisted by process_request.
                 # This guard keeps an unexpected coordinator error from killing
                 # automatic cleanup for every other Run.
-                print(f"run cleanup loop failed: {type(exc).__name__}: {exc}")
+                runtime_logger().exception(
+                    "run cleanup loop failed",
+                    extra={
+                        "event": "run_cleanup.loop_failed",
+                        "details": {"error_type": type(exc).__name__},
+                    },
+                )
             stop_event.wait(max(0.1, float(poll_interval)))
 
     def backfill_cache_catalog(self) -> dict[str, int]:

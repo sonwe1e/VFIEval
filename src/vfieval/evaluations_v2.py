@@ -22,7 +22,6 @@ from PIL import Image
 
 from vfieval.compare_inputs import (
     inspect_compare_path,
-    resolve_compare_descriptor,
     validate_strict_alignment,
     validate_strict_decoded_alignment,
 )
@@ -30,6 +29,7 @@ from vfieval.alignment import plan_alignment, validate_temporal_alignment
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database, utc_ts
 from vfieval.evaluations import CONFIDENCE_VALUES, METRIC_DIRECTIONS, QUALITY_REASONS
+from vfieval.file_inputs import MIDPOINT_TRIPLET_CONTRACT
 from vfieval.media_assets import get_asset, resolve_asset_path, slugify, sync_run_assets
 from vfieval.media_items import (
     _assert_reusable_compare_prediction,
@@ -47,6 +47,7 @@ from vfieval.pipeline.evaluation_freeze import (
     freeze_campaign_media,
 )
 from vfieval.run_cleanup import cache_lease
+from vfieval.storage_budget import campaign_requested_bytes, ensure_storage_capacity
 
 
 LEGACY_COPY_FREEZE_PIPELINE_VERSION = "campaign-freeze-legacy-copy-v1"
@@ -243,6 +244,7 @@ class CampaignDependencyError(ValueError):
 PREPARATION_CLAIM_STALE_SECONDS = 10 * 60
 CAMPAIGN_PURGE_CLAIM_STALE_SECONDS = 10 * 60
 _PREPARATION_RUNNER_LOCK = threading.Lock()
+_PUBLISH_REQUEST_LOCK = threading.Lock()
 
 
 def _json(value: Any) -> str:
@@ -454,11 +456,115 @@ def _asset_info(asset: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _contract_name(metadata: dict[str, Any]) -> str | None:
+    raw: Any = metadata.get("evaluation_contract")
+    if raw is None or raw == "":
+        preflight = metadata.get("preflight")
+        if isinstance(preflight, dict):
+            raw = preflight.get("evaluation_contract")
+    if isinstance(raw, dict):
+        raw = raw.get("name") or raw.get("version")
+    text = str(raw or "").strip()
+    return text or None
+
+
+def _run_evaluation_contract_report(
+    db: Database,
+    run: int | dict[str, Any],
+) -> dict[str, Any]:
+    row = db.get_run(int(run)) if not isinstance(run, dict) else run
+    run_id = int(row["id"])
+    metadata = dict(row.get("metadata") or {})
+    contract = _contract_name(metadata)
+    clamped = db.get(
+        """
+        SELECT id FROM samples
+        WHERE dataset_id = ?
+          AND COALESCE(json_extract(metadata_json, '$.clamped_boundary'), 0) = 1
+        LIMIT 1
+        """,
+        (int(row["dataset_id"]),),
+    ) is not None
+    if clamped:
+        status = "untrusted_clamped_boundary"
+        reason = (
+            f"Run {run_id} contains a clamped-boundary pseudo-GT sample; "
+            f"rerun it with {MIDPOINT_TRIPLET_CONTRACT} before creating a Campaign"
+        )
+    elif contract is None:
+        status = "legacy_missing_contract"
+        reason = (
+            f"Run {run_id} predates the evaluation contract marker; rerun it with "
+            f"{MIDPOINT_TRIPLET_CONTRACT} before creating a Campaign"
+        )
+    elif contract != MIDPOINT_TRIPLET_CONTRACT:
+        status = "unsupported_contract"
+        reason = (
+            f"Run {run_id} uses unsupported evaluation contract {contract}; rerun it with "
+            f"{MIDPOINT_TRIPLET_CONTRACT} before creating a Campaign"
+        )
+    else:
+        status = "trusted"
+        reason = None
+    return {
+        "name": contract,
+        "required": MIDPOINT_TRIPLET_CONTRACT,
+        "status": status,
+        "trusted": status == "trusted",
+        "has_clamped_boundary": clamped,
+        "reason": reason,
+    }
+
+
+def _require_run_evaluation_contract(db: Database, run: int | dict[str, Any]) -> dict[str, Any]:
+    report = _run_evaluation_contract_report(db, run)
+    if not report["trusted"]:
+        raise ValueError(str(report["reason"]))
+    return report
+
+
+def _campaign_contract_reports(db: Database, campaign_id: int) -> list[dict[str, Any]]:
+    rows = db.query(
+        """
+        SELECT slot, source_run_id FROM evaluation_methods_v2
+        WHERE campaign_id = ? AND source_run_id IS NOT NULL
+        ORDER BY slot
+        """,
+        (int(campaign_id),),
+    )
+    reports: list[dict[str, Any]] = []
+    for method in rows:
+        run_id = int(method["source_run_id"])
+        try:
+            report = _run_evaluation_contract_report(db, run_id)
+        except KeyError:
+            report = {
+                "name": None,
+                "required": MIDPOINT_TRIPLET_CONTRACT,
+                "status": "source_run_missing",
+                "trusted": False,
+                "has_clamped_boundary": False,
+                "reason": f"source Run {run_id} is no longer available for contract verification",
+            }
+        reports.append({"slot": str(method["slot"]), "run_id": run_id, **report})
+    return reports
+
+
+def _assert_campaign_evaluation_contracts(db: Database, campaign_id: int) -> None:
+    invalid = [
+        report for report in _campaign_contract_reports(db, int(campaign_id))
+        if not report["trusted"]
+    ]
+    if invalid:
+        raise ValueError("; ".join(str(report["reason"]) for report in invalid))
+
+
 def list_run_outputs(db: Database) -> list[dict[str, Any]]:
     """Return valid Run -> video -> track output groups for V2 selectors."""
     rows = db.query(
         """
         SELECT r.id AS run_id, r.name AS run_name, r.created_at AS run_created_at,
+               r.dataset_id AS run_dataset_id, r.metadata_json AS run_metadata_json,
                rma.video_name, rma.track_label, rma.model_name, rma.checkpoint,
                ma.id AS asset_id, ma.display_name, ma.frame_count, ma.width,
                ma.height, ma.fps, ma.created_at AS asset_created_at
@@ -482,15 +588,24 @@ def list_run_outputs(db: Database) -> list[dict[str, Any]]:
         if key in seen:
             continue
         seen.add(key)
-        run = runs.setdefault(
-            int(row["run_id"]),
-            {
+        run_id = int(row["run_id"])
+        run = runs.get(run_id)
+        if run is None:
+            run = {
                 "run_id": int(row["run_id"]),
                 "run_name": str(row["run_name"]),
                 "created_at": row["run_created_at"],
+                "evaluation_contract": _run_evaluation_contract_report(
+                    db,
+                    {
+                        "id": int(row["run_id"]),
+                        "dataset_id": int(row["run_dataset_id"]),
+                        "metadata": _loads(row.get("run_metadata_json")),
+                    },
+                ),
                 "_videos": {},
-            },
-        )
+            }
+            runs[run_id] = run
         video_name = str(row["video_name"])
         video = run["_videos"].setdefault(video_name, {"video_name": video_name, "tracks": []})
         video["tracks"].append(
@@ -634,6 +749,7 @@ def _method_output_rows(db: Database, workspace: WorkspaceConfig, method: dict[s
         raise ValueError(f"Run {method['run_id']} output is unavailable")
     if str(run.get("status") or "") != "completed":
         raise ValueError(f"Run {method['run_id']} is not completed")
+    contract_report = _require_run_evaluation_contract(db, run)
     sync_run_assets(db, workspace, int(method["run_id"]))
     tracks = db.query(
         """
@@ -720,6 +836,7 @@ def _method_output_rows(db: Database, workspace: WorkspaceConfig, method: dict[s
             "run_name": str(run.get("name") or ""),
             "model_name": str(metadata.get("model_file") or run.get("model_name") or ""),
             "checkpoint": str(metadata.get("checkpoint") or ""),
+            "evaluation_contract": contract_report,
         },
         "outputs": outputs,
         "references": references,
@@ -1089,6 +1206,24 @@ def _preview_item_campaign_v2(
     if len(collection_ids) != 1:
         raise ValueError("one Campaign may select media items from only one GT group")
     methods = _normalize_item_method_specs(body)
+    method_contracts: dict[str, dict[str, Any] | None] = {}
+    for method in methods:
+        if method["kind"] != "run":
+            method_contracts[str(method["slot"])] = None
+            continue
+        try:
+            method_contracts[str(method["slot"])] = _run_evaluation_contract_report(
+                db, int(method["run_id"])
+            )
+        except KeyError:
+            method_contracts[str(method["slot"])] = {
+                "name": None,
+                "required": MIDPOINT_TRIPLET_CONTRACT,
+                "status": "source_run_missing",
+                "trusted": False,
+                "has_clamped_boundary": False,
+                "reason": f"source Run {method['run_id']} is not available",
+            }
     spatial_policy = dict(body.get("spatial_policy") or {})
     spatial_policy.setdefault("mode", "smallest_pred")
     spatial_policy.setdefault("filter", "lanczos")
@@ -1103,6 +1238,9 @@ def _preview_item_campaign_v2(
         ]
         reasons: list[str] = []
         for method, prediction in zip(methods, selected_predictions):
+            contract_report = method_contracts.get(str(method["slot"]))
+            if contract_report is not None and not contract_report["trusted"]:
+                reasons.append(str(contract_report["reason"]))
             if prediction is None:
                 reasons.append(
                     f"{method.get('label') or method.get('run_id') or method.get('method_key')} 缺少该 Item"
@@ -1139,6 +1277,7 @@ def _preview_item_campaign_v2(
                 "height": int(original.get("height") or (prediction or {}).get("height") or 0),
                 "fps": (prediction or {}).get("fps"),
                 "alignment": alignment,
+                "evaluation_contract": method_contracts.get(slot),
             }
         reference_alignment = (plan.get("sources") or {}).get("gt") or {}
         reference_original = reference_alignment.get("original") or {}
@@ -1180,6 +1319,7 @@ def _preview_item_campaign_v2(
                 "model_name": str(((run or {}).get("metadata") or {}).get("model_file") or ""),
                 "checkpoint": str(((run or {}).get("metadata") or {}).get("checkpoint") or ""),
                 "track_label": str(method.get("method_key") or ""),
+                "evaluation_contract": method_contracts.get(str(method["slot"])),
             }
         )
     ready = [row for row in rows if row["selectable"]]
@@ -1346,6 +1486,7 @@ def _create_item_campaign_v2(
             "group_id": int(preview["group_id"]),
             "media_item_ids": requested_ids,
             "spatial_policy": preview["spatial_policy"],
+            "evaluation_contract": MIDPOINT_TRIPLET_CONTRACT,
         }
     )
     with db.connection() as conn:
@@ -1378,7 +1519,12 @@ def _create_item_campaign_v2(
                     str(method.get("label") or "")[:240],
                     str(method.get("model_name") or "")[:240],
                     str(method.get("checkpoint") or "")[:500],
-                    _json(method.get("raw") or {}),
+                    _json(
+                        {
+                            **(method.get("raw") or {}),
+                            "evaluation_contract": method.get("evaluation_contract"),
+                        }
+                    ),
                     now,
                 ),
             )
@@ -1456,6 +1602,8 @@ def create_campaign_v2(db: Database, workspace: WorkspaceConfig, body: dict[str,
         raise ValueError(f"selected Campaign V2 videos were not found: {', '.join(sorted(missing))}")
     now = utc_ts()
     seed = int(body.get("seed") if body.get("seed") is not None else random.SystemRandom().randrange(2**31))
+    config = dict(body.get("metadata") or {})
+    config["evaluation_contract"] = MIDPOINT_TRIPLET_CONTRACT
     with db.connection() as conn:
         cur = conn.execute(
             """
@@ -1466,7 +1614,7 @@ def create_campaign_v2(db: Database, workspace: WorkspaceConfig, body: dict[str,
             """,
             (
                 _token(), name[:240], title[:240], target_votes, seed,
-                _json(body.get("metadata") or {}), now, now,
+                _json(config), now, now,
             ),
         )
         campaign_id = int(cur.lastrowid)
@@ -1489,7 +1637,12 @@ def create_campaign_v2(db: Database, workspace: WorkspaceConfig, body: dict[str,
                     str(method["label"])[:240],
                     str(method.get("model_name") or "")[:240],
                     str(method.get("checkpoint") or "")[:500],
-                    _json(method.get("raw") or {}),
+                    _json(
+                        {
+                            **(method.get("raw") or {}),
+                            "evaluation_contract": method.get("evaluation_contract"),
+                        }
+                    ),
                     now,
                 ),
             )
@@ -1592,6 +1745,13 @@ def get_campaign_v2(db: Database, campaign_id: int) -> dict[str, Any]:
             "read_only": row["status"] in {"published", "closed", "archived"},
         }
     )
+    contract_reports = _campaign_contract_reports(db, int(campaign_id))
+    row["evaluation_contracts"] = contract_reports
+    row["contract_warnings"] = [
+        str(report["reason"])
+        for report in contract_reports
+        if not report["trusted"]
+    ]
     return row
 
 
@@ -1891,7 +2051,22 @@ def _preparation_claim_heartbeat(
         thread.join(timeout=2.0)
 
 
-def request_publish_campaign_v2(db: Database, campaign_id: int) -> dict[str, Any]:
+def request_publish_campaign_v2(
+    db: Database,
+    campaign_id: int,
+    workspace: WorkspaceConfig | None = None,
+) -> dict[str, Any]:
+    """Serialize capacity reservation and durable publication requests."""
+
+    with _PUBLISH_REQUEST_LOCK:
+        return _request_publish_campaign_v2(db, campaign_id, workspace)
+
+
+def _request_publish_campaign_v2(
+    db: Database,
+    campaign_id: int,
+    workspace: WorkspaceConfig | None,
+) -> dict[str, Any]:
     """Persist a publish request for a background preparation runner."""
     campaign = get_campaign_v2(db, int(campaign_id))
     if campaign["status"] == "published":
@@ -1900,6 +2075,13 @@ def request_publish_campaign_v2(db: Database, campaign_id: int) -> dict[str, Any
         return {"campaign": campaign, "preparation": get_preparation_v2(db, int(campaign_id))}
     if campaign["status"] not in {"draft", "failed"}:
         raise ValueError("only a draft or failed Campaign V2 can be queued for publication")
+    _assert_campaign_evaluation_contracts(db, int(campaign_id))
+    workspace = workspace or WorkspaceConfig.from_root(db.db_path.parent)
+    ensure_storage_capacity(
+        db,
+        workspace,
+        requested_bytes=campaign_requested_bytes(db, int(campaign_id)),
+    )
     now = utc_ts()
     final_root = (db.db_path.parent / "evaluations" / str(int(campaign_id))).resolve()
     with db.connection() as conn:
@@ -1933,6 +2115,7 @@ def run_pending_preparations(
     *,
     limit: int = 4,
     stale_after_seconds: int = 600,
+    cancel_check: Any = None,
 ) -> list[dict[str, Any]]:
     """Run Campaign preparation non-reentrantly within this service process."""
 
@@ -1942,6 +2125,7 @@ def run_pending_preparations(
             workspace,
             limit=limit,
             stale_after_seconds=stale_after_seconds,
+            cancel_check=cancel_check,
         )
 
 
@@ -1951,6 +2135,7 @@ def _run_pending_preparations_locked(
     *,
     limit: int = 4,
     stale_after_seconds: int = 600,
+    cancel_check: Any = None,
 ) -> list[dict[str, Any]]:
     """Claim queued (or restart-stale) preparations and finish them idempotently."""
 
@@ -1970,6 +2155,8 @@ def _run_pending_preparations_locked(
     )
     results: list[dict[str, Any]] = []
     for candidate in candidates:
+        if cancel_check is not None and cancel_check():
+            break
         campaign_id = int(candidate["campaign_id"])
         claim_token = _claim_pending_preparation(
             db,
@@ -1984,8 +2171,19 @@ def _run_pending_preparations_locked(
                 workspace,
                 campaign_id,
                 claim_token=claim_token,
+                cancel_check=cancel_check,
             )
             results.append({"campaign_id": campaign_id, "status": campaign["status"]})
+        except FreezeCancelled as exc:
+            results.append(
+                {
+                    "campaign_id": campaign_id,
+                    "status": "interrupted",
+                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                }
+            )
+            if cancel_check is not None and cancel_check():
+                break
         except Exception as exc:
             results.append(
                 {
@@ -2924,6 +3122,7 @@ def publish_campaign_v2(
     campaign_id: int,
     *,
     claim_token: str | None = None,
+    cancel_check: Any = None,
 ) -> dict[str, Any]:
     """Freeze and publish a two-method Campaign V2 under a durable claim.
 
@@ -2933,7 +3132,11 @@ def publish_campaign_v2(
     change between validation and publication.
     """
     ensure_v2_schema(db)
+    existing_campaign = get_campaign_v2(db, int(campaign_id))
+    if existing_campaign["status"] == "published":
+        return existing_campaign
     if claim_token is None:
+        _assert_campaign_evaluation_contracts(db, int(campaign_id))
         claim_token = _claim_direct_preparation(db, int(campaign_id))
         if claim_token is None:
             return get_campaign_v2(db, int(campaign_id))
@@ -2942,8 +3145,6 @@ def publish_campaign_v2(
         raise ValueError("Campaign V2 publication requires a preparation claim")
     _require_preparation_claim(db, int(campaign_id), claim_token)
     campaign = get_campaign_v2(db, int(campaign_id))
-    if campaign["status"] == "published":
-        return campaign
 
     started = utc_ts()
     evaluations_root = workspace.evaluations_dir.resolve()
@@ -2990,6 +3191,7 @@ def publish_campaign_v2(
 
     manifest: dict[str, Any] = {
         "schema_version": 2,
+        "evaluation_contract": MIDPOINT_TRIPLET_CONTRACT,
         "freeze_pipeline": FREEZE_PIPELINE_VERSION,
         "campaign_id": int(campaign_id),
         "created_at": started,
@@ -2997,6 +3199,9 @@ def publish_campaign_v2(
     }
     moved = False
     try:
+        # Recheck under the owned preparation attempt. This catches queued
+        # drafts created by older releases and records a durable failed state.
+        _assert_campaign_evaluation_contracts(db, int(campaign_id))
         with _preparation_claim_heartbeat(db, int(campaign_id), claim_token) as ownership_lost:
             _require_preparation_claim(
                 db, int(campaign_id), claim_token, ownership_lost=ownership_lost
@@ -3005,7 +3210,7 @@ def publish_campaign_v2(
             def check_preparation_cancelled() -> bool:
                 if ownership_lost.is_set():
                     raise EvaluationConflict("Campaign V2 preparation claim was superseded")
-                return False
+                return bool(cancel_check is not None and cancel_check())
 
             staging.mkdir(parents=True, exist_ok=False)
             frozen: dict[tuple[int, str], dict[str, Any]] = {}
@@ -3076,6 +3281,8 @@ def publish_campaign_v2(
             }
             manifest_path = staging / "manifest.json"
             manifest_path.write_text(_json(manifest), encoding="utf-8")
+            if check_preparation_cancelled():
+                raise FreezeCancelled("Campaign preparation was interrupted by service shutdown")
 
             # Final filesystem replacement and metadata publication are guarded
             # by one SQLite write transaction.  A stale worker can never move or
@@ -3322,29 +3529,51 @@ def publish_campaign_v2(
                         final_root.unlink()
                     else:
                         shutil.rmtree(final_root)
-                conn.execute(
-                    """
-                    UPDATE evaluation_campaigns_v2
-                    SET status = 'failed', updated_at = ?
-                    WHERE id = ? AND status = 'preparing'
-                    """,
-                    (failed, int(campaign_id)),
-                )
-                conn.execute(
-                    """
-                    UPDATE evaluation_preparations_v2
-                    SET state = 'failed', claim_token = '', error_json = ?,
-                        completed_at = ?, updated_at = ?
-                    WHERE campaign_id = ? AND state = 'running' AND claim_token = ?
-                    """,
-                    (
-                        _json({"message": str(exc), "type": type(exc).__name__}),
-                        failed,
-                        failed,
-                        int(campaign_id),
-                        claim_token,
-                    ),
-                )
+                if isinstance(exc, FreezeCancelled):
+                    conn.execute(
+                        """
+                        UPDATE evaluation_preparations_v2
+                        SET state = 'queued', claim_token = '', staging_path = '',
+                            error_json = ?, completed_at = NULL, updated_at = ?
+                        WHERE campaign_id = ? AND state = 'running' AND claim_token = ?
+                        """,
+                        (
+                            _json(
+                                {
+                                    "message": "service stopped during preparation; it will resume after restart",
+                                    "type": "ServiceStopping",
+                                    "retryable": True,
+                                }
+                            ),
+                            failed,
+                            int(campaign_id),
+                            claim_token,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE evaluation_campaigns_v2
+                        SET status = 'failed', updated_at = ?
+                        WHERE id = ? AND status = 'preparing'
+                        """,
+                        (failed, int(campaign_id)),
+                    )
+                    conn.execute(
+                        """
+                        UPDATE evaluation_preparations_v2
+                        SET state = 'failed', claim_token = '', error_json = ?,
+                            completed_at = ?, updated_at = ?
+                        WHERE campaign_id = ? AND state = 'running' AND claim_token = ?
+                        """,
+                        (
+                            _json({"message": str(exc), "type": type(exc).__name__}),
+                            failed,
+                            failed,
+                            int(campaign_id),
+                            claim_token,
+                        ),
+                    )
         raise
 
 

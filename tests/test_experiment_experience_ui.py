@@ -56,6 +56,61 @@ class ExperimentExperienceUiTests(unittest.TestCase):
         self.assertIn('state.preflightLevel !== "deep"', start)
         self.assertIn('state.preflightLevel === "deep" && state.preflight.preflight_token', start)
 
+    def test_safe_defaults_and_profile_recommendation_require_explicit_application(self) -> None:
+        self.assertIn('<option value="auto" selected>auto</option>', self.index_html)
+        self.assertIn('<input name="batch_size" type="number" min="1" value="1">', self.index_html)
+        self.assertIn(
+            '<input name="batch_size_per_device" type="number" min="1" value="1">',
+            self.index_html,
+        )
+
+        render = self.app_js.split("function renderExecutionProfileRecommendation", 1)[1].split(
+            "function applyExecutionProfileRecommendation", 1
+        )[0]
+        apply = self.app_js.split("function applyExecutionProfileRecommendation", 1)[1].split(
+            "function renderDecodePanel", 1
+        )[0]
+        self.assertIn("data-apply-execution-profile", render)
+        self.assertIn("建议不会自动覆盖当前设置", render)
+        self.assertIn("form.elements.batch_size.value", apply)
+        self.assertIn("form.elements.batch_size_per_device.value", apply)
+        self.assertIn("schedulePreflight(0)", apply)
+
+    def test_preflight_exposes_execution_contract_and_resource_summary(self) -> None:
+        summary = self.app_js.split("function renderPreflightExecutionSummary", 1)[1].split(
+            "function highRiskWorkloadConfirmation", 1
+        )[0]
+        for label in (
+            "执行设备",
+            "设备卡数",
+            "每设备 Batch",
+            "解码后端",
+            "评测契约",
+            "单设备显存",
+            "主机可用内存",
+            "磁盘可用空间",
+        ):
+            self.assertIn(label, summary)
+        self.assertIn("effective_devices", summary)
+        self.assertIn("evaluation_contract", summary)
+        self.assertIn("storage_capacity", summary)
+        self.assertIn("remaining_after_request", summary)
+
+    def test_deployment_health_banner_surfaces_relay_and_worker_failures(self) -> None:
+        self.assertIn('id="deployment-health"', self.index_html)
+        renderer = self.app_js.split("function renderDeploymentHealth", 1)[1].split(
+            "async function refreshDeploymentHealth", 1
+        )[0]
+        refresh = self.app_js.split("async function refreshDeploymentHealth", 1)[1].split(
+            "function escapeHtml", 1
+        )[0]
+        self.assertIn("maintenance?.job_recovery", renderer)
+        self.assertIn("leases.stale", renderer)
+        self.assertIn("storage.free_bytes", renderer)
+        self.assertIn("Windows 中继", renderer)
+        self.assertIn('api("/api/health")', refresh)
+        self.assertIn(".deployment-health.bad", self.styles)
+
     def test_file_input_run_offers_clone_with_current_inputs(self) -> None:
         clone = self.app_js.split("async function cloneRunWithCurrentInputs", 1)[1].split(
             "async function retryRunMetrics", 1

@@ -15,7 +15,6 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from PIL import Image
 
 from vfieval.alignment import materialize_aligned_rgb
 

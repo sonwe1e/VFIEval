@@ -6,6 +6,7 @@ import math
 import os
 import shutil
 import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +22,10 @@ from vfieval.pipeline.postprocess import compose_interpolated, validate_model_ou
 
 VIDEO_SUFFIXES = {".avi", ".m4v", ".mkv", ".mov", ".mp4", ".webm"}
 CHECKPOINT_SUFFIXES = {".bin", ".ckpt", ".pth", ".pt", ".safetensors"}
-DECODE_STRATEGY_VERSION = "opencv-rgb-v1"
+MIDPOINT_TRIPLET_CONTRACT = "midpoint-triplet-v2"
+DECODE_STRATEGY_VERSION = "backend-bound-rgb-pts-v2"
+DECODE_COLOR_POLICY = "decoded-rgb-png-v1"
+DECODE_ROTATION_POLICY = "backend-native-auto-rotation-v1"
 VIDEO_INSPECT_VERSION = "ffprobe-opencv-v4"
 _DRY_RUN_CACHE: dict[str, dict[str, Any]] = {}
 DRY_RUN_INPUT_SHAPE = (1, 3, 128, 128)
@@ -756,6 +760,7 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
     video_group = str(payload.get("video_group") or "")
     frame_step = max(1, int(payload.get("frame_step") or 1))
     max_frames = _optional_positive_int(payload.get("max_frames"))
+    decode_backend = normalize_decode_backend(payload.get("decode_backend") or "auto")
     device_request = str(payload.get("device") or "auto")
     precision_request = str(payload.get("precision") or "auto")
     checkpoint_request = payload.get("checkpoint")
@@ -764,6 +769,7 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
     result: dict[str, Any] = {
         "ok": True,
         "run_type": "model_inference",
+        "evaluation_contract": MIDPOINT_TRIPLET_CONTRACT,
         "preflight_level": preflight_level,
         "errors": [],
         "warnings": [],
@@ -901,6 +907,7 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
             info["video_file"] = entry["video_file"]
             info["valid_triplets"] = _valid_triplets(info["frame_count"], frame_step, max_frames)
             info["triplets"] = info["valid_triplets"]
+            info["evaluation_contract"] = MIDPOINT_TRIPLET_CONTRACT
             if quick_preflight:
                 # The canonical decode key includes a full content hash.  Leave
                 # that filesystem scan to the deep gate instead of repeating it
@@ -914,17 +921,40 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
                     entry["qualified"],
                 )
                 info["physical_identity"] = physical_identity
-                info["cache_key"] = decode_cache_key(
+                cache_candidates = decode_cache_key_candidates(
                     video_path,
                     "video_gt_triplets",
                     frame_step,
                     max_frames,
+                    requested_backend=decode_backend,
                     content_sha256=physical_identity["sha256"],
                 )
+                info["cache_candidates"] = [
+                    {
+                        **candidate,
+                        "status": decode_cache_status(workspace, candidate["cache_key"]),
+                    }
+                    for candidate in cache_candidates
+                ]
+                selected_candidate = next(
+                    (
+                        candidate
+                        for candidate in cache_candidates
+                        if _read_completed_decode_manifest(workspace, candidate["cache_key"])
+                        is not None
+                    ),
+                    cache_candidates[0],
+                )
+                info["cache_key"] = selected_candidate["cache_key"]
+                info["cache_backend"] = selected_candidate["backend"]
                 info["cache_status"] = decode_cache_status(workspace, info["cache_key"])
                 manifest = _read_completed_decode_manifest(workspace, info["cache_key"])
                 if manifest is not None:
                     info = _merge_manifest_info(info, manifest)
+                    info["valid_triplets"] = _valid_triplets(
+                        info["frame_count"], frame_step, max_frames
+                    )
+                    info["triplets"] = info["valid_triplets"]
                 else:
                     info["frame_count_warning"] = (
                         "No completed decode manifest is available; frame count uses "
@@ -950,7 +980,11 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
         if bad:
             raise RuntimeError(f"视频无法解码: {', '.join(bad)}")
         if short:
-            raise RuntimeError(f"视频帧数不足 3 帧: {', '.join(short)}")
+            minimum_frames = 2 * frame_step + 1
+            raise RuntimeError(
+                f"视频帧数不足，frame_step={frame_step} 的真实对称三元组至少需要 "
+                f"{minimum_frames} 帧: {', '.join(short)}"
+            )
         groups = selection["groups"]
         result["video_group"] = {
             "name": " + ".join(groups) if selection["multi_group"] else selection["primary_group"],
@@ -958,6 +992,8 @@ def preflight_run(db: Database, workspace: WorkspaceConfig, payload: dict[str, A
             "multi_group": selection["multi_group"],
             "video_count": len(video_infos),
             "selected_videos": selection["selected_videos"],
+            "decode_backend": decode_backend,
+            "evaluation_contract": MIDPOINT_TRIPLET_CONTRACT,
             "frame_count": sum(int(info["frame_count"]) for info in video_infos),
             "duration_seconds": sum(float(info.get("duration_seconds") or 0.0) for info in video_infos),
             "triplets": sum(int(info["triplets"]) for info in video_infos),
@@ -1199,7 +1235,13 @@ def decode_cache_key(
     max_frames: int | None,
     *,
     content_sha256: str | None = None,
+    requested_backend: str = "auto",
+    actual_backend: str | None = None,
 ) -> str:
+    requested = normalize_decode_backend(requested_backend)
+    actual = normalize_decode_backend(actual_backend or ("ffmpeg" if requested == "auto" else requested))
+    if actual == "auto":
+        raise ValueError("decode cache actual_backend must resolve to ffmpeg or opencv")
     stat = video_path.stat()
     data = {
         "path": str(video_path.resolve()).replace("\\", "/"),
@@ -1210,8 +1252,210 @@ def decode_cache_key(
         "frame_step": frame_step,
         "max_frames": max_frames,
         "strategy": DECODE_STRATEGY_VERSION,
+        "requested_backend": requested,
+        "actual_decoder": decode_backend_identity(actual),
+        "color_policy": DECODE_COLOR_POLICY,
+        "rotation_policy": DECODE_ROTATION_POLICY,
     }
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def normalize_decode_backend(value: Any) -> str:
+    backend = str(value or "auto").strip().lower()
+    if backend not in {"auto", "ffmpeg", "opencv"}:
+        raise ValueError("decode_backend must be auto, ffmpeg, or opencv")
+    return backend
+
+
+def decode_backend_candidates(requested_backend: Any) -> tuple[str, ...]:
+    requested = normalize_decode_backend(requested_backend)
+    return ("ffmpeg", "opencv") if requested == "auto" else (requested,)
+
+
+def _decoder_command_version(path: str | None) -> str:
+    if not path:
+        return "unavailable"
+    try:
+        completed = subprocess.run(
+            [path, "-version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        first_line = (completed.stdout or completed.stderr or "").splitlines()
+        if first_line:
+            return first_line[0].strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return "unknown"
+
+
+def _binary_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@lru_cache(maxsize=16)
+def _cached_executable_content_identity(
+    resolved_path: str,
+    size: int,
+    mtime_ns: int,
+    ctime_ns: int,
+    device: int,
+    inode: int,
+) -> tuple[str, str]:
+    """Hash/version cache bound to the executable's current stat identity."""
+
+    del size, mtime_ns, ctime_ns, device, inode
+    path = Path(resolved_path)
+    try:
+        digest = _binary_sha256(path)
+    except OSError:
+        digest = "unavailable"
+    return digest, _decoder_command_version(resolved_path)
+
+
+def _executable_identity(path: str | None) -> dict[str, Any]:
+    if not path:
+        return {
+            "path": "",
+            "size": None,
+            "mtime_ns": None,
+            "ctime_ns": None,
+            "file_id": "",
+            "sha256": "unavailable",
+            "version": "unavailable",
+        }
+
+    resolved = Path(path).resolve()
+    resolved_text = str(resolved)
+    last_identity: dict[str, Any] | None = None
+    # A replacement can race with hashing/version inspection. Retry once when
+    # the file's stat identity changes so the returned digest describes the
+    # same executable generation as the recorded metadata.
+    for _attempt in range(2):
+        try:
+            before = resolved.stat()
+        except OSError:
+            return {
+                "path": resolved_text,
+                "size": None,
+                "mtime_ns": None,
+                "ctime_ns": None,
+                "file_id": "",
+                "sha256": "unavailable",
+                "version": _decoder_command_version(resolved_text),
+            }
+        signature = (
+            int(before.st_size),
+            int(before.st_mtime_ns),
+            int(before.st_ctime_ns),
+            int(before.st_dev),
+            int(before.st_ino),
+        )
+        digest, version = _cached_executable_content_identity(
+            resolved_text,
+            *signature,
+        )
+        last_identity = {
+            "path": resolved_text,
+            "size": signature[0],
+            "mtime_ns": signature[1],
+            "ctime_ns": signature[2],
+            "file_id": f"{signature[3]}:{signature[4]}",
+            "sha256": digest,
+            "version": version,
+        }
+        try:
+            after = resolved.stat()
+        except OSError:
+            break
+        after_signature = (
+            int(after.st_size),
+            int(after.st_mtime_ns),
+            int(after.st_ctime_ns),
+            int(after.st_dev),
+            int(after.st_ino),
+        )
+        if after_signature == signature:
+            return last_identity
+    return last_identity or {
+        "path": resolved_text,
+        "size": None,
+        "mtime_ns": None,
+        "ctime_ns": None,
+        "file_id": "",
+        "sha256": "unavailable",
+        "version": "unknown",
+    }
+
+
+def decode_backend_identity(actual_backend: str) -> dict[str, Any]:
+    """Return the concrete decoder identity that participates in cache keys."""
+
+    backend = normalize_decode_backend(actual_backend)
+    if backend == "auto":
+        raise ValueError("decoder identity requires a concrete backend")
+    if backend == "ffmpeg":
+        executable = _executable_identity(shutil.which("ffmpeg"))
+        timestamp_probe = _executable_identity(shutil.which("ffprobe"))
+
+        return {
+            "backend": backend,
+            "executable": executable["path"],
+            "executable_size": executable["size"],
+            "executable_mtime_ns": executable["mtime_ns"],
+            "executable_ctime_ns": executable["ctime_ns"],
+            "executable_file_id": executable["file_id"],
+            "executable_sha256": executable["sha256"],
+            "version": executable["version"],
+            "timestamp_probe": timestamp_probe["path"],
+            "timestamp_probe_size": timestamp_probe["size"],
+            "timestamp_probe_mtime_ns": timestamp_probe["mtime_ns"],
+            "timestamp_probe_ctime_ns": timestamp_probe["ctime_ns"],
+            "timestamp_probe_file_id": timestamp_probe["file_id"],
+            "timestamp_probe_sha256": timestamp_probe["sha256"],
+            "timestamp_probe_version": timestamp_probe["version"],
+        }
+    try:
+        import cv2
+
+        version = str(getattr(cv2, "__version__", "unknown"))
+    except ImportError:
+        version = "unavailable"
+    return {"backend": backend, "executable": "python:cv2", "version": version}
+
+
+def decode_cache_key_candidates(
+    video_path: Path,
+    decode_mode: str,
+    frame_step: int,
+    max_frames: int | None,
+    *,
+    requested_backend: str = "auto",
+    content_sha256: str | None = None,
+) -> list[dict[str, str]]:
+    requested = normalize_decode_backend(requested_backend)
+    source_sha256 = str(content_sha256 or file_sha256(video_path))
+    return [
+        {
+            "backend": actual,
+            "cache_key": decode_cache_key(
+                video_path,
+                decode_mode,
+                frame_step,
+                max_frames,
+                content_sha256=source_sha256,
+                requested_backend=requested,
+                actual_backend=actual,
+            ),
+        }
+        for actual in decode_backend_candidates(requested)
+    ]
 
 
 def decode_cache_dir(workspace: WorkspaceConfig, cache_key: str) -> Path:
@@ -1645,9 +1889,26 @@ def video_summary(
     frame_step: int = 1,
     max_frames: int | None = None,
     exact: bool = False,
+    decode_backend: str = "auto",
 ) -> dict[str, Any]:
     info = inspect_video(path, workspace, exact=exact)
-    cache_key = decode_cache_key(path, "video_gt_triplets", frame_step, max_frames)
+    candidates = decode_cache_key_candidates(
+        path,
+        "video_gt_triplets",
+        frame_step,
+        max_frames,
+        requested_backend=decode_backend,
+    )
+    selected = next(
+        (
+            candidate
+            for candidate in candidates
+            if _read_completed_decode_manifest(workspace, candidate["cache_key"])
+            is not None
+        ),
+        candidates[0],
+    )
+    cache_key = selected["cache_key"]
     manifest = _read_decode_manifest(workspace, cache_key)
     if manifest:
         info = _merge_manifest_info(info, manifest)
@@ -1666,6 +1927,8 @@ def video_summary(
         "decodable": info["decodable"],
         "error": info["error"],
         "valid_triplets": _valid_triplets(info["frame_count"], frame_step, max_frames),
+        "evaluation_contract": MIDPOINT_TRIPLET_CONTRACT,
+        "cache_backend": selected["backend"],
         "cache_status": decode_cache_status(workspace, cache_key),
         "metadata_source": info.get("metadata_source"),
         "codec": info.get("codec"),
@@ -1750,6 +2013,16 @@ def _merge_manifest_info(info: dict[str, Any], manifest: dict[str, Any]) -> dict
             "decodable": manifest.get("decode_status") == "completed" or frame_count > 0,
             "error": None if frame_count > 0 else merged.get("error"),
             "metadata_source": "manifest_exact",
+            "decode_backend": manifest.get("decode_backend"),
+            "decode_backend_request": manifest.get("decode_backend_request"),
+            "decoder_identity": manifest.get("decoder_identity"),
+            "timestamps_available": bool(manifest.get("timestamps_available")),
+            "timestamps_unavailable_reason": manifest.get(
+                "timestamps_unavailable_reason"
+            ),
+            "evaluation_contract": (
+                manifest.get("evaluation_contract") or MIDPOINT_TRIPLET_CONTRACT
+            ),
         }
     )
     return merged
@@ -1816,18 +2089,11 @@ def _optional_positive_int(value: Any) -> int | None:
 
 
 def _valid_triplets(frame_count: int, frame_step: int, max_frames: int | None) -> int:
-    # One interpolated frame per adjacent source pair (N-step samples). This
-    # now matches _add_video_triplets, so the predicted video is N-step frames
-    # long — previously it was N-2*step, which lost the boundary samples. The
-    # last sample is a clamped boundary pair with no strict GT; every earlier
-    # sample is a symmetric triple. Threshold for "ok to run" is at least one
-    # strict triple (>= 2*step+1 frames), so the count is clamped to zero below
-    # that floor (matches the inner-loop guard in _add_video_triplets).
+    # A midpoint sample needs real frames at i, i + step, and i + 2*step.
+    # Sliding i by one yields exactly N - 2*step trustworthy samples.
     effective = min(int(frame_count or 0), max_frames or int(frame_count or 0))
     step = max(1, int(frame_step or 1))
-    if effective < 2 * step + 1:
-        return 0
-    return max(0, effective - step)
+    return max(0, effective - 2 * step)
 
 
 def _parse_rate(value: Any) -> float | None:

@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from vfieval.pipeline.io import save_rgb_tensor, tensor_to_uint8_image
+from vfieval.pipeline.io import save_rgb_tensor
 
 
 def save_mask(mask: torch.Tensor, path: str | Path) -> None:

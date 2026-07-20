@@ -21,15 +21,18 @@ from vfieval.metrics.names import METRIC_NAMES
 
 METRIC_ASSET_VERSION = "v2"
 METRIC_ADAPTER_VERSION = "portable-metrics-v2"
+FEATURE_METRIC_ADAPTER_VERSION = "feature-distance-v3"
 STATUS_AVAILABLE = "available"
 STATUS_MISSING_WEIGHTS = "missing_weights"
 STATUS_MISSING_EVALUATOR = "missing_evaluator"
 STATUS_MISSING_DEPENDENCY = "missing_dependency"
+STATUS_INVALID_ASSETS = "invalid_assets"
 PLACEHOLDER_STATUS = "placeholder"
 
 _HEALTH_CACHE_TTL_SECONDS = 30.0
 _HEALTH_CACHE_LOCK = threading.Lock()
 _HEALTH_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
+_FEATURE_VALIDATION_CACHE: dict[str, dict[str, Any]] = {}
 
 DINO_REPO_URL = "https://github.com/facebookresearch/dinov2/archive/refs/heads/main.zip"
 DINO_VITS14_REG_WEIGHTS_URL = "https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_reg4_pretrain.pth"
@@ -148,6 +151,29 @@ def metric_health(
     return payload
 
 
+def record_feature_metric_validation(
+    workspace: WorkspaceConfig,
+    metric_name: str,
+    implementation_fingerprint: str,
+    report: dict[str, Any],
+) -> None:
+    """Publish a runtime strict-load report back into metric health.
+
+    Health itself stays cheap and does not construct large third-party models.
+    Once an adapter has loaded a model, subsequent health reads expose that
+    exact compatibility report and reject the same asset fingerprint when the
+    strict load failed.
+    """
+
+    fingerprint = str(implementation_fingerprint or "").strip()
+    if not fingerprint:
+        return
+    cache_key = (str(metric_assets_dir(workspace)), str(metric_name))
+    with _HEALTH_CACHE_LOCK:
+        _FEATURE_VALIDATION_CACHE[fingerprint] = json.loads(json.dumps(report, default=str))
+        _HEALTH_CACHE.pop(cache_key, None)
+
+
 def _metric_health_uncached(workspace: WorkspaceConfig, metric_name: str) -> dict[str, Any]:
     requirement = METRIC_REQUIREMENTS[metric_name]
     manifest_path = metric_manifest_path(workspace, metric_name)
@@ -261,6 +287,11 @@ def metric_cache_config(workspace: WorkspaceConfig, metric_name: str) -> dict[st
         "video_eval_long_edge": health.get("video_eval_long_edge"),
         "device_policy": health.get("device_policy"),
         "repo_dir": _path_fingerprint(health.get("repo_dir")) if health.get("repo_dir") else None,
+        "manifest_fingerprint": health.get("manifest_fingerprint"),
+        "driver_fingerprint": health.get("driver_fingerprint"),
+        "weights_fingerprint": health.get("weights_fingerprint"),
+        "implementation_fingerprint": health.get("implementation_fingerprint"),
+        "weight_load_validation": health.get("weight_load_validation"),
     }
 
 
@@ -308,6 +339,10 @@ def _prepare_downloaded_metric(
         manifest, manifest_error = _load_manifest(manifest_path)
         if manifest_error is None and manifest is not None and not _manifest_is_placeholder(manifest):
             if _downloaded_manifest_assets_exist(metric_name, metric_dir, manifest):
+                if metric_name in {"lpips_vit_patch", "lpips_convnext"}:
+                    pinned = _pin_feature_manifest_assets(metric_name, metric_dir, manifest)
+                    if pinned != manifest:
+                        _atomic_write_text(manifest_path, json.dumps(pinned, indent=2))
                 return {"manifest_path": manifest_path, "downloads": [{"metric_name": metric_name, "status": "skipped"}]}
 
     if force:
@@ -328,7 +363,7 @@ def _prepare_downloaded_metric(
         raise ValueError(f"unsupported downloadable metric: {metric_name}")
 
     manifest_path.write_text(
-        json.dumps(_downloaded_manifest(metric_name), indent=2),
+        json.dumps(_downloaded_manifest(metric_name, metric_dir), indent=2),
         encoding="utf-8",
     )
     return {"manifest_path": manifest_path, "downloads": [{"metric_name": metric_name, **row} for row in downloads]}
@@ -438,9 +473,9 @@ def _atomic_write_text(path: Path, text: str) -> None:
     tmp_path.replace(path)
 
 
-def _downloaded_manifest(metric_name: str) -> dict[str, Any]:
+def _downloaded_manifest(metric_name: str, metric_dir: Path | None = None) -> dict[str, Any]:
     if metric_name == "lpips_vit_patch":
-        return {
+        manifest = {
             "metric_name": metric_name,
             "asset_version": METRIC_ASSET_VERSION,
             "implementation_mode": "dinov2_feature_distance",
@@ -456,8 +491,9 @@ def _downloaded_manifest(metric_name: str) -> dict[str, Any]:
                 "weights": DINO_VITS14_REG_WEIGHTS_URL,
             },
         }
+        return _pin_feature_manifest_assets(metric_name, metric_dir, manifest) if metric_dir else manifest
     if metric_name == "lpips_convnext":
-        return {
+        manifest = {
             "metric_name": metric_name,
             "asset_version": METRIC_ASSET_VERSION,
             "implementation_mode": "convnext_feature_distance",
@@ -471,6 +507,7 @@ def _downloaded_manifest(metric_name: str) -> dict[str, Any]:
                 "weights": CONVNEXT_TINY_WEIGHTS_URL,
             },
         }
+        return _pin_feature_manifest_assets(metric_name, metric_dir, manifest) if metric_dir else manifest
     if metric_name == "cgvqm":
         return {
             "metric_name": metric_name,
@@ -490,6 +527,32 @@ def _downloaded_manifest(metric_name: str) -> dict[str, Any]:
             "env": {},
         }
     raise ValueError(f"unsupported downloadable metric: {metric_name}")
+
+
+def _pin_feature_manifest_assets(
+    metric_name: str,
+    metric_dir: Path,
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    pinned = dict(manifest)
+    fingerprints = dict(pinned.get("asset_fingerprints") or {})
+    weights_path = _resolve_manifest_file_path(metric_dir, str(pinned.get("weights_path") or ""))
+    if weights_path.is_file():
+        fingerprints["weights"] = {
+            "sha256": _file_sha256(weights_path),
+            "size": int(weights_path.stat().st_size),
+        }
+    repo_value = str(pinned.get("repo_dir") or "").strip()
+    if metric_name == "lpips_vit_patch" and repo_value:
+        repo_dir = _resolve_manifest_file_path(metric_dir, repo_value)
+        if repo_dir.is_dir():
+            repo_fingerprint = _directory_fingerprint(repo_dir)
+            fingerprints["repo"] = {
+                "sha256": repo_fingerprint["sha256"],
+                "file_count": repo_fingerprint["file_count"],
+            }
+    pinned["asset_fingerprints"] = fingerprints
+    return pinned
 
 
 def _cgvqm_wrapper_source() -> str:
@@ -915,6 +978,31 @@ def _feature_metric_health(
                 extra=_feature_status_extra(requirement, manifest_path, manifest, weights_path=weights_path, repo_dir=repo_dir),
             )
 
+    extra = _feature_status_extra(
+        requirement,
+        manifest_path,
+        manifest,
+        weights_path=weights_path,
+        repo_dir=repo_dir,
+    )
+    fingerprint_error = _feature_asset_fingerprint_error(
+        metric_name,
+        manifest,
+        weights_path,
+        repo_dir,
+    )
+    if fingerprint_error:
+        return _status(
+            metric_name,
+            STATUS_INVALID_ASSETS,
+            fingerprint_error,
+            requirement,
+            manifest_path=manifest_path,
+            expected_paths=expected_paths,
+            asset_version=str(manifest.get("asset_version") or METRIC_ASSET_VERSION),
+            extra=extra,
+        )
+
     missing_packages = _missing_packages(requirement.get("packages", ()))
     if weights_path.suffix.lower() == ".safetensors" and _missing_packages(("safetensors",)):
         missing_packages.append("safetensors")
@@ -927,7 +1015,26 @@ def _feature_metric_health(
             manifest_path=manifest_path,
             expected_paths=expected_paths,
             asset_version=str(manifest.get("asset_version") or METRIC_ASSET_VERSION),
-            extra=_feature_status_extra(requirement, manifest_path, manifest, weights_path=weights_path, repo_dir=repo_dir),
+            extra=extra,
+        )
+
+    validation = extra.get("weight_load_validation") or {}
+    if validation.get("status") == "incompatible":
+        weight_load = validation.get("weight_load") or {}
+        return _status(
+            metric_name,
+            STATUS_INVALID_ASSETS,
+            (
+                "feature metric checkpoint failed strict compatibility validation "
+                f"(matched={weight_load.get('matched_key_count', 0)}, "
+                f"missing={len(weight_load.get('missing_keys') or [])}, "
+                f"unexpected={len(weight_load.get('unexpected_keys') or [])})"
+            ),
+            requirement,
+            manifest_path=manifest_path,
+            expected_paths=expected_paths,
+            asset_version=str(manifest.get("asset_version") or METRIC_ASSET_VERSION),
+            extra=extra,
         )
 
     return _status(
@@ -938,7 +1045,7 @@ def _feature_metric_health(
         manifest_path=manifest_path,
         expected_paths=expected_paths,
         asset_version=str(manifest.get("asset_version") or METRIC_ASSET_VERSION),
-        extra=_feature_status_extra(requirement, manifest_path, manifest, weights_path=weights_path, repo_dir=repo_dir),
+        extra=extra,
     )
 
 
@@ -1264,6 +1371,49 @@ def _validate_feature_metric_manifest(
         return "lpips_vit_patch manifest repo_dir must point at a local DINOv2 checkout"
     if repo_dir is not None and not isinstance(repo_dir, str):
         return "metric manifest repo_dir must be a string when provided"
+    source_url = manifest.get("source_url")
+    if not isinstance(source_url, dict) or not isinstance(source_url.get("weights"), str) or not source_url["weights"].strip():
+        return "feature metric manifest source_url.weights must identify the checkpoint source"
+    if metric_name == "lpips_vit_patch" and (
+        not isinstance(source_url.get("repo"), str) or not source_url["repo"].strip()
+    ):
+        return "lpips_vit_patch manifest source_url.repo must identify the DINOv2 source"
+    fingerprints = manifest.get("asset_fingerprints")
+    if not isinstance(fingerprints, dict):
+        return "feature metric manifest asset_fingerprints must lock installed asset hashes"
+    required_fingerprints = ["weights"] + (["repo"] if metric_name == "lpips_vit_patch" else [])
+    for key in required_fingerprints:
+        entry = fingerprints.get(key)
+        sha256 = entry.get("sha256") if isinstance(entry, dict) else None
+        if not isinstance(sha256, str) or len(sha256) != 64 or any(
+            char not in "0123456789abcdefABCDEF" for char in sha256
+        ):
+            return f"feature metric manifest asset_fingerprints.{key}.sha256 must be a SHA-256 digest"
+    return None
+
+
+def _feature_asset_fingerprint_error(
+    metric_name: str,
+    manifest: dict[str, Any],
+    weights_path: Path,
+    repo_dir: Path | None,
+) -> str | None:
+    declared = manifest.get("asset_fingerprints") or {}
+    expected_weights = str((declared.get("weights") or {}).get("sha256") or "").lower()
+    actual_weights = _file_sha256(weights_path).lower()
+    if actual_weights != expected_weights:
+        return (
+            "feature metric weights fingerprint mismatch: "
+            f"expected {expected_weights}, got {actual_weights}"
+        )
+    if metric_name == "lpips_vit_patch" and repo_dir is not None:
+        expected_repo = str((declared.get("repo") or {}).get("sha256") or "").lower()
+        actual_repo = str(_directory_fingerprint(repo_dir)["sha256"]).lower()
+        if actual_repo != expected_repo:
+            return (
+                "feature metric evaluator fingerprint mismatch: "
+                f"expected {expected_repo}, got {actual_repo}"
+            )
     return None
 
 
@@ -1314,10 +1464,57 @@ def _feature_status_extra(
 ) -> dict[str, Any]:
     manifest = manifest or {}
     default_weights = "dinov2_vits14_reg.pth" if requirement.get("backbone") == "dinov2_vits14_reg" else "model.safetensors"
-    return {
+    resolved_weights = (
+        weights_path
+        or _resolve_manifest_file_path(
+            manifest_path.parent,
+            str(manifest.get("weights_path") or default_weights),
+        )
+    ).resolve()
+    resolved_repo = (
+        repo_dir.resolve()
+        if repo_dir is not None
+        else (
+            _resolve_manifest_file_path(manifest_path.parent, str(manifest.get("repo_dir"))).resolve()
+            if manifest.get("repo_dir")
+            else None
+        )
+    )
+    manifest_fingerprint = _path_fingerprint(manifest_path)
+    weights_fingerprint = _path_fingerprint(resolved_weights)
+    repo_fingerprint = _path_fingerprint(resolved_repo) if resolved_repo is not None else None
+    adapter_fingerprint = _path_fingerprint(Path(__file__).with_name("feature.py"))
+    driver_fingerprint = {
+        "adapter": adapter_fingerprint,
+        "repo": repo_fingerprint,
+    }
+    implementation_payload = {
+        "adapter_version": FEATURE_METRIC_ADAPTER_VERSION,
+        "implementation_mode": manifest.get("implementation_mode") or requirement.get("implementation_mode"),
         "backbone": manifest.get("backbone") or requirement.get("backbone"),
-        "weights_path": str((weights_path or _resolve_manifest_file_path(manifest_path.parent, str(manifest.get("weights_path") or default_weights))).resolve()),
-        "repo_dir": str(repo_dir.resolve()) if repo_dir is not None else (str(_resolve_manifest_file_path(manifest_path.parent, str(manifest.get("repo_dir"))).resolve()) if manifest.get("repo_dir") else None),
+        "manifest_sha256": manifest_fingerprint.get("sha256"),
+        "adapter_sha256": adapter_fingerprint.get("sha256"),
+        "weights_sha256": weights_fingerprint.get("sha256"),
+        "repo_sha256": (repo_fingerprint or {}).get("sha256"),
+    }
+    implementation_fingerprint = hashlib.sha256(
+        json.dumps(implementation_payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
+    ).hexdigest()
+    with _HEALTH_CACHE_LOCK:
+        validation = json.loads(
+            json.dumps(
+                _FEATURE_VALIDATION_CACHE.get(
+                    implementation_fingerprint,
+                    {"status": "not_checked", "contract": "strict-state-dict-v1"},
+                ),
+                default=str,
+            )
+        )
+    return {
+        "adapter_version": FEATURE_METRIC_ADAPTER_VERSION,
+        "backbone": manifest.get("backbone") or requirement.get("backbone"),
+        "weights_path": str(resolved_weights),
+        "repo_dir": str(resolved_repo) if resolved_repo is not None else None,
         "input_size": int(manifest.get("input_size") or requirement.get("input_size") or 0),
         "eval_resolution": {
             "mode": "max_edge",
@@ -1327,6 +1524,11 @@ def _feature_status_extra(
         "normalize": manifest.get("normalize") or "imagenet",
         "source_url": manifest.get("source_url"),
         "device_policy": manifest.get("device_policy") or requirement.get("device_policy"),
+        "manifest_fingerprint": manifest_fingerprint,
+        "driver_fingerprint": driver_fingerprint,
+        "weights_fingerprint": weights_fingerprint,
+        "implementation_fingerprint": implementation_fingerprint,
+        "weight_load_validation": validation,
     }
 
 
@@ -1581,7 +1783,7 @@ def _directory_fingerprint(path: Path) -> dict[str, Any]:
         latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
         digest.update(rel.encode("utf-8"))
         digest.update(str(stat.st_size).encode("ascii"))
-        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+        digest.update(_file_sha256(child).encode("ascii"))
     return {
         "path": str(path.resolve()),
         "exists": True,

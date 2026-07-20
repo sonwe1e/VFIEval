@@ -191,6 +191,7 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
                 base_url = f"http://127.0.0.1:{server.server_address[1]}"
                 with urllib.request.urlopen(f"{base_url}/api/health", timeout=10) as response:
                     payload = json.loads(response.read().decode("utf-8"))
+                    request_id = response.headers.get("X-Request-ID")
             finally:
                 server.shutdown()
                 server.server_close()
@@ -211,6 +212,12 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
                 1,
             )
             self.assertEqual(sync_calls, [True])
+            self.assertTrue(request_id)
+            self.assertIn("build_id", payload["release"])
+            self.assertIn("latest_migration", payload["schema"])
+            self.assertGreater(payload["storage"]["total_bytes"], 0)
+            self.assertIn("running", payload["leases"])
+            self.assertFalse(payload["maintenance"]["job_recovery"]["running"])
             cleanup_service.process_pending.assert_not_called()
 
     def test_frontend_displays_actual_artifact_bytes_against_budget(self) -> None:

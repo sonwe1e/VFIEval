@@ -3,11 +3,10 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 import re
-import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -21,15 +20,17 @@ from vfieval.catalog_sync import CatalogSyncCoordinator
 from vfieval.config import WorkspaceConfig
 from vfieval.datasets import _sample_token, scan_dataset
 from vfieval.db import Database
+from vfieval.diagnostics import health_snapshot, release_info
 from vfieval.file_inputs import (
     DECODE_STRATEGY_VERSION,
+    MIDPOINT_TRIPLET_CONTRACT,
     VIDEO_SUFFIXES,
     checkpoints_dir,
     ensure_video_thumbnail,
-    inspect_video,
     list_checkpoints,
     list_model_files,
     models_dir,
+    normalize_decode_backend,
     normalize_device_precision,
     preflight_run,
     resolve_checkpoint,
@@ -58,6 +59,7 @@ from vfieval.input_identity import (
     resolved_checkpoint_relative_path,
     validate_input_identity,
 )
+from vfieval.job_leases import JobRecoveryService
 from vfieval.media_assets import (
     bind_run_asset,
     create_collection,
@@ -78,7 +80,6 @@ from vfieval.media_items import (
     bind_run_source,
     ensure_canonical_gt_item,
     get_media_item,
-    get_media_item_member,
     list_item_groups,
     list_item_predictions,
     list_media_items,
@@ -87,10 +88,20 @@ from vfieval.media_items import (
     register_external_prediction,
     resolve_media_item_compare,
     resolve_item_member,
-    resolve_item_reference,
 )
-from vfieval.orchestration import start_decode_worker
+from vfieval.orchestration import open_worker_admission, shutdown_worker_processes, start_decode_worker
 from vfieval.run_cleanup import RunCleanupService, RunPurgePreviewError, register_run_cache_refs
+from vfieval.runtime_logging import (
+    close_runtime_logging,
+    configure_runtime_logging,
+    log_event,
+    runtime_logger,
+)
+from vfieval.storage_budget import (
+    StorageCapacityError,
+    ensure_storage_capacity,
+    storage_capacity,
+)
 from vfieval.pipeline.inference import DEFAULT_VISUALIZE_HEIGHT, DEFAULT_VISUALIZE_WIDTH
 from vfieval.performance import recommend_execution_profile
 from vfieval.worker import WorkerOptions, detect_capabilities, run_worker
@@ -105,22 +116,12 @@ from vfieval.uploads import (
 )
 
 from vfieval.evaluations import (
-    add_candidate,
     analysis_csv,
     campaign_analysis,
     campaign_export,
     campaign_export_csv,
-    close_campaign,
-    create_adhoc_task,
-    create_campaign,
     get_campaign,
-    list_campaigns,
     list_candidates,
-    next_task,
-    publish_campaign,
-    submit_vote,
-    task_media_asset_id,
-    upsert_evaluator,
 )
 from vfieval.evaluations_v2 import (
     EvaluationConflict,
@@ -146,7 +147,6 @@ from vfieval.evaluations_v2 import (
     legacy_campaigns_readonly,
     list_campaigns_v2,
     list_campaign_purge_requests_v2,
-    list_run_outputs,
     preview_campaign_v2,
     process_campaign_purge_requests_v2,
     request_publish_campaign_v2,
@@ -200,6 +200,67 @@ class _WorkloadRiskConfirmationRequired(ValueError):
         }
 
 
+class _BoundedThreadingHTTPServer(ThreadingHTTPServer):
+    """Thread-per-request server with an explicit concurrency ceiling."""
+
+    daemon_threads = True
+    block_on_close = True
+    request_queue_size = 128
+
+    def __init__(self, server_address, request_handler_class, *, max_threads: int = 64):
+        self._request_slots = threading.BoundedSemaphore(max(1, int(max_threads)))
+        super().__init__(server_address, request_handler_class)
+
+    def get_request(self):
+        request, client_address = super().get_request()
+        request.settimeout(120.0)
+        return request, client_address
+
+    def process_request(self, request, client_address) -> None:
+        if not self._request_slots.acquire(blocking=False):
+            payload = b'{"error":{"type":"ServerBusy","message":"server request capacity reached; retry shortly"}}'
+            response = (
+                b"HTTP/1.1 503 Service Unavailable\r\n"
+                b"Content-Type: application/json; charset=utf-8\r\n"
+                b"Cache-Control: no-store\r\n"
+                b"Retry-After: 2\r\n"
+                + f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n".encode("ascii")
+                + payload
+            )
+            try:
+                request.sendall(response)
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            log_event(
+                logging.WARNING,
+                "http.capacity_rejected",
+                "request rejected because the HTTP worker limit was reached",
+                client=str(client_address[0]) if client_address else "",
+            )
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+    def handle_error(self, request, client_address) -> None:
+        runtime_logger().exception(
+            "uncaught HTTP request error",
+            extra={
+                "event": "http.uncaught_error",
+                "details": {"client": str(client_address[0]) if client_address else ""},
+            },
+        )
+
+
 def _is_client_disconnect(exc: BaseException) -> bool:
     if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
         return True
@@ -215,20 +276,31 @@ def _is_client_disconnect(exc: BaseException) -> bool:
 
 
 def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -> None:
+    open_worker_admission()
+    log_path = configure_runtime_logging(workspace)
     cleanup_stale_uploads(db, workspace)
     ensure_v2_schema(db)
     cleanup_service = RunCleanupService(db, workspace)
     catalog_sync = CatalogSyncCoordinator(db, workspace)
     preparation_stop = threading.Event()
     preparation_wake = threading.Event()
+    job_recovery = JobRecoveryService(
+        db,
+        on_recovered=lambda rows: _log_recovered_jobs(rows),
+    )
     handler = _make_handler(
         db,
         workspace,
         cleanup_service=cleanup_service,
         catalog_sync=catalog_sync,
         preparation_wake_event=preparation_wake,
+        job_recovery=job_recovery,
     )
-    server = ThreadingHTTPServer((host, port), handler)
+    try:
+        max_http_threads = max(1, int(os.getenv("VFIEVAL_HTTP_MAX_THREADS", "64")))
+    except ValueError:
+        max_http_threads = 64
+    server = _BoundedThreadingHTTPServer((host, port), handler, max_threads=max_http_threads)
     cleanup_stop = threading.Event()
     cleanup_thread = threading.Thread(
         target=cleanup_service.run_forever,
@@ -244,8 +316,20 @@ def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -
         daemon=True,
     )
     preparation_thread.start()
+    job_recovery.start()
     catalog_sync.request_sync(include_runs=True)
-    print(f"VFIEval listening on http://{host}:{port}")
+    build = release_info()
+    log_event(
+        logging.INFO,
+        "server.started",
+        f"VFIEval listening on http://{host}:{port}",
+        host=host,
+        port=port,
+        max_http_threads=max_http_threads,
+        log_path=str(log_path),
+        build_id=build["build_id"],
+        version=build["version"],
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -254,9 +338,49 @@ def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -
         cleanup_stop.set()
         preparation_stop.set()
         preparation_wake.set()
+        job_recovery.stop(timeout=5)
         cleanup_thread.join(timeout=5)
-        preparation_thread.join(timeout=5)
+        preparation_thread.join(timeout=30)
+        if preparation_thread.is_alive():
+            log_event(
+                logging.WARNING,
+                "campaign.preparation_shutdown_timeout",
+                "Campaign preparation did not reach a cancellation checkpoint before shutdown timeout",
+            )
         catalog_sync.wait(timeout=5)
+        worker_shutdown = shutdown_worker_processes(timeout=5)
+        if (
+            worker_shutdown["tracked"]
+            or worker_shutdown["remaining"]
+            or worker_shutdown["threads_tracked"]
+            or worker_shutdown["threads_remaining"]
+        ):
+            log_event(
+                logging.INFO
+                if not (worker_shutdown["remaining"] or worker_shutdown["threads_remaining"])
+                else logging.WARNING,
+                "worker_processes.stopped",
+                "Local accelerator worker processes were stopped with the server",
+                **worker_shutdown,
+            )
+        server.server_close()
+        log_event(logging.INFO, "server.stopped", "VFIEval server stopped")
+        close_runtime_logging()
+
+
+def _log_recovered_jobs(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        error = row.get("error") if isinstance(row.get("error"), dict) else {}
+        log_event(
+            logging.ERROR,
+            "job.worker_lost",
+            "A stale worker Job was fenced and its Run failed safely",
+            job_id=row.get("job_id"),
+            run_ids=row.get("run_ids"),
+            action=row.get("action"),
+            error_type=error.get("type"),
+            last_heartbeat_at=error.get("last_heartbeat_at"),
+        )
 
 
 def _run_evaluation_preparations_forever(
@@ -267,14 +391,25 @@ def _run_evaluation_preparations_forever(
 ) -> None:
     while not stop_event.is_set():
         try:
-            results = run_pending_preparations(db, workspace, limit=1)
+            results = run_pending_preparations(
+                db,
+                workspace,
+                limit=1,
+                cancel_check=stop_event.is_set,
+            )
             _log_evaluation_preparation_results(db, workspace, results)
         except Exception as exc:
-            print(f"evaluation preparation loop failed: {type(exc).__name__}: {exc}")
+            runtime_logger().exception(
+                "evaluation preparation loop failed",
+                extra={"event": "campaign.preparation_loop_failed", "details": {"error_type": type(exc).__name__}},
+            )
         try:
             process_campaign_purge_requests_v2(db, workspace, limit=20)
         except Exception as exc:
-            print(f"evaluation cleanup loop failed: {type(exc).__name__}: {exc}")
+            runtime_logger().exception(
+                "evaluation cleanup loop failed",
+                extra={"event": "campaign.cleanup_loop_failed", "details": {"error_type": type(exc).__name__}},
+            )
         if wake_event is None:
             stop_event.wait(1.0)
         else:
@@ -298,7 +433,12 @@ def _log_evaluation_preparation_results(
             continue
         status = str(result.get("status") or "").strip().lower()
         if status == "published":
-            print(f"Campaign V2 {campaign_id} preparation published")
+            log_event(
+                logging.INFO,
+                "campaign.preparation_published",
+                "Campaign preparation published",
+                campaign_id=campaign_id,
+            )
             continue
         if status != "failed":
             continue
@@ -314,9 +454,12 @@ def _log_evaluation_preparation_results(
             campaign_id,
             error.get("message"),
         )
-        print(
-            f"Campaign V2 {campaign_id} preparation failed: "
-            f"{error_type}: {message}"
+        log_event(
+            logging.ERROR,
+            "campaign.preparation_failed",
+            message,
+            campaign_id=campaign_id,
+            error_type=error_type,
         )
 
 
@@ -400,6 +543,7 @@ def _make_handler(
     cleanup_service: RunCleanupService | None = None,
     catalog_sync: CatalogSyncCoordinator | None = None,
     preparation_wake_event: threading.Event | None = None,
+    job_recovery: JobRecoveryService | None = None,
 ):
     # Schema/backfill is cheap and idempotent. Catalog reconciliation itself is
     # owned by the coordinator: production starts it in the background and all
@@ -471,6 +615,7 @@ def _make_handler(
         server_version = "VFIEval/0.1"
 
         def handle_one_request(self) -> None:
+            self.request_id = uuid.uuid4().hex[:16]
             try:
                 super().handle_one_request()
             except OSError as exc:
@@ -481,6 +626,18 @@ def _make_handler(
             if not _is_client_disconnect(exc):
                 return False
             self.close_connection = True
+            log_event(
+                logging.INFO,
+                "http.client_disconnected",
+                "client disconnected while the server was writing a response",
+                request_id=getattr(self, "request_id", ""),
+                method=getattr(self, "command", ""),
+                path=urlparse(getattr(self, "path", "")).path,
+                client=str(self.client_address[0]) if getattr(self, "client_address", None) else "",
+                error_type=type(exc).__name__,
+                errno=getattr(exc, "errno", None),
+                winerror=getattr(exc, "winerror", None),
+            )
             return True
 
         def _client_io(self, operation: Any, *args: Any) -> bool:
@@ -504,12 +661,22 @@ def _make_handler(
                 if path in {"/app.js", "/styles.css", "/studio.js", "/studio.css", "/blind.js", "/blind.css"}:
                     return self._send_static(path.lstrip("/"))
                 if path == "/api/health":
+                    health = health_snapshot(db, workspace)
                     return self._json(
                         {
-                            "ok": True,
+                            "ok": health["ok"],
                             "metrics": list(METRIC_NAMES),
+                            "release": health["release"],
+                            "schema": health["schema"],
+                            "storage": health["storage"],
+                            "leases": health["leases"],
                             "maintenance": {
                                 "catalog": catalog_sync.status(),
+                                "job_recovery": (
+                                    job_recovery.status()
+                                    if job_recovery is not None
+                                    else {"running": False, "leases": health["leases"]}
+                                ),
                                 **db.cleanup_backlog_counts(),
                             },
                         }
@@ -1026,6 +1193,8 @@ def _make_handler(
                         upload = create_upload_session(db, workspace, body)
                     except FileExistsError as exc:
                         return self._error(HTTPStatus.CONFLICT, str(exc), type(exc).__name__)
+                    except StorageCapacityError as exc:
+                        return self._json(exc.public_payload(), status=HTTPStatus.INSUFFICIENT_STORAGE)
                     except ValueError as exc:
                         return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
                     return self._json(
@@ -1061,7 +1230,7 @@ def _make_handler(
                     action = match.group(2)
                     try:
                         if action == "publish":
-                            result = request_publish_campaign_v2(db, campaign_id)
+                            result = request_publish_campaign_v2(db, campaign_id, workspace)
                             if preparation_wake_event is not None:
                                 preparation_wake_event.set()
                             else:
@@ -1082,6 +1251,8 @@ def _make_handler(
                         return self._json({"campaign": campaign})
                     except EvaluationConflict as exc:
                         return self._error(HTTPStatus.CONFLICT, str(exc), type(exc).__name__)
+                    except StorageCapacityError as exc:
+                        return self._json(exc.public_payload(), status=HTTPStatus.INSUFFICIENT_STORAGE)
                     except ValueError as exc:
                         return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
                 match = re.fullmatch(r"/api/evaluation-cleanup-requests/(\d+)/retry", path)
@@ -1232,7 +1403,7 @@ def _make_handler(
                     prepared["preflight_level"] = preflight_level
                     result = preflight_run(db, workspace, prepared)
                     result["preflight_cache_hit"] = False
-                    _attach_workload_estimate(result, prepared)
+                    _attach_workload_estimate(db, workspace, result, prepared)
                     profile_request = dict(prepared)
                     profile_request.update(
                         {
@@ -1246,6 +1417,9 @@ def _make_handler(
                         result["preflight_token"] = store_preflight(prepared, result)
                     return self._json(result)
                 if path == "/api/runs":
+                    # Even Runs without a detailed workload estimate must retain
+                    # the configured emergency free-space margin.
+                    ensure_storage_capacity(db, workspace, requested_bytes=0)
                     body = source_assets_to_video_payload(db, workspace, body)
                     body = _prepare_media_item_compare_payload(db, workspace, body)
                     # These fields are server-owned trust material.  A client
@@ -1429,10 +1603,20 @@ def _make_handler(
                 match = re.fullmatch(r"/api/jobs/(\d+)/heartbeat", path)
                 if match:
                     job_id = int(match.group(1))
-                    worker_id = body.get("worker_id")
-                    if worker_id:
-                        db.touch_worker(str(worker_id), body.get("capabilities") or None)
-                    db.touch_job(job_id)
+                    worker_id = str(body.get("worker_id") or "").strip()
+                    if not worker_id:
+                        return self._error(
+                            HTTPStatus.BAD_REQUEST,
+                            "worker_id is required for an owner-fenced Job heartbeat",
+                            "WorkerIdRequired",
+                        )
+                    if not db.heartbeat_job(job_id, worker_id):
+                        return self._error(
+                            HTTPStatus.CONFLICT,
+                            "job lease is no longer owned by this worker; stop the stale worker",
+                            "JobLeaseLost",
+                        )
+                    db.touch_worker(worker_id, body.get("capabilities") or None)
                     return self._json({"job_id": job_id, "status": "heartbeat"})
                 self._error(HTTPStatus.NOT_FOUND, "not found")
             except EvaluationConflict as exc:
@@ -1452,6 +1636,8 @@ def _make_handler(
                 self._json(exc.public_payload(), status=HTTPStatus.CONFLICT)
             except _WorkloadRiskConfirmationRequired as exc:
                 self._json(exc.public_payload(), status=HTTPStatus.CONFLICT)
+            except StorageCapacityError as exc:
+                self._json(exc.public_payload(), status=HTTPStatus.INSUFFICIENT_STORAGE)
             except ValueError as exc:
                 self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
             except KeyError as exc:
@@ -1575,7 +1761,15 @@ def _make_handler(
                 self._error_internal(exc)
 
         def log_message(self, fmt: str, *args) -> None:
-            print(f"{self.address_string()} - {fmt % args}")
+            log_event(
+                logging.INFO,
+                "http.access",
+                fmt % args,
+                request_id=getattr(self, "request_id", ""),
+                method=getattr(self, "command", ""),
+                path=urlparse(getattr(self, "path", "")).path,
+                client=str(self.client_address[0]) if getattr(self, "client_address", None) else "",
+            )
 
         def _read_json(self) -> dict:
             length = int(self.headers.get("Content-Length", "0"))
@@ -1593,6 +1787,7 @@ def _make_handler(
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Request-ID", getattr(self, "request_id", ""))
             for key, value in (headers or {}).items():
                 self.send_header(key, value)
             if not self._client_io(self.end_headers):
@@ -1604,6 +1799,7 @@ def _make_handler(
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(payload)))
             self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Request-ID", getattr(self, "request_id", ""))
             if filename:
                 self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
             if not self._client_io(self.end_headers):
@@ -1616,9 +1812,30 @@ def _make_handler(
         def _error_internal(self, exc: Exception) -> None:
             # Log full detail server-side; never echo raw exception text (which can
             # contain internal paths/stack info) back to the client.
-            print(f"internal error handling {self.command} {self.path}: {type(exc).__name__}: {exc}")
+            support_id = uuid.uuid4().hex[:12]
+            runtime_logger().error(
+                "internal request error",
+                exc_info=(type(exc), exc, exc.__traceback__),
+                extra={
+                    "event": "http.internal_error",
+                    "details": {
+                        "support_id": support_id,
+                        "request_id": getattr(self, "request_id", ""),
+                        "method": getattr(self, "command", ""),
+                        "path": urlparse(getattr(self, "path", "")).path,
+                        "error_type": type(exc).__name__,
+                    },
+                },
+            )
             self._json(
-                {"error": {"type": "InternalServerError", "message": "internal server error"}},
+                {
+                    "error": {
+                        "type": "InternalServerError",
+                        "message": "internal server error",
+                        "support_id": support_id,
+                        "request_id": getattr(self, "request_id", ""),
+                    }
+                },
                 status=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
 
@@ -1670,6 +1887,7 @@ def _make_handler(
                 self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
                 self.send_header("Content-Range", f"bytes */{file_size}")
                 self.send_header("Accept-Ranges", "bytes")
+                self.send_header("X-Request-ID", getattr(self, "request_id", ""))
                 self._client_io(self.end_headers)
                 return
             if byte_range is None:
@@ -1677,6 +1895,7 @@ def _make_handler(
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(file_size))
                 self.send_header("Accept-Ranges", "bytes")
+                self.send_header("X-Request-ID", getattr(self, "request_id", ""))
                 if cache_control:
                     self.send_header("Cache-Control", cache_control)
                 if not self._client_io(self.end_headers):
@@ -1696,6 +1915,7 @@ def _make_handler(
                 self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
                 self.send_header("Content-Length", str(content_length))
                 self.send_header("Accept-Ranges", "bytes")
+                self.send_header("X-Request-ID", getattr(self, "request_id", ""))
                 if cache_control:
                     self.send_header("Cache-Control", cache_control)
                 if not self._client_io(self.end_headers):
@@ -2325,7 +2545,7 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         if isinstance(cached, dict)
         else preflight_run(db, workspace, preflight_payload)
     )
-    workload = preflight.get("workload") or _attach_workload_estimate(preflight, body)
+    workload = preflight.get("workload") or _attach_workload_estimate(db, workspace, preflight, body)
     if not preflight["ok"]:
         raise ValueError(_preflight_error_message(preflight))
     acknowledged_scope = str(
@@ -2345,6 +2565,12 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         != str(workload.get("risk_fingerprint") or "")
     ):
         raise _WorkloadRiskConfirmationRequired(workload)
+    if workload is not None:
+        workload["storage_capacity"] = ensure_storage_capacity(
+            db,
+            workspace,
+            requested_bytes=int(workload.get("artifact_budget_bytes") or 0),
+        )
     metrics = list(body.get("metrics") or [])
     if artifact_profile == "benchmark" and metrics:
         raise ValueError("benchmark artifact_profile does not run metrics")
@@ -2371,6 +2597,7 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         group_label = selection["primary_group"]
     frame_step = max(1, int(body.get("frame_step") or 1))
     max_frames = _optional_int(body.get("max_frames"))
+    decode_backend = normalize_decode_backend(body.get("decode_backend") or "auto")
     video_infos = preflight.get("video_group", {}).get("videos", [])
     selected_videos = [str(name) for name in selection["selected_videos"]]
     height, width = resolve_run_dimensions(body, video_infos)
@@ -2393,6 +2620,8 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         height=height,
         width=width,
     )
+    reference_config["decode_backend"] = decode_backend
+    reference_config["evaluation_contract"] = MIDPOINT_TRIPLET_CONTRACT
     trusted_preflight_inputs = body.get("_preflight_physical_inputs")
     if not isinstance(trusted_preflight_inputs, dict) and not isinstance(cached, dict):
         try:
@@ -2474,6 +2703,8 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         "checkpoint": body.get("checkpoint") or "none",
         "frame_step": frame_step,
         "max_frames": max_frames,
+        "decode_backend": decode_backend,
+        "evaluation_contract": MIDPOINT_TRIPLET_CONTRACT,
         "selected_videos": selected_videos,
         "source_assets": body.get("source_assets") or [],
         "metrics": metrics,
@@ -2563,6 +2794,8 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
             "multi_group": multi_group,
             "frame_step": frame_step,
             "max_frames": max_frames,
+            "decode_backend": decode_backend,
+            "evaluation_contract": MIDPOINT_TRIPLET_CONTRACT,
             "video_glob": "*",
             "selected_videos": selected_videos,
             "source_assets": body.get("source_assets") or [],
@@ -2576,6 +2809,7 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         "request": request_metadata,
         "model_file": model_path.name,
         "artifact_contract": CANONICAL_ARTIFACT_CONTRACT,
+        "evaluation_contract": MIDPOINT_TRIPLET_CONTRACT,
         "checkpoint": checkpoint_relative,
         "video_group": group_label,
         "video_groups": groups,
@@ -2652,7 +2886,7 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
             "selected_videos": selected_videos,
             "video_count": len(selected_videos),
             "total_frames": total_decode_frames,
-            "decode_backend": str(body.get("decode_backend") or "auto"),
+            "decode_backend": decode_backend,
         },
         progress_total=total_decode_frames,
         metadata={"phase": "decode"},
@@ -2744,7 +2978,6 @@ def _prepare_media_item_compare_payload(
     # Compare/evaluation/snapshot sources even if malformed DB rows claim they
     # are reusable.  Keep the HTTP layer deliberately descriptor-only.
     resolved = resolve_media_item_compare(db, workspace, item_id, member_ids)
-    item = resolved["item"]
     canonical_member_id = int(resolved["reference"]["member_id"])
     members = list(resolved["members"])
 
@@ -3295,6 +3528,8 @@ def _preflight_request_fingerprint(request: dict[str, Any]) -> str:
 
 
 def _attach_workload_estimate(
+    db: Database,
+    workspace: WorkspaceConfig,
     preflight: dict[str, Any],
     request: dict[str, Any],
 ) -> dict[str, Any] | None:
@@ -3340,6 +3575,21 @@ def _attach_workload_estimate(
         artifact_profile=str(request.get("artifact_profile") or "evaluation"),
         prefetch_depth=3,
     )
+    capacity = storage_capacity(
+        db,
+        workspace,
+        requested_bytes=int(workload.get("artifact_budget_bytes") or 0),
+    )
+    workload["storage_capacity"] = capacity
+    if not capacity["sufficient"]:
+        workload["risk_level"] = "high"
+        workload.setdefault("risk_reasons", []).append(
+            {
+                "code": "insufficient_workspace_storage",
+                "free_bytes": int(capacity["free_bytes"]),
+                "required_free_bytes": int(capacity["required_free_bytes"]),
+            }
+        )
     preflight["workload"] = workload
     if workload["risk_level"] == "high" and not any(
         row.get("type") == "WorkloadRisk"
@@ -3812,83 +4062,6 @@ def _start_local_inference_worker(db: Database, workspace: WorkspaceConfig, coun
 
     for index in range(max(1, int(count))):
         threading.Thread(target=_target, args=(index,), daemon=True).start()
-
-
-def _start_local_npu_worker_processes(
-    workspace: WorkspaceConfig,
-    run_id: int,
-    devices: list[str],
-    start_metric_worker: bool = False,
-) -> list[subprocess.Popen]:
-    processes = []
-    logs_dir = workspace.runs_dir / str(run_id) / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    for index, device in enumerate(devices):
-        command = _worker_process_command(
-            workspace,
-            role="inference",
-            device_filter=device,
-            worker_id=f"local-npu-{run_id}-{index}-{device.replace(':', '-')}",
-            once=True,
-            idle_timeout=None,
-        )
-        processes.append(_spawn_worker_process(command, logs_dir / f"worker-{device.replace(':', '-')}.log"))
-    if start_metric_worker:
-        command = _worker_process_command(
-            workspace,
-            role="metric",
-            device_filter=None,
-            worker_id=f"local-metric-{run_id}",
-            once=False,
-            idle_timeout=86400.0,
-        )
-        processes.append(_spawn_worker_process(command, logs_dir / "worker-metric.log"))
-    return processes
-
-
-def _worker_process_command(
-    workspace: WorkspaceConfig,
-    role: str,
-    device_filter: str | None = None,
-    worker_id: str | None = None,
-    once: bool = False,
-    idle_timeout: float | None = None,
-) -> list[str]:
-    command = [
-        sys.executable,
-        "-m",
-        "vfieval.cli",
-        "--workspace",
-        str(workspace.root),
-        "worker",
-        "--role",
-        role,
-        "--poll-interval",
-        "1",
-    ]
-    if once:
-        command.append("--once")
-    if worker_id:
-        command.extend(["--worker-id", worker_id])
-    if device_filter:
-        command.extend(["--device-filter", device_filter])
-    if idle_timeout is not None:
-        command.extend(["--idle-timeout", str(float(idle_timeout))])
-    return command
-
-
-def _spawn_worker_process(command: list[str], log_path: Path) -> subprocess.Popen:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ)
-    env.setdefault("PYTHONUNBUFFERED", "1")
-    src_root = str(Path(__file__).resolve().parents[1])
-    existing_pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = src_root if not existing_pythonpath else f"{src_root}{os.pathsep}{existing_pythonpath}"
-    log_handle = log_path.open("ab")
-    try:
-        return subprocess.Popen(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env)
-    finally:
-        log_handle.close()
 
 
 def _selection_hash(selected_videos: list[str], frame_step: int, max_frames: int | None) -> str:

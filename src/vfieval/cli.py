@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
 from vfieval.config import WorkspaceConfig
 from vfieval.datasets import scan_dataset
 from vfieval.db import Database
+from vfieval.diagnostics import create_diagnostics_bundle, run_doctor
 from vfieval.metrics import METRIC_NAMES, create_metric
 from vfieval.metrics.base import MetricUnavailable
 from vfieval.metrics.health import metrics_health, prepare_metric_asset_manifest
 from vfieval.server import _create_run_from_files, run_server
+from vfieval.runtime_logging import close_runtime_logging, configure_runtime_logging, log_event
 from vfieval.worker import WorkerOptions, run_worker
 
 
@@ -97,6 +100,15 @@ def main(argv: list[str] | None = None) -> int:
 
     jobs = sub.add_parser("jobs")
     jobs.add_argument("--limit", type=int, default=50)
+
+    doctor = sub.add_parser("doctor", help="check devices, media tools, metrics, database, and storage")
+    doctor.add_argument("--json", action="store_true", dest="json_output")
+
+    diagnostics = sub.add_parser("diagnostics", help="create a sanitized support bundle")
+    selection = diagnostics.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--run-id", type=int)
+    selection.add_argument("--campaign-id", type=int)
+    diagnostics.add_argument("--output")
 
     args = parser.parse_args(argv)
     workspace = WorkspaceConfig.from_root(args.workspace)
@@ -244,22 +256,53 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "worker":
-        run_worker(
-            db,
-            workspace,
-            WorkerOptions(
-                role=args.role,
-                once=args.once,
-                poll_interval=args.poll_interval,
-                worker_id=args.worker_id,
-                device_filter=args.device_filter,
-                idle_timeout=args.idle_timeout,
-            ),
-        )
+        configure_runtime_logging(workspace, filename=f"worker-{os.getpid()}.jsonl")
+        log_event(20, "worker.started", "VFIEval worker started", role=args.role, device=args.device_filter)
+        try:
+            run_worker(
+                db,
+                workspace,
+                WorkerOptions(
+                    role=args.role,
+                    once=args.once,
+                    poll_interval=args.poll_interval,
+                    worker_id=args.worker_id,
+                    device_filter=args.device_filter,
+                    idle_timeout=args.idle_timeout,
+                ),
+            )
+        finally:
+            log_event(20, "worker.stopped", "VFIEval worker stopped", role=args.role, device=args.device_filter)
+            close_runtime_logging()
         return 0
 
     if args.command == "jobs":
         print(json.dumps(db.list_jobs(limit=args.limit), indent=2))
+        return 0
+
+    if args.command == "doctor":
+        report = run_doctor(db, workspace)
+        if args.json_output:
+            print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
+        else:
+            status = "PASS" if report["ok"] else "FAIL"
+            print(f"VFIEval doctor: {status}")
+            for name, check in report["checks"].items():
+                check_status = str(check.get("status") or "info").upper() if isinstance(check, dict) else "INFO"
+                reason = str(check.get("reason") or "") if isinstance(check, dict) else ""
+                print(f"  {check_status:7} {name}{': ' + reason if reason else ''}")
+            print("Use --json for the complete machine-readable report.")
+        return 0 if report["ok"] else 1
+
+    if args.command == "diagnostics":
+        bundle = create_diagnostics_bundle(
+            db,
+            workspace,
+            run_id=args.run_id,
+            campaign_id=args.campaign_id,
+            output=args.output,
+        )
+        print(json.dumps({"diagnostics_bundle": str(bundle)}, indent=2, ensure_ascii=False))
         return 0
 
     raise AssertionError(args.command)

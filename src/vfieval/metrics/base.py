@@ -13,7 +13,9 @@ class MetricResult:
 
 
 class MetricUnavailable(RuntimeError):
-    pass
+    def __init__(self, message: str, details: dict[str, object] | None = None):
+        super().__init__(message)
+        self.details = dict(details or {})
 
 
 class MetricBatchOutOfMemory(MetricUnavailable):

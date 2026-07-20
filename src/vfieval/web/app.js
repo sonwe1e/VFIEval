@@ -141,6 +141,7 @@ const state = {
   evaluationTaskStartedAt: 0,
   evaluationFrameIndex: 0,
   campaignAnalysisFilters: { video: "", model: "", checkpoint: "", collection_id: "", evaluator_id: "" },
+  runtimeHealth: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -161,6 +162,39 @@ async function api(path, options = {}) {
     throw error;
   }
   return data;
+}
+
+function renderDeploymentHealth(health, error = null) {
+  const host = $("deployment-health");
+  if (!host) return;
+  if (error || !health) {
+    host.className = "deployment-health bad";
+    host.textContent = "服务连接异常：无法读取健康状态，请检查计算服务器或 Windows 中继。";
+    return;
+  }
+  const release = health.release || {};
+  const storage = health.storage || {};
+  const leases = health.leases || {};
+  const recovery = health.maintenance?.job_recovery || {};
+  const catalog = health.maintenance?.catalog || {};
+  const warnings = [];
+  if (storage.status === "error" || storage.status === "warning") warnings.push(`磁盘剩余 ${formatBytes(storage.free_bytes || 0)}`);
+  if (Number(leases.stale || 0) > 0) warnings.push(`${Number(leases.stale)} 个任务心跳已过期`);
+  if (recovery.last_error) warnings.push("任务恢复服务异常");
+  if (["failed", "error"].includes(String(catalog.state || ""))) warnings.push("媒体目录同步失败");
+  host.className = `deployment-health ${warnings.length ? "warn" : "ok"}`;
+  host.textContent = warnings.length
+    ? `服务需要关注 · ${warnings.join(" · ")} · Build ${release.build_id || release.version || "unknown"}`
+    : `服务正常 · ${Number(leases.running || 0)} 个后台任务 · 磁盘可用 ${formatBytes(storage.free_bytes || 0)} · Build ${release.build_id || release.version || "development"}`;
+}
+
+async function refreshDeploymentHealth() {
+  try {
+    state.runtimeHealth = await api("/api/health");
+    renderDeploymentHealth(state.runtimeHealth);
+  } catch (error) {
+    renderDeploymentHealth(null, error);
+  }
 }
 
 function escapeHtml(value) {
@@ -1182,6 +1216,59 @@ function renderWorkloadEstimate(workload) {
   `;
 }
 
+function renderPreflightExecutionSummary(result, isQuick) {
+  const device = result?.device || {};
+  const workload = result?.workload || {};
+  const effective = workload.effective || {};
+  const videos = result?.video_group?.videos || [];
+  const devices = Array.isArray(device.effective_devices) && device.effective_devices.length
+    ? device.effective_devices.map((value) => String(value))
+    : (device.effective_device && !String(device.effective_device).startsWith("multi_")
+      ? [String(device.effective_device)]
+      : []);
+  const deviceCount = Number(device.device_count || devices.length || 0);
+  const decoderBackends = Array.from(new Set(videos
+    .map((row) => row.decode_backend || row.manifest_backend || row.cache_backend || row.decoder_backend)
+    .filter(Boolean)
+    .map((value) => String(value))));
+  const decoder = result?.decode?.actual_backend
+    || result?.decode?.backend
+    || result?.cache?.backend
+    || decoderBackends.join(" / ")
+    || result?.video_group?.decode_backend
+    || (isQuick ? "深度预检时确认" : "解码任务启动时确认");
+  const evaluationContract = result?.evaluation_contract
+    || result?.contracts?.evaluation
+    || result?.video_group?.evaluation_contract
+    || "-";
+  const storageCapacity = workload?.storage_capacity || result?.storage_capacity || {};
+  const diskFree = storageCapacity.free_bytes
+    ?? result?.storage?.free_bytes
+    ?? result?.disk?.free_bytes
+    ?? workload?.storage?.free_bytes
+    ?? workload?.disk_free_bytes;
+  const diskParts = diskFree == null ? [] : [formatBytes(diskFree)];
+  if (storageCapacity.reserved_bytes != null) {
+    diskParts.push(`已预留 ${formatBytes(storageCapacity.reserved_bytes)}`);
+  }
+  const remainingAfterRequest = storageCapacity.remaining_after_request_bytes
+    ?? storageCapacity.remaining_after_request;
+  if (remainingAfterRequest != null) {
+    diskParts.push(`本次后 ${formatBytes(remainingAfterRequest)}`);
+  }
+  const diskClass = storageCapacity.sufficient === false ? " class=\"bad-text\"" : "";
+  return `
+    <div><span>执行设备</span><strong>${escapeHtml(devices.join(", ") || device.effective_device || "-")}</strong></div>
+    <div><span>设备卡数</span><strong>${escapeHtml(deviceCount || (isQuick ? "待确认" : "-"))}</strong></div>
+    <div><span>每设备 Batch</span><strong>${escapeHtml(effective.batch_size_per_device ?? "-")}</strong></div>
+    <div><span>解码后端</span><strong>${escapeHtml(decoder)}</strong></div>
+    <div><span>评测契约</span><strong>${escapeHtml(evaluationContract)}</strong></div>
+    <div><span>单设备显存</span><strong>${escapeHtml(formatBytes(effective.device_memory_bytes))}</strong></div>
+    <div><span>主机可用内存</span><strong>${escapeHtml(formatBytes(effective.host_available_memory_bytes))}</strong></div>
+    <div><span>磁盘可用空间</span><strong${diskClass}>${escapeHtml(diskParts.join("；") || "接口未提供")}</strong></div>
+  `;
+}
+
 function highRiskWorkloadConfirmation(workload) {
   if (workload?.risk_level !== "high") return true;
   const fingerprint = String(workload.risk_fingerprint || "").trim();
@@ -1246,6 +1333,7 @@ function renderPreflight() {
       <div><span>缓存状态</span><strong>${escapeHtml(cacheStatus)}</strong></div>
       <div><span>设备/精度</span><strong>${escapeHtml(`${result.device?.effective_device || "-"} / ${result.device?.effective_precision || "-"}`)}</strong></div>
       <div><span>支持精度</span><strong>${escapeHtml((result.device?.supported_precisions || []).join(" / ") || "-")}</strong></div>
+      ${renderPreflightExecutionSummary(result, isQuick)}
     </div>
     ${renderMessages("errors", result.errors || [])}
     ${renderMessages("warnings", result.warnings || [])}
@@ -2193,7 +2281,6 @@ function renderRunError(run) {
     return `<div class="message error run-error-banner"><p><strong>${escapeHtml(run.error.type || "Error")}</strong>: ${escapeHtml(run.error.message || JSON.stringify(run.error))}</p>${meta}<button class="secondary" data-retry-run="${escapeHtml(run.id)}" type="button">Retry this Run</button>${cloneAction}</div>`;
   }
   return `<div class="message error run-error-banner"><p><strong>${escapeHtml(run.error.type || "Error")}</strong>: ${escapeHtml(run.error.message || JSON.stringify(run.error))}</p><button class="secondary" data-retry-run="${escapeHtml(run.id)}" type="button">Retry this Run</button>${cloneAction}</div>`;
-  return `<div class="message error"><p><strong>${escapeHtml(run.error.type || "错误")}</strong>: ${escapeHtml(run.error.message || JSON.stringify(run.error))}</p></div>`;
 }
 
 function runExecutionTarget(run) {
@@ -2469,7 +2556,35 @@ function renderExecutionProfileRecommendation(preflight) {
   if (!profile) return "";
   const settings = profile.settings || {};
   const performance = profile.performance || {};
-  return `<div class="message"><p><strong>Benchmark 建议</strong>：batch ${escapeHtml(settings.batch_size ?? "-")}，prefetch ${escapeHtml(settings.prefetch_workers ?? "-")}，save ${escapeHtml(settings.save_workers ?? "-")}；历史稳态 ${formatNumber(performance.steady_state_fps)} FPS。用户设置仍会优先。</p></div>`;
+  return `<div class="message"><p><strong>Benchmark 建议</strong>：batch ${escapeHtml(settings.batch_size_per_device ?? settings.batch_size ?? "-")}，prefetch ${escapeHtml(settings.prefetch_workers ?? "-")}，save ${escapeHtml(settings.save_workers ?? "-")}；历史稳态 ${formatNumber(performance.steady_state_fps)} FPS。建议不会自动覆盖当前设置。</p><button class="secondary" data-apply-execution-profile type="button">应用这组建议</button></div>`;
+}
+
+function applyExecutionProfileRecommendation() {
+  const settings = state.preflight?.execution_profile?.settings;
+  if (!settings || typeof settings !== "object") {
+    toast("当前没有可应用的 Benchmark 建议");
+    return;
+  }
+  const form = $("infer-form");
+  const applied = [];
+  const batchSize = Number(settings.batch_size_per_device ?? settings.batch_size);
+  if (Number.isInteger(batchSize) && batchSize > 0) {
+    form.elements.batch_size.value = String(batchSize);
+    form.elements.batch_size_per_device.value = String(batchSize);
+    applied.push(`batch ${batchSize}`);
+  }
+  for (const name of ["prefetch_workers", "save_workers", "max_save_inflight"]) {
+    const value = Number(settings[name]);
+    if (!Number.isInteger(value) || value <= 0 || !form.elements[name]) continue;
+    form.elements[name].value = String(value);
+    applied.push(`${name} ${value}`);
+  }
+  if (!applied.length) {
+    toast("这条历史建议没有可应用的参数");
+    return;
+  }
+  schedulePreflight(0);
+  toast(`已应用建议：${applied.join("，")}`);
 }
 
 function renderDecodePanel(run) {
@@ -5067,6 +5182,11 @@ async function refreshCatalog() {
 }
 
 document.addEventListener("click", (event) => {
+  const executionProfile = event.target.closest?.("[data-apply-execution-profile]");
+  if (executionProfile) {
+    applyExecutionProfileRecommendation();
+    return;
+  }
   const campaignDependency = event.target.closest?.("[data-open-campaign-dependency]");
   if (campaignDependency) {
     const campaignId = Number(campaignDependency.dataset.openCampaignDependency || 0);
@@ -5786,4 +5906,8 @@ refreshCatalog()
     if (result.failures?.length) toast(`启动时有 ${result.failures.length} 个数据面板未能加载`);
   })
   .catch((error) => toast(error.message));
+refreshDeploymentHealth();
+setInterval(() => {
+  if (!document.hidden) refreshDeploymentHealth();
+}, 30000);
 startRunsPoll();

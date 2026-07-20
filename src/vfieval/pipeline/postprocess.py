@@ -115,30 +115,6 @@ def backward_warp(image: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
     return F.grid_sample(image, normalized, mode="bilinear", padding_mode="border", align_corners=True)
 
 
-def resize_bundle(bundle: dict[str, torch.Tensor], height: int, width: int) -> dict[str, torch.Tensor]:
-    """Resize every tensor in a composed bundle to (height, width).
-
-    Flow tensors are in pixel units, so resizing scales their displacement
-    magnitudes to match the new resolution. RGB/mask tensors are resized
-    directly. Tensors already at the target size are returned unchanged.
-    """
-    resized: dict[str, torch.Tensor] = {}
-    for name, tensor in bundle.items():
-        if not isinstance(tensor, torch.Tensor) or tensor.ndim != 4:
-            resized[name] = tensor
-            continue
-        src_h, src_w = int(tensor.shape[-2]), int(tensor.shape[-1])
-        if (src_h, src_w) == (height, width):
-            resized[name] = tensor
-            continue
-        out = F.interpolate(tensor, size=(height, width), mode="bilinear", align_corners=True)
-        if name in ("flowt_0", "flowt_1"):
-            scale = out.new_tensor([float(width) / float(src_w), float(height) / float(src_h)]).view(1, 2, 1, 1)
-            out = out * scale
-        resized[name] = out
-    return resized
-
-
 def compose_interpolated(
     img0: torch.Tensor,
     img1: torch.Tensor,
@@ -213,8 +189,6 @@ def compose_interpolated_native(
     }
 
 
-_BUNDLE_RGB_KEYS = ("pred", "warp0", "warp1", "blend")
-_BUNDLE_MASK_KEYS = ("mask0", "mask1")
 _BUNDLE_FLOW_KEYS = ("flowt_0", "flowt_1")
 
 

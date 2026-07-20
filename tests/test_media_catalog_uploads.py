@@ -21,6 +21,7 @@ from vfieval.media_assets import (
     create_collection,
     get_asset,
     list_assets,
+    list_folder_group_videos,
     soft_delete_asset,
     source_assets_to_video_payload,
     sync_folder_assets,
@@ -54,6 +55,36 @@ def _frame_zip(entries: list[tuple[str, bytes]]) -> bytes:
 
 
 class MediaCatalogUploadTests(unittest.TestCase):
+    def test_folder_catalog_triplets_use_only_real_symmetric_centers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            collection = create_collection(
+                db,
+                "Folder Group",
+                metadata={"source_kind": "folder", "video_group": "group-a"},
+            )
+            upsert_asset(
+                db,
+                collection_id=collection["id"],
+                source_key="folder:group-a/clip.mp4",
+                source_kind="folder",
+                media_kind="video",
+                role="gt",
+                display_name="clip.mp4",
+                original_name="clip.mp4",
+                storage_path=workspace.root.parent / "videos" / "group-a" / "clip.mp4",
+                frame_count=10,
+                width=16,
+                height=8,
+                fps=24,
+            )
+
+            full = list_folder_group_videos(db, "group-a", frame_step=2)
+            limited = list_folder_group_videos(db, "group-a", frame_step=2, max_frames=7)
+
+            self.assertEqual(full["videos"][0]["valid_triplets"], 6)
+            self.assertEqual(limited["videos"][0]["valid_triplets"], 3)
+
     def test_run_asset_publication_failure_invalidates_unbound_asset(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace, db = make_workspace(tmp)

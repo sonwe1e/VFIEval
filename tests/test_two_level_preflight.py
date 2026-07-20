@@ -66,6 +66,7 @@ class TwoLevelPreflightTests(unittest.TestCase):
                 )
                 self.assertTrue(quick["ok"], quick)
                 self.assertEqual(quick["preflight_level"], "quick")
+                self.assertEqual(quick["evaluation_contract"], "midpoint-triplet-v2")
                 self.assertIsNone(quick["model"]["interface_ok"])
                 self.assertFalse(quick["model"]["interface_checked"])
                 self.assertEqual(quick["video_group"]["videos"][0]["frame_count_source"], "container")
@@ -76,6 +77,7 @@ class TwoLevelPreflightTests(unittest.TestCase):
                 deep = preflight_run(db, workspace, request)
                 self.assertTrue(deep["ok"], deep)
                 self.assertEqual(deep["preflight_level"], "deep")
+                self.assertEqual(deep["evaluation_contract"], "midpoint-triplet-v2")
                 self.assertTrue(deep["model"]["interface_ok"])
                 self.assertTrue(deep["model"]["interface_checked"])
                 self.assertTrue(
@@ -85,7 +87,9 @@ class TwoLevelPreflightTests(unittest.TestCase):
                     )
                 )
                 dry_run.assert_called_once()
-                cache_key.assert_called_once()
+                # Deep preflight computes separately keyed FFmpeg and OpenCV
+                # candidates; quick preflight still computes neither.
+                self.assertEqual(cache_key.call_count, 2)
 
             self.assertEqual(exact_modes, [False, False])
 

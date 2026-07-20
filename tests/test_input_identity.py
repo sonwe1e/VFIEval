@@ -172,6 +172,28 @@ class RunInputIdentityTests(unittest.TestCase):
             )
             self.assertNotEqual(automatic["fingerprint"], explicit["fingerprint"])
 
+    def test_requested_decode_backend_is_part_of_run_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            base_request = {
+                "model_file": "rife.py",
+                "checkpoint": "auto",
+                "video_groups": ["set-a"],
+                "selected_videos": ["clip.mp4"],
+                "batch_size": 1,
+                "precision": "fp32",
+                "metrics": [],
+                "evaluation_contract": "midpoint-triplet-v2",
+            }
+            ffmpeg = self._identity(root, request={**base_request, "decode_backend": "ffmpeg"})
+            opencv = self._identity(root, request={**base_request, "decode_backend": "opencv"})
+            self.assertNotEqual(ffmpeg["fingerprint"], opencv["fingerprint"])
+            differences = {
+                row["field"]
+                for row in compare_input_identities(ffmpeg, opencv)["differences"]
+            }
+            self.assertEqual(differences, {"request.decode_backend"})
+
     def test_structured_differences_are_public_and_raise_typed_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

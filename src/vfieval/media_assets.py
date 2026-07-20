@@ -558,68 +558,6 @@ def bind_metric_result(
         )
 
 
-def run_asset_pair(
-    db: Database,
-    run_id: int,
-    video_name: str,
-    track_label: str = "",
-) -> tuple[int | None, int | None]:
-    reference = db.get(
-        """
-        SELECT asset_id FROM run_media_assets
-        WHERE run_id = ? AND role = 'gt' AND video_name = ?
-        ORDER BY CASE WHEN json_extract(metadata_json, '$.input') = 1 THEN 1 ELSE 0 END, asset_id DESC
-        LIMIT 1
-        """,
-        (int(run_id), str(video_name)),
-    )
-    distorted = db.get(
-        """
-        SELECT asset_id FROM run_media_assets
-        WHERE run_id = ? AND role = 'pred' AND video_name = ?
-          AND (? = '' OR track_label = ?)
-        ORDER BY CASE WHEN json_extract(metadata_json, '$.input') = 1 THEN 1 ELSE 0 END, asset_id DESC
-        LIMIT 1
-        """,
-        (int(run_id), str(video_name), str(track_label), str(track_label)),
-    )
-    return (
-        int(reference["asset_id"]) if reference is not None else None,
-        int(distorted["asset_id"]) if distorted is not None else None,
-    )
-
-
-def bind_metric_result(
-    db: Database,
-    metric_result_id: int,
-    reference_asset_id: int | None,
-    distorted_asset_id: int | None,
-    *,
-    video_name: str = "",
-    track_label: str = "",
-    metadata: dict[str, Any] | None = None,
-) -> None:
-    with db.connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO metric_asset_bindings(
-                metric_result_id, reference_asset_id, distorted_asset_id,
-                video_name, track_label, metadata_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(metric_result_id) DO UPDATE SET
-                reference_asset_id = excluded.reference_asset_id,
-                distorted_asset_id = excluded.distorted_asset_id,
-                video_name = excluded.video_name,
-                track_label = excluded.track_label,
-                metadata_json = excluded.metadata_json
-            """,
-            (
-                int(metric_result_id), reference_asset_id, distorted_asset_id,
-                str(video_name), str(track_label), _json(metadata), utc_ts(),
-            ),
-        )
-
-
 def _folder_collection_slug(db: Database, group_name: str) -> str:
     """Return a stable, collision-safe Collection slug for ``videos/<group>``.
 
@@ -878,7 +816,11 @@ def list_folder_group_videos(
     def triplets(row: dict[str, Any]) -> int:
         frame_count = int(row.get("frame_count") or 0)
         effective = min(frame_count, limit) if limit is not None else frame_count
-        return max(0, (effective - 2 * step + step - 1) // step)
+        # ``frame_step`` is the symmetric distance from the GT center to each
+        # source frame, not a stride between samples. Every real center in
+        # [step, N-step) is eligible, so an N-frame source has N - 2*step
+        # samples. Never advertise a clamped boundary sample in the picker.
+        return max(0, effective - 2 * step)
 
     key_name = str(sort or "name").lstrip("-")
     sort_keys = {

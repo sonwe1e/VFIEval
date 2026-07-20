@@ -15,12 +15,14 @@ from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
 from vfieval.devices import list_npu_devices, npu_unavailable_reason, prepare_worker_device, supported_precisions
 from vfieval.job_errors import describe_job_failure, enrich_job_error
+from vfieval.job_leases import JobLeaseHeartbeat
 from vfieval.orchestration import create_inference_jobs_for_run, start_workers_for_run
 from vfieval.pipeline.decode_runner import run_decode_job
 from vfieval.pipeline.inference import RunCanceled, run_inference_job
 from vfieval.pipeline.finalize_runner import run_finalize_job
 from vfieval.pipeline.metrics_runner import run_metric_job
 from vfieval.run_cleanup import RunCleanupService
+from vfieval.runtime_logging import log_event, runtime_logger
 from vfieval.metrics import METRIC_NAMES
 
 
@@ -153,7 +155,10 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
             continue
         last_activity = time.time()
 
+        heartbeat = JobLeaseHeartbeat(db, int(job["id"]), worker_id)
         try:
+            if not heartbeat.start():
+                raise RuntimeError(f"Job {job['id']} rejected its worker heartbeat lease")
             if job["kind"] == "decode":
                 result = run_decode_job(db, workspace, int(job["id"]))
                 run_id = job.get("payload", {}).get("run_id")
@@ -206,8 +211,19 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
                             },
                             result.performance,
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        runtime_logger().exception(
+                            "execution profile recording failed",
+                            extra={
+                                "event": "performance.profile_record_failed",
+                                "details": {
+                                    "job_id": int(job["id"]),
+                                    "run_id": int(run_id),
+                                    "worker_id": worker_id,
+                                    "error_type": type(exc).__name__,
+                                },
+                            },
+                        )
             elif job["kind"] == "metric":
                 result = run_metric_job(db, workspace, int(job["id"]))
                 payload = job.get("payload") or {}
@@ -228,6 +244,15 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
             else:
                 raise ValueError(f"unsupported job kind {job['kind']}")
         except RunCanceled:
+            log_event(
+                30,
+                "job.canceled",
+                "Job stopped because its Run is canceled or already failed",
+                job_id=int(job["id"]),
+                run_id=(job.get("payload") or {}).get("run_id"),
+                kind=job.get("kind"),
+                worker_id=worker_id,
+            )
             payload = job.get("payload") or {}
             if payload.get("run_id") is not None:
                 canceled_run_id = int(payload["run_id"])
@@ -252,6 +277,20 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
                     "traceback": traceback.format_exc(),
                 },
             )
+            runtime_logger().exception(
+                "worker Job failed",
+                extra={
+                    "event": "job.failed",
+                    "details": {
+                        "job_id": int(job["id"]),
+                        "run_id": int(run_id) if run_id is not None else None,
+                        "kind": job.get("kind"),
+                        "device": payload.get("device") or payload.get("metric_device"),
+                        "worker_id": worker_id,
+                        "error_type": type(exc).__name__,
+                    },
+                },
+            )
             if run_id is not None:
                 if not db.fail_claimed_job_and_run(int(job["id"]), int(run_id), error):
                     run = db.get_run(int(run_id))
@@ -272,14 +311,31 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
                 db.fail_job(int(job["id"]), error)
             if options.once:
                 return
+        else:
+            log_event(
+                20,
+                "job.completed",
+                "worker Job completed",
+                job_id=int(job["id"]),
+                run_id=(job.get("payload") or {}).get("run_id"),
+                kind=job.get("kind"),
+                worker_id=worker_id,
+            )
         finally:
+            heartbeat.stop()
             # A delete request may have been waiting for this exact worker
             # boundary. Persistent purge state lets any worker safely resume it;
             # the SQLite claim prevents two workers from deleting concurrently.
             try:
                 RunCleanupService(db, workspace).process_pending(limit=20)
             except Exception as exc:
-                print(f"run cleanup coordinator failed: {type(exc).__name__}: {exc}")
+                runtime_logger().exception(
+                    "run cleanup coordinator failed",
+                    extra={
+                        "event": "run_cleanup.coordinator_failed",
+                        "details": {"worker_id": worker_id, "error_type": type(exc).__name__},
+                    },
+                )
 
 
 def _complete_claimed_job(db: Database, job: dict[str, object], result: dict[str, object]) -> None:

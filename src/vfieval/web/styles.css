@@ -515,6 +515,31 @@ summary {
   margin-top: 12px;
 }
 
+.deployment-health {
+  margin-bottom: 14px;
+  padding: 10px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.deployment-health.ok {
+  border-color: color-mix(in srgb, #31a56a 45%, var(--line));
+  color: #267d52;
+}
+
+.deployment-health.warn {
+  border-color: color-mix(in srgb, #d89b28 55%, var(--line));
+  color: #98640c;
+}
+
+.deployment-health.bad {
+  border-color: color-mix(in srgb, #d14e4e 55%, var(--line));
+  color: #ad3434;
+}
+
 .alignment-plan-summary,
 .alignment-report {
   margin-top: 14px;

@@ -97,16 +97,19 @@ class ServerClientDisconnectTests(unittest.TestCase):
     def test_broken_pipe_before_client_io_is_still_an_internal_error(self) -> None:
         handler = self._handler()
         handler._json = mock.Mock()
+        error = BrokenPipeError(errno.EPIPE, "worker pipe failed")
+        logger = mock.Mock()
 
-        output = io.StringIO()
-        with redirect_stdout(output):
-            handler._error_internal(BrokenPipeError(errno.EPIPE, "worker pipe failed"))
+        with mock.patch("vfieval.server.runtime_logger", return_value=logger):
+            handler._error_internal(error)
 
-        self.assertIn("BrokenPipeError: [Errno 32] worker pipe failed", output.getvalue())
-        handler._json.assert_called_once_with(
-            {"error": {"type": "InternalServerError", "message": "internal server error"}},
-            status=HTTPStatus.INTERNAL_SERVER_ERROR,
-        )
+        self.assertIs(logger.error.call_args.kwargs["exc_info"][1], error)
+        payload = handler._json.call_args.args[0]["error"]
+        self.assertEqual(payload["type"], "InternalServerError")
+        self.assertEqual(payload["message"], "internal server error")
+        self.assertRegex(payload["support_id"], r"^[a-f0-9]{12}$")
+        self.assertEqual(payload["request_id"], "")
+        self.assertEqual(handler._json.call_args.kwargs["status"], HTTPStatus.INTERNAL_SERVER_ERROR)
         self.assertFalse(handler.close_connection)
 
     def test_json_disconnect_is_suppressed_at_request_boundary(self) -> None:
@@ -236,32 +239,33 @@ class ServerClientDisconnectTests(unittest.TestCase):
     def test_real_internal_error_is_logged_and_returns_500(self) -> None:
         handler = self._handler()
         handler._json = mock.Mock()
+        error = RuntimeError("database failed")
+        logger = mock.Mock()
 
-        output = io.StringIO()
-        with redirect_stdout(output):
-            handler._error_internal(RuntimeError("database failed"))
+        with mock.patch("vfieval.server.runtime_logger", return_value=logger):
+            handler._error_internal(error)
 
-        self.assertIn("RuntimeError: database failed", output.getvalue())
-        handler._json.assert_called_once_with(
-            {"error": {"type": "InternalServerError", "message": "internal server error"}},
-            status=HTTPStatus.INTERNAL_SERVER_ERROR,
-        )
+        self.assertIs(logger.error.call_args.kwargs["exc_info"][1], error)
+        payload = handler._json.call_args.args[0]["error"]
+        self.assertEqual(payload["type"], "InternalServerError")
+        self.assertEqual(payload["message"], "internal server error")
+        self.assertRegex(payload["support_id"], r"^[a-f0-9]{12}$")
+        self.assertEqual(handler._json.call_args.kwargs["status"], HTTPStatus.INTERNAL_SERVER_ERROR)
         self.assertFalse(handler.close_connection)
 
     def test_disconnect_while_writing_500_preserves_only_original_error_log(self) -> None:
         handler = self._prepare_response_handler()
+        error = RuntimeError("database failed")
+        logger = mock.Mock()
 
-        output = io.StringIO()
-        with redirect_stdout(output):
+        with mock.patch("vfieval.server.runtime_logger", return_value=logger):
             self._run_at_request_boundary(
                 handler,
-                lambda request_handler: request_handler._error_internal(
-                    RuntimeError("database failed")
-                ),
+                lambda request_handler: request_handler._error_internal(error),
             )
 
-        self.assertIn("RuntimeError: database failed", output.getvalue())
-        self.assertNotIn("BrokenPipeError", output.getvalue())
+        logger.error.assert_called_once()
+        self.assertIs(logger.error.call_args.kwargs["exc_info"][1], error)
         self.assertTrue(handler.close_connection)
 
     def test_unrelated_oserror_is_not_suppressed(self) -> None:

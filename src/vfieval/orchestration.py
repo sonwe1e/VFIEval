@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+import atexit
 import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
+
+
+_WORKER_PROCESSES: dict[int, subprocess.Popen] = {}
+_LOCAL_WORKER_THREADS: dict[int, threading.Thread] = {}
+_WORKER_LIFECYCLE_LOCK = threading.RLock()
+_WORKER_PROCESS_SHUTDOWN_LOCK = threading.Lock()
+_WORKER_ADMISSION_OPEN = True
+_WORKER_LIFECYCLE_GENERATION = 0
+_WORKER_LIFECYCLE_STOP_EVENT = threading.Event()
+_WORKER_THREAD_CONTEXT = threading.local()
 
 
 def create_inference_jobs_for_run(
@@ -272,18 +284,100 @@ def _create_inference_shards(
     )
 
 
-def _start_local_worker(db: Database, workspace: WorkspaceConfig, role: str, count: int = 1) -> None:
-    def _target(index: int) -> None:
+class _WorkerAdmissionClosed(RuntimeError):
+    pass
+
+
+def _admitted_worker_generation() -> tuple[int, threading.Event] | None:
+    with _WORKER_LIFECYCLE_LOCK:
+        caller_generation = getattr(_WORKER_THREAD_CONTEXT, "generation", None)
+        if not _WORKER_ADMISSION_OPEN:
+            return None
+        if caller_generation is not None and int(caller_generation) != _WORKER_LIFECYCLE_GENERATION:
+            return None
+        return _WORKER_LIFECYCLE_GENERATION, _WORKER_LIFECYCLE_STOP_EVENT
+
+
+def open_worker_admission() -> int:
+    """Open a fresh local-worker generation for a new server lifecycle."""
+    global _WORKER_ADMISSION_OPEN
+    global _WORKER_LIFECYCLE_GENERATION
+    global _WORKER_LIFECYCLE_STOP_EVENT
+    with _WORKER_LIFECYCLE_LOCK:
+        if _WORKER_ADMISSION_OPEN:
+            return _WORKER_LIFECYCLE_GENERATION
+        _WORKER_LIFECYCLE_GENERATION += 1
+        _WORKER_LIFECYCLE_STOP_EVENT = threading.Event()
+        _WORKER_ADMISSION_OPEN = True
+        return _WORKER_LIFECYCLE_GENERATION
+
+
+def _unregister_local_worker_thread(thread: threading.Thread) -> None:
+    with _WORKER_LIFECYCLE_LOCK:
+        key = id(thread)
+        if _LOCAL_WORKER_THREADS.get(key) is thread:
+            _LOCAL_WORKER_THREADS.pop(key, None)
+
+
+def _local_worker_thread_snapshot() -> list[threading.Thread]:
+    with _WORKER_LIFECYCLE_LOCK:
+        return list(_LOCAL_WORKER_THREADS.values())
+
+
+def _tracked_local_worker_thread_count() -> int:
+    with _WORKER_LIFECYCLE_LOCK:
+        return len(_LOCAL_WORKER_THREADS)
+
+
+def _run_registered_local_worker(
+    db: Database,
+    workspace: WorkspaceConfig,
+    role: str,
+    index: int,
+    generation: int,
+    stop_event: threading.Event,
+) -> None:
+    thread = threading.current_thread()
+    _WORKER_THREAD_CONTEXT.generation = generation
+    try:
+        if stop_event.is_set():
+            return
         from vfieval.worker import WorkerOptions, run_worker
 
+        if stop_event.is_set():
+            return
         run_worker(
             db,
             workspace,
             WorkerOptions(role=role, once=True, worker_id=f"local-ui-{role}-worker-{index}"),
         )
+    finally:
+        _WORKER_THREAD_CONTEXT.__dict__.pop("generation", None)
+        _unregister_local_worker_thread(thread)
 
+
+def _start_local_worker(db: Database, workspace: WorkspaceConfig, role: str, count: int = 1) -> None:
     for index in range(max(1, int(count))):
-        threading.Thread(target=_target, args=(index,), daemon=True).start()
+        with _WORKER_LIFECYCLE_LOCK:
+            admission = _admitted_worker_generation()
+            if admission is None:
+                return
+            generation, stop_event = admission
+            thread = threading.Thread(
+                target=_run_registered_local_worker,
+                args=(db, workspace, role, index, generation, stop_event),
+                name=f"vfieval-local-{role}-{index}",
+                daemon=True,
+            )
+            _LOCAL_WORKER_THREADS[id(thread)] = thread
+            try:
+                # Starting under the lifecycle lock removes the register/start
+                # gap where shutdown could otherwise try to join an unstarted
+                # thread and then let it escape afterward.
+                thread.start()
+            except Exception:
+                _LOCAL_WORKER_THREADS.pop(id(thread), None)
+                raise
 
 
 def _start_local_npu_worker_processes(
@@ -292,6 +386,8 @@ def _start_local_npu_worker_processes(
     devices: list[str],
     start_metric_worker: bool = False,
 ) -> list[subprocess.Popen]:
+    if _admitted_worker_generation() is None:
+        return []
     processes = []
     logs_dir = workspace.runs_dir / str(run_id) / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -304,7 +400,10 @@ def _start_local_npu_worker_processes(
             once=True,
             idle_timeout=None,
         )
-        processes.append(_spawn_worker_process(command, logs_dir / f"worker-{device.replace(':', '-')}.log"))
+        try:
+            processes.append(_spawn_worker_process(command, logs_dir / f"worker-{device.replace(':', '-')}.log"))
+        except _WorkerAdmissionClosed:
+            return processes
     finalize_command = worker_process_command(
         workspace,
         role="finalize",
@@ -313,7 +412,10 @@ def _start_local_npu_worker_processes(
         once=False,
         idle_timeout=3600.0,
     )
-    processes.append(_spawn_worker_process(finalize_command, logs_dir / "worker-finalize.log"))
+    try:
+        processes.append(_spawn_worker_process(finalize_command, logs_dir / "worker-finalize.log"))
+    except _WorkerAdmissionClosed:
+        return processes
     if start_metric_worker:
         for index, metric_device in enumerate(devices or [None]):
             command = worker_process_command(
@@ -325,11 +427,210 @@ def _start_local_npu_worker_processes(
                 idle_timeout=86400.0,
             )
             suffix = str(metric_device or "default").replace(":", "-")
-            processes.append(_spawn_worker_process(command, logs_dir / f"worker-metric-{suffix}.log"))
+            try:
+                processes.append(_spawn_worker_process(command, logs_dir / f"worker-metric-{suffix}.log"))
+            except _WorkerAdmissionClosed:
+                return processes
     return processes
 
 
+def _worker_process_snapshot() -> list[subprocess.Popen]:
+    with _WORKER_LIFECYCLE_LOCK:
+        return list(_WORKER_PROCESSES.values())
+
+
+def _tracked_worker_process_count() -> int:
+    with _WORKER_LIFECYCLE_LOCK:
+        return len(_WORKER_PROCESSES)
+
+
+def _unregister_worker_process(process: subprocess.Popen) -> None:
+    with _WORKER_LIFECYCLE_LOCK:
+        key = id(process)
+        if _WORKER_PROCESSES.get(key) is process:
+            _WORKER_PROCESSES.pop(key, None)
+
+
+def _watch_worker_process(process: subprocess.Popen) -> None:
+    try:
+        process.wait()
+    except Exception:
+        # A transient wait failure must not make a live owned child invisible
+        # to explicit shutdown. Poll only removes a process confirmed dead.
+        if _process_exited(process):
+            _unregister_worker_process(process)
+    else:
+        _unregister_worker_process(process)
+
+
+def _process_exited(process: subprocess.Popen) -> bool:
+    try:
+        return process.poll() is not None
+    except Exception:
+        return False
+
+
+def _wait_for_worker_process(process: subprocess.Popen, timeout: float) -> bool:
+    try:
+        process.wait(timeout=max(0.0, float(timeout)))
+    except subprocess.TimeoutExpired:
+        return False
+    except (ChildProcessError, ProcessLookupError):
+        pass
+    except Exception:
+        if not _process_exited(process):
+            return False
+    _unregister_worker_process(process)
+    return True
+
+
+def _stop_process_spawned_during_shutdown(process: subprocess.Popen) -> None:
+    """Fence a child whose ``Popen`` overlapped a completed shutdown pass."""
+    if _process_exited(process):
+        _unregister_worker_process(process)
+        return
+    try:
+        process.terminate()
+    except Exception:
+        pass
+    if _wait_for_worker_process(process, 0.25):
+        return
+    try:
+        process.kill()
+    except Exception:
+        return
+    _wait_for_worker_process(process, 0.75)
+
+
+def _register_worker_process(
+    process: subprocess.Popen,
+    *,
+    spawn_generation: int,
+) -> subprocess.Popen:
+    with _WORKER_LIFECYCLE_LOCK:
+        _WORKER_PROCESSES[id(process)] = process
+        overlapped_shutdown = (
+            not _WORKER_ADMISSION_OPEN
+            or spawn_generation != _WORKER_LIFECYCLE_GENERATION
+        )
+    watcher = threading.Thread(
+        target=_watch_worker_process,
+        args=(process,),
+        name=f"vfieval-worker-process-{getattr(process, 'pid', id(process))}",
+        daemon=True,
+    )
+    watcher.start()
+    if overlapped_shutdown:
+        _stop_process_spawned_during_shutdown(process)
+    return process
+
+
+def shutdown_worker_processes(timeout: float = 5.0) -> dict[str, int]:
+    """Close local-worker admission and stop workers owned by this module.
+
+    Calls are serialized and idempotent. Registered local worker threads get a
+    shared stop signal and are joined within the same grace deadline. Because
+    ``run_worker`` has no external stop parameter, a thread already executing
+    a Job may outlive that deadline, but its generation remains fenced from
+    all later handoffs. Every tracked subprocess receives ``terminate`` first;
+    processes still alive after the deadline receive ``kill``.
+    """
+    timeout_seconds = max(0.0, float(timeout))
+    with _WORKER_PROCESS_SHUTDOWN_LOCK:
+        global _WORKER_ADMISSION_OPEN
+        global _WORKER_LIFECYCLE_GENERATION
+        with _WORKER_LIFECYCLE_LOCK:
+            if _WORKER_ADMISSION_OPEN:
+                _WORKER_ADMISSION_OPEN = False
+                _WORKER_LIFECYCLE_GENERATION += 1
+            _WORKER_LIFECYCLE_STOP_EVENT.set()
+            tracked_at_start = len(_WORKER_PROCESSES)
+            threads_tracked_at_start = len(_LOCAL_WORKER_THREADS)
+        terminate_requested = 0
+        kill_requested = 0
+        targets = _worker_process_snapshot()
+        deadline = time.monotonic() + timeout_seconds
+        for process in targets:
+            if _process_exited(process):
+                _unregister_worker_process(process)
+                continue
+            try:
+                process.terminate()
+                terminate_requested += 1
+            except (ChildProcessError, ProcessLookupError):
+                _unregister_worker_process(process)
+            except Exception:
+                # Keep the process registered so the kill pass can retry.
+                pass
+
+        for thread in _local_worker_thread_snapshot():
+            if thread is threading.current_thread():
+                continue
+            if not thread.is_alive():
+                _unregister_local_worker_thread(thread)
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            thread.join(timeout=remaining)
+            if not thread.is_alive():
+                _unregister_local_worker_thread(thread)
+
+        for process in targets:
+            if _process_exited(process):
+                _unregister_worker_process(process)
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            _wait_for_worker_process(process, remaining)
+
+        # Snapshot again so children whose Popen overlapped admission closure
+        # cannot escape the hard-stop pass.
+        survivors = _worker_process_snapshot()
+        for process in survivors:
+            if _process_exited(process):
+                _unregister_worker_process(process)
+                continue
+            try:
+                process.kill()
+                kill_requested += 1
+            except (ChildProcessError, ProcessLookupError):
+                _unregister_worker_process(process)
+            except Exception:
+                pass
+
+        kill_deadline = time.monotonic() + min(1.0, max(0.1, timeout_seconds))
+        for process in survivors:
+            if _process_exited(process):
+                _unregister_worker_process(process)
+                continue
+            remaining = kill_deadline - time.monotonic()
+            if remaining <= 0.0:
+                break
+            _wait_for_worker_process(process, remaining)
+
+        with _WORKER_LIFECYCLE_LOCK:
+            for thread in list(_LOCAL_WORKER_THREADS.values()):
+                if not thread.is_alive():
+                    _LOCAL_WORKER_THREADS.pop(id(thread), None)
+            remaining_count = len(_WORKER_PROCESSES)
+            threads_remaining = len(_LOCAL_WORKER_THREADS)
+        return {
+            "tracked": tracked_at_start,
+            "terminate_requested": terminate_requested,
+            "kill_requested": kill_requested,
+            "remaining": remaining_count,
+            "threads_tracked": threads_tracked_at_start,
+            "threads_remaining": threads_remaining,
+        }
+
+
 def _spawn_worker_process(command: list[str], log_path: Path) -> subprocess.Popen:
+    admission = _admitted_worker_generation()
+    if admission is None:
+        raise _WorkerAdmissionClosed("local worker admission is closed")
+    spawn_generation, _stop_event = admission
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env.setdefault("PYTHONUNBUFFERED", "1")
@@ -338,6 +639,17 @@ def _spawn_worker_process(command: list[str], log_path: Path) -> subprocess.Pope
     env["PYTHONPATH"] = src_root if not existing_pythonpath else f"{src_root}{os.pathsep}{existing_pythonpath}"
     log_handle = log_path.open("ab")
     try:
-        return subprocess.Popen(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env)
+        process = subprocess.Popen(command, stdout=log_handle, stderr=subprocess.STDOUT, env=env)
     finally:
         log_handle.close()
+    return _register_worker_process(process, spawn_generation=spawn_generation)
+
+
+def _shutdown_worker_processes_at_exit() -> None:
+    try:
+        shutdown_worker_processes(timeout=2.0)
+    except Exception:
+        pass
+
+
+atexit.register(_shutdown_worker_processes_at_exit)

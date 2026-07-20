@@ -550,6 +550,12 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn("不生成合成总分", self.studio_js)
         self.assertNotIn("combined_score", self.studio_js)
 
+    def test_historical_evaluation_contract_warning_is_visible(self) -> None:
+        detail = self._studio_function_source("renderCampaignDetail")
+        self.assertIn("contract_warnings", detail)
+        self.assertIn("evaluation-contract-warning", detail)
+        self.assertIn("midpoint-triplet-v2", detail)
+
     def test_v2_lpips_curve_is_lazy_fingerprint_scoped_and_race_guarded(self) -> None:
         self.assertIn("/objective-curve?item_id=", self.studio_js)
         self.assertIn("data-objective-curve-item", self.studio_js)

@@ -216,7 +216,10 @@ class DecodeProgressTests(unittest.TestCase):
                     frames.append(frame)
                 if progress_callback:
                     progress_callback({"event": "video_done", "backend": "opencv", "frames": len(frames)})
-                return frames, 24.0, [index / 24.0 for index in range(5)], {"backend": "opencv", "fallback_reason": None}
+                return frames, 24.0, [index / 24.0 for index in range(5)], {
+                    "backend": decode_backend,
+                    "fallback_reason": None,
+                }
 
             first_run = db.create_run("first", model_id, dataset_id, 8, 8, 1, "cpu", "fp32", [], create_inference_job=False)
             first_job = db.add_run_job(
@@ -230,7 +233,7 @@ class DecodeProgressTests(unittest.TestCase):
             self.assertEqual(int(claimed["id"]), first_job)
             with patch("vfieval.datasets._decode_video", side_effect=fake_decode) as decode_video:
                 first_result = run_decode_job(db, workspace, first_job)
-            self.assertEqual(first_result["samples"], 4)  # N - frame_step = 5 - 1 = 4
+            self.assertEqual(first_result["samples"], 3)  # N - 2*frame_step = 5 - 2 = 3
             decode_video.assert_called_once()
 
             second_run = db.create_run("second", model_id, dataset_id, 8, 8, 1, "cpu", "fp32", [], create_inference_job=False)
@@ -252,12 +255,12 @@ class DecodeProgressTests(unittest.TestCase):
             ffmpeg_decode.assert_not_called()
             opencv_decode.assert_not_called()
             second_job_row = db.get_job(second_job)
-            self.assertEqual(second_result["samples"], 4)  # N - frame_step = 5 - 1 = 4
+            self.assertEqual(second_result["samples"], 3)  # N - 2*frame_step = 5 - 2 = 3
             self.assertEqual(second_job_row["result"]["phase"], "indexing_cached_frames")
             self.assertEqual(second_job_row["result"]["backend"], "cache")
             self.assertEqual(second_job_row["result"]["cache_hits"], 1)
             self.assertEqual(second_job_row["result"]["cache_misses"], 0)
-            self.assertEqual(second_job_row["result"]["manifest_backend"], "opencv")
+            self.assertEqual(second_job_row["result"]["manifest_backend"], "ffmpeg")
             self.assertEqual(second_job_row["progress_current"], 5)
 
     def test_decode_cache_key_ignores_model_runtime_and_metric_choices(self) -> None:
@@ -285,6 +288,39 @@ class DecodeProgressTests(unittest.TestCase):
 
             self.assertNotEqual(base_key, decode_cache_key(video_path, "video_gt_triplets", 2, 12))
             self.assertNotEqual(base_key, decode_cache_key(video_path, "video_gt_triplets", 1, 24))
+
+    def test_decode_cache_key_binds_requested_and_actual_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            video_path = Path(tmp) / "clip.mp4"
+            video_path.write_bytes(b"same source video")
+
+            auto_ffmpeg = decode_cache_key(
+                video_path,
+                "video_gt_triplets",
+                1,
+                None,
+                requested_backend="auto",
+                actual_backend="ffmpeg",
+            )
+            auto_opencv = decode_cache_key(
+                video_path,
+                "video_gt_triplets",
+                1,
+                None,
+                requested_backend="auto",
+                actual_backend="opencv",
+            )
+            explicit_opencv = decode_cache_key(
+                video_path,
+                "video_gt_triplets",
+                1,
+                None,
+                requested_backend="opencv",
+                actual_backend="opencv",
+            )
+
+            self.assertNotEqual(auto_ffmpeg, auto_opencv)
+            self.assertNotEqual(auto_opencv, explicit_opencv)
 
     def test_run_detail_contains_decode_cache_reuse_copy(self) -> None:
         app_js = (ROOT / "src" / "vfieval" / "web" / "app.js").read_text(encoding="utf-8")

@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import io
 import json
 import os
-from contextlib import redirect_stdout
 from pathlib import Path
 import tempfile
 import threading
@@ -49,8 +47,7 @@ class ServerRequestMaintenanceTests(unittest.TestCase):
                 "https://server/evaluate/secret-campaign-token-123456789"
             )
 
-            output = io.StringIO()
-            with redirect_stdout(output):
+            with patch("vfieval.server.log_event") as logged:
                 _log_evaluation_preparation_results(
                     db,
                     workspace,
@@ -72,21 +69,25 @@ class ServerRequestMaintenanceTests(unittest.TestCase):
                     ],
                 )
 
-            lines = output.getvalue().splitlines()
-            self.assertEqual(len(lines), 2)
-            self.assertEqual(lines[0], "Campaign V2 6 preparation published")
-            self.assertIn("Campaign V2 7 preparation failed: RuntimeError", lines[1])
-            self.assertIn("exit code 32", lines[1])
-            self.assertIn("stderr: encoder stopped", lines[1])
-            self.assertIn("encoder availability", lines[1])
-            self.assertIn("<method>", lines[1])
-            self.assertIn("<path>", lines[1])
-            self.assertIn("<url>", lines[1])
-            self.assertNotIn("Private Method Name", lines[1])
-            self.assertNotIn("secret-campaign-token", lines[1])
-            self.assertNotIn(str(workspace.root), lines[1])
-            self.assertNotIn("evaluations", lines[1])
-            self.assertNotIn("a.mp4", lines[1])
+            self.assertEqual(logged.call_count, 2)
+            published, failed = logged.call_args_list
+            self.assertEqual(published.args[1], "campaign.preparation_published")
+            self.assertEqual(published.kwargs["campaign_id"], 6)
+            self.assertEqual(failed.args[1], "campaign.preparation_failed")
+            self.assertEqual(failed.kwargs["campaign_id"], 7)
+            self.assertEqual(failed.kwargs["error_type"], "RuntimeError")
+            message = failed.args[2]
+            self.assertIn("exit code 32", message)
+            self.assertIn("stderr: encoder stopped", message)
+            self.assertIn("encoder availability", message)
+            self.assertIn("<method>", message)
+            self.assertIn("<path>", message)
+            self.assertIn("<url>", message)
+            self.assertNotIn("Private Method Name", message)
+            self.assertNotIn("secret-campaign-token", message)
+            self.assertNotIn(str(workspace.root), message)
+            self.assertNotIn("evaluations", message)
+            self.assertNotIn("a.mp4", message)
 
     def test_campaign_preparation_loop_logs_only_returned_terminal_results(self) -> None:
         workspace = MagicMock(spec=WorkspaceConfig)
@@ -94,7 +95,6 @@ class ServerRequestMaintenanceTests(unittest.TestCase):
         stop_event = MagicMock(spec=threading.Event)
         stop_event.is_set.side_effect = [False, False, True]
 
-        output = io.StringIO()
         with patch(
             "vfieval.server.run_pending_preparations",
             side_effect=[
@@ -107,13 +107,12 @@ class ServerRequestMaintenanceTests(unittest.TestCase):
         ) as run_pending, patch(
             "vfieval.server.process_campaign_purge_requests_v2",
             return_value=[],
-        ), redirect_stdout(output):
+        ), patch("vfieval.server.log_event") as logged:
             _run_evaluation_preparations_forever(db, workspace, stop_event)
 
-        self.assertEqual(
-            output.getvalue().splitlines(),
-            ["Campaign V2 10 preparation published"],
-        )
+        logged.assert_called_once()
+        self.assertEqual(logged.call_args.args[1], "campaign.preparation_published")
+        self.assertEqual(logged.call_args.kwargs["campaign_id"], 10)
         self.assertEqual(run_pending.call_count, 2)
 
     def test_video_group_gets_are_catalog_snapshots_and_thumbnail_is_lazy(self) -> None:

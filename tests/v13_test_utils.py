@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
+from vfieval.file_inputs import MIDPOINT_TRIPLET_CONTRACT
 from vfieval.pipeline.inference import _write_mp4
 from vfieval.run_cleanup import RunCleanupService
 from vfieval.server import _make_handler
@@ -80,7 +81,11 @@ def add_completed_pred_run(
         "cpu",
         "fp32",
         [],
-        metadata={"output_dir": str(workspace.runs_dir / name), "run_type": "model_inference"},
+        metadata={
+            "output_dir": str(workspace.runs_dir / name),
+            "run_type": "model_inference",
+            "evaluation_contract": MIDPOINT_TRIPLET_CONTRACT,
+        },
     )
     managed_pred_path = workspace.runs_dir / str(run_id) / "videos" / video_name / "pred.mp4"
     managed_pred_path.parent.mkdir(parents=True, exist_ok=True)

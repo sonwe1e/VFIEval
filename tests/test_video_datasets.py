@@ -50,24 +50,31 @@ class VideoDatasetTests(unittest.TestCase):
                 metadata={"frame_step": 1},
             )
 
-            self.assertEqual(scan_dataset(db, workspace, dataset_id), 4)
+            self.assertEqual(scan_dataset(db, workspace, dataset_id), 3)
             dataset = db.get_dataset(dataset_id)
             self.assertEqual(dataset["source_type"], "video")
             self.assertEqual(dataset["video_count"], 1)
             self.assertEqual(dataset["frame_count"], 5)
+            self.assertEqual(
+                dataset["metadata"]["evaluation_contract"], "midpoint-triplet-v2"
+            )
+            self.assertEqual(len(dataset["metadata"]["decoder_reports"]), 1)
+            decoder_report = dataset["metadata"]["decoder_reports"][0]
+            self.assertIn(decoder_report["actual_backend"], {"ffmpeg", "opencv"})
+            self.assertTrue(decoder_report["decoder_identity"])
             self.assertTrue(Path(dataset["decoded_root_path"]).exists())
             samples = db.list_samples(dataset_id)
-            # N - frame_step samples (5 - 1 = 4): the interior 3 keep strict GT
-            # triples; the last is a clamped boundary sample whose gt_path points
-            # at the last source frame so pred/gt videos stay frame-aligned
-            # (the last GT is flagged as approximate in metadata).
-            self.assertEqual(len(samples), 4)
+            # midpoint-triplet-v2 publishes only real symmetric triples:
+            # N - 2*frame_step = 5 - 2 = 3.
+            self.assertEqual(len(samples), 3)
             self.assertTrue(all(sample["gt_path"] for sample in samples))
-            self.assertEqual(
-                [bool(sample.get("metadata", {}).get("clamped_boundary")) for sample in samples],
-                [False, False, False, True],
+            self.assertTrue(
+                all(not sample.get("metadata", {}).get("clamped_boundary") for sample in samples)
             )
             self.assertEqual(samples[0]["metadata"]["decode_mode"], "video_gt_triplets")
+            self.assertEqual(
+                samples[0]["metadata"]["evaluation_contract"], "midpoint-triplet-v2"
+            )
 
             run_id = db.create_run("average-video", model_id, dataset_id, 4, 4, 2, "cpu", "fp32", [])
             run_worker(db, workspace, WorkerOptions(role="inference", once=True, worker_id="video-inference"))
@@ -75,19 +82,12 @@ class VideoDatasetTests(unittest.TestCase):
             run = db.get_run(run_id)
             self.assertEqual(run["status"], "completed")
             inference_job_id = int(run["inference_job_id"])
-            self.assertEqual(len(db.list_artifacts(job_id=inference_job_id, kind="pred")), 4)
-            # pred video is the per-sample pred stitched together (4 frames N-step).
+            self.assertEqual(len(db.list_artifacts(job_id=inference_job_id, kind="pred")), 3)
+            # Pred and GT videos contain only the three trustworthy midpoint samples.
             self.assertEqual(len(db.list_artifacts(job_id=inference_job_id, kind="pred_video")), 1)
-            # gt video is still assembled — the boundary sample keeps a gt_path
-            # (pointing at the clamped last source frame), so pred/gt videos are
-            # frame-aligned despite the last GT being approximate.
             self.assertEqual(len(db.list_artifacts(job_id=inference_job_id, kind="gt_video")), 1)
 
-    def test_video_triplet_count_equals_source_minus_step(self) -> None:
-        # Regression test for the "12 frames produced only 10 preds" bug: after the
-        # fix, an N-frame source produces N - frame_step samples (one interpolated
-        # frame per adjacent pair), with only the last sample being a clamped
-        # boundary pair (metadata flag ``clamped_boundary=True``).
+    def test_video_triplet_count_equals_source_minus_two_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             video_path = root / "clip.avi"
@@ -105,15 +105,43 @@ class VideoDatasetTests(unittest.TestCase):
                 decode_mode="video_gt_triplets",
                 metadata={"frame_step": 1},
             )
-            self.assertEqual(scan_dataset(db, workspace, dataset_id), 11)  # N - step
+            self.assertEqual(scan_dataset(db, workspace, dataset_id), 10)  # N - 2*step
             samples = db.list_samples(dataset_id)
-            self.assertEqual(len(samples), 11)
-            self.assertEqual(
-                [bool(s.get("metadata", {}).get("clamped_boundary")) for s in samples],
-                [False] * 10 + [True],
-            )
-            # All samples carry a gt path so pred and gt videos stay aligned.
+            self.assertEqual(len(samples), 10)
+            self.assertTrue(all(not s.get("metadata", {}).get("clamped_boundary") for s in samples))
             self.assertTrue(all(s["gt_path"] for s in samples))
+
+    def test_frame_step_two_keeps_only_symmetric_triplets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video_path = root / "clip.avi"
+            _write_video(video_path, frames=8)
+            workspace = WorkspaceConfig.from_root(root / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            dataset_id = db.create_dataset(
+                "step-two",
+                str(video_path),
+                has_gt=True,
+                source_type="video",
+                decode_mode="video_gt_triplets",
+                metadata={"frame_step": 2},
+            )
+
+            self.assertEqual(scan_dataset(db, workspace, dataset_id), 4)
+            samples = db.list_samples(dataset_id)
+            self.assertEqual(
+                [
+                    (
+                        sample["metadata"]["img0_index"],
+                        sample["metadata"]["gt_index"],
+                        sample["metadata"]["img1_index"],
+                    )
+                    for sample in samples
+                ],
+                [(0, 2, 4), (1, 3, 5), (2, 4, 6), (3, 5, 7)],
+            )
 
     def test_video_pairs_without_ground_truth(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

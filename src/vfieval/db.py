@@ -66,7 +66,7 @@ def artifact_storage_metadata(
     return result
 
 
-LATEST_SCHEMA_VERSION = "2026-07-media-items-v2-cache-build-locks"
+LATEST_SCHEMA_VERSION = "2026-07-job-heartbeat-leases"
 
 
 RUN_TERMINAL_STATUSES = {"completed", "failed", "canceled"}
@@ -215,6 +215,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     error_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL,
     started_at REAL,
+    heartbeat_at REAL,
     finished_at REAL
 );
 
@@ -899,6 +900,13 @@ class Database:
         }.items():
             if name not in run_columns:
                 conn.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
+        job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+        if "heartbeat_at" not in job_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN heartbeat_at REAL")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_jobs_running_heartbeat "
+            "ON jobs(status, heartbeat_at, started_at, id)"
+        )
         cache_ref_columns = {row["name"] for row in conn.execute("PRAGMA table_info(run_cache_refs)").fetchall()}
         if "released_at" not in cache_ref_columns:
             conn.execute("ALTER TABLE run_cache_refs ADD COLUMN released_at REAL")
@@ -955,7 +963,7 @@ class Database:
             model_id = int(existing["id"])
             with self.connection() as conn:
                 conn.execute(
-                    f"""
+                    """
                     UPDATE models
                     SET adapter = ?,
                         checkpoint_path = ?,
@@ -1730,7 +1738,7 @@ class Database:
             f"""
             SELECT rj.*, j.kind, j.status, j.payload_json, j.worker_id,
                    j.progress_current, j.progress_total, j.result_json, j.error_json,
-                   j.started_at, j.finished_at
+                   j.started_at, j.heartbeat_at, j.finished_at
             FROM run_jobs rj
             JOIN jobs j ON j.id = rj.job_id
             WHERE rj.run_id = ?{clause}
@@ -5025,10 +5033,10 @@ class Database:
             cur = conn.execute(
                 """
                 UPDATE jobs
-                SET status = 'running', worker_id = ?, started_at = ?
+                SET status = 'running', worker_id = ?, started_at = ?, heartbeat_at = ?
                 WHERE id = ? AND status = 'queued'
                 """,
-                (worker_id, now, int(row["id"])),
+                (worker_id, now, now, int(row["id"])),
             )
             if cur.rowcount != 1:
                 conn.commit()
@@ -5044,8 +5052,9 @@ class Database:
         total: int | None = None,
         result: dict[str, Any] | None = None,
     ) -> bool:
-        assignments = ["progress_current = ?"]
-        params: list[Any] = [int(current)]
+        now = utc_ts()
+        assignments = ["progress_current = ?", "heartbeat_at = ?"]
+        params: list[Any] = [int(current), now]
         if total is not None:
             assignments.append("progress_total = ?")
             params.append(int(total))
@@ -5152,17 +5161,354 @@ class Database:
             )
             return bool(cur.rowcount)
 
-    def touch_job(self, job_id: int) -> None:
+    def heartbeat_job(self, job_id: int, worker_id: str) -> bool:
+        """Renew a running Job lease owned by ``worker_id``.
+
+        Worker ownership is a fencing token: a late heartbeat from an old
+        process cannot revive or extend a Job that has been recovered or
+        claimed by another worker.
+        """
         now = utc_ts()
         with self.connection() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """
                 UPDATE jobs
-                SET started_at = COALESCE(started_at, ?)
+                SET started_at = COALESCE(started_at, ?), heartbeat_at = ?
+                WHERE id = ? AND status = 'running' AND worker_id = ?
+                """,
+                (now, now, int(job_id), str(worker_id)),
+            )
+            if cur.rowcount:
+                conn.execute(
+                    "UPDATE workers SET last_seen_at = ? WHERE id = ?",
+                    (now, str(worker_id)),
+                )
+            return bool(cur.rowcount)
+
+    def touch_job(self, job_id: int) -> bool:
+        """Compatibility heartbeat for the existing HTTP worker endpoint.
+
+        New in-process workers use :meth:`heartbeat_job` so lease renewal is
+        owner-fenced.  The legacy endpoint authenticates the worker separately
+        and therefore retains this job-id-only surface until that API changes.
+        """
+        now = utc_ts()
+        with self.connection() as conn:
+            cur = conn.execute(
+                """
+                UPDATE jobs
+                SET started_at = COALESCE(started_at, ?), heartbeat_at = ?
                 WHERE id = ? AND status = 'running'
                 """,
-                (now, job_id),
+                (now, now, int(job_id)),
             )
+            return bool(cur.rowcount)
+
+    def job_lease_summary(
+        self,
+        stale_before: float | None = None,
+        *,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Return a cheap SQLite-only summary for runtime health surfaces."""
+        observed_at = utc_ts() if now is None else float(now)
+        cutoff = observed_at - 90.0 if stale_before is None else float(stale_before)
+        row = self.get(
+            """
+            SELECT
+                COUNT(*) AS running,
+                COALESCE(SUM(
+                    CASE WHEN COALESCE(heartbeat_at, started_at, created_at) < ?
+                         THEN 1 ELSE 0 END
+                ), 0) AS stale,
+                MIN(COALESCE(heartbeat_at, started_at, created_at)) AS oldest_heartbeat_at
+            FROM jobs
+            WHERE status = 'running'
+            """,
+            (cutoff,),
+        ) or {}
+        running = int(row.get("running") or 0)
+        stale = int(row.get("stale") or 0)
+        oldest = row.get("oldest_heartbeat_at")
+        return {
+            "running": running,
+            "fresh": max(0, running - stale),
+            "stale": stale,
+            "oldest_heartbeat_at": float(oldest) if oldest is not None else None,
+            "oldest_heartbeat_age_seconds": (
+                max(0.0, observed_at - float(oldest)) if oldest is not None else None
+            ),
+        }
+
+    def recover_stale_jobs(
+        self,
+        stale_before: float,
+        *,
+        recovered_at: float | None = None,
+        lease_timeout_seconds: float | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Fence stale running Jobs and safely fail their active Runs.
+
+        The stale check is repeated under ``BEGIN IMMEDIATE``.  A heartbeat
+        that commits before the recovery writer lock therefore wins, while a
+        late worker is fenced by the Job's terminal status.  Run failure,
+        root Job failure, queued-sibling cancellation, and media invalidation
+        are committed together.
+        """
+        cutoff = float(stale_before)
+        now = utc_ts() if recovered_at is None else float(recovered_at)
+        batch_limit = max(1, min(int(limit), 1000))
+        candidate_rows = self.query(
+            """
+            SELECT id
+            FROM jobs
+            WHERE status = 'running'
+              AND COALESCE(heartbeat_at, started_at, created_at) < ?
+            ORDER BY COALESCE(heartbeat_at, started_at, created_at), id
+            LIMIT ?
+            """,
+            (cutoff, batch_limit),
+        )
+        recovered: list[dict[str, Any]] = []
+        for candidate in candidate_rows:
+            job_id = int(candidate["id"])
+            with self.connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM jobs
+                    WHERE id = ? AND status = 'running'
+                      AND COALESCE(heartbeat_at, started_at, created_at) < ?
+                    """,
+                    (job_id, cutoff),
+                ).fetchone()
+                if row is None:
+                    continue
+
+                job = dict(row)
+                job["payload"] = _loads(job.get("payload_json"))
+                run_rows = conn.execute(
+                    """
+                    SELECT DISTINCT r.id, r.status, r.inference_job_id,
+                                    r.metric_job_id
+                    FROM runs r
+                    JOIN jobs j ON j.id = ?
+                    LEFT JOIN run_jobs rj
+                      ON rj.run_id = r.id AND rj.job_id = j.id
+                    WHERE rj.job_id IS NOT NULL
+                       OR r.inference_job_id = j.id
+                       OR r.metric_job_id = j.id
+                       OR CAST(json_extract(j.payload_json, '$.run_id') AS INTEGER) = r.id
+                    ORDER BY r.id
+                    """,
+                    (job_id,),
+                ).fetchall()
+                active_runs = [
+                    run_row
+                    for run_row in run_rows
+                    if str(run_row["status"] or "") not in RUN_NON_PROGRESS_STATUSES
+                ]
+                last_heartbeat = (
+                    row["heartbeat_at"]
+                    if row["heartbeat_at"] is not None
+                    else row["started_at"]
+                    if row["started_at"] is not None
+                    else row["created_at"]
+                )
+                kind = str(row["kind"] or "job")
+                error = enrich_job_error(
+                    job,
+                    {
+                        "type": "WorkerLost",
+                        "code": "worker_lost",
+                        "message": (
+                            f"{kind.capitalize()} worker stopped reporting heartbeat; "
+                            "the Job was interrupted safely. Check the worker and device, "
+                            "then retry the Run."
+                        ),
+                        "interrupted": True,
+                        "retryable": True,
+                        "last_heartbeat_at": float(last_heartbeat),
+                        "recovered_at": now,
+                    },
+                )
+                if lease_timeout_seconds is not None:
+                    error["lease_timeout_seconds"] = float(lease_timeout_seconds)
+                if len(run_rows) == 1 and error.get("run_id") is None:
+                    error["run_id"] = int(run_rows[0]["id"])
+
+                if active_runs:
+                    job_cur = conn.execute(
+                        """
+                        UPDATE jobs
+                        SET status = 'failed', error_json = ?, finished_at = ?
+                        WHERE id = ? AND status = 'running'
+                          AND COALESCE(heartbeat_at, started_at, created_at) < ?
+                        """,
+                        (_json(error), now, job_id, cutoff),
+                    )
+                    if job_cur.rowcount != 1:
+                        continue
+                    failed_run_ids: list[int] = []
+                    for run_row in active_runs:
+                        run_id = int(run_row["id"])
+                        metric_phase = str(run_row["status"] or "") in {
+                            "metric_queued",
+                            "metric_running",
+                        }
+                        run_error = dict(error)
+                        run_error["run_id"] = run_id
+                        run_cur = conn.execute(
+                            """
+                            UPDATE runs
+                            SET status = 'failed', error_json = ?,
+                                content_revision = content_revision + 1,
+                                finished_at = ?, updated_at = ?
+                            WHERE id = ?
+                              AND status NOT IN (
+                                  'completed', 'failed', 'cancel_requested', 'canceled'
+                              )
+                            """,
+                            (_json(run_error), now, now, run_id),
+                        )
+                        if run_cur.rowcount != 1:
+                            continue
+                        failed_run_ids.append(run_id)
+                        conn.execute(
+                            """
+                            UPDATE jobs
+                            SET status = 'canceled', error_json = ?, finished_at = ?
+                            WHERE status = 'queued'
+                              AND (
+                                  id IN (SELECT job_id FROM run_jobs WHERE run_id = ?)
+                                  OR id = ? OR id = ?
+                                  OR CAST(json_extract(payload_json, '$.run_id') AS INTEGER) = ?
+                              )
+                            """,
+                            (
+                                _json(
+                                    {
+                                        "message": "sibling shard failed the run",
+                                        "type": "RunCanceled",
+                                    }
+                                ),
+                                now,
+                                run_id,
+                                run_row["inference_job_id"],
+                                run_row["metric_job_id"],
+                                run_id,
+                            ),
+                        )
+                        if not metric_phase:
+                            conn.execute(
+                                """
+                                UPDATE media_assets
+                                SET state = 'unavailable', updated_at = ?
+                                WHERE source_kind = 'run_artifact'
+                                  AND id IN (
+                                      SELECT asset_id FROM run_media_assets
+                                      WHERE run_id = ?
+                                        AND (
+                                            COALESCE(json_extract(metadata_json, '$.input'), 0) != 1
+                                            OR COALESCE(
+                                                json_extract(metadata_json, '$.compare_snapshot'), 0
+                                            ) = 1
+                                        )
+                                  )
+                                """,
+                                (now, run_id),
+                            )
+                    self._converge_recovered_cancel_requests(conn, run_rows, now)
+                    recovered.append(
+                        {
+                            "job_id": job_id,
+                            "run_ids": failed_run_ids,
+                            "action": "failed",
+                            "error": error,
+                        }
+                    )
+                    continue
+
+                terminal_run_statuses = {str(run_row["status"] or "") for run_row in run_rows}
+                if terminal_run_statuses & {"cancel_requested", "canceled"}:
+                    terminal_error = {
+                        "message": "Run cancellation completed while its worker was unavailable",
+                        "type": "RunCanceled",
+                    }
+                elif terminal_run_statuses:
+                    terminal_error = {
+                        "message": "Run already reached a terminal state",
+                        "type": "RunCanceled",
+                    }
+                else:
+                    terminal_error = error
+                terminal_status = "canceled" if run_rows else "failed"
+                cur = conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = ?, error_json = ?, finished_at = ?
+                    WHERE id = ? AND status = 'running'
+                      AND COALESCE(heartbeat_at, started_at, created_at) < ?
+                    """,
+                    (terminal_status, _json(terminal_error), now, job_id, cutoff),
+                )
+                if cur.rowcount != 1:
+                    continue
+                self._converge_recovered_cancel_requests(conn, run_rows, now)
+                recovered.append(
+                    {
+                        "job_id": job_id,
+                        "run_ids": [int(run_row["id"]) for run_row in run_rows],
+                        "action": terminal_status,
+                        "error": terminal_error,
+                    }
+                )
+        return recovered
+
+    @staticmethod
+    def _converge_recovered_cancel_requests(
+        conn: sqlite3.Connection,
+        run_rows: Iterable[sqlite3.Row],
+        now: float,
+    ) -> None:
+        """Finish cancellation after recovery fenced the last running Job."""
+        cancel_error = {"message": "User canceled the Run", "type": "RunCanceled"}
+        for run_row in run_rows:
+            if str(run_row["status"] or "") != "cancel_requested":
+                continue
+            run_id = int(run_row["id"])
+            running = conn.execute(
+                """
+                SELECT 1
+                FROM jobs j
+                WHERE j.status = 'running'
+                  AND (
+                      j.id IN (SELECT job_id FROM run_jobs WHERE run_id = ?)
+                      OR j.id = ? OR j.id = ?
+                      OR CAST(json_extract(j.payload_json, '$.run_id') AS INTEGER) = ?
+                  )
+                LIMIT 1
+                """,
+                (
+                    run_id,
+                    run_row["inference_job_id"],
+                    run_row["metric_job_id"],
+                    run_id,
+                ),
+            ).fetchone()
+            if running is None:
+                conn.execute(
+                    """
+                    UPDATE runs
+                    SET status = 'canceled', error_json = ?,
+                        content_revision = content_revision + 1,
+                        finished_at = ?, updated_at = ?
+                    WHERE id = ? AND status = 'cancel_requested'
+                    """,
+                    (_json(cancel_error), now, now, run_id),
+                )
 
     def add_artifact(
         self,

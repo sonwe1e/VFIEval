@@ -25,6 +25,7 @@
       </aside>
 
     <main class="shell">
+      <div id="deployment-health" class="deployment-health" role="status" aria-live="polite">正在检查服务状态…</div>
       <section id="view-create" class="view active">
         <div class="view-head">
           <h2>新建任务</h2>
@@ -111,8 +112,8 @@
               <label>
                 <span>精度</span>
                 <select name="precision">
-                  <option value="auto">auto</option>
-                  <option value="fp32" selected>fp32</option>
+                  <option value="auto" selected>auto</option>
+                  <option value="fp32">fp32</option>
                   <option value="fp16">fp16</option>
                   <option value="bf16">bf16</option>
                 </select>
@@ -127,11 +128,11 @@
               </label>
               <label>
                 <span>Batch Size</span>
-                <input name="batch_size" type="number" min="1" value="64">
+                <input name="batch_size" type="number" min="1" value="1">
               </label>
               <label>
                 <span>每卡 Batch Size</span>
-                <input name="batch_size_per_device" type="number" min="1" value="64">
+                <input name="batch_size_per_device" type="number" min="1" value="1">
               </label>
               <label>
                 <span>每卡评测 Batch Size</span>

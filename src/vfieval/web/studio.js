@@ -673,9 +673,13 @@
       : "";
     const legacy = Number(campaign.schema_version || 1) < 2;
     const objective = objectiveMetrics(analysis, legacy);
+    const contractWarnings = Array.isArray(campaign.contract_warnings)
+      ? campaign.contract_warnings
+      : (Array.isArray(payload?.contract_warnings) ? payload.contract_warnings : []);
     host.innerHTML = `
       <div class="studio-detail-head"><div><p class="eyebrow">${legacy ? "历史 Campaign" : "Campaign V2"}</p><h3>${safe(campaign.name)}</h3><p class="muted">${safe(campaign.public_title || campaign.metadata?.public_title || "匿名视频质量评测")}</p></div><span class="studio-status">${safe(campaignStatus(campaign))}</span></div>
       ${legacy ? "<div class=\"message warn\"><p>旧 schema v1 Campaign 只读保留；可继续导出，不会按标签猜测迁移。</p></div>" : ""}
+      ${contractWarnings.length ? `<div class="message warn evaluation-contract-warning"><p>该历史 Campaign 的源 Run 不满足当前 midpoint-triplet-v2 评测契约；现有结果保持只读，请按提示重新运行源实验后再创建新 Campaign。</p><p>${safe(contractWarnings.join("；"))}</p></div>` : ""}
       ${preparationProgressMarkup(progress, campaign)}
       ${progress.error?.message || campaign.preparation_error?.message ? `<div class="message error"><p>${safe(progress.error?.message || campaign.preparation_error?.message)}</p></div>` : ""}
       <div class="summary-grid"><div><span>视频</span><strong>${Number(coverage.items || campaign.item_count || 0)}</strong></div><div><span>任务</span><strong>${Number(coverage.tasks || campaign.task_count || 0)}</strong></div><div><span>投票</span><strong>${Number(coverage.votes || campaign.vote_count || 0)}</strong></div><div><span>目标票数/视频</span><strong>${Number(campaign.target_votes || 0)}</strong></div></div>

@@ -68,7 +68,7 @@ from vfieval.media_items import (
     register_external_prediction,
 )
 from vfieval.run_cleanup import RunCleanupService
-from vfieval.pipeline.evaluation_freeze import FreezeBackendUnavailable
+from vfieval.pipeline.evaluation_freeze import FreezeBackendUnavailable, FreezeCancelled
 
 from v13_test_utils import add_completed_pred_run, make_workspace, write_mp4
 
@@ -643,6 +643,67 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
         }
         return run_a, run_b, body, (gt_path, pred_a, pred_b)
 
+    def test_legacy_run_contract_is_visible_and_blocks_new_campaign(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            run_a, _run_b, body, _paths = self._two_runs(workspace, db)
+            metadata = dict(db.get_run(run_a).get("metadata") or {})
+            metadata.pop("evaluation_contract", None)
+            with db.connection() as conn:
+                conn.execute(
+                    "UPDATE runs SET metadata_json = ? WHERE id = ?",
+                    (json.dumps(metadata), run_a),
+                )
+
+            outputs = {row["run_id"]: row for row in list_run_outputs(db)}
+            self.assertEqual(
+                outputs[run_a]["evaluation_contract"]["status"],
+                "legacy_missing_contract",
+            )
+            with self.assertRaisesRegex(ValueError, "midpoint-triplet-v2"):
+                preview_campaign_v2(db, workspace, body)
+
+            metadata["evaluation_contract"] = "midpoint-triplet-v2"
+            dataset_id = int(db.get_run(run_a)["dataset_id"])
+            sample = db.get(
+                "SELECT id, metadata_json FROM samples WHERE dataset_id = ? LIMIT 1",
+                (dataset_id,),
+            )
+            assert sample is not None
+            sample_metadata = json.loads(sample["metadata_json"])
+            sample_metadata["clamped_boundary"] = True
+            with db.connection() as conn:
+                conn.execute(
+                    "UPDATE runs SET metadata_json = ? WHERE id = ?",
+                    (json.dumps(metadata), run_a),
+                )
+                conn.execute(
+                    "UPDATE samples SET metadata_json = ? WHERE id = ?",
+                    (json.dumps(sample_metadata), int(sample["id"])),
+                )
+            outputs = {row["run_id"]: row for row in list_run_outputs(db)}
+            self.assertEqual(
+                outputs[run_a]["evaluation_contract"]["status"],
+                "untrusted_clamped_boundary",
+            )
+
+    def test_publish_rechecks_contract_without_mutating_draft(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            run_a, _run_b, body, _paths = self._two_runs(workspace, db)
+            draft = create_campaign_v2(db, workspace, body)
+            metadata = dict(db.get_run(run_a).get("metadata") or {})
+            metadata.pop("evaluation_contract", None)
+            with db.connection() as conn:
+                conn.execute(
+                    "UPDATE runs SET metadata_json = ? WHERE id = ?",
+                    (json.dumps(metadata), run_a),
+                )
+
+            with self.assertRaisesRegex(ValueError, "midpoint-triplet-v2"):
+                request_publish_campaign_v2(db, int(draft["id"]))
+            self.assertEqual(get_campaign_v2(db, int(draft["id"]))["status"], "draft")
+
     def _item_campaign(
         self,
         workspace,
@@ -795,6 +856,50 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
         )
         return plan, sources
 
+    def test_service_shutdown_requeues_active_preparation_before_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _item, body, _paths = self._item_campaign(workspace, db)
+            campaign = create_campaign_v2(db, workspace, body)
+            campaign_id = int(campaign["id"])
+            request_publish_campaign_v2(db, campaign_id, workspace)
+            stop = threading.Event()
+            entered = threading.Event()
+            results: list[dict] = []
+
+            def blocked_stage(*_args, cancel_check=None, **_kwargs):
+                entered.set()
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    if cancel_check is not None and cancel_check():
+                        raise FreezeCancelled("test service shutdown")
+                    time.sleep(0.01)
+                raise AssertionError("preparation did not receive the shutdown cancellation")
+
+            with patch("vfieval.evaluations_v2._stage_item_campaign_media", side_effect=blocked_stage):
+                thread = threading.Thread(
+                    target=lambda: results.extend(
+                        run_pending_preparations(
+                            db,
+                            workspace,
+                            limit=1,
+                            cancel_check=stop.is_set,
+                        )
+                    )
+                )
+                thread.start()
+                self.assertTrue(entered.wait(5))
+                stop.set()
+                thread.join(timeout=5)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(results[0]["status"], "interrupted")
+            self.assertEqual(get_campaign_v2(db, campaign_id)["status"], "preparing")
+            preparation = get_preparation_v2(db, campaign_id)
+            self.assertEqual(preparation["state"], "queued")
+            self.assertTrue(preparation["error"]["retryable"])
+            self.assertFalse((workspace.evaluations_dir / str(campaign_id)).exists())
+
     def test_item_mode_publish_materializes_three_streams_and_frozen_members(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace, db = make_workspace(tmp)
@@ -809,11 +914,13 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             self.assertTrue(plan["sources"]["pred_b"]["aspect_changed"])
 
             draft = create_campaign_v2(db, workspace, body)
+            self.assertEqual(draft["config"]["evaluation_contract"], "midpoint-triplet-v2")
             published = publish_campaign_v2(db, workspace, int(draft["id"]))
             self.assertEqual(published["status"], "published")
             self.assertEqual(published["tasks"], 1)
             package = workspace.evaluations_dir / str(draft["id"])
             manifest = json.loads((package / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["evaluation_contract"], "midpoint-triplet-v2")
             manifest_item = manifest["items"][0]
             self.assertEqual(manifest_item["media_item_id"], int(item["id"]))
             self.assertEqual(manifest_item["alignment_fingerprint"], plan["fingerprint"])

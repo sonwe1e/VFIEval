@@ -18,6 +18,7 @@ from vfieval.config import WorkspaceConfig
 from vfieval.db import Database, utc_ts
 from vfieval.file_inputs import VIDEO_SUFFIXES
 from vfieval.media_assets import get_collection, inspect_uploaded_video, slugify, upsert_asset
+from vfieval.storage_budget import ensure_storage_capacity
 
 
 UPLOAD_CHUNK_SIZE = 8 * 1024 * 1024
@@ -77,6 +78,7 @@ def create_upload_session(db: Database, workspace: WorkspaceConfig, body: dict[s
     )
     if int((usage or {}).get("bytes") or 0) + expected_size > UPLOAD_COLLECTION_QUOTA_BYTES:
         raise ValueError(f"collection upload quota of {UPLOAD_COLLECTION_QUOTA_BYTES} bytes would be exceeded")
+    ensure_storage_capacity(db, workspace, requested_bytes=expected_size)
     if media_kind == "video" and Path(original_name).suffix.lower() not in VIDEO_SUFFIXES:
         raise ValueError("uploaded video has an unsupported file extension")
     if media_kind == "frame_sequence":

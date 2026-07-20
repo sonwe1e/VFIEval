@@ -27,10 +27,14 @@ from vfieval.compare_inputs import (
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
 from vfieval.file_inputs import (
+    MIDPOINT_TRIPLET_CONTRACT,
     VIDEO_SUFFIXES,
+    decode_backend_candidates,
+    decode_backend_identity,
     decode_cache_dir,
     decode_cache_key,
     file_sha256,
+    normalize_decode_backend,
 )
 from vfieval.run_cleanup import cache_lease, decode_cache_build_lock
 
@@ -76,6 +80,10 @@ ProgressCallback = Callable[[dict[str, Any]], None]
 
 class DecodeCacheBuildError(RuntimeError):
     """A recoverable decode-cache coordination or publish failure."""
+
+
+class VideoDecodeBackendError(RuntimeError):
+    """The selected decoder could not decode this source video."""
 
 
 class VideoEntry:
@@ -178,32 +186,45 @@ def scan_video_dataset(
     decoded_root.mkdir(parents=True, exist_ok=True)
     added = 0
     decoded_frames = 0
-    decode_results: list[tuple[str, list[Path], float, list[float], dict[str, Any]] | None] = [None for _ in videos]
+    decode_results: list[
+        tuple[str, list[Path], float, list[float | None], dict[str, Any]] | None
+    ] = [None for _ in videos]
     progress_counts = [0 for _ in videos]
     cache_hits = 0
     cache_misses = 0
     cache_hit_videos: list[str] = []
     cache_miss_videos: list[str] = []
+    decoder_reports: list[dict[str, Any]] = []
     lock = Lock()
 
-    def decode_one(video_index: int, entry: "VideoEntry") -> tuple[str, list[Path], float, list[float], dict[str, Any]]:
+    def decode_one(
+        video_index: int,
+        entry: "VideoEntry",
+    ) -> tuple[str, list[Path], float, list[float | None], dict[str, Any]]:
         video_path = entry.path
-        cache_key = decode_cache_key(video_path, decode_mode, frame_step, max_frames)
         local_cache_hit = False
+        local_cache_miss = False
 
         def on_decode_progress(event: dict[str, Any]) -> None:
-            nonlocal cache_hits, cache_misses, local_cache_hit
+            nonlocal cache_hits, cache_misses, local_cache_hit, local_cache_miss
             if progress_callback is None:
                 return
             frames_done = int(event.get("frames") or 0)
             with lock:
                 progress_counts[video_index] = frames_done
                 if event.get("event") == "cache_hit" and not local_cache_hit:
+                    if local_cache_miss:
+                        local_cache_miss = False
+                        cache_misses = max(0, cache_misses - 1)
+                        try:
+                            cache_miss_videos.remove(entry.display_name)
+                        except ValueError:
+                            pass
                     local_cache_hit = True
                     cache_hits += 1
                     cache_hit_videos.append(entry.display_name)
-                elif event.get("event") == "cache_miss" and not event.get("_cache_miss_counted"):
-                    event["_cache_miss_counted"] = True
+                elif event.get("event") == "cache_miss" and not local_cache_miss:
+                    local_cache_miss = True
                     cache_misses += 1
                     cache_miss_videos.append(entry.display_name)
                 payload = {
@@ -219,11 +240,10 @@ def scan_video_dataset(
                 }
             progress_callback(payload)
 
-        frames, fps, timestamps, decode_info = _decode_video_cached(
+        cache_key, frames, fps, timestamps, decode_info = _decode_video_with_backend_cache(
             db,
             workspace,
             video_path,
-            cache_key,
             max_frames,
             decode_mode,
             frame_step,
@@ -247,6 +267,26 @@ def scan_video_dataset(
         if result is None:
             raise RuntimeError(f"video decode did not produce a result: {entry.path.name}")
         cache_key, frames, fps, timestamps, decode_info = result
+        decoder_reports.append(
+            {
+                "video_file": entry.video_file,
+                "cache_key": cache_key,
+                "requested_backend": str(
+                    decode_info.get("requested_backend") or decode_backend
+                ),
+                "actual_backend": str(
+                    decode_info.get("manifest_backend")
+                    or decode_info.get("backend")
+                    or "unknown"
+                ),
+                "decoder_identity": decode_info.get("decoder_identity"),
+                "cache_hit": bool(decode_info.get("cache_hit")),
+                "fallback_reason": decode_info.get("fallback_reason"),
+                "timestamps_available": bool(
+                    decode_info.get("timestamps_available")
+                ),
+            }
+        )
         decoded_frames += len(frames)
         if decode_mode == "video_gt_triplets":
             added += _add_video_triplets(
@@ -287,6 +327,12 @@ def scan_video_dataset(
             "selected_videos": [entry.video_file for entry in entries],
             "decode_mode": decode_mode,
             "decode_backend": decode_backend,
+            "decoder_reports": decoder_reports,
+            "evaluation_contract": (
+                MIDPOINT_TRIPLET_CONTRACT
+                if decode_mode == "video_gt_triplets"
+                else None
+            ),
         },
     )
     return added
@@ -643,25 +689,17 @@ def _add_video_triplets(
     frames: list[Path],
     frame_step: int,
     fps: float,
-    timestamps: list[float],
+    timestamps: list[float | None],
     cache_key: str,
 ) -> int:
     added = 0
     if len(frames) < 2 * frame_step + 1:
         return 0
-    # Produce N-step samples (one interpolated frame per adjacent source pair)
-    # so the predicted video is N-1 frames long — matching the visualization
-    # and comparison expectation. Interior samples keep the symmetric triple
-    # (img0=i, gt=i+step, img1=i+2*step). Boundary samples clamp the trailing
-    # anchor to the last frame; the boundary sample's pred is a blend between
-    # the last two source frames (no true midpoint GT exists). gt_path here
-    # points at ``frames[gt_index]`` (= the clamped last source frame) so
-    # gt_video stays frame-aligned with pred_video; a metadata flag marks the
-    # sample as clamped so its GT is understood as an approximation.
-    for sample_index, img0_index in enumerate(range(0, len(frames) - frame_step)):
+    # Only publish real symmetric triples. A trailing pair without a distinct
+    # midpoint GT is not a full-reference evaluation sample.
+    for sample_index, img0_index in enumerate(range(0, len(frames) - 2 * frame_step)):
         gt_index = img0_index + frame_step
-        img1_index = min(img0_index + 2 * frame_step, len(frames) - 1)
-        is_clamped_boundary = img0_index + 2 * frame_step > len(frames) - 1
+        img1_index = img0_index + 2 * frame_step
         name = f"{video_index:03d}_{entry.sample_token}_{sample_index:06d}"
         db.add_sample(
             dataset_id=dataset_id,
@@ -680,7 +718,6 @@ def _add_video_triplets(
                 fps,
                 timestamps,
                 cache_key,
-                clamped_boundary=is_clamped_boundary,
             ),
         )
         added += 1
@@ -695,7 +732,7 @@ def _add_video_pairs(
     frames: list[Path],
     frame_step: int,
     fps: float,
-    timestamps: list[float],
+    timestamps: list[float | None],
     cache_key: str,
 ) -> int:
     added = 0
@@ -875,23 +912,16 @@ def _load_compare_source_frames_with_cache(
             raise ValueError(
                 "compare source video changed while its content signature was being read"
             )
-        cache_key = decode_cache_key(
-            source_path,
-            cache_prefix,
-            1,
-            None,
-            content_sha256=source_sha256,
-        )
         identity_seconds = time.monotonic() - identity_started
         decode_started = time.monotonic()
-        frames, fps, timestamps, decode_info = _decode_video_cached(
+        cache_key, frames, fps, timestamps, decode_info = _decode_video_with_backend_cache(
             db,
             workspace,
             source_path,
-            cache_key,
             None,
             cache_prefix,
             1,
+            content_sha256=source_sha256,
         )
         decode_seconds = time.monotonic() - decode_started
         stat_after_decode = source_path.stat()
@@ -917,6 +947,12 @@ def _load_compare_source_frames_with_cache(
                 "source_hash_seconds": 0.0 if trusted_identity else identity_seconds,
                 "decode_seconds": decode_seconds,
                 "cache_hit": bool(decode_info.get("cache_hit")),
+                "decode_backend": (
+                    decode_info.get("manifest_backend") or decode_info.get("backend")
+                ),
+                "decode_backend_request": decode_info.get("requested_backend"),
+                "decoder_identity": decode_info.get("decoder_identity"),
+                "timestamps_available": bool(decode_info.get("timestamps_available")),
             },
         )
     if source_path.is_dir():
@@ -925,6 +961,84 @@ def _load_compare_source_frames_with_cache(
             raise FileNotFoundError(f"frame directory has no supported images: {source_path}")
         return frames, None, [None for _ in frames], None
     raise ValueError(f"unsupported compare source: {source_path}")
+
+
+def _decode_video_with_backend_cache(
+    db: Database,
+    workspace: WorkspaceConfig,
+    video_path: Path,
+    max_frames: int | None,
+    decode_mode: str,
+    frame_step: int,
+    progress_callback: ProgressCallback | None = None,
+    decode_backend: str = "auto",
+    *,
+    content_sha256: str | None = None,
+) -> tuple[str, list[Path], float, list[float | None], dict[str, Any]]:
+    """Resolve an auto request into backend-specific cache identities.
+
+    FFmpeg and OpenCV never publish into the same key. An ``auto`` request
+    tries the FFmpeg identity first and only then opens the independently
+    keyed OpenCV cache/build path.
+    """
+
+    requested = normalize_decode_backend(decode_backend)
+    source_sha256 = str(content_sha256 or file_sha256(video_path))
+    fallback_reason: str | None = None
+    for actual in decode_backend_candidates(requested):
+        cache_key = decode_cache_key(
+            video_path,
+            decode_mode,
+            frame_step,
+            max_frames,
+            content_sha256=source_sha256,
+            requested_backend=requested,
+            actual_backend=actual,
+        )
+        try:
+            frames, fps, timestamps, decode_info = _decode_video_cached(
+                db,
+                workspace,
+                video_path,
+                cache_key,
+                max_frames,
+                decode_mode,
+                frame_step,
+                progress_callback=progress_callback,
+                decode_backend=actual,
+                requested_decode_backend=requested,
+                decoder_identity=decode_backend_identity(actual),
+                decode_fallback_reason=fallback_reason,
+            )
+            if fallback_reason and not decode_info.get("fallback_reason"):
+                decode_info["fallback_reason"] = fallback_reason
+            decode_info["requested_backend"] = requested
+            decode_info["decoder_identity"] = decode_backend_identity(actual)
+            decode_info.setdefault(
+                "timestamps_available",
+                bool(timestamps)
+                and all(
+                    value is not None and math.isfinite(float(value))
+                    for value in timestamps
+                ),
+            )
+            return cache_key, frames, fps, timestamps, decode_info
+        except DecodeCacheBuildError:
+            raise
+        except RuntimeError as exc:
+            if requested != "auto" or actual != "ffmpeg":
+                raise
+            fallback_reason = f"ffmpeg unavailable or failed: {exc}"
+            if progress_callback:
+                progress_callback(
+                    {
+                        "event": "fallback",
+                        "backend": "opencv",
+                        "fallback_reason": fallback_reason,
+                        "frames": 0,
+                    }
+                )
+    raise RuntimeError("no decode backend is available")
 
 
 def _decode_video_cached(
@@ -937,7 +1051,11 @@ def _decode_video_cached(
     frame_step: int,
     progress_callback: ProgressCallback | None = None,
     decode_backend: str = "auto",
-) -> tuple[list[Path], float, list[float], dict[str, Any]]:
+    *,
+    requested_decode_backend: str | None = None,
+    decoder_identity: dict[str, Any] | None = None,
+    decode_fallback_reason: str | None = None,
+) -> tuple[list[Path], float, list[float | None], dict[str, Any]]:
     output_dir = decode_cache_dir(workspace, cache_key)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
 
@@ -999,8 +1117,24 @@ def _decode_video_cached(
                     decode_backend=decode_backend,
                     progress_callback=progress_callback,
                 )
+                reported_backend = str(decode_info.get("backend") or "")
+                if decoder_identity is not None and reported_backend != decode_backend:
+                    raise VideoDecodeBackendError(
+                        "decoder result backend does not match its cache identity: "
+                        f"expected {decode_backend}, got {reported_backend or '<missing>'}"
+                    )
+                if decode_fallback_reason:
+                    decode_info["fallback_reason"] = decode_fallback_reason
                 width, height = _frame_size(frames[0]) if frames else (0, 0)
                 final_frames = [output_dir / path.name for path in frames]
+                available_timestamps = bool(timestamps) and all(
+                    value is not None and math.isfinite(float(value)) for value in timestamps
+                )
+                duration_seconds = (
+                    max(0.0, float(timestamps[-1]) - float(timestamps[0]))
+                    if available_timestamps
+                    else (len(frames) / fps if fps > 0 else 0.0)
+                )
                 manifest = {
                     "video_name": video_path.stem,
                     "video_file": video_path.name,
@@ -1012,15 +1146,37 @@ def _decode_video_cached(
                     "frame_count": len(frames),
                     "width": width,
                     "height": height,
-                    "duration_seconds": float(timestamps[-1]) if timestamps else (len(frames) / fps if fps > 0 else 0.0),
-                    "valid_triplets": max(0, len(frames) - frame_step),
+                    "duration_seconds": duration_seconds,
+                    "valid_triplets": max(0, len(frames) - 2 * frame_step),
+                    "evaluation_contract": (
+                        MIDPOINT_TRIPLET_CONTRACT
+                        if decode_mode == "video_gt_triplets"
+                        else None
+                    ),
                     "decode_status": "completed",
                     "decode_mode": decode_mode,
                     "frame_step": frame_step,
                     "max_frames": max_frames,
                     "decode_backend": decode_info.get("backend"),
+                    "decode_backend_request": normalize_decode_backend(
+                        requested_decode_backend or decode_backend
+                    ),
+                    "decoder_identity": decoder_identity
+                    or {
+                        "backend": str(decode_info.get("backend") or decode_backend),
+                        "executable": "",
+                        "version": "unspecified-direct-cache-call",
+                    },
                     "decode_fallback_reason": decode_info.get("fallback_reason"),
+                    "timestamps_available": available_timestamps,
+                    "timestamps_unavailable_reason": (
+                        None
+                        if available_timestamps
+                        else "decoder did not expose one finite timestamp per decoded frame"
+                    ),
                     "color": "RGB",
+                    "color_policy": "decoded-rgb-png-v1",
+                    "rotation_policy": "backend-native-auto-rotation-v1",
                 }
                 (staging_dir / "manifest.json").write_text(
                     json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -1068,14 +1224,17 @@ def _decode_video_cached(
 
 
 def _decode_cache_hit_result(
-    cached: tuple[list[Path], float, list[float], dict[str, Any]],
+    cached: tuple[list[Path], float, list[float | None], dict[str, Any]],
     progress_callback: ProgressCallback | None,
-) -> tuple[list[Path], float, list[float], dict[str, Any]]:
+) -> tuple[list[Path], float, list[float | None], dict[str, Any]]:
     frames, fps, timestamps, manifest = cached
     decode_info = {
         "backend": "cache",
         "manifest_backend": manifest.get("decode_backend"),
         "fallback_reason": manifest.get("decode_fallback_reason"),
+        "requested_backend": manifest.get("decode_backend_request"),
+        "decoder_identity": manifest.get("decoder_identity"),
+        "timestamps_available": bool(manifest.get("timestamps_available")),
         "cache_hit": True,
     }
     if progress_callback:
@@ -1094,7 +1253,7 @@ def _decode_cache_hit_result(
 def _read_valid_decode_cache(
     output_dir: Path,
     cache_key: str,
-) -> tuple[list[Path], float, list[float], dict[str, Any]] | None:
+) -> tuple[list[Path], float, list[float | None], dict[str, Any]] | None:
     """Return a completed cache only when its manifest and every frame agree."""
     manifest_path = output_dir / "manifest.json"
     if not manifest_path.is_file():
@@ -1112,8 +1271,8 @@ def _read_valid_decode_cache(
         fps = float(manifest.get("fps") or 24.0)
         if not math.isfinite(fps) or fps <= 0:
             return None
-        timestamps = [float(value) for value in raw_timestamps]
-        if not all(math.isfinite(value) for value in timestamps):
+        timestamps = [None if value is None else float(value) for value in raw_timestamps]
+        if not all(value is None or math.isfinite(value) for value in timestamps):
             return None
         root = output_dir.resolve()
         frames = [Path(str(value)).resolve() for value in raw_frames]
@@ -1166,7 +1325,7 @@ def _publish_decode_staging(
     staging_dir: Path,
     output_dir: Path,
     cache_key: str,
-) -> tuple[list[Path], float, list[float], dict[str, Any]] | None:
+) -> tuple[list[Path], float, list[float | None], dict[str, Any]] | None:
     """Publish a private staging directory, accepting a valid concurrent winner."""
     try:
         staging_dir.rename(output_dir)
@@ -1205,8 +1364,8 @@ def _decode_video(
     max_frames: int | None,
     decode_backend: str = "auto",
     progress_callback: ProgressCallback | None = None,
-) -> tuple[list[Path], float, list[float], dict[str, Any]]:
-    requested = str(decode_backend or "auto")
+) -> tuple[list[Path], float, list[float | None], dict[str, Any]]:
+    requested = normalize_decode_backend(decode_backend)
     fallback_reason = None
     if requested in {"auto", "ffmpeg"}:
         try:
@@ -1214,7 +1373,7 @@ def _decode_video(
             return frames, fps, timestamps, {"backend": "ffmpeg", "fallback_reason": None}
         except Exception as exc:
             if requested == "ffmpeg":
-                raise
+                raise VideoDecodeBackendError(f"ffmpeg decode failed: {exc}") from exc
             fallback_reason = f"ffmpeg unavailable or failed: {exc}"
             _clear_decoded_frames(output_dir)
             if progress_callback:
@@ -1271,7 +1430,7 @@ def _decode_video_ffmpeg(
     output_dir: Path,
     max_frames: int | None,
     progress_callback: ProgressCallback | None = None,
-) -> tuple[list[Path], float, list[float]]:
+) -> tuple[list[Path], float, list[float | None]]:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise RuntimeError("ffmpeg is not on PATH")
@@ -1354,10 +1513,82 @@ def _decode_video_ffmpeg(
     fps = _ffmpeg_reported_fps(stderr) or _probe_video_fps(video_path)
     if not math.isfinite(fps) or fps <= 0:
         fps = 24.0
-    timestamps = [index / fps for index in range(len(frames))]
+    probed_timestamps = _probe_video_frame_timestamps(video_path, max_frames=max_frames)
+    timestamps: list[float | None]
+    if probed_timestamps is not None and len(probed_timestamps) == len(frames):
+        timestamps = list(probed_timestamps)
+    else:
+        # Frame index / FPS is not evidence of a real presentation timestamp,
+        # especially for VFR sources. Preserve unavailability explicitly.
+        timestamps = [None for _ in frames]
     if progress_callback:
         progress_callback({"event": "video_done", "backend": "ffmpeg", "frames": len(frames)})
     return frames, fps, timestamps
+
+
+def _probe_video_frame_timestamps(
+    video_path: Path,
+    *,
+    max_frames: int | None = None,
+) -> list[float] | None:
+    """Return one real ffprobe PTS per decoded video frame when available."""
+
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_frames",
+        "-show_entries",
+        "frame=best_effort_timestamp_time,pts_time",
+        "-of",
+        "json",
+    ]
+    if max_frames is not None:
+        # Allow a small reorder/lookahead margin for codecs with B-frames while
+        # avoiding a full-file probe when inference intentionally truncates.
+        command.extend(["-read_intervals", f"%+#{int(max_frames) + 32}"])
+    command.append(str(video_path))
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    try:
+        payload = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    rows = payload.get("frames") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return None
+    if max_frames is not None:
+        rows = rows[: int(max_frames)]
+    timestamps: list[float] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            return None
+        raw = row.get("best_effort_timestamp_time")
+        if raw in {None, "", "N/A"}:
+            raw = row.get("pts_time")
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        timestamps.append(value)
+    return timestamps or None
 
 
 def _ffmpeg_reported_fps(stderr: str) -> float | None:
@@ -1463,10 +1694,8 @@ def _video_sample_metadata(
     img1_index: int,
     gt_index: int | None,
     fps: float,
-    timestamps: list[float],
+    timestamps: list[float | None],
     cache_key: str,
-    *,
-    clamped_boundary: bool = False,
 ) -> dict[str, Any]:
     video_path = entry.path
     metadata: dict[str, Any] = {
@@ -1491,11 +1720,10 @@ def _video_sample_metadata(
         metadata["gt_index"] = gt_index
         metadata["frame_index"] = gt_index
         metadata["timestamps"]["gt"] = timestamps[gt_index] if gt_index < len(timestamps) else None
+        metadata["evaluation_contract"] = MIDPOINT_TRIPLET_CONTRACT
     else:
         # video_pairs path: no GT frame exists, report frame position as img0.
         metadata["frame_index"] = img0_index
-    if clamped_boundary:
-        metadata["clamped_boundary"] = True
     return metadata
 
 

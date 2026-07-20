@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import unittest
@@ -14,12 +16,19 @@ from PIL import Image
 from vfieval.config import WorkspaceConfig
 from vfieval.datasets import (
     _decode_video_cached,
+    _decode_video_with_backend_cache,
     _ffmpeg_reported_fps,
     _load_compare_source_frames_with_cache,
+    _probe_video_frame_timestamps,
     _publish_decode_staging,
 )
 from vfieval.db import Database
-from vfieval.file_inputs import decode_cache_dir, decode_cache_key
+from vfieval.file_inputs import (
+    _binary_sha256,
+    decode_backend_identity,
+    decode_cache_dir,
+    decode_cache_key,
+)
 
 
 def _workspace(tmp: str) -> tuple[WorkspaceConfig, Database]:
@@ -59,8 +68,191 @@ Output #0, image2, to '%06d.png':
 """
         self.assertEqual(_ffmpeg_reported_fps(report), 23.98)
 
+    def test_frame_timestamps_come_from_ffprobe_pts(self) -> None:
+        payload = json.dumps(
+            {
+                "frames": [
+                    {"best_effort_timestamp_time": "0.125"},
+                    {"best_effort_timestamp_time": "0.170"},
+                    {"pts_time": "0.260"},
+                ]
+            }
+        )
+        with patch("vfieval.datasets.shutil.which", return_value="ffprobe"), patch(
+            "vfieval.datasets.subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout=payload, stderr=""),
+        ):
+            timestamps = _probe_video_frame_timestamps(Path("clip.mp4"), max_frames=2)
+
+        self.assertEqual(timestamps, [0.125, 0.17])
+
+    def test_missing_frame_pts_is_reported_as_unavailable(self) -> None:
+        payload = json.dumps(
+            {"frames": [{"best_effort_timestamp_time": "0.0"}, {}]}
+        )
+        with patch("vfieval.datasets.shutil.which", return_value="ffprobe"), patch(
+            "vfieval.datasets.subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout=payload, stderr=""),
+        ):
+            timestamps = _probe_video_frame_timestamps(Path("clip.mp4"))
+
+        self.assertIsNone(timestamps)
+
 
 class DecodeCacheCoordinationTests(unittest.TestCase):
+    def test_same_path_decoder_replacement_changes_identity_and_cache_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "clip.mp4"
+            ffmpeg = root / "ffmpeg.exe"
+            ffprobe = root / "ffprobe.exe"
+            replacement = root / "ffmpeg-new.exe"
+            video.write_bytes(b"source video")
+            ffmpeg.write_bytes(b"decoder-generation-one")
+            ffprobe.write_bytes(b"timestamp-probe")
+
+            def locate(command: str) -> str | None:
+                return {
+                    "ffmpeg": str(ffmpeg),
+                    "ffprobe": str(ffprobe),
+                }.get(command)
+
+            version_result = SimpleNamespace(
+                returncode=0,
+                stdout="ffmpeg version fixture\n",
+                stderr="",
+            )
+            with (
+                patch("vfieval.file_inputs.shutil.which", side_effect=locate),
+                patch("vfieval.file_inputs.subprocess.run", return_value=version_result),
+                patch(
+                    "vfieval.file_inputs._binary_sha256",
+                    wraps=_binary_sha256,
+                ) as binary_sha256,
+            ):
+                first_identity = decode_backend_identity("ffmpeg")
+                unchanged_identity = decode_backend_identity("ffmpeg")
+                first_key = decode_cache_key(
+                    video,
+                    "video_gt_triplets",
+                    1,
+                    None,
+                    actual_backend="ffmpeg",
+                )
+
+                self.assertEqual(first_identity, unchanged_identity)
+                self.assertEqual(binary_sha256.call_count, 2)
+
+                original_stat = ffmpeg.stat()
+                replacement.write_bytes(b"decoder-generation-two")
+                os.utime(
+                    replacement,
+                    ns=(
+                        original_stat.st_atime_ns,
+                        original_stat.st_mtime_ns + 2_000_000_000,
+                    ),
+                )
+                os.replace(replacement, ffmpeg)
+
+                second_identity = decode_backend_identity("ffmpeg")
+                second_key = decode_cache_key(
+                    video,
+                    "video_gt_triplets",
+                    1,
+                    None,
+                    actual_backend="ffmpeg",
+                )
+
+            self.assertEqual(first_identity["executable"], second_identity["executable"])
+            self.assertEqual(first_identity["executable_size"], second_identity["executable_size"])
+            self.assertNotEqual(
+                first_identity["executable_sha256"],
+                second_identity["executable_sha256"],
+            )
+            self.assertEqual(len(second_identity["executable_sha256"]), 64)
+            self.assertNotEqual(first_key, second_key)
+            self.assertEqual(binary_sha256.call_count, 3)
+
+    def test_auto_fallback_uses_a_separate_opencv_cache_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = _workspace(tmp)
+            video = Path(tmp) / "clip.mp4"
+            video.write_bytes(b"source")
+            calls = []
+
+            def cached(_db, _workspace, _video, cache_key, _max_frames, _mode, _step, **kwargs):
+                backend = kwargs["decode_backend"]
+                calls.append((backend, cache_key))
+                if backend == "ffmpeg":
+                    raise RuntimeError("unsupported fixture codec")
+                return [Path(tmp) / "frame.png"], 5.0, [0.0], {
+                    "backend": "opencv",
+                    "cache_hit": True,
+                }
+
+            with patch("vfieval.datasets._decode_video_cached", side_effect=cached):
+                cache_key, _frames, _fps, _timestamps, info = (
+                    _decode_video_with_backend_cache(
+                        db,
+                        workspace,
+                        video,
+                        None,
+                        "test-auto-fallback",
+                        1,
+                    )
+                )
+
+            self.assertEqual([backend for backend, _key in calls], ["ffmpeg", "opencv"])
+            self.assertNotEqual(calls[0][1], calls[1][1])
+            self.assertEqual(cache_key, calls[1][1])
+            self.assertIn("unsupported fixture codec", info["fallback_reason"])
+
+    def test_unavailable_pts_remain_null_in_decode_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = _workspace(tmp)
+            video = Path(tmp) / "clip.mp4"
+            video.write_bytes(b"source")
+            cache_key = decode_cache_key(
+                video,
+                "pts-unavailable",
+                1,
+                None,
+                requested_backend="ffmpeg",
+                actual_backend="ffmpeg",
+            )
+
+            def decode(_video, output_dir, _max_frames, **_kwargs):
+                frames = []
+                for index in range(2):
+                    frame = output_dir / f"{index:06d}.png"
+                    Image.new("RGB", (4, 4), (index, 0, 0)).save(frame)
+                    frames.append(frame)
+                return frames, 5.0, [None, None], {
+                    "backend": "ffmpeg",
+                    "fallback_reason": None,
+                }
+
+            with patch("vfieval.datasets._decode_video", side_effect=decode):
+                _decode_video_cached(
+                    db,
+                    workspace,
+                    video,
+                    cache_key,
+                    None,
+                    "pts-unavailable",
+                    1,
+                    decode_backend="ffmpeg",
+                )
+
+            manifest = json.loads(
+                (decode_cache_dir(workspace, cache_key) / "manifest.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["timestamps"], [None, None])
+            self.assertFalse(manifest["timestamps_available"])
+            self.assertIn("finite timestamp", manifest["timestamps_unavailable_reason"])
+
     def test_trusted_catalog_identity_skips_hash_and_stat_change_forces_hash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace, db = _workspace(tmp)

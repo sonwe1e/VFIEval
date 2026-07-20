@@ -10,7 +10,7 @@ import statistics
 import uuid
 from collections import Counter, defaultdict
 from itertools import combinations
-from typing import Any, Iterable
+from typing import Any
 from urllib.parse import quote
 
 from vfieval.compare_inputs import inspect_compare_path, validate_strict_alignment, validate_strict_decoded_alignment

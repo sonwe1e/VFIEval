@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import queue
 import re
 import shutil
 import subprocess
@@ -34,7 +33,6 @@ from vfieval.pipeline.artifact_integrity import (
 from vfieval.pipeline.io import batch_tensors, load_rgb_tensor, resize_batch
 from vfieval.pipeline.postprocess import (
     compose_interpolated,
-    normalize_model_outputs,
 )
 from vfieval.pipeline.visualize import save_difference, save_extra_tensor, save_preview_image, save_rgb_tensor
 

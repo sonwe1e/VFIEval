@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -18,7 +19,15 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
-from vfieval.metrics.feature import ConvNextFeatureMetric, DinoPatchMetric, _resolve_metric_device
+from vfieval.metrics.feature import (
+    ConvNextFeatureMetric,
+    DinoPatchMetric,
+    _load_state_dict,
+    _resolve_metric_device,
+    _run_convnext_conformance,
+    _run_dino_conformance,
+    _validate_conformance,
+)
 from vfieval.metrics import METRIC_NAMES, create_metric
 from vfieval.metrics.base import MetricBatchOutOfMemory, MetricResult, MetricUnavailable
 from vfieval.metrics.cgvqm import (
@@ -29,7 +38,12 @@ from vfieval.metrics.cgvqm import (
     _parse_driver_output,
     _validate_eval_frame_counts,
 )
-from vfieval.metrics.health import metric_cache_config, metric_health, prepare_metric_asset_manifest
+from vfieval.metrics.health import (
+    metric_cache_config,
+    metric_health,
+    prepare_metric_asset_manifest,
+    record_feature_metric_validation,
+)
 from vfieval.pipeline.metrics_runner import (
     METRIC_CACHE_VERSION,
     _evaluate_with_cache,
@@ -95,7 +109,7 @@ class MetricTests(unittest.TestCase):
             root = Path(tmp)
             db = Database(root / "vfieval.sqlite")
             db.init()
-            model_id = db.register_model("stray-video-gt", "dummy", None, 4, 4, {})
+            db.register_model("stray-video-gt", "dummy", None, 4, 4, {})
             dataset_id = db.create_dataset("stray-video-gt", str(root), False)
             frame = root / "frame.png"
             Image.new("RGB", (4, 4), (1, 2, 3)).save(frame)
@@ -151,7 +165,7 @@ class MetricTests(unittest.TestCase):
             root = Path(tmp)
             db = Database(root / "vfieval.sqlite")
             db.init()
-            model_id = db.register_model("strict-video", "dummy", None, 8, 8, {})
+            db.register_model("strict-video", "dummy", None, 8, 8, {})
             dataset_id = db.create_dataset("strict-video", str(root), True)
             frame = root / "frame.png"
             Image.new("RGB", (8, 8)).save(frame)
@@ -246,6 +260,168 @@ class MetricTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(MetricUnavailable, r"npu:1.*torch_npu failed"):
                 _resolve_metric_device("npu:1")
+
+    def test_feature_checkpoint_load_is_strict_and_diagnostic(self) -> None:
+        import torch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            model = torch.nn.Sequential(torch.nn.Linear(2, 3), torch.nn.Linear(3, 1))
+            valid_path = root / "valid.pth"
+            torch.save({"state_dict": model.state_dict()}, valid_path)
+
+            report = _load_state_dict(model, valid_path)
+
+            self.assertEqual(report["status"], "compatible")
+            self.assertEqual(report["matched_key_count"], len(model.state_dict()))
+            self.assertFalse(report["missing_keys"])
+            self.assertFalse(report["unexpected_keys"])
+            self.assertFalse(report["shape_mismatches"])
+
+            invalid_path = root / "invalid.pth"
+            torch.save({"state_dict": {"unrelated.weight": torch.ones(1)}}, invalid_path)
+            with self.assertRaises(MetricUnavailable) as raised:
+                _load_state_dict(model, invalid_path)
+
+            mismatch = raised.exception.details["weight_load"]
+            self.assertEqual(mismatch["matched_key_count"], 0)
+            self.assertIn("unrelated.weight", mismatch["unexpected_keys"])
+            self.assertEqual(mismatch["status"], "incompatible")
+
+    def test_feature_conformance_rejects_non_finite_distance(self) -> None:
+        report = _validate_conformance("lpips_vit_patch", 0.0, 0.25)
+        self.assertEqual(report["status"], "passed")
+        with self.assertRaises(MetricUnavailable) as raised:
+            _validate_conformance("lpips_convnext", 0.0, float("nan"))
+        self.assertEqual(raised.exception.details["conformance"]["status"], "failed")
+        self.assertEqual(raised.exception.details["validation_scope"], "runtime")
+
+    def test_feature_conformance_rejects_constant_features_as_asset_degradation(self) -> None:
+        with self.assertRaises(MetricUnavailable) as raised:
+            _validate_conformance("lpips_vit_patch", 0.0, 0.0)
+
+        self.assertEqual(raised.exception.details["validation_scope"], "asset")
+        report = raised.exception.details["conformance"]
+        self.assertEqual(report["status"], "failed")
+        self.assertGreater(report["required_perturbed_distance"], 0.0)
+
+    def test_feature_conformance_forward_failure_is_device_scoped_for_both_adapters(self) -> None:
+        import torch
+
+        class UnsupportedDino:
+            def forward_features(self, _tensor):
+                raise RuntimeError("NPU operator is not supported")
+
+        class UnsupportedConvNext:
+            def forward_intermediates(self, _tensor, *, intermediates_only):
+                raise RuntimeError("NPU operator is not supported")
+
+        checks = (
+            ("lpips_vit_patch", _run_dino_conformance, UnsupportedDino()),
+            ("lpips_convnext", _run_convnext_conformance, UnsupportedConvNext()),
+        )
+        for metric_name, smoke, model in checks:
+            with self.subTest(metric_name=metric_name):
+                with self.assertRaises(MetricUnavailable) as raised:
+                    smoke(model, torch.device("cpu"))
+                self.assertEqual(raised.exception.details["validation_scope"], "device")
+                self.assertIn("not supported", str(raised.exception))
+
+        metric = DinoPatchMetric(WorkspaceConfig.from_root(Path.cwd() / ".vfieval"), "npu:0")
+        device_failure = MetricUnavailable(
+            "NPU operator is not supported",
+            {"validation_scope": "device"},
+        )
+        with patch("vfieval.metrics.feature.record_feature_metric_validation") as record:
+            metric._record_failed_validation(
+                {"implementation_fingerprint": "a" * 64},
+                device_failure,
+            )
+        record.assert_not_called()
+
+    def test_constant_adapter_features_fail_conformance_instead_of_publishing_zero(self) -> None:
+        import torch
+
+        class ConstantDino:
+            def forward_features(self, tensor):
+                return {
+                    "x_norm_patchtokens": torch.zeros(
+                        (tensor.shape[0], 16, 8),
+                        device=tensor.device,
+                    )
+                }
+
+        class ConstantConvNext:
+            def forward_intermediates(self, tensor, *, intermediates_only):
+                return [
+                    torch.zeros(
+                        (tensor.shape[0], 8, 4, 4),
+                        device=tensor.device,
+                    )
+                ]
+
+        for metric_name, smoke, model in (
+            ("lpips_vit_patch", _run_dino_conformance, ConstantDino()),
+            ("lpips_convnext", _run_convnext_conformance, ConstantConvNext()),
+        ):
+            with self.subTest(metric_name=metric_name):
+                with self.assertRaises(MetricUnavailable) as raised:
+                    smoke(model, torch.device("cpu"))
+                self.assertEqual(raised.exception.details["validation_scope"], "asset")
+                self.assertIn("semantically degenerate", str(raised.exception))
+
+    def test_feature_health_exposes_fingerprints_and_remembers_strict_load_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            metric_dir = _metric_dir(workspace, "lpips_convnext")
+            weights_path = metric_dir / "weights.pth"
+            weights_path.write_bytes(b"checkpoint")
+            _write_feature_manifest(metric_dir, "lpips_convnext", weights_path.name)
+
+            health = metric_health(workspace, "lpips_convnext", refresh=True)
+
+            self.assertEqual(health["status"], "available")
+            self.assertEqual(health["weight_load_validation"]["status"], "not_checked")
+            self.assertEqual(len(health["implementation_fingerprint"]), 64)
+            self.assertEqual(health["weights_fingerprint"]["sha256"], hashlib.sha256(b"checkpoint").hexdigest())
+            config = metric_cache_config(workspace, "lpips_convnext")
+            self.assertEqual(config["implementation_fingerprint"], health["implementation_fingerprint"])
+            self.assertEqual(config["manifest_fingerprint"], health["manifest_fingerprint"])
+
+            record_feature_metric_validation(
+                workspace,
+                "lpips_convnext",
+                health["implementation_fingerprint"],
+                {
+                    "status": "incompatible",
+                    "weight_load": {
+                        "matched_key_count": 0,
+                        "missing_keys": ["stem.0.weight"],
+                        "unexpected_keys": ["wrong.weight"],
+                    },
+                },
+            )
+            invalid = metric_health(workspace, "lpips_convnext")
+            self.assertEqual(invalid["status"], "invalid_assets")
+            self.assertFalse(invalid["available"])
+            self.assertIn("matched=0", invalid["reason"])
+
+    def test_feature_health_rejects_weights_changed_after_manifest_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            metric_dir = _metric_dir(workspace, "lpips_convnext")
+            weights_path = metric_dir / "weights.pth"
+            weights_path.write_bytes(b"pinned-checkpoint")
+            _write_feature_manifest(metric_dir, "lpips_convnext", weights_path.name)
+            weights_path.write_bytes(b"changed-checkpoint")
+
+            health = metric_health(workspace, "lpips_convnext", refresh=True)
+
+            self.assertEqual(health["status"], "invalid_assets")
+            self.assertFalse(health["available"])
+            self.assertIn("fingerprint mismatch", health["reason"])
 
     def test_dino_batch_keeps_one_model_and_one_warmup_per_shape(self) -> None:
         import torch
@@ -1184,12 +1360,15 @@ class MetricTests(unittest.TestCase):
             self.assertEqual(vit["device_policy"], "require_run_device")
             self.assertEqual(vit["input_size"], 518)
             self.assertEqual(vit["pad_multiple"], 14)
+            self.assertEqual(len(vit["asset_fingerprints"]["weights"]["sha256"]), 64)
+            self.assertEqual(len(vit["asset_fingerprints"]["repo"]["sha256"]), 64)
             self.assertTrue((vit_manifest.parent / "dinov2").is_dir())
             self.assertTrue((vit_manifest.parent / "dinov2_vits14_reg.pth").is_file())
             self.assertEqual(convnext["backbone"], "convnextv2_tiny.fcmae_ft_in22k_in1k")
             self.assertEqual(convnext["weights_path"], "model.safetensors")
             self.assertEqual(convnext["input_size"], 288)
             self.assertEqual(convnext["pad_multiple"], 32)
+            self.assertEqual(len(convnext["asset_fingerprints"]["weights"]["sha256"]), 64)
             self.assertTrue((convnext_manifest.parent / "model.safetensors").is_file())
             self.assertEqual(cgvqm["implementation_mode"], "cgvqm_wrapper")
             self.assertEqual(cgvqm["video_eval_long_edge"], 720)
@@ -1829,9 +2008,21 @@ def _write_feature_manifest(metric_dir: Path, metric_name: str, weights_path: st
         "weights_path": weights_path,
         "device_policy": "require_run_device",
         "input_size": input_size,
+        "source_url": {"weights": "https://example.invalid/test-checkpoint"},
+    }
+    resolved_weights = metric_dir / weights_path
+    weights_sha256 = (
+        hashlib.sha256(resolved_weights.read_bytes()).hexdigest()
+        if resolved_weights.is_file()
+        else "0" * 64
+    )
+    payload["asset_fingerprints"] = {
+        "weights": {"sha256": weights_sha256},
     }
     if repo_dir is not None:
         payload["repo_dir"] = repo_dir
+        payload["source_url"]["repo"] = "https://example.invalid/test-repo"
+        payload["asset_fingerprints"]["repo"] = {"sha256": "0" * 64}
     manifest_path = metric_dir / "manifest.json"
     manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return manifest_path

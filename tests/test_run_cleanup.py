@@ -13,7 +13,6 @@ from http.server import ThreadingHTTPServer
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database
 from vfieval.media_assets import bind_run_asset, create_collection, upsert_asset
-import vfieval.run_cleanup as run_cleanup
 from vfieval.media_items import (
     bind_compare_input,
     bind_run_source,

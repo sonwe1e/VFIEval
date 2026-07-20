@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import time
@@ -9,6 +10,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -244,6 +247,41 @@ class EvaluationCampaignV2HttpTests(unittest.TestCase):
                     f"/api/evaluation-campaigns/v2/{campaign_id}",
                 )
                 self.assertEqual(status, 404)
+            finally:
+                stop_server(server, thread)
+
+    def test_campaign_publish_reserves_storage_before_marking_preparing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"VFIEVAL_MIN_FREE_BYTES": "100"},
+            clear=False,
+        ):
+            workspace, db = make_workspace(tmp)
+            _run_a, _run_b, body = self._campaign_fixture(workspace, db, prefix="storage")
+            campaign = create_campaign_v2(db, workspace, body)
+            campaign_id = int(campaign["id"])
+            server, thread, base_url = start_server(db, workspace)
+            try:
+                with patch(
+                    "vfieval.storage_budget.shutil.disk_usage",
+                    return_value=SimpleNamespace(total=1000, used=999, free=1),
+                ):
+                    status, error = _json_request(
+                        base_url,
+                        f"/api/evaluation-campaigns/v2/{campaign_id}/publish",
+                        method="POST",
+                        payload={},
+                    )
+                self.assertEqual(status, 507, error)
+                self.assertEqual(error["error"]["type"], "StorageCapacityError")
+                self.assertFalse(error["error"]["capacity"]["sufficient"])
+                detail_status, detail = _json_request(
+                    base_url,
+                    f"/api/evaluation-campaigns/v2/{campaign_id}",
+                )
+                self.assertEqual(detail_status, 200, detail)
+                self.assertEqual(detail["campaign"]["status"], "draft")
+                self.assertFalse(detail["preparation"])
             finally:
                 stop_server(server, thread)
 

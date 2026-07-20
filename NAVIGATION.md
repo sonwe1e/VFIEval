@@ -42,6 +42,9 @@ raw grep, add `--glob '!*.backup.*'`.
 | Legacy blind evaluation | `src/vfieval/evaluations.py` | ~850 | schema v1 read/export compatibility |
 | Execution profiles | `src/vfieval/performance.py` | ~150 | benchmark fingerprint and recommendation |
 | Multi-device finalize | `src/vfieval/pipeline/finalize_runner.py` | ~150 | merge shard manifests, encode videos, queue metrics |
+| Job leases + recovery | `src/vfieval/job_leases.py` | ~200 | heartbeat renewal, stale-worker fencing and Run failure recovery |
+| Storage reservations | `src/vfieval/storage_budget.py` | ~190 | Run/upload/Campaign disk budget and 507 capacity errors |
+| Runtime support | `src/vfieval/diagnostics.py`, `runtime_logging.py` | ~500 | cheap health snapshot, doctor/support bundle, rotating structured logs |
 
 Route dispatch is a flat `if path == ...` chain in `server.py`: `do_GET` (L72),
 `do_POST` (L218), `do_DELETE` (L413). To add a route, edit the relevant handler.
@@ -79,7 +82,7 @@ User rating (1–5, 0.25 step) + free-text issue per run; content-scoped (video/
 - **Exact input identity:** `input_identity.py` builds portable model/checkpoint/source signatures, normalized request fingerprints, and public structured retry differences
 - **Routes:** `POST /api/runs` (default), `POST /api/preflight` with `preflight_level=quick|deep`, and `POST /api/preflight/quick`; deep preflight returns `input_fingerprint` and mints a short-lived request-and-physical-input-bound token reused by matching Run creation
 - **Preflight/scan:** `file_inputs.py` `preflight_run` (L346), `resolve_video_selection` (L232), `_dry_run_model_file` (L926); quick preflight skips model construction/full cache identity, deep preflight owns the model contract check
-- **Workload guard:** `workload.py` `estimate_workload` (pure JSON-safe memory/artifact estimate, risk reasons/fingerprint)
+- **Workload guard:** `workload.py` `estimate_workload` (pure JSON-safe memory/artifact estimate, risk reasons/fingerprint); `storage_budget.py` adds active reservations, safety margin, and pre-submit capacity enforcement
 - **Dataset:** `datasets.py` `_resolve_video_entries` (L659), `VideoEntry` (L71)
 - **Frontend:** `app.js` `payloadFromForm` (L673), `startRun` (deep/token/risk acknowledgement), `runPreflight` (automatic quick vs forced deep), `renderPreflight`/`renderWorkloadEstimate`
 - **Tests:** `tests/test_v2_runs.py`, `tests/test_v3_file_flow.py`, `tests/test_video_datasets.py`, `tests/test_two_level_preflight.py`, `tests/test_run_reproducibility.py`, `tests/test_experiment_experience_ui.py`, `tests/test_workload.py`, `tests/test_input_identity.py`
@@ -95,8 +98,8 @@ User rating (1–5, 0.25 step) + free-text issue per run; content-scoped (video/
 - **Post-proc:** `pipeline/postprocess.py` `validate_model_outputs` (L10), `normalize_model_outputs` (L53), `backward_warp` (L104), `compose_interpolated` (L142)
 - **Model load diag:** `models/utils.py` `load_state_dict_portable`; report → `run_dir/logs/model_load.log`
 - **Concurrency knobs:** `payload["prefetch_workers"]` (default 2), `payload["save_workers"]` (default min(8, cpu))
-- **Worker loop:** `worker.py`, `orchestration.py`
-- **Tests:** `tests/test_end_to_end.py`, `tests/test_postprocess.py`
+- **Worker loop:** `worker.py`, `orchestration.py`; `job_leases.py` renews claimed Job heartbeats and owns bounded stale-worker recovery (`JobRecoveryService`); `orchestration.shutdown_worker_processes` gracefully terminates only locally spawned accelerator workers
+- **Tests:** `tests/test_end_to_end.py`, `tests/test_postprocess.py`, `tests/test_job_leases.py`, `tests/test_orchestration_processes.py`
 
 ### 7. Model / checkpoint / video catalog (file entry points)
 - **Scan:** `file_inputs.py` `list_model_files` (L45), `list_checkpoints` (L66), `list_video_groups` (L94)
@@ -123,7 +126,7 @@ User rating (1–5, 0.25 step) + free-text issue per run; content-scoped (video/
 - **Storage diagnostic:** artifact publication records canonical/preview byte sizes in artifact metadata; completion summaries expose actual bytes and `_run_detail` compares them with the preflight workload budget without filesystem reads.
 - **Frontend:** `app.js` `runContentRevisionChanged`, `invalidateRunResultCache`, `refreshRunsOnce`, `refreshRunResults`, `selectRun`, `loadRunVideoTimeline`, `loadSampleDetail`; requests carry generation/abort guards and preserve the current selection on refresh. Paged Run payloads include a global `active_total`, keeping the two-second poll active even when work is outside the visible page/filter.
 - **Tests:** `tests/test_sample_api_scope.py`, `tests/test_db_indices.py`, `tests/test_run_result_freshness_ui.py`
-- **Runtime health:** `GET /api/health` reads `CatalogSyncCoordinator.status()` plus durable Run/Campaign cleanup backlog counts; it never claims work or walks storage. Covered by `tests/test_runtime_diagnostics.py`.
+- **Runtime health/support:** `GET /api/health` reads release/schema/storage/Job-lease/recovery state plus `CatalogSyncCoordinator.status()` and durable cleanup backlogs; it never claims work or walks storage. `cli.py doctor` performs the slower dependency/device/media checks, while `diagnostics` creates a sanitized ZIP with selected Run/Campaign state and structured log tails. Covered by `tests/test_runtime_diagnostics.py`, `tests/test_support_diagnostics.py`.
 
 ### 10. Run lifecycle (retry / cancel / delete / cleanup)
 - **Service:** `run_cleanup.py` `RunCleanupService.preview_run_purge`, `consume_run_purge_preview`, `request_delete`, `request_artifact_cleanup`, `process_pending`, `_purge_run`, `gc_preview`, `garbage_collect`; `register_run_cache_refs`, `cache_lease`
@@ -176,7 +179,7 @@ User rating (1–5, 0.25 step) + free-text issue per run; content-scoped (video/
 
 ### 16. Blind evaluation V2 + frozen Campaign packages
 - **Core:** `evaluations_v2.py` `list_run_outputs`, `preview_campaign_v2`, `create_campaign_v2`, `request_publish_campaign_v2`, `run_pending_preparations`, `publish_campaign_v2`, `delete_campaign_v2`, blind session/payload/media/heartbeat/vote/review functions, `campaign_analysis_v2`, `campaign_objective_curve_v2`, `campaign_export_v2`; `pipeline/evaluation_freeze.py` owns three-stream bounded rawvideo/paired-remux package materialization
-- **Lifecycle:** draft → preparing → published → closed/archived; failed preparation can be retried. The publish route persists `preparing/queued` before its HTTP response, so a response-side client disconnect does not fail the durable job. Publish deep-validates every selected GT/A/B item, builds staging, freezes under `.vfieval/evaluations/{campaign_id}`, revalidates all source content, writes a SHA-256 manifest, registers evaluation-package assets, then creates tasks atomically. New packages omit Diff; historical Diff entries remain readable. Encoder-side EPIPE is diagnosed with the sink name, FFmpeg exit code and stderr, and the preparation loop emits one sanitized terminal result line.
+- **Lifecycle:** draft → preparing → published → closed/archived; failed preparation can be retried. The publish route reserves frozen-package disk capacity before persisting `preparing/queued`, so a 507 never leaves a partial request; after persistence, a response-side client disconnect does not fail the durable job. Publish deep-validates every selected GT/A/B item, builds staging, freezes under `.vfieval/evaluations/{campaign_id}`, revalidates all source content, writes a SHA-256 manifest, registers evaluation-package assets, then creates tasks atomically. New packages omit Diff; historical Diff entries remain readable. Encoder-side EPIPE is diagnosed with the sink name, FFmpeg exit code and stderr, and the preparation loop emits one sanitized terminal result line.
 - **Tables:** `evaluation_campaigns_v2`, `evaluation_methods_v2`, `evaluation_items_v2`, `evaluation_bindings_v2`, `evaluation_preparations_v2`, `evaluation_tasks_v2`, `evaluation_assignments_v2`, `evaluation_votes_v2`, `evaluation_analysis_cache_v2`; shared identity table `evaluators`
 - **Admin routes:** `GET /api/evaluation-campaigns`, `POST /api/evaluation-campaigns/v2/preview`, `POST /api/evaluation-campaigns/v2`, `GET /api/evaluation-campaigns/v2/{id}[/{analysis,export,objective-curve}]`, `POST /api/evaluation-campaigns/v2/{id}/{publish,close,archive}`, `DELETE /api/evaluation-campaigns/v2/{id}`
 - **Participant routes:** `/evaluate/{opaque_token}`; `/api/blind/{token}`, `/session`, `/reviews`, `/reviews/{task_token}`, task-token `/media/{reference,left,right}`, `/vote`, `/heartbeat`. Draft/preparing/failed public payloads are deliberately incomplete and never expose task, method, Run or asset identity.

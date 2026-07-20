@@ -172,7 +172,7 @@ class EndToEndTests(unittest.TestCase):
                 frame_paths.append(path)
             model_id = db.register_model("dummy", "dummy", None, 8, 8)
             dataset_id = db.create_dataset("video", str(root), has_gt=True, source_type="video")
-            sample_id = db.add_sample(
+            db.add_sample(
                 dataset_id,
                 "clip-0",
                 str(frame_paths[0]),
