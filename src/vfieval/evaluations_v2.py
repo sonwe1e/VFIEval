@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS evaluation_campaigns_v2 (
 CREATE TABLE IF NOT EXISTS evaluation_methods_v2 (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     campaign_id INTEGER NOT NULL REFERENCES evaluation_campaigns_v2(id) ON DELETE CASCADE,
-    slot TEXT NOT NULL CHECK(slot IN ('a', 'b')),
+    slot TEXT NOT NULL CHECK(slot IN ('a', 'b', 'c', 'd', 'e')),
     source_kind TEXT NOT NULL CHECK(source_kind IN ('run_track', 'upload')),
     source_run_id INTEGER,
     source_track_label TEXT NOT NULL DEFAULT '',
@@ -260,6 +260,7 @@ def _loads(value: str | None, default: Any | None = None) -> Any:
 def ensure_v2_schema(db: Database) -> None:
     """Install V2 tables without modifying or guessing at legacy campaign rows."""
     _ensure_evaluation_package_media_kind(db)
+    _ensure_evaluation_methods_v2_slots(db)
     with db.connection() as conn:
         conn.executescript(CAMPAIGN_V2_SCHEMA)
         columns = {
@@ -317,6 +318,89 @@ def ensure_v2_schema(db: Database) -> None:
             "CREATE INDEX IF NOT EXISTS idx_eval_bindings_v2_source_member "
             "ON evaluation_bindings_v2(source_member_id, item_id)"
         )
+
+
+def _ensure_evaluation_methods_v2_slots(db: Database) -> None:
+    """Expand the slot CHECK from ('a','b') to ('a','b','c','d','e').
+
+    SQLite cannot alter CHECK constraints in-place.  The migration follows the
+    same legacy-rename pattern as :func:`_ensure_evaluation_package_media_kind`:
+    rename old table, recreate with new constraint, copy all rows, drop old.
+    The UNIQUE index on (campaign_id, slot) is rebuilt automatically via the
+    new table definition.
+    """
+    conn = db.connect()
+    try:
+        sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'evaluation_methods_v2'"
+        ).fetchone()
+        current_sql = str(sql_row["sql"] or "") if sql_row else ""
+        # Already upgraded or table doesn't exist yet — nothing to do.
+        if not current_sql or "'c'" in current_sql:
+            return
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("PRAGMA legacy_alter_table=ON")
+        conn.execute("BEGIN EXCLUSIVE")
+        # Re-check under the exclusive lock.
+        sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'evaluation_methods_v2'"
+        ).fetchone()
+        current_sql = str(sql_row["sql"] or "") if sql_row else ""
+        if current_sql and "'c'" not in current_sql:
+            conn.execute(
+                "ALTER TABLE evaluation_methods_v2 "
+                "RENAME TO evaluation_methods_v2_slots_upgrade"
+            )
+            conn.execute(
+                """
+                CREATE TABLE evaluation_methods_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    campaign_id INTEGER NOT NULL
+                        REFERENCES evaluation_campaigns_v2(id) ON DELETE CASCADE,
+                    slot TEXT NOT NULL CHECK(slot IN ('a', 'b', 'c', 'd', 'e')),
+                    source_kind TEXT NOT NULL CHECK(source_kind IN ('run_track', 'upload')),
+                    source_run_id INTEGER,
+                    source_track_label TEXT NOT NULL DEFAULT '',
+                    label_snapshot TEXT NOT NULL,
+                    model_snapshot TEXT NOT NULL DEFAULT '',
+                    checkpoint_snapshot TEXT NOT NULL DEFAULT '',
+                    source_spec_json TEXT NOT NULL DEFAULT '{}',
+                    created_at REAL NOT NULL,
+                    UNIQUE(campaign_id, slot)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO evaluation_methods_v2(
+                    id, campaign_id, slot, source_kind, source_run_id,
+                    source_track_label, label_snapshot, model_snapshot,
+                    checkpoint_snapshot, source_spec_json, created_at
+                )
+                SELECT
+                    id, campaign_id, slot, source_kind, source_run_id,
+                    source_track_label, label_snapshot, model_snapshot,
+                    checkpoint_snapshot, source_spec_json, created_at
+                FROM evaluation_methods_v2_slots_upgrade
+                """
+            )
+            conn.execute("DROP TABLE evaluation_methods_v2_slots_upgrade")
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            conn.execute("PRAGMA legacy_alter_table=OFF")
+            conn.execute("PRAGMA foreign_keys=ON")
+        except Exception:
+            pass
+        conn.close()
 
 
 def _ensure_evaluation_package_media_kind(db: Database) -> None:

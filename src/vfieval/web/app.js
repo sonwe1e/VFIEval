@@ -156,12 +156,28 @@ async function api(path, options = {}) {
   });
   const data = await response.json();
   if (!response.ok) {
-    const error = new Error(data.error?.message || data.message || response.statusText);
+    const message = response.status === 507
+      ? _formatStorageCapacityError(data)
+      : (data.error?.message || data.message || response.statusText);
+    const error = new Error(message);
     error.status = response.status;
     error.payload = data;
     throw error;
   }
   return data;
+}
+
+function _formatStorageCapacityError(payload) {
+  const cap = payload?.error?.capacity;
+  if (!cap) return payload?.error?.message || "磁盘空间不足，无法创建任务";
+  const free = Number(cap.free_bytes || 0);
+  const needed = Number(cap.required_free_bytes || 0);
+  const reserved = Number(cap.reserved_bytes || 0);
+  const shortfall = Math.max(0, needed - free);
+  const parts = [`磁盘空间不足，无法创建任务。可用 ${formatBytes(free)}`];
+  if (reserved > 0) parts.push(`已预留 ${formatBytes(reserved)}`);
+  parts.push(`还需 ${formatBytes(shortfall)}`);
+  return parts.join("，") + "。请清理旧运行产物后重试。";
 }
 
 function renderDeploymentHealth(health, error = null) {

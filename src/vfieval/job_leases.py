@@ -7,7 +7,13 @@ from vfieval.db import Database, utc_ts
 
 
 DEFAULT_JOB_HEARTBEAT_INTERVAL_SECONDS = 10.0
-DEFAULT_JOB_LEASE_TIMEOUT_SECONDS = 90.0
+# 180 s = 18× the heartbeat interval.  On an 8-card Ascend A3 the metric and
+# postprocess threads compete for the Python GIL, which can starve the
+# heartbeat thread for 20–40 s under peak load.  90 s was too close to that
+# ceiling; 180 s provides a comfortable margin without delaying detection of
+# genuinely dead workers (JobRecoveryService sweeps every 15 s, so a truly
+# silent worker is still fenced within ~3 minutes).
+DEFAULT_JOB_LEASE_TIMEOUT_SECONDS = 180.0
 DEFAULT_JOB_RECOVERY_INTERVAL_SECONDS = 15.0
 
 

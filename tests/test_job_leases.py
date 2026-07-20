@@ -231,7 +231,7 @@ class JobLeaseTests(unittest.TestCase):
             self.assertEqual(lost_job["error"]["type"], "WorkerLost")
             self.assertTrue(lost_job["error"]["interrupted"])
             self.assertTrue(lost_job["error"]["retryable"])
-            self.assertEqual(lost_job["error"]["lease_timeout_seconds"], 90.0)
+            self.assertEqual(lost_job["error"]["lease_timeout_seconds"], 180.0)
             failed_run = db.get_run(run_id)
             self.assertEqual(failed_run["status"], "failed")
             self.assertEqual(failed_run["error"]["type"], "WorkerLost")

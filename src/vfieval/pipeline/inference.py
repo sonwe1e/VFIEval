@@ -579,6 +579,9 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
                 outputs = model.predict(img0, img1, 0.5)
             device_events.stop("transfer_and_model", model_event)
             timing["model"] += time.perf_counter() - t1
+            # Surface any save-pool failure that accumulated during the GPU
+            # forward pass before we start chunk composition for this batch.
+            pipeline.raise_if_failed()
 
             t2 = time.perf_counter()
             post_event = device_events.start()
