@@ -119,8 +119,10 @@ from vfieval.evaluations_v2 import (
     blind_submit_vote,
     campaign_analysis_v2,
     campaign_export_v2,
+    campaign_objective_curve_v2,
     close_campaign_v2,
     create_campaign_v2,
+    delete_campaign_v2,
     discard_empty_legacy_draft,
     ensure_v2_schema,
     get_campaign_v2,
@@ -352,12 +354,27 @@ def _make_handler(
                     campaigns = [*list_campaigns_v2(db), *legacy_campaigns_readonly(db)]
                     campaigns.sort(key=lambda row: float(row.get("created_at") or 0), reverse=True)
                     return self._json({"campaigns": campaigns})
-                match = re.fullmatch(r"/api/evaluation-campaigns/v2/(\d+)(?:/(analysis|export|preparation))?", path)
+                match = re.fullmatch(
+                    r"/api/evaluation-campaigns/v2/(\d+)(?:/(analysis|export|preparation|objective-curve))?",
+                    path,
+                )
                 if match:
                     campaign_id = int(match.group(1))
                     section = match.group(2)
                     if section == "analysis":
                         return self._json(campaign_analysis_v2(db, campaign_id))
+                    if section == "objective-curve":
+                        item_id = _optional_int(query.get("item_id", [None])[0])
+                        if item_id is None:
+                            return self._error(HTTPStatus.BAD_REQUEST, "item_id is required")
+                        return self._json(
+                            campaign_objective_curve_v2(
+                                db,
+                                campaign_id,
+                                item_id,
+                                str(query.get("metric_name", [""])[0] or ""),
+                            )
+                        )
                     if section == "preparation":
                         return self._json(
                             {
@@ -1064,6 +1081,29 @@ def _make_handler(
         def do_DELETE(self) -> None:
             try:
                 parsed = urlparse(self.path)
+                campaign_match = re.fullmatch(r"/api/evaluation-campaigns/v2/(\d+)", parsed.path)
+                if campaign_match:
+                    try:
+                        body = self._read_json()
+                    except _RequestBodyTooLarge as exc:
+                        return self._error(
+                            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                            str(exc),
+                            "RequestBodyTooLarge",
+                        )
+                    if not isinstance(body, dict):
+                        return self._error(
+                            HTTPStatus.BAD_REQUEST,
+                            "Campaign V2 delete body must be a JSON object",
+                        )
+                    result = delete_campaign_v2(
+                        db,
+                        workspace,
+                        int(campaign_match.group(1)),
+                        confirmed=body.get("confirm") is True,
+                        destructive_confirmed=body.get("confirm_destructive") is True,
+                    )
+                    return self._json(result)
                 asset_match = re.fullmatch(r"/api/media/assets/(\d+)", parsed.path)
                 if asset_match:
                     asset = soft_delete_asset(db, workspace, int(asset_match.group(1)))
@@ -1088,6 +1128,8 @@ def _make_handler(
                 return self._json(_purge_response(request), status=HTTPStatus.ACCEPTED)
             except KeyError as exc:
                 self._error(HTTPStatus.NOT_FOUND, str(exc), type(exc).__name__)
+            except EvaluationConflict as exc:
+                self._error(HTTPStatus.CONFLICT, str(exc), type(exc).__name__)
             except ValueError as exc:
                 self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
             except Exception as exc:

@@ -18,7 +18,7 @@ from vfieval.metrics.base import MetricBatchOutOfMemory, MetricUnavailable
 from vfieval.metrics.health import metric_cache_config, metric_requires_video_input
 from vfieval.pipeline.inference import RunCanceled
 from vfieval.pipeline.artifact_integrity import strict_video_pair_issue
-from vfieval.media_assets import bind_metric_result, run_asset_pair, sync_run_assets
+from vfieval.media_assets import bind_metric_result, run_asset_pair
 
 METRIC_CACHE_VERSION = "metric-cache-v3"
 
@@ -43,9 +43,6 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
     if unsupported:
         raise ValueError(f"unsupported metrics: {', '.join(unsupported)}")
     _raise_if_canceled(db, run_id, job_id)
-    if run_id is not None:
-        sync_run_assets(db, workspace, run_id)
-
     artifacts = []
     pred_videos = []
     for current_job_id in inference_job_ids:
@@ -374,12 +371,44 @@ def _run_frame_metric_batches(
             }
         )
 
-    metric = create_metric(metric_name, workspace, device=metric_device) if pending else None
     default_batch = 8 if metric_name == "lpips_vit_patch" else 32
     batch_size = requested_batch_size or default_batch
     effective_batch = batch_size
     offset = 0
     unavailable_reason: str | None = None
+    metric = None
+    if pending:
+        try:
+            metric = create_metric(metric_name, workspace, device=metric_device)
+        except MetricUnavailable as exc:
+            unavailable_reason = str(exc)
+            effective_batch = 0
+            for row in pending:
+                details = {
+                    **dict(getattr(exc, "details", {}) or {}),
+                    "reason": unavailable_reason,
+                    "device": metric_device,
+                    **row["reference_details"],
+                }
+                db.set_metric_cache(row["cache_key"], metric_name, "unavailable", None, details)
+                outcomes[row["index"]] = ("unavailable", None, details)
+            offset = len(pending)
+        except Exception as exc:
+            effective_batch = 0
+            for row in pending:
+                outcomes[row["index"]] = (
+                    "failed",
+                    None,
+                    {
+                        **dict(getattr(exc, "details", {}) or {}),
+                        "reason": str(exc),
+                        "type": type(exc).__name__,
+                        "sample_id": row["sample_id"],
+                        "device": metric_device,
+                        **row["reference_details"],
+                    },
+                )
+            offset = len(pending)
     if outcomes:
         _publish_metric_progress(db, job_id, run_id, current + len(outcomes), total, job_payload)
     while offset < len(pending):
@@ -1380,14 +1409,18 @@ def _evaluate_with_cache(
     if cached and not (retry and cached["status"] in {"failed", "unavailable"}):
         return cached["status"], cached["value"], {"cached": True, **cached["details"]}
 
-    metric = create_metric(metric_name, workspace, device=metric_device)
     work_dir = workspace.tmp_dir / "metrics" / metric_name / hashlib.sha1(cache_key.encode("utf-8")).hexdigest()
     try:
+        metric = create_metric(metric_name, workspace, device=metric_device)
         result = metric.evaluate(reference_path, distorted_path, work_dir)
         db.set_metric_cache(cache_key, metric_name, result.status, result.value, result.details)
         return result.status, result.value, result.details
     except MetricUnavailable as exc:
-        details = {**dict(getattr(exc, "details", {}) or {}), "reason": str(exc)}
+        details = {
+            **dict(getattr(exc, "details", {}) or {}),
+            "reason": str(exc),
+            "device": metric_device,
+        }
         db.set_metric_cache(cache_key, metric_name, "unavailable", None, details)
         return "unavailable", None, details
     except Exception as exc:

@@ -2458,6 +2458,14 @@ class Database:
         now = utc_ts()
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            previous = conn.execute(
+                "SELECT status FROM runs WHERE id = ?",
+                (int(run_id),),
+            ).fetchone()
+            metric_phase = previous is not None and str(previous["status"] or "") in {
+                "metric_queued",
+                "metric_running",
+            }
             cur = conn.execute(
                 """
                 UPDATE runs
@@ -2500,22 +2508,23 @@ class Database:
                     run_id,
                 ),
             )
-            conn.execute(
-                """
-                UPDATE media_assets
-                SET state = 'unavailable', updated_at = ?
-                WHERE source_kind = 'run_artifact'
-                  AND id IN (
-                      SELECT asset_id FROM run_media_assets
-                      WHERE run_id = ?
-                        AND (
-                            COALESCE(json_extract(metadata_json, '$.input'), 0) != 1
-                            OR COALESCE(json_extract(metadata_json, '$.compare_snapshot'), 0) = 1
-                        )
-                  )
-                """,
-                (now, run_id),
-            )
+            if not metric_phase:
+                conn.execute(
+                    """
+                    UPDATE media_assets
+                    SET state = 'unavailable', updated_at = ?
+                    WHERE source_kind = 'run_artifact'
+                      AND id IN (
+                          SELECT asset_id FROM run_media_assets
+                          WHERE run_id = ?
+                            AND (
+                                COALESCE(json_extract(metadata_json, '$.input'), 0) != 1
+                                OR COALESCE(json_extract(metadata_json, '$.compare_snapshot'), 0) = 1
+                            )
+                      )
+                    """,
+                    (now, run_id),
+                )
             return True
 
     def fail_claimed_job_and_run(
@@ -2535,7 +2544,7 @@ class Database:
             conn.execute("BEGIN IMMEDIATE")
             associated_job = conn.execute(
                 """
-                SELECT j.status
+                SELECT j.status, r.status AS run_status
                 FROM jobs j
                 JOIN runs r ON r.id = ?
                 WHERE j.id = ?
@@ -2553,6 +2562,10 @@ class Database:
             ).fetchone()
             if associated_job is None or str(associated_job["status"] or "") != "running":
                 return False
+            metric_phase = str(associated_job["run_status"] or "") in {
+                "metric_queued",
+                "metric_running",
+            }
             cur = conn.execute(
                 """
                 UPDATE runs
@@ -2595,22 +2608,23 @@ class Database:
                     int(run_id),
                 ),
             )
-            conn.execute(
-                """
-                UPDATE media_assets
-                SET state = 'unavailable', updated_at = ?
-                WHERE source_kind = 'run_artifact'
-                  AND id IN (
-                      SELECT asset_id FROM run_media_assets
-                      WHERE run_id = ?
-                        AND (
-                            COALESCE(json_extract(metadata_json, '$.input'), 0) != 1
-                            OR COALESCE(json_extract(metadata_json, '$.compare_snapshot'), 0) = 1
-                        )
-                  )
-                """,
-                (now, int(run_id)),
-            )
+            if not metric_phase:
+                conn.execute(
+                    """
+                    UPDATE media_assets
+                    SET state = 'unavailable', updated_at = ?
+                    WHERE source_kind = 'run_artifact'
+                      AND id IN (
+                          SELECT asset_id FROM run_media_assets
+                          WHERE run_id = ?
+                            AND (
+                                COALESCE(json_extract(metadata_json, '$.input'), 0) != 1
+                                OR COALESCE(json_extract(metadata_json, '$.compare_snapshot'), 0) = 1
+                            )
+                      )
+                    """,
+                    (now, int(run_id)),
+                )
             return True
 
     def request_run_cancel(self, run_id: int) -> bool:

@@ -21,6 +21,7 @@ from vfieval.media_assets import (
     upsert_asset,
 )
 from vfieval.evaluations import create_campaign
+from vfieval.evaluations_v2 import create_campaign_v2
 
 from v13_test_utils import (
     add_completed_pred_run,
@@ -163,6 +164,46 @@ class EvaluationCampaignV2HttpTests(unittest.TestCase):
         self.assertRegex(str(detail["share_url"]), r"^/evaluate/[A-Za-z0-9_-]+$")
         self.assertNotIn("://", str(detail["share_url"]))
         return detail
+
+    def test_campaign_v2_delete_route_requires_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _run_a, _run_b, body = self._campaign_fixture(workspace, db, prefix="delete")
+            campaign = create_campaign_v2(db, workspace, body)
+            campaign_id = int(campaign["id"])
+            server, thread, base_url = start_server(db, workspace)
+            try:
+                status, error = _json_request(
+                    base_url,
+                    f"/api/evaluation-campaigns/v2/{campaign_id}",
+                    method="DELETE",
+                    payload={},
+                )
+                self.assertEqual(status, 400, error)
+                self.assertIn("confirm=true", error["error"]["message"])
+
+                status, missing_item = _json_request(
+                    base_url,
+                    f"/api/evaluation-campaigns/v2/{campaign_id}/objective-curve",
+                )
+                self.assertEqual(status, 400, missing_item)
+                self.assertIn("item_id", missing_item["error"]["message"])
+
+                status, deleted = _json_request(
+                    base_url,
+                    f"/api/evaluation-campaigns/v2/{campaign_id}",
+                    method="DELETE",
+                    payload={"confirm": True},
+                )
+                self.assertEqual(status, 200, deleted)
+                self.assertTrue(deleted["deleted"])
+                status, _missing = _json_request(
+                    base_url,
+                    f"/api/evaluation-campaigns/v2/{campaign_id}",
+                )
+                self.assertEqual(status, 404)
+            finally:
+                stop_server(server, thread)
 
     def test_canonical_media_endpoints_exclude_invalid_run_outputs_and_internal_sources(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -13,6 +13,7 @@ class EvaluationStudioUiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.index_html = (WEB / "index.html").read_text(encoding="utf-8")
+        cls.app_js = (WEB / "app.js").read_text(encoding="utf-8")
         cls.studio_js = (WEB / "studio.js").read_text(encoding="utf-8")
         cls.studio_css = (WEB / "studio.css").read_text(encoding="utf-8")
         cls.blind_html = (WEB / "blind.html").read_text(encoding="utf-8")
@@ -506,6 +507,29 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn("row.status_counts", self.studio_js)
         self.assertIn("不生成合成总分", self.studio_js)
         self.assertNotIn("combined_score", self.studio_js)
+
+    def test_v2_lpips_curve_is_lazy_fingerprint_scoped_and_race_guarded(self) -> None:
+        self.assertIn("/objective-curve?item_id=", self.studio_js)
+        self.assertIn("data-objective-curve-item", self.studio_js)
+        self.assertIn("data-objective-curve-metric", self.studio_js)
+        self.assertIn('class="objective-curve-line series-', self.studio_js)
+        self.assertIn("objectiveCurveFingerprint", self.studio_js)
+        self.assertIn("objectiveCurveInFlight?.key === key", self.studio_js)
+        self.assertIn("studioState.objectiveCurveInFlight !== requestToken", self.studio_js)
+        self.assertIn("objectiveCurveErrors[key]", self.studio_js)
+        self.assertIn("data-objective-curve-retry", self.studio_js)
+        self.assertIn(".objective-curve-plot", self.studio_css)
+
+    def test_v2_campaign_permanent_delete_and_dependency_entry_are_exposed(self) -> None:
+        self.assertIn("data-studio-delete", self.studio_js)
+        self.assertIn('method: "DELETE"', self.studio_js)
+        self.assertIn("confirm_destructive", self.studio_js)
+        self.assertIn("openCampaign,", self.studio_js)
+        self.assertIn("data-open-campaign-dependency", self.app_js)
+        self.assertIn("VFIEvalStudio.openCampaign", self.app_js)
+        self.assertIn("sibling shard failed the run", self.app_js)
+        self.assertIn("Run already failed", self.app_js)
+        self.assertIn("级联取消", self.app_js)
 
     def test_first_visit_waits_for_public_intro_before_session_creation(self) -> None:
         self.assertIn("if (!blindState.evaluatorName)", self.blind_js)

@@ -734,11 +734,16 @@ class RunCleanupService:
                 if claim_lost.is_set():
                     raise RuntimeError("run purge claim was lost before cleanup completed")
             except Exception as exc:
+                error = {"type": type(exc).__name__, "message": str(exc)}
+                for key in ("code", "campaign_id", "campaign_ids", "action"):
+                    value = getattr(exc, key, None)
+                    if value is not None:
+                        error[key] = value
                 try:
                     return self.db.update_run_purge_request(
                         int(request["id"]),
                         "failed",
-                        error={"type": type(exc).__name__, "message": str(exc)},
+                        error=error,
                         expected_claim_token=claim_token,
                     )
                 except RuntimeError:

@@ -13,6 +13,13 @@
     preparationPoll: null,
     preparationPollKey: null,
     campaignRequestGeneration: 0,
+    objectiveCurveRequestGeneration: 0,
+    campaignDetail: null,
+    objectiveCurveSelection: null,
+    objectiveCurveCache: {},
+    objectiveCurveLoadingKey: "",
+    objectiveCurveInFlight: null,
+    objectiveCurveErrors: {},
     itemRequestGeneration: 0,
     methodRequestGeneration: 0,
     previewGeneration: 0,
@@ -369,6 +376,133 @@
     return entries.length ? entries.map(([status, count]) => `${safe(status)}: ${Number(count || 0)}`).join(" · ") : "-";
   }
 
+  function objectiveCurveChoices(analysis, campaign) {
+    const allowed = new Set(["lpips_vit_patch", "lpips_convnext"]);
+    const itemsById = new Map((campaign?.items || []).map((item) => [Number(item.id), item]));
+    const grouped = new Map();
+    for (const row of analysis?.objective?.items || []) {
+      const metricName = String(row.metric_name || "");
+      const itemIdValue = Number(row.item_id || 0);
+      if (!allowed.has(metricName) || !itemIdValue || !itemsById.has(itemIdValue)) continue;
+      const key = `${itemIdValue}:${metricName}`;
+      const current = grouped.get(key) || {
+        itemId: itemIdValue,
+        videoName: String(itemsById.get(itemIdValue)?.video_name || row.video_name || ""),
+        metricName,
+        methods: new Set(),
+        completedMethods: new Set(),
+      };
+      current.methods.add(Number(row.method_id || 0));
+      if (Number(row.frame_coverage?.completed || 0) > 0) {
+        current.completedMethods.add(Number(row.method_id || 0));
+      }
+      grouped.set(key, current);
+    }
+    return Array.from(grouped.values())
+      .map((row) => ({
+        ...row,
+        methodCount: row.methods.size,
+        completedMethodCount: row.completedMethods.size,
+      }))
+      .sort((left, right) => left.videoName.localeCompare(right.videoName)
+        || left.metricName.localeCompare(right.metricName));
+  }
+
+  function objectiveCurveFingerprint(analysis) {
+    return String(analysis?.objective?.metric_fingerprint || "");
+  }
+
+  function objectiveCurveKey(campaignId, selection, fingerprint = "") {
+    return `${Number(campaignId)}:${Number(selection?.itemId || 0)}:${String(selection?.metricName || "")}:${String(fingerprint)}`;
+  }
+
+  function objectiveCurveSegments(points, minOrdinal, maxOrdinal, minValue, maxValue) {
+    const segments = [];
+    let current = [];
+    for (const point of points || []) {
+      const ordinal = Number(point.ordinal);
+      const value = point.status === "completed" && point.value != null ? Number(point.value) : Number.NaN;
+      if (!Number.isFinite(value)) {
+        if (current.length) segments.push(current.join(" "));
+        current = [];
+      } else {
+        const x = maxOrdinal === minOrdinal ? 50 : 4 + ((ordinal - minOrdinal) / (maxOrdinal - minOrdinal)) * 92;
+        const y = maxValue === minValue ? 26 : 44 - ((value - minValue) / (maxValue - minValue)) * 36;
+        current.push(`${x.toFixed(3)},${y.toFixed(3)}`);
+      }
+    }
+    if (current.length) segments.push(current.join(" "));
+    return segments;
+  }
+
+  function renderObjectiveCurveChart(curve) {
+    if (!curve?.series?.length) return "<p class=\"muted\">该 Item 没有可用的 LPIPS 曲线数据。</p>";
+    const reasons = Array.from(new Set(curve.series.flatMap((series) => [
+      ...Object.keys(series.reason_counts || {}),
+      ...(series.points || []).map((point) => point.reason || ""),
+    ]).filter(Boolean)));
+    const completed = curve.series.flatMap((series) => (series.points || []).filter((point) =>
+      point.status === "completed" && point.value != null && Number.isFinite(Number(point.value))));
+    if (!completed.length) {
+      return `<div class="message warn"><p>没有 completed 的 LPIPS 点。${curve.series.map((series) => `${safe(series.method_label)}：${objectiveMetricStatuses(series.status_counts)}`).join("；")}${reasons.length ? `。原因：${safe(reasons.slice(0, 5).join("；"))}` : ""}</p></div>`;
+    }
+    const values = completed.map((point) => Number(point.value));
+    const maxOrdinal = Math.max(0, Number(curve.frame_count || 1) - 1);
+    const minValue = Math.min(...values);
+    const maxValue = Math.max(...values);
+    const lines = curve.series.map((series, index) => objectiveCurveSegments(
+      series.points, 0, maxOrdinal, minValue, maxValue,
+    ).map((points) => `<polyline class="objective-curve-line series-${index === 0 ? "a" : "b"}" points="${points}" fill="none"></polyline>`).join("")).join("");
+    const dots = curve.series.map((series, index) => (series.points || []).filter((point) =>
+      point.status === "completed" && point.value != null && Number.isFinite(Number(point.value))).map((point) => {
+      const ordinal = Number(point.ordinal);
+      const frame = Number(point.frame_index);
+      const value = Number(point.value);
+      const x = maxOrdinal === 0 ? 50 : 4 + (ordinal / maxOrdinal) * 92;
+      const y = maxValue === minValue ? 26 : 44 - ((value - minValue) / (maxValue - minValue)) * 36;
+      return `<circle tabindex="0" class="objective-curve-dot series-${index === 0 ? "a" : "b"}" cx="${x.toFixed(3)}" cy="${y.toFixed(3)}" r="0.75"><title>${safe(series.method_label)} · frame ${frame} · ${value.toFixed(6)}</title></circle>`;
+    }).join("")).join("");
+    const unavailable = curve.series.flatMap((series) => (series.points || []).filter((point) => point.status !== "completed"));
+    const unavailableDots = curve.series.map((series, index) => (series.points || []).filter((point) => point.status !== "completed").map((point) => {
+      const ordinal = Number(point.ordinal);
+      const x = maxOrdinal === 0 ? 50 : 4 + (ordinal / maxOrdinal) * 92;
+      const y = index === 0 ? 47 : 49;
+      return `<circle tabindex="0" class="objective-curve-missing series-${index === 0 ? "a" : "b"}" cx="${x.toFixed(3)}" cy="${y}" r="0.8"><title>${safe(series.method_label)} · frame ${Number(point.frame_index)} · ${safe(point.status)}${point.reason ? ` · ${safe(point.reason)}` : ""}</title></circle>`;
+    }).join("")).join("");
+    return `
+      <div class="objective-curve-legend">${curve.series.map((series, index) => `<span><i class="series-${index === 0 ? "a" : "b"}"></i>${safe(series.method_label)} · ${objectiveMetricStatuses(series.status_counts)}</span>`).join("")}</div>
+      <div class="objective-curve-plot"><svg viewBox="0 0 100 52" preserveAspectRatio="xMidYMid meet" role="img" aria-label="${safe(curve.metric_name)} 双曲线对比"><g class="objective-curve-grid"><line x1="4" x2="96" y1="8" y2="8"></line><line x1="4" x2="96" y1="26" y2="26"></line><line x1="4" x2="96" y1="44" y2="44"></line></g>${lines}${dots}${unavailableDots}</svg></div>
+      <div class="objective-curve-scale"><span>frame ${Number(curve.series[0]?.points?.[0]?.frame_index ?? 0)}</span><span>LPIPS ${minValue.toFixed(6)} – ${maxValue.toFixed(6)}</span><span>frame ${Number((curve.series[0]?.points || [])[(curve.series[0]?.points || []).length - 1]?.frame_index ?? 0)}</span></div>
+      <p class="muted">双方 completed 重合帧 ${Number(curve.completed_overlap || 0)}。数值越低越好；断线表示缺失或不可用。${reasons.length ? ` 原因：${safe(reasons.slice(0, 3).join("；"))}` : ""}</p>`;
+  }
+
+  function renderObjectiveCurvePanel(analysis, campaign) {
+    const choices = objectiveCurveChoices(analysis, campaign);
+    if (!choices.length) return "";
+    const current = studioState.objectiveCurveSelection;
+    const validCurrent = choices.some((row) => row.itemId === Number(current?.itemId)
+      && row.metricName === String(current?.metricName || ""));
+    if (!validCurrent) {
+      const preferred = choices.find((row) => row.completedMethodCount >= 2) || choices[0];
+      studioState.objectiveCurveSelection = { itemId: preferred.itemId, metricName: preferred.metricName };
+    }
+    const selection = studioState.objectiveCurveSelection;
+    const itemChoices = Array.from(new Map(choices.map((row) => [row.itemId, row])).values());
+    const metricChoices = choices.filter((row) => row.itemId === Number(selection.itemId));
+    const fingerprint = objectiveCurveFingerprint(analysis);
+    const key = objectiveCurveKey(campaign.id, selection, fingerprint);
+    const curve = studioState.objectiveCurveCache[key];
+    const curveError = studioState.objectiveCurveErrors[key];
+    const body = studioState.objectiveCurveLoadingKey === key
+      ? "<p class=\"muted\">正在读取逐帧 LPIPS 数据…</p>"
+      : curveError
+        ? `<div class="message error"><p>${safe(curveError)}</p><button type="button" class="secondary" data-objective-curve-retry>重试读取</button></div>`
+      : curve
+        ? renderObjectiveCurveChart(curve)
+        : "<p class=\"muted\">等待读取逐帧 LPIPS 数据。</p>";
+    return `<section class="stats-block studio-objective-curve" data-analysis-section="objective-curve"><div class="studio-analysis-head"><div><h3>LPIPS 双曲线</h3><p class="muted">按 Campaign 精确绑定对比两个预测方法，不触发重新计算。</p></div><div class="objective-curve-controls"><label><span>Item</span><select data-objective-curve-item>${itemChoices.map((row) => `<option value="${row.itemId}" ${row.itemId === Number(selection.itemId) ? "selected" : ""}>${safe(row.videoName)}</option>`).join("")}</select></label><label><span>指标</span><select data-objective-curve-metric>${metricChoices.map((row) => `<option value="${safe(row.metricName)}" ${row.metricName === selection.metricName ? "selected" : ""}>${safe(row.metricName)}</option>`).join("")}</select></label></div></div><div class="objective-curve-body">${body}</div></section>`;
+  }
+
   function participantShareUrl(shareUrl, campaign) {
     const rawUrl = String(
       shareUrl || (campaign?.share_token ? `/evaluate/${campaign.share_token}` : ""),
@@ -439,9 +573,12 @@
     if (!host) return;
     const campaign = payload?.campaign || payload;
     if (!campaign?.id) {
+      studioState.campaignDetail = null;
+      studioState.objectiveCurveSelection = null;
       host.innerHTML = "<p class=\"muted\">选择 Campaign 查看准备进度、分享链接和结果。</p>";
       return;
     }
+    studioState.campaignDetail = payload;
     const progress = payload.preparation || campaign.preparation || {};
     const coverage = payload.coverage || campaign.coverage || {};
     const analysis = payload.analysis || null;
@@ -457,9 +594,44 @@
       <div class="summary-grid"><div><span>视频</span><strong>${Number(coverage.items || campaign.item_count || 0)}</strong></div><div><span>任务</span><strong>${Number(coverage.tasks || campaign.task_count || 0)}</strong></div><div><span>投票</span><strong>${Number(coverage.votes || campaign.vote_count || 0)}</strong></div><div><span>目标票数/视频</span><strong>${Number(campaign.target_votes || 0)}</strong></div></div>
       ${shareUrl ? `<label class="studio-share"><span>参与链接</span><div><input readonly value="${safe(shareUrl)}"><button data-copy-share="${safe(shareUrl)}" type="button">复制</button></div></label>` : ""}
       ${shareUrl && isLoopbackOrigin() ? `<div class="message warn studio-share-warning"><p>当前链接使用本机回环地址，只能在这台电脑上打开。若要让受控内网参与者访问，请以 <code>--host 0.0.0.0</code> 启动服务，再从 <code>http://&lt;服务器内网 IP&gt;:8765</code> 打开 Studio 并重新复制链接；不要将服务暴露到公网。</p></div>` : ""}
-      <div class="studio-actions">${!legacy && ["draft", "failed"].includes(campaign.status) ? `<button data-studio-publish="${Number(campaign.id)}" type="button">${campaign.status === "failed" ? "重试发布" : "发布并冻结"}</button>` : ""}${!legacy && campaign.status === "published" ? `<button data-studio-close="${Number(campaign.id)}" type="button">关闭</button>` : ""}${!legacy && ["closed", "failed"].includes(campaign.status) ? `<button class="secondary" data-studio-archive="${Number(campaign.id)}" type="button">归档</button>` : ""}${legacy && !campaign.archived ? `<button class="secondary" data-studio-legacy-archive="${Number(campaign.id)}" type="button">归档</button>` : ""}${legacy && campaign.status === "draft" && Number(campaign.vote_count || campaign.votes || 0) === 0 ? `<button class="danger secondary" data-studio-legacy-discard="${Number(campaign.id)}" type="button">丢弃空 Draft</button>` : ""}${legacy ? `<a class="secondary button-link" href="/api/evaluation-campaigns/${Number(campaign.id)}/export">导出</a>` : `<a class="secondary button-link" href="/api/evaluation-campaigns/v2/${Number(campaign.id)}/export">导出</a>`}</div>
+      <div class="studio-actions">${!legacy && ["draft", "failed"].includes(campaign.status) ? `<button data-studio-publish="${Number(campaign.id)}" type="button">${campaign.status === "failed" ? "重试发布" : "发布并冻结"}</button>` : ""}${!legacy && campaign.status === "published" ? `<button data-studio-close="${Number(campaign.id)}" type="button">关闭</button>` : ""}${!legacy && ["closed", "failed"].includes(campaign.status) ? `<button class="secondary" data-studio-archive="${Number(campaign.id)}" type="button">归档</button>` : ""}${!legacy ? `<button class="danger secondary" data-studio-delete="${Number(campaign.id)}" type="button">永久删除</button>` : ""}${legacy && !campaign.archived ? `<button class="secondary" data-studio-legacy-archive="${Number(campaign.id)}" type="button">归档</button>` : ""}${legacy && campaign.status === "draft" && Number(campaign.vote_count || campaign.votes || 0) === 0 ? `<button class="danger secondary" data-studio-legacy-discard="${Number(campaign.id)}" type="button">丢弃空 Draft</button>` : ""}${legacy ? `<a class="secondary button-link" href="/api/evaluation-campaigns/${Number(campaign.id)}/export">导出</a>` : `<a class="secondary button-link" href="/api/evaluation-campaigns/v2/${Number(campaign.id)}/export">导出</a>`}</div>
       ${ranking.length ? `<section class="stats-block studio-human-results" data-analysis-section="human"><h3>人工排名</h3><div class="coverage-table"><table><thead><tr><th>排名</th><th>方法</th><th>得分</th><th>95% CI</th></tr></thead><tbody>${ranking.map((row, index) => `<tr><td>${index + 1}</td><td>${safe(row.label || row.name)}</td><td>${Number(row.score || 0).toFixed(4)}</td><td>${safe((row.ci95 || []).join(" – ") || "-")}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
-      ${!legacy && objective.length ? `<section class="stats-block studio-objective-results" data-analysis-section="objective"><div class="studio-analysis-head"><h3>客观指标</h3><p class="muted">客观指标与人工排名分别展示，不生成合成总分。</p></div><div class="coverage-table"><table><thead><tr><th>指标</th><th>方法</th><th>方向</th><th>状态</th><th>有效样本</th><th>均值 / 中位数</th><th>P10 / P90</th></tr></thead><tbody>${objective.map((row) => `<tr><td>${safe(row.metric_name || "-")}</td><td>${safe(row.method_label || "-")}</td><td>${safe(row.direction || "-")}</td><td>${objectiveMetricStatuses(row.status_counts)}</td><td>${Number(row.count || 0)}</td><td>${objectiveMetricNumber(row.mean)} / ${objectiveMetricNumber(row.median)}</td><td>${objectiveMetricNumber(row.p10)} / ${objectiveMetricNumber(row.p90)}</td></tr>`).join("")}</tbody></table></div></section>` : ""}`;
+      ${!legacy && objective.length ? `<section class="stats-block studio-objective-results" data-analysis-section="objective"><div class="studio-analysis-head"><h3>客观指标</h3><p class="muted">客观指标与人工排名分别展示，不生成合成总分。</p></div><div class="coverage-table"><table><thead><tr><th>指标</th><th>方法</th><th>方向</th><th>状态</th><th>有效样本</th><th>均值 / 中位数</th><th>P10 / P90</th></tr></thead><tbody>${objective.map((row) => `<tr><td>${safe(row.metric_name || "-")}</td><td>${safe(row.method_label || "-")}</td><td>${safe(row.direction || "-")}</td><td>${objectiveMetricStatuses(row.status_counts)}</td><td>${Number(row.count || 0)}</td><td>${objectiveMetricNumber(row.mean)} / ${objectiveMetricNumber(row.median)}</td><td>${objectiveMetricNumber(row.p10)} / ${objectiveMetricNumber(row.p90)}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
+      ${!legacy ? renderObjectiveCurvePanel(analysis, campaign) : ""}`;
+    const selection = studioState.objectiveCurveSelection;
+    if (!legacy && selection) loadObjectiveCurve(campaign.id, selection).catch((error) => notify(error.message));
+  }
+
+  async function loadObjectiveCurve(campaignId, selection) {
+    const detail = studioState.campaignDetail;
+    const fingerprint = objectiveCurveFingerprint(detail?.analysis);
+    const key = objectiveCurveKey(campaignId, selection, fingerprint);
+    if (studioState.objectiveCurveCache[key] || studioState.objectiveCurveErrors[key]) return;
+    if (studioState.objectiveCurveInFlight?.key === key) return;
+    const generation = ++studioState.objectiveCurveRequestGeneration;
+    const requestToken = { key, generation };
+    studioState.objectiveCurveInFlight = requestToken;
+    studioState.objectiveCurveLoadingKey = key;
+    try {
+      const curve = await request(`/api/evaluation-campaigns/v2/${Number(campaignId)}/objective-curve?item_id=${Number(selection.itemId)}&metric_name=${encodeURIComponent(selection.metricName)}`);
+      if (studioState.objectiveCurveInFlight !== requestToken
+          || generation !== studioState.objectiveCurveRequestGeneration) return;
+      studioState.objectiveCurveCache[key] = curve;
+    } catch (error) {
+      if (studioState.objectiveCurveInFlight === requestToken
+          && generation === studioState.objectiveCurveRequestGeneration) {
+        studioState.objectiveCurveErrors[key] = error.message || String(error);
+      }
+      throw error;
+    } finally {
+      if (studioState.objectiveCurveInFlight === requestToken) {
+        studioState.objectiveCurveInFlight = null;
+        studioState.objectiveCurveLoadingKey = "";
+      }
+      if (generation === studioState.objectiveCurveRequestGeneration) {
+        if (studioState.campaignDetail) renderCampaignDetail(studioState.campaignDetail);
+      }
+    }
   }
 
   async function loadCampaigns() {
@@ -512,6 +684,12 @@
   async function openCampaign(key, rerenderList = true) {
     const requestedKey = String(key).includes(":") ? String(key) : `v2:${Number(key)}`;
     const requestGeneration = ++studioState.campaignRequestGeneration;
+    if (studioState.selectedCampaignKey !== requestedKey) {
+      studioState.objectiveCurveRequestGeneration += 1;
+      studioState.objectiveCurveSelection = null;
+      studioState.objectiveCurveLoadingKey = "";
+      studioState.campaignDetail = null;
+    }
     if (studioState.preparationPoll && studioState.preparationPollKey !== requestedKey) {
       clearInterval(studioState.preparationPoll);
       studioState.preparationPoll = null;
@@ -590,6 +768,31 @@
     await request(`/api/evaluation-campaigns/v2/${Number(campaignId)}/${action}`, { method: "POST", body: "{}" });
     await loadCampaigns();
     await openCampaign(`v2:${Number(campaignId)}`);
+  }
+
+  async function deleteCampaign(campaignId) {
+    const campaign = studioState.campaigns.find((row) =>
+      Number(row.schema_version || 1) >= 2 && Number(row.id) === Number(campaignId));
+    if (!campaign) throw new Error("Campaign V2 不存在或已经删除");
+    if (!window.confirm(`永久删除盲测记录“${campaign.name || campaign.id}”？此操作不可撤销。`)) return;
+    const destructive = ["preparing", "published", "closed", "archived"].includes(String(campaign.status || ""))
+      || Number(campaign.vote_count || campaign.votes || 0) > 0;
+    if (destructive && !window.confirm("该记录正在准备、已经发布或包含投票。继续将永久删除任务、投票、分析缓存和冻结媒体。确认继续？")) return;
+    const result = await request(`/api/evaluation-campaigns/v2/${Number(campaignId)}`, {
+      method: "DELETE",
+      body: JSON.stringify({ confirm: true, confirm_destructive: destructive }),
+    });
+    studioState.campaignRequestGeneration += 1;
+    studioState.objectiveCurveRequestGeneration += 1;
+    studioState.selectedCampaignKey = null;
+    studioState.campaignDetail = null;
+    studioState.objectiveCurveSelection = null;
+    studioState.objectiveCurveLoadingKey = "";
+    renderCampaignDetail(null);
+    await loadCampaigns();
+    notify(result.cleanup_pending
+      ? "盲测记录已删除；隔离文件仍被占用，可稍后再次调用删除接口重试清理"
+      : `盲测记录已永久删除，释放 ${formatBytes(result.reclaimed_bytes || 0)}`);
   }
 
   async function legacyCampaignArchive(campaignId) {
@@ -694,6 +897,36 @@
   }
 
   document.addEventListener("change", (event) => {
+    if (event.target.matches?.("[data-objective-curve-item]")) {
+      const detail = studioState.campaignDetail;
+      const campaign = detail?.campaign || detail;
+      const choices = objectiveCurveChoices(detail?.analysis, campaign)
+        .filter((row) => row.itemId === Number(event.target.value));
+      const preferred = choices.find((row) => row.completedMethodCount >= 2) || choices[0];
+      if (preferred) {
+        studioState.objectiveCurveRequestGeneration += 1;
+        studioState.objectiveCurveLoadingKey = "";
+        studioState.objectiveCurveSelection = {
+          itemId: preferred.itemId,
+          metricName: preferred.metricName,
+        };
+        renderCampaignDetail(detail);
+      }
+      return;
+    }
+    if (event.target.matches?.("[data-objective-curve-metric]")) {
+      const current = studioState.objectiveCurveSelection;
+      if (current) {
+        studioState.objectiveCurveRequestGeneration += 1;
+        studioState.objectiveCurveLoadingKey = "";
+        studioState.objectiveCurveSelection = {
+          itemId: Number(current.itemId),
+          metricName: String(event.target.value || ""),
+        };
+        renderCampaignDetail(studioState.campaignDetail);
+      }
+      return;
+    }
     if (event.target.matches?.("#studio-item-group")) {
       studioState.selectedGroupId = event.target.value || "";
       studioState.selectedItemIds.clear();
@@ -733,6 +966,22 @@
   });
 
   document.addEventListener("click", (event) => {
+    const curveRetry = event.target.closest?.("[data-objective-curve-retry]");
+    if (curveRetry) {
+      const detail = studioState.campaignDetail;
+      const campaign = detail?.campaign || detail;
+      const selection = studioState.objectiveCurveSelection;
+      if (campaign?.id && selection) {
+        const key = objectiveCurveKey(
+          campaign.id,
+          selection,
+          objectiveCurveFingerprint(detail?.analysis),
+        );
+        delete studioState.objectiveCurveErrors[key];
+        renderCampaignDetail(detail);
+      }
+      return;
+    }
     const campaign = event.target.closest?.("[data-studio-campaign]");
     if (campaign) return openCampaign(campaign.dataset.studioCampaign).catch((error) => notify(error.message));
     const copy = event.target.closest?.("[data-copy-share]");
@@ -743,13 +992,22 @@
     if (close) return campaignAction("close", close.dataset.studioClose).catch((error) => notify(error.message));
     const archive = event.target.closest?.("[data-studio-archive]");
     if (archive) return campaignAction("archive", archive.dataset.studioArchive).catch((error) => notify(error.message));
+    const campaignDelete = event.target.closest?.("[data-studio-delete]");
+    if (campaignDelete) return deleteCampaign(campaignDelete.dataset.studioDelete).catch((error) => notify(error.message));
     const legacyArchive = event.target.closest?.("[data-studio-legacy-archive]");
     if (legacyArchive) return legacyCampaignArchive(legacyArchive.dataset.studioLegacyArchive).catch((error) => notify(error.message));
     const legacyDiscard = event.target.closest?.("[data-studio-legacy-discard]");
     if (legacyDiscard) return legacyCampaignDiscard(legacyDiscard.dataset.studioLegacyDiscard).catch((error) => notify(error.message));
   });
 
-  window.VFIEvalStudio = { load, refresh: load, previewCoverage, createCampaign, prefillFromCompare };
+  window.VFIEvalStudio = {
+    load,
+    refresh: load,
+    openCampaign,
+    previewCoverage,
+    createCampaign,
+    prefillFromCompare,
+  };
 
   el("studio-refresh")?.addEventListener("click", () => load().catch((error) => notify(error.message)));
   el("studio-preview")?.addEventListener("click", () => previewCoverage().catch((error) => notify(error.message)));

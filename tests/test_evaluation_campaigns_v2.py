@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import shutil
 import tempfile
 import sys
 import threading
@@ -20,6 +21,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from vfieval.evaluations_v2 import (
+    CampaignDependencyError,
     EvaluationConflict,
     SourceChanged,
     _capture_source_tree_guard,
@@ -35,8 +37,10 @@ from vfieval.evaluations_v2 import (
     blind_submit_vote,
     campaign_analysis_v2,
     campaign_export_v2,
+    campaign_objective_curve_v2,
     close_campaign_v2,
     create_campaign_v2,
+    delete_campaign_v2,
     get_campaign_v2,
     get_preparation_v2,
     list_run_outputs,
@@ -387,6 +391,113 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
             self.assertEqual(metric["count"], 2)
             self.assertEqual(metric["mean"], 0.5)
             self.assertEqual(metric["frame_coverage"]["completed"], 6)
+
+    def test_objective_curve_compares_two_methods_on_semantic_frame_domain(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _media_item, body, paths = self._item_campaign(workspace, db)
+            campaign = create_campaign_v2(db, workspace, body)
+            detail = get_campaign_v2(db, int(campaign["id"]))
+            evaluation_item = detail["items"][0]
+            methods = {int(row["id"]): row for row in detail["methods"]}
+
+            rows_by_slot = {
+                "a": [("completed", 0.10, {}), ("unavailable", None, {"reason": "weights missing"})],
+                "b": [("completed", 0.15, {}), ("completed", 0.25, {}), ("completed", None, {})],
+            }
+            for binding in evaluation_item["bindings"]:
+                method = methods[int(binding["method_id"])]
+                run_id = int(method["source_run_id"])
+                run = db.get_run(run_id)
+                dataset_id = int(run["dataset_id"])
+                inference_job_id = int(run["inference_job_id"])
+                samples = db.query(
+                    "SELECT id, metadata_json FROM samples WHERE dataset_id = ? ORDER BY id",
+                    (dataset_id,),
+                )
+                sample_ids = [int(samples[0]["id"])]
+                for frame_index in (2, 4):
+                    sample_ids.append(
+                        db.add_sample(
+                            dataset_id,
+                            f"clip_{frame_index:06d}",
+                            str(paths[1]),
+                            str(paths[1]),
+                            str(paths[0]),
+                            {"video_name": "clip", "frame_index": frame_index},
+                        )
+                    )
+                metric_job_id = db.add_run_job(
+                    run_id,
+                    "metric",
+                    {"metric_names": ["lpips_vit_patch"], "metric_wave_id": f"curve-{method['slot']}"},
+                )
+                with db.connection() as conn:
+                    conn.execute(
+                        "UPDATE runs SET metrics_json = ? WHERE id = ?",
+                        (json.dumps(["lpips_vit_patch"]), run_id),
+                    )
+                    conn.execute(
+                        "UPDATE jobs SET status = 'completed' WHERE id = ?",
+                        (metric_job_id,),
+                    )
+                for sample_id, (status, value, details_json) in zip(
+                    sample_ids,
+                    rows_by_slot[str(method["slot"])],
+                ):
+                    result_id = db.add_metric_result(
+                        metric_job_id,
+                        inference_job_id,
+                        sample_id,
+                        "lpips_vit_patch",
+                        status,
+                        value,
+                        details_json,
+                    )
+                    bind_metric_result(
+                        db,
+                        result_id,
+                        None,
+                        int(binding["source_asset_id"]),
+                        video_name="clip",
+                    )
+
+            curve = campaign_objective_curve_v2(
+                db,
+                int(campaign["id"]),
+                int(evaluation_item["id"]),
+                "lpips_vit_patch",
+            )
+
+            self.assertEqual(curve["frame_count"], 3)
+            self.assertEqual(
+                [point["frame_index"] for point in curve["series"][0]["points"]],
+                [0, 2, 4],
+            )
+            by_slot = {row["slot"]: row for row in curve["series"]}
+            self.assertEqual(
+                [point["status"] for point in by_slot["a"]["points"]],
+                ["completed", "unavailable", "missing"],
+            )
+            self.assertEqual(
+                [point["status"] for point in by_slot["b"]["points"]],
+                ["completed", "completed", "unavailable"],
+            )
+            self.assertIn("weights missing", by_slot["a"]["reason_counts"])
+            self.assertIn(
+                "metric completed without a finite value",
+                by_slot["b"]["reason_counts"],
+            )
+            serialized = json.dumps(curve, sort_keys=True)
+            for forbidden in ("run_id", "asset_id", "sample_id", "storage_path"):
+                self.assertNotIn(forbidden, serialized)
+            with self.assertRaisesRegex(ValueError, "metric_name"):
+                campaign_objective_curve_v2(
+                    db,
+                    int(campaign["id"]),
+                    int(evaluation_item["id"]),
+                    "vmaf",
+                )
 
     def _upload_asset(self, db, collection_id, path, role, name):
         return upsert_asset(
@@ -1843,6 +1954,97 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
                 )
                 self.assertEqual(asset["source_kind"], "evaluation_package")
                 self.assertTrue(path.exists())
+
+    def test_incomplete_published_campaign_can_be_deleted_and_run_purge_retried(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            run_a, _run_b, body, _paths = self._two_runs(workspace, db)
+            campaign = publish_campaign_v2(
+                db,
+                workspace,
+                create_campaign_v2(db, workspace, body)["id"],
+            )
+            campaign_id = int(campaign["id"])
+            package = workspace.evaluations_dir / str(campaign_id)
+            (package / "manifest.json").unlink()
+
+            service = RunCleanupService(db, workspace, cache_grace_seconds=0)
+            request = service.request_delete(run_a)
+            failed = service.process_request(int(request["id"]))
+            self.assertEqual(failed["status"], "failed")
+            self.assertEqual(failed["error"]["type"], CampaignDependencyError.__name__)
+            self.assertEqual(failed["error"]["campaign_id"], campaign_id)
+            self.assertEqual(failed["error"]["action"], "open_campaign")
+
+            with self.assertRaisesRegex(ValueError, "confirm_destructive"):
+                delete_campaign_v2(
+                    db,
+                    workspace,
+                    campaign_id,
+                    confirmed=True,
+                )
+            deleted = delete_campaign_v2(
+                db,
+                workspace,
+                campaign_id,
+                confirmed=True,
+                destructive_confirmed=True,
+            )
+            self.assertTrue(deleted["deleted"])
+            self.assertFalse(package.exists())
+            self.assertIsNone(
+                db.get("SELECT id FROM evaluation_campaigns_v2 WHERE id = ?", (campaign_id,))
+            )
+            self.assertEqual(
+                db.query(
+                    "SELECT id FROM media_assets WHERE source_kind = 'evaluation_package' "
+                    "AND source_key GLOB ?",
+                    (f"evaluation_package:{campaign_id}:*",),
+                ),
+                [],
+            )
+
+            retried = service.request_delete(run_a)
+            completed = service.process_request(int(retried["id"]))
+            self.assertEqual(completed["status"], "completed")
+            self.assertIsNotNone(db.get_run(run_a)["deleted_at"])
+
+    def test_campaign_delete_tombstone_cleanup_is_retryable_after_file_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _run_a, _run_b, body, _paths = self._two_runs(workspace, db)
+            campaign = create_campaign_v2(db, workspace, body)
+            campaign_id = int(campaign["id"])
+            package = workspace.evaluations_dir / str(campaign_id)
+            package.mkdir(parents=True)
+            (package / "broken.partial").write_bytes(b"partial")
+            tombstone = workspace.evaluations_dir / ".delete-staging" / str(campaign_id)
+            real_rmtree = shutil.rmtree
+
+            def fail_tombstone_once(path, *args, **kwargs):
+                if Path(path) == tombstone:
+                    raise OSError("file is in use")
+                return real_rmtree(path, *args, **kwargs)
+
+            with patch("vfieval.evaluations_v2.shutil.rmtree", side_effect=fail_tombstone_once):
+                deleted = delete_campaign_v2(
+                    db,
+                    workspace,
+                    campaign_id,
+                    confirmed=True,
+                )
+            self.assertTrue(deleted["cleanup_pending"])
+            self.assertTrue(tombstone.exists())
+
+            retried = delete_campaign_v2(
+                db,
+                workspace,
+                campaign_id,
+                confirmed=True,
+            )
+            self.assertTrue(retried["already_deleted"])
+            self.assertFalse(retried["cleanup_pending"])
+            self.assertFalse(tombstone.exists())
 
     def test_run_purge_freezes_readable_published_v1_campaign_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

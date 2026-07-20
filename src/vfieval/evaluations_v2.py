@@ -7,6 +7,7 @@ import os
 import random
 import secrets
 import shutil
+import sqlite3
 import statistics
 import threading
 import time
@@ -200,6 +201,26 @@ ON evaluation_votes_v2(evaluator_id, created_at);
 
 class EvaluationConflict(ValueError):
     """The campaign is valid, but concurrent state made this action stale."""
+
+
+class CampaignDependencyError(ValueError):
+    """A Run purge is blocked by one Campaign V2 record that needs attention."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        campaign_id: int,
+        code: str,
+        campaign_ids: Iterable[int] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = str(code)
+        self.campaign_id = int(campaign_id)
+        self.campaign_ids = [
+            int(value) for value in (campaign_ids if campaign_ids is not None else [campaign_id])
+        ]
+        self.action = "open_campaign"
 
 
 PREPARATION_CLAIM_STALE_SECONDS = 10 * 60
@@ -3325,6 +3346,415 @@ def archive_campaign_v2(db: Database, campaign_id: int) -> dict[str, Any]:
     return get_campaign_v2(db, int(campaign_id))
 
 
+def delete_campaign_v2(
+    db: Database,
+    workspace: WorkspaceConfig,
+    campaign_id: int,
+    *,
+    confirmed: bool,
+    destructive_confirmed: bool = False,
+) -> dict[str, Any]:
+    """Permanently remove one Campaign V2 and only its frozen package data.
+
+    Package completeness is deliberately *not* a precondition.  A broken
+    package must remain deletable so it cannot permanently block deletion of a
+    producer Run.  The final package is first renamed inside the managed
+    evaluations root while an IMMEDIATE SQLite transaction fences preparation
+    publication.  If metadata deletion fails, the package is restored before
+    the error is returned.
+    """
+
+    ensure_v2_schema(db)
+    if not confirmed:
+        raise ValueError("confirm=true is required to permanently delete a Campaign V2")
+
+    workspace_root = workspace.root.resolve()
+    evaluations_root = workspace.evaluations_dir.resolve()
+    if evaluations_root != workspace_root / "evaluations":
+        raise ValueError("the evaluations directory is not the trusted workspace path")
+    # Keep the leaf lexical: resolving it would follow a malicious/broken
+    # symlink and could turn deletion of one Campaign into deletion of another.
+    package = evaluations_root / str(int(campaign_id))
+    if package.parent.resolve() != evaluations_root:
+        raise ValueError("Campaign V2 package resolved outside the evaluations directory")
+    quarantine_root = evaluations_root / ".delete-staging"
+    quarantine = quarantine_root / str(int(campaign_id))
+    if quarantine.parent != quarantine_root:
+        raise ValueError("Campaign V2 delete target escaped its staging directory")
+
+    def is_junction(path: Path) -> bool:
+        check = getattr(path, "is_junction", None)
+        return bool(check()) if callable(check) else False
+
+    def validate_quarantine_root(*, create: bool) -> None:
+        if quarantine_root.is_symlink() or is_junction(quarantine_root):
+            raise ValueError("Campaign V2 delete staging is not a trusted directory")
+        if create:
+            quarantine_root.mkdir(parents=True, exist_ok=True)
+        if not quarantine_root.exists():
+            return
+        if quarantine_root.resolve() != quarantine_root:
+            raise ValueError("Campaign V2 delete staging is not a trusted directory")
+
+    def remove_quarantine() -> bool:
+        if not (quarantine.exists() or quarantine.is_symlink()):
+            return True
+        try:
+            if quarantine.is_symlink() or quarantine.is_file():
+                quarantine.unlink()
+            elif is_junction(quarantine):
+                quarantine.rmdir()
+            else:
+                shutil.rmtree(quarantine)
+        except OSError:
+            return False
+        return True
+
+    # A deterministic tombstone makes the filesystem half of deletion
+    # retryable after a process crash or a Windows file-sharing violation.
+    existing_campaign = db.get(
+        "SELECT status FROM evaluation_campaigns_v2 WHERE id = ?",
+        (int(campaign_id),),
+    )
+    if existing_campaign is None:
+        validate_quarantine_root(create=False)
+        if quarantine.exists() or quarantine.is_symlink():
+            cleaned = remove_quarantine()
+            return {
+                "campaign_id": int(campaign_id),
+                "deleted": True,
+                "already_deleted": True,
+                "reclaimed_bytes": 0,
+                "cleanup_pending": not cleaned,
+                "residual_paths": [] if cleaned else [str(quarantine)],
+                "cleanup_warnings": [],
+                "skipped_asset_ids": [],
+            }
+        raise KeyError(f"evaluation campaign V2 {campaign_id} not found")
+
+    moved = False
+    package_bytes = 0
+    frozen_asset_ids: list[int] = []
+    frozen_member_ids: list[int] = []
+    collection_ids: list[int] = []
+    skipped_asset_ids: list[int] = []
+    status = ""
+    vote_count = 0
+    task_count = 0
+    try:
+        with db.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            campaign = conn.execute(
+                "SELECT status FROM evaluation_campaigns_v2 WHERE id = ?",
+                (int(campaign_id),),
+            ).fetchone()
+            if campaign is None:
+                raise KeyError(f"evaluation campaign V2 {campaign_id} not found")
+            status = str(campaign["status"] or "")
+            counts = conn.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM evaluation_tasks_v2 WHERE campaign_id = ?) AS tasks,
+                    (SELECT COUNT(*) FROM evaluation_votes_v2 v
+                     JOIN evaluation_tasks_v2 t ON t.id = v.task_id
+                     WHERE t.campaign_id = ?) AS votes
+                """,
+                (int(campaign_id), int(campaign_id)),
+            ).fetchone()
+            task_count = int(counts["tasks"] or 0)
+            vote_count = int(counts["votes"] or 0)
+            destructive = status in {"preparing", "published", "closed", "archived"} or vote_count > 0
+            if destructive and not destructive_confirmed:
+                raise ValueError(
+                    "confirm_destructive=true is required to delete a preparing, published, "
+                    "closed, archived, or voted Campaign V2"
+                )
+
+            external_reference = conn.execute(
+                """
+                SELECT 1 AS blocked
+                WHERE EXISTS (
+                    SELECT 1 FROM evaluation_tasks_v2 t
+                    WHERE t.campaign_id != ?
+                      AND (
+                        t.item_id IN (SELECT id FROM evaluation_items_v2 WHERE campaign_id = ?)
+                        OR t.binding_a_id IN (
+                            SELECT b.id FROM evaluation_bindings_v2 b
+                            JOIN evaluation_items_v2 i ON i.id = b.item_id
+                            WHERE i.campaign_id = ?
+                        )
+                        OR t.binding_b_id IN (
+                            SELECT b.id FROM evaluation_bindings_v2 b
+                            JOIN evaluation_items_v2 i ON i.id = b.item_id
+                            WHERE i.campaign_id = ?
+                        )
+                      )
+                ) OR EXISTS (
+                    SELECT 1 FROM evaluation_bindings_v2 b
+                    JOIN evaluation_items_v2 i ON i.id = b.item_id
+                    JOIN evaluation_methods_v2 m ON m.id = b.method_id
+                    WHERE i.campaign_id != ? AND m.campaign_id = ?
+                ) OR EXISTS (
+                    SELECT 1 FROM evaluation_votes_v2 v
+                    JOIN evaluation_tasks_v2 t ON t.id = v.task_id
+                    JOIN evaluation_methods_v2 m ON m.id = v.preferred_method_id
+                    WHERE t.campaign_id != ? AND m.campaign_id = ?
+                )
+                """,
+                (
+                    int(campaign_id),
+                    int(campaign_id),
+                    int(campaign_id),
+                    int(campaign_id),
+                    int(campaign_id),
+                    int(campaign_id),
+                    int(campaign_id),
+                    int(campaign_id),
+                ),
+            ).fetchone()
+            if external_reference is not None:
+                raise EvaluationConflict(
+                    "Campaign V2 deletion is blocked by a cross-Campaign reference"
+                )
+
+            # Revoking the claim and changing the status makes every existing
+            # preparation worker fail its next ownership check.  The writer
+            # transaction remains open through metadata deletion, so a retrying
+            # publisher cannot acquire a fresh claim in between.
+            if status == "preparing":
+                now = utc_ts()
+                conn.execute(
+                    "UPDATE evaluation_campaigns_v2 SET status = 'failed', updated_at = ? WHERE id = ?",
+                    (now, int(campaign_id)),
+                )
+                conn.execute(
+                    """
+                    UPDATE evaluation_preparations_v2
+                    SET state = 'failed', claim_token = '', error_json = ?,
+                        completed_at = ?, updated_at = ?
+                    WHERE campaign_id = ?
+                    """,
+                    (
+                        _json({"type": "CampaignDeleted", "message": "Campaign deletion requested"}),
+                        now,
+                        now,
+                        int(campaign_id),
+                    ),
+                )
+
+            direct_asset_ids = {
+                int(row["asset_id"])
+                for row in conn.execute(
+                    """
+                    SELECT frozen_reference_asset_id AS asset_id
+                    FROM evaluation_items_v2
+                    WHERE campaign_id = ? AND frozen_reference_asset_id IS NOT NULL
+                    UNION
+                    SELECT b.frozen_asset_id AS asset_id
+                    FROM evaluation_bindings_v2 b
+                    JOIN evaluation_items_v2 i ON i.id = b.item_id
+                    WHERE i.campaign_id = ? AND b.frozen_asset_id IS NOT NULL
+                    """,
+                    (int(campaign_id), int(campaign_id)),
+                ).fetchall()
+            }
+            collection_row = conn.execute(
+                "SELECT id, metadata_json FROM media_collections WHERE slug = ?",
+                (f"evaluation-package-{int(campaign_id)}",),
+            ).fetchone()
+            owned_collection_id: int | None = None
+            if collection_row is not None:
+                try:
+                    collection_metadata = _loads(collection_row["metadata_json"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    collection_metadata = {}
+                if (
+                    isinstance(collection_metadata, dict)
+                    and collection_metadata.get("source_kind") == "evaluation_package"
+                    and type(collection_metadata.get("campaign_id")) is int
+                    and int(collection_metadata["campaign_id"]) == int(campaign_id)
+                ):
+                    owned_collection_id = int(collection_row["id"])
+                    collection_ids.append(owned_collection_id)
+
+            candidate_clauses = ["ma.source_key GLOB ?"]
+            candidate_params: list[Any] = [f"evaluation_package:{int(campaign_id)}:*"]
+            if direct_asset_ids:
+                candidate_clauses.append(
+                    f"ma.id IN ({','.join('?' for _ in direct_asset_ids)})"
+                )
+                candidate_params.extend(sorted(direct_asset_ids))
+            if owned_collection_id is not None:
+                candidate_clauses.append("ma.collection_id = ?")
+                candidate_params.append(owned_collection_id)
+            candidate_rows = conn.execute(
+                f"""
+                SELECT ma.id, ma.collection_id, ma.source_key, ma.provenance_json
+                FROM media_assets ma
+                WHERE ma.source_kind = 'evaluation_package'
+                  AND ({' OR '.join(candidate_clauses)})
+                ORDER BY ma.id
+                """,
+                tuple(candidate_params),
+            ).fetchall()
+            owned_asset_ids: set[int] = set()
+            for asset_row in candidate_rows:
+                try:
+                    provenance = _loads(asset_row["provenance_json"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    provenance = {}
+                provenance_owned = (
+                    isinstance(provenance, dict)
+                    and type(provenance.get("campaign_id")) is int
+                    and int(provenance["campaign_id"]) == int(campaign_id)
+                )
+                key_owned = str(asset_row["source_key"] or "").startswith(
+                    f"evaluation_package:{int(campaign_id)}:"
+                )
+                if key_owned or provenance_owned:
+                    owned_asset_ids.add(int(asset_row["id"]))
+            frozen_asset_ids = sorted(owned_asset_ids)
+            collection_ids = sorted(set(collection_ids))
+            skipped_asset_ids = sorted(direct_asset_ids - owned_asset_ids)
+            if frozen_asset_ids:
+                placeholders = ",".join("?" for _ in frozen_asset_ids)
+                member_rows = conn.execute(
+                    f"""
+                    SELECT id FROM media_item_members
+                    WHERE producer_kind = 'evaluation_package'
+                      AND asset_id IN ({placeholders})
+                    ORDER BY id
+                    """,
+                    tuple(frozen_asset_ids),
+                ).fetchall()
+                frozen_member_ids = sorted(int(row["id"]) for row in member_rows)
+
+            validate_quarantine_root(create=True)
+            if (quarantine.exists() or quarantine.is_symlink()) and (
+                package.exists() or package.is_symlink()
+            ):
+                if not remove_quarantine():
+                    raise EvaluationConflict(
+                        "Campaign V2 has a previous deletion tombstone that could not be cleaned"
+                    )
+            if package.exists() or package.is_symlink():
+                os.replace(package, quarantine)
+                moved = True
+            elif quarantine.exists() or quarantine.is_symlink():
+                moved = True
+            if moved:
+                try:
+                    package_bytes = (
+                        int(quarantine.lstat().st_size)
+                        if quarantine.is_symlink() or is_junction(quarantine)
+                        else _path_size(quarantine)
+                    )
+                except OSError:
+                    package_bytes = 0
+
+            # Explicit child-first deletion keeps the operation readable and
+            # avoids relying on SQLite's cascade ordering around RESTRICT FKs.
+            conn.execute(
+                "DELETE FROM evaluation_votes_v2 WHERE task_id IN "
+                "(SELECT id FROM evaluation_tasks_v2 WHERE campaign_id = ?)",
+                (int(campaign_id),),
+            )
+            conn.execute(
+                "DELETE FROM evaluation_assignments_v2 WHERE task_id IN "
+                "(SELECT id FROM evaluation_tasks_v2 WHERE campaign_id = ?)",
+                (int(campaign_id),),
+            )
+            conn.execute("DELETE FROM evaluation_tasks_v2 WHERE campaign_id = ?", (int(campaign_id),))
+            conn.execute("DELETE FROM evaluation_analysis_cache_v2 WHERE campaign_id = ?", (int(campaign_id),))
+            conn.execute("DELETE FROM evaluation_preparations_v2 WHERE campaign_id = ?", (int(campaign_id),))
+            conn.execute(
+                "DELETE FROM evaluation_bindings_v2 WHERE item_id IN "
+                "(SELECT id FROM evaluation_items_v2 WHERE campaign_id = ?)",
+                (int(campaign_id),),
+            )
+            conn.execute("DELETE FROM evaluation_items_v2 WHERE campaign_id = ?", (int(campaign_id),))
+            conn.execute("DELETE FROM evaluation_methods_v2 WHERE campaign_id = ?", (int(campaign_id),))
+            conn.execute("DELETE FROM evaluation_campaigns_v2 WHERE id = ?", (int(campaign_id),))
+
+            if frozen_member_ids:
+                placeholders = ",".join("?" for _ in frozen_member_ids)
+                conn.execute(
+                    f"DELETE FROM media_item_members WHERE id IN ({placeholders})",
+                    tuple(frozen_member_ids),
+                )
+            if frozen_asset_ids:
+                placeholders = ",".join("?" for _ in frozen_asset_ids)
+                conn.execute(
+                    f"DELETE FROM media_assets WHERE id IN ({placeholders})",
+                    tuple(frozen_asset_ids),
+                )
+            for collection_id in collection_ids:
+                conn.execute(
+                    "DELETE FROM media_collections WHERE id = ? "
+                    "AND NOT EXISTS (SELECT 1 FROM media_assets WHERE collection_id = ?) "
+                    "AND NOT EXISTS (SELECT 1 FROM media_items WHERE collection_id = ?) "
+                    "AND NOT EXISTS (SELECT 1 FROM upload_sessions WHERE collection_id = ?)",
+                    (collection_id, collection_id, collection_id, collection_id),
+                )
+    except BaseException as exc:
+        if moved and (quarantine.exists() or quarantine.is_symlink()) and not package.exists():
+            package.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(quarantine, package)
+        if isinstance(exc, sqlite3.IntegrityError):
+            raise EvaluationConflict(
+                "Campaign V2 deletion is blocked by an external reference"
+            ) from exc
+        raise
+
+    residual_paths: list[str] = []
+    if moved and not remove_quarantine():
+        residual_paths.append(str(quarantine))
+
+    # A superseded preparation worker normally removes its own unique staging
+    # directory.  Also collect already-stale directories for this Campaign;
+    # failure here is reported but cannot resurrect the deleted record.
+    preparation_staging = evaluations_root / ".staging"
+    if (
+        preparation_staging.parent.resolve() == evaluations_root
+        and preparation_staging.is_dir()
+        and not preparation_staging.is_symlink()
+    ):
+        for candidate in preparation_staging.glob(f"{int(campaign_id)}-*"):
+            if candidate.parent != preparation_staging:
+                continue
+            try:
+                if candidate.is_symlink() or candidate.is_file():
+                    candidate.unlink()
+                elif is_junction(candidate):
+                    candidate.rmdir()
+                else:
+                    shutil.rmtree(candidate)
+            except OSError:
+                residual_paths.append(str(candidate))
+
+    return {
+        "campaign_id": int(campaign_id),
+        "deleted": True,
+        "previous_status": status,
+        "deleted_tasks": task_count,
+        "deleted_votes": vote_count,
+        "deleted_assets": len(frozen_asset_ids),
+        "deleted_members": len(frozen_member_ids),
+        "reclaimed_bytes": 0 if moved and str(quarantine) in residual_paths else int(package_bytes),
+        "cleanup_pending": bool(residual_paths),
+        "residual_paths": residual_paths,
+        "cleanup_warnings": (
+            [
+                "Campaign frozen pointers referenced assets whose evaluation-package "
+                "ownership could not be verified; those asset rows were preserved"
+            ]
+            if skipped_asset_ids
+            else []
+        ),
+        "skipped_asset_ids": skipped_asset_ids,
+    }
+
+
 def _campaign_by_token(db: Database, token: str) -> dict[str, Any]:
     ensure_v2_schema(db)
     row = db.get("SELECT * FROM evaluation_campaigns_v2 WHERE public_token = ?", (str(token),))
@@ -4363,6 +4793,7 @@ def _objective_metric_snapshot(
                    mr.metric_name, mr.status, mr.value, mr.details_json,
                    mab.distorted_asset_id,
                    mab.video_name AS binding_video_name,
+                   mab.track_label AS binding_track_label,
                    s.metadata_json AS sample_metadata_json
             FROM metric_results mr
             LEFT JOIN metric_asset_bindings mab ON mab.metric_result_id = mr.id
@@ -4392,6 +4823,7 @@ def _objective_metric_snapshot(
             row["details"] = details if isinstance(details, dict) else {}
             sample_metadata = _loads(row.pop("sample_metadata_json", None))
             sample_metadata = sample_metadata if isinstance(sample_metadata, dict) else {}
+            row["sample_metadata"] = sample_metadata
             video_name = str(
                 row.get("binding_video_name")
                 or row["details"].get("video_name")
@@ -4415,6 +4847,12 @@ def _objective_metric_snapshot(
             ):
                 continue
             row["video_name"] = video_name
+            row["track_label"] = str(
+                row.get("binding_track_label")
+                or row["details"].get("compare_track_label")
+                or sample_metadata.get("compare_track_label")
+                or ""
+            )
             if row.get("sample_id") is not None:
                 identity: tuple[Any, ...] = ("sample", int(row["sample_id"]))
             else:
@@ -4574,6 +5012,11 @@ def _objective_metric_snapshot(
     return {
         "asset_to_binding": asset_to_binding,
         "rows": list(latest.values()),
+        "fallback_rows": [
+            row
+            for row in all_latest.values()
+            if int(row["id"]) not in selected_ids and row.get("sample_id") is not None
+        ],
         "run_states": run_states,
         "result_fallback_reasons": result_fallback_reasons,
         "job_fallback_reasons": job_fallback_reasons,
@@ -4667,6 +5110,7 @@ def _objective_by_method(
             value = statistics.mean(completed_values) if status == "completed" else None
             item_results.append(
                 {
+                    "item_id": int(binding.get("item_id") or 0),
                     "video_name": str(binding.get("video_name") or ""),
                     "metric_name": metric_name,
                     "direction": METRIC_DIRECTIONS.get(metric_name, "lower_is_better"),
@@ -4752,6 +5196,349 @@ def _objective_by_method(
     }
 
 
+def campaign_objective_curve_v2(
+    db: Database,
+    campaign_id: int,
+    item_id: int,
+    metric_name: str,
+) -> dict[str, Any]:
+    """Return lazy, Item-scoped LPIPS points for the Campaign's two methods.
+
+    The complete semantic frame domain comes from the frozen Item mapping when
+    available.  Missing metric rows are explicit points rather than silently
+    shrinking the x-axis, and unbound per-sample failures from the selected
+    producer Run may fill a missing bound result without inventing values.
+    """
+
+    metric_name = str(metric_name or "").strip()
+    if metric_name not in FRAME_OBJECTIVE_METRICS:
+        raise ValueError(
+            "objective curve metric_name must be lpips_vit_patch or lpips_convnext"
+        )
+    campaign = get_campaign_v2(db, int(campaign_id))
+    item = next(
+        (row for row in campaign["items"] if int(row["id"]) == int(item_id)),
+        None,
+    )
+    if item is None:
+        raise ValueError(f"Item {item_id} does not belong to Campaign V2 {campaign_id}")
+    methods = {int(row["id"]): row for row in campaign["methods"]}
+    temporal = dict((item.get("alignment") or {}).get("temporal") or {})
+    expected_frame_count = int(temporal.get("frame_count") or 0)
+    bindings: list[dict[str, Any]] = []
+    for binding in item.get("bindings") or []:
+        current_expected = expected_frame_count
+        if current_expected <= 0:
+            asset = db.get(
+                "SELECT frame_count FROM media_assets WHERE id = ?",
+                (int(binding["source_asset_id"]),),
+            ) or {}
+            current_expected = int(asset.get("frame_count") or 0)
+        expected_frame_count = max(expected_frame_count, current_expected)
+        bindings.append(
+            {
+                **binding,
+                "item_id": int(item["id"]),
+                "video_name": str(item.get("video_name") or ""),
+                "expected_frame_count": current_expected,
+            }
+        )
+    if len(bindings) != 2:
+        raise ValueError("Campaign V2 objective curve requires exactly two method bindings")
+
+    member_mappings: dict[int, dict[str, Any]] = {}
+    member_ids = sorted(
+        {
+            int(binding["source_member_id"])
+            for binding in bindings
+            if binding.get("source_member_id") is not None
+        }
+    )
+    if member_ids:
+        placeholders = ",".join("?" for _ in member_ids)
+        for row in db.query(
+            f"SELECT id, temporal_mapping_json FROM media_item_members WHERE id IN ({placeholders})",
+            tuple(member_ids),
+        ):
+            try:
+                mapping = _loads(row.get("temporal_mapping_json"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                mapping = {}
+            member_mappings[int(row["id"])] = mapping if isinstance(mapping, dict) else {}
+
+    snapshot = _objective_metric_snapshot(db, bindings, methods)
+    asset_ids = {int(binding["source_asset_id"]) for binding in bindings}
+    selected_rows = [
+        row
+        for row in snapshot.get("rows") or []
+        if str(row.get("metric_name") or "") == metric_name
+        and int(row.get("distorted_asset_id") or 0) in asset_ids
+        and row.get("sample_id") is not None
+    ]
+    fallback_rows = [
+        row
+        for row in snapshot.get("fallback_rows") or []
+        if str(row.get("metric_name") or "") == metric_name
+        and row.get("sample_id") is not None
+        and str(row.get("status") or "") in {"failed", "unavailable", "skipped"}
+    ]
+    sample_ids = sorted(
+        {
+            int(row["sample_id"])
+            for row in [*selected_rows, *fallback_rows]
+            if row.get("sample_id") is not None
+        }
+    )
+    sample_metadata: dict[int, dict[str, Any]] = {}
+    if sample_ids:
+        placeholders = ",".join("?" for _ in sample_ids)
+        for row in db.query(
+            f"SELECT id, metadata_json FROM samples WHERE id IN ({placeholders})",
+            tuple(sample_ids),
+        ):
+            try:
+                metadata = _loads(row.get("metadata_json"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                metadata = {}
+            sample_metadata[int(row["id"])] = metadata if isinstance(metadata, dict) else {}
+
+    def semantic_frame(row: dict[str, Any]) -> int | None:
+        metadata = sample_metadata.get(int(row["sample_id"]), {})
+        raw = metadata.get("frame_index")
+        if raw is None:
+            raw = metadata.get("sample_index")
+        try:
+            return int(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def sample_timestamp(row: dict[str, Any]) -> float | None:
+        metadata = sample_metadata.get(int(row["sample_id"]), {})
+        timestamps = metadata.get("timestamps") or {}
+        raw = None
+        if isinstance(timestamps, dict):
+            raw = timestamps.get("gt")
+            if raw is None:
+                raw = timestamps.get("pred")
+        try:
+            value = float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+        return value if value is None or math.isfinite(value) else None
+
+    explicit_domains: list[list[int]] = []
+    mapping_timestamps: dict[int, dict[int, float]] = {}
+    for binding in bindings:
+        mapping = member_mappings.get(int(binding.get("source_member_id") or 0), {})
+        indices = mapping.get("source_frame_indices")
+        if isinstance(indices, list):
+            try:
+                parsed_indices = [int(value) for value in indices]
+            except (TypeError, ValueError):
+                parsed_indices = []
+            if len(parsed_indices) == len(indices) and len(set(parsed_indices)) == len(parsed_indices):
+                explicit_domains.append(parsed_indices)
+                raw_timestamps = mapping.get("timestamps") or mapping.get("source_timestamps")
+                if isinstance(raw_timestamps, list) and len(raw_timestamps) == len(parsed_indices):
+                    parsed_timestamps: dict[int, float] = {}
+                    try:
+                        for frame_index, raw_timestamp in zip(parsed_indices, raw_timestamps):
+                            timestamp = float(raw_timestamp)
+                            if math.isfinite(timestamp):
+                                parsed_timestamps[frame_index] = timestamp
+                    except (TypeError, ValueError):
+                        parsed_timestamps = {}
+                    mapping_timestamps[int(binding["method_id"])] = parsed_timestamps
+    if explicit_domains and any(domain != explicit_domains[0] for domain in explicit_domains[1:]):
+        raise ValueError("Campaign V2 method mappings disagree on semantic frame indices")
+
+    observed_frames = {
+        frame
+        for row in [*selected_rows, *fallback_rows]
+        if (frame := semantic_frame(row)) is not None
+    }
+    if explicit_domains:
+        frame_domain = list(explicit_domains[0])
+    else:
+        mapping_first = temporal.get("mapping_first")
+        mapping_last = temporal.get("mapping_last")
+        mapping_count = int(temporal.get("mapping_count") or 0)
+        try:
+            first = int(mapping_first) if mapping_first is not None else None
+            last = int(mapping_last) if mapping_last is not None else None
+        except (TypeError, ValueError):
+            first = last = None
+        if (
+            first is not None
+            and last is not None
+            and last >= first
+            and mapping_count > 0
+            and last - first + 1 == mapping_count
+        ):
+            frame_domain = list(range(first, last + 1))
+        elif observed_frames:
+            frame_domain = sorted(observed_frames)
+        elif expected_frame_count > 0:
+            frame_domain = list(range(expected_frame_count))
+        else:
+            frame_domain = []
+    domain_set = set(frame_domain)
+
+    rows_by_asset: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in selected_rows:
+        rows_by_asset[int(row["distorted_asset_id"])].append(row)
+
+    timestamp_tolerance = float(temporal.get("timestamp_tolerance_seconds") or 0.001)
+    series: list[dict[str, Any]] = []
+    completed_frames_by_method: list[set[int]] = []
+    timestamps_by_method: dict[int, dict[int, float]] = {}
+    for binding in sorted(bindings, key=lambda row: str(row.get("slot") or "")):
+        method_id = int(binding["method_id"])
+        method = methods[method_id]
+        method_rows: dict[int, dict[str, Any]] = {}
+        method_timestamps = dict(mapping_timestamps.get(method_id, {}))
+        malformed_rows = 0
+        for row in rows_by_asset.get(int(binding["source_asset_id"]), []):
+            frame_index = semantic_frame(row)
+            if frame_index is None or (domain_set and frame_index not in domain_set):
+                malformed_rows += 1
+                continue
+            current = method_rows.get(frame_index)
+            if current is None or int(row["id"]) > int(current["id"]):
+                method_rows[frame_index] = row
+                timestamp = sample_timestamp(row)
+                if timestamp is not None:
+                    method_timestamps[frame_index] = timestamp
+
+        producer_run_id = method.get("source_run_id")
+        expected_track = str(method.get("source_track_label") or "")
+        for row in fallback_rows:
+            if producer_run_id is None or int(row.get("producer_run_id") or -1) != int(producer_run_id):
+                continue
+            if not expected_track:
+                continue
+            if str(row.get("video_name") or "") != str(item.get("video_name") or ""):
+                continue
+            if expected_track and str(row.get("track_label") or "") != expected_track:
+                continue
+            frame_index = semantic_frame(row)
+            if frame_index is None or frame_index in method_rows or (domain_set and frame_index not in domain_set):
+                continue
+            method_rows[frame_index] = row
+            timestamp = sample_timestamp(row)
+            if timestamp is not None:
+                method_timestamps[frame_index] = timestamp
+
+        job_reasons = dict(snapshot.get("job_fallback_reasons") or {}).get(
+            (int(producer_run_id), metric_name, "") if producer_run_id is not None else (),
+            {},
+        )
+        primary_job_reason = next(iter(job_reasons), "")
+        points: list[dict[str, Any]] = []
+        for ordinal, frame_index in enumerate(frame_domain):
+            row = method_rows.get(frame_index)
+            if row is None:
+                points.append(
+                    {
+                        "ordinal": ordinal,
+                        "frame_index": frame_index,
+                        "timestamp": method_timestamps.get(frame_index),
+                        "status": "missing",
+                        "value": None,
+                        "reason": primary_job_reason or "metric result is not available for this frame",
+                    }
+                )
+                continue
+            status = str(row.get("status") or "unavailable")
+            raw_value = row.get("value")
+            try:
+                numeric_value = float(raw_value) if raw_value is not None else None
+            except (TypeError, ValueError):
+                numeric_value = None
+            if numeric_value is not None and not math.isfinite(numeric_value):
+                numeric_value = None
+            if status != "completed":
+                numeric_value = None
+            details = dict(row.get("details") or {})
+            reason = str(details.get("reason") or details.get("type") or "")
+            if status == "completed" and numeric_value is None:
+                status = "unavailable"
+                reason = reason or "metric completed without a finite value"
+            points.append(
+                {
+                    "ordinal": ordinal,
+                    "frame_index": frame_index,
+                    "timestamp": method_timestamps.get(frame_index),
+                    "status": status,
+                    "value": numeric_value,
+                    "reason": reason,
+                }
+            )
+        status_counts = Counter(str(point["status"]) for point in points)
+        completed_frames = {
+            int(point["frame_index"])
+            for point in points
+            if point["status"] == "completed" and point["value"] is not None
+        }
+        completed_frames_by_method.append(completed_frames)
+        timestamps_by_method[method_id] = method_timestamps
+        series_reasons = Counter(
+            str(point["reason"])
+            for point in points
+            if point["status"] != "completed" and str(point.get("reason") or "")
+        )
+        for reason, count in job_reasons.items():
+            if reason not in series_reasons:
+                series_reasons[str(reason)] = int(count)
+        if malformed_rows:
+            series_reasons["metric rows missing a valid semantic frame index"] += malformed_rows
+        series.append(
+            {
+                "slot": str(binding.get("slot") or method.get("slot") or ""),
+                "method_id": method_id,
+                "method_label": str(method.get("label_snapshot") or ""),
+                "coverage": {
+                    "expected": len(frame_domain),
+                    "observed": len(method_rows),
+                    "completed": len(completed_frames),
+                },
+                "status_counts": dict(sorted(status_counts.items())),
+                "reason_counts": dict(sorted(series_reasons.items())),
+                "points": points,
+            }
+        )
+
+    if len(series) == 2:
+        left_timestamps = timestamps_by_method.get(int(series[0]["method_id"]), {})
+        right_timestamps = timestamps_by_method.get(int(series[1]["method_id"]), {})
+        for frame_index in set(left_timestamps).intersection(right_timestamps):
+            if abs(left_timestamps[frame_index] - right_timestamps[frame_index]) > timestamp_tolerance:
+                raise ValueError(
+                    f"Campaign V2 method timestamps disagree at frame {frame_index}"
+                )
+    overlap = (
+        len(set.intersection(*completed_frames_by_method))
+        if len(completed_frames_by_method) == 2
+        else 0
+    )
+    return {
+        "campaign_id": int(campaign_id),
+        "item": {
+            "id": int(item["id"]),
+            "media_item_id": (
+                int(item["media_item_id"]) if item.get("media_item_id") is not None else None
+            ),
+            "video_name": str(item.get("video_name") or ""),
+        },
+        "metric_name": metric_name,
+        "direction": METRIC_DIRECTIONS.get(metric_name, "lower_is_better"),
+        "frame_count": len(frame_domain),
+        "series": series,
+        "completed_overlap": overlap,
+        "metric_fingerprint": str(snapshot.get("fingerprint") or ""),
+    }
+
+
 def campaign_analysis_v2(
     db: Database,
     campaign_id: int,
@@ -4780,6 +5567,7 @@ def campaign_analysis_v2(
             bindings.append(
                 {
                     **binding,
+                    "item_id": int(item["id"]),
                     "video_name": video_name,
                     "expected_frame_count": expected_frame_count,
                 }
@@ -4787,6 +5575,7 @@ def campaign_analysis_v2(
     objective_snapshot = _objective_metric_snapshot(db, bindings, methods)
     cache_key = _json(
         {
+            "analysis_version": 2,
             "bootstrap_samples": samples,
             "video": str(video or ""),
             "objective_fingerprint": str(objective_snapshot["fingerprint"]),
@@ -5062,9 +5851,13 @@ def protect_campaign_media_for_run(
         (int(run_id),),
     )
     if preparing:
-        raise ValueError(
+        campaign_ids = [int(row["id"]) for row in preparing]
+        raise CampaignDependencyError(
             "Run is referenced by a Campaign V2 preparation: "
-            + ", ".join(str(row["id"]) for row in preparing)
+            + ", ".join(str(value) for value in campaign_ids),
+            campaign_id=campaign_ids[0],
+            campaign_ids=campaign_ids,
+            code="campaign_preparing",
         )
     v2_rows = db.query(
         """
@@ -5075,9 +5868,14 @@ def protect_campaign_media_for_run(
         (int(run_id),),
     )
     for row in v2_rows:
-        package = (workspace.evaluations_dir / str(int(row["id"]))).resolve()
+        campaign_id = int(row["id"])
+        package = (workspace.evaluations_dir / str(campaign_id)).resolve()
         if not (package / "manifest.json").is_file():
-            raise ValueError(f"Campaign V2 {row['id']} evaluation package is incomplete")
+            raise CampaignDependencyError(
+                f"Campaign V2 {campaign_id} evaluation package is incomplete",
+                campaign_id=campaign_id,
+                code="campaign_package_incomplete",
+            )
         assets = db.query(
             """
             SELECT frozen_reference_asset_id AS asset_id
@@ -5091,19 +5889,27 @@ def protect_campaign_media_for_run(
             (int(row["id"]), int(row["id"])),
         )
         if not assets or any(asset.get("asset_id") is None for asset in assets):
-            raise ValueError(f"Campaign V2 {row['id']} has incomplete frozen asset bindings")
+            raise CampaignDependencyError(
+                f"Campaign V2 {campaign_id} has incomplete frozen asset bindings",
+                campaign_id=campaign_id,
+                code="campaign_frozen_bindings_incomplete",
+            )
         for asset_row in assets:
             asset = get_asset(db, int(asset_row["asset_id"]), include_deleted=True)
             path = Path(str(asset["storage_path"])).resolve()
             try:
                 path.relative_to(package)
             except ValueError as exc:
-                raise ValueError(
-                    f"Campaign V2 {row['id']} frozen asset escaped its evaluation package"
+                raise CampaignDependencyError(
+                    f"Campaign V2 {campaign_id} frozen asset escaped its evaluation package",
+                    campaign_id=campaign_id,
+                    code="campaign_frozen_asset_outside_package",
                 ) from exc
             if asset["state"] != "ready" or asset.get("deleted_at") is not None or not path.exists():
-                raise ValueError(
-                    f"Campaign V2 {row['id']} frozen asset {asset['id']} is unavailable"
+                raise CampaignDependencyError(
+                    f"Campaign V2 {campaign_id} frozen asset {asset['id']} is unavailable",
+                    campaign_id=campaign_id,
+                    code="campaign_frozen_asset_unavailable",
                 )
     legacy_rows = _legacy_assets_for_run(db, int(run_id))
     migrated: list[int] = []

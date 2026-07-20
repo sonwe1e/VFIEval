@@ -382,6 +382,106 @@ class MetricTests(unittest.TestCase):
             self.assertEqual(result["summary"]["lpips_convnext"]["completed"], 4)
             self.assertEqual(result["performance"]["lpips_convnext"]["effective_batch_size"], 2)
 
+    def test_frame_metric_factory_unavailable_is_recorded_per_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = WorkspaceConfig.from_root(root / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            model_id = db.register_model("factory-unavailable", "dummy", None, 8, 8, {})
+            dataset_id = db.create_dataset("factory-unavailable", str(root), True)
+            run_id = db.create_run(
+                "factory-unavailable",
+                model_id,
+                dataset_id,
+                8,
+                8,
+                1,
+                "cuda:7",
+                "fp32",
+                ["lpips_vit_patch"],
+                create_inference_job=False,
+            )
+            inference_job_id = db.add_run_job(
+                run_id,
+                "inference",
+                {"run_id": run_id, "dataset_id": dataset_id},
+                device="cuda:7",
+            )
+            for index in range(2):
+                gt = root / f"factory-gt-{index}.png"
+                pred = root / f"factory-pred-{index}.png"
+                Image.new("RGB", (8, 8), (index, 0, 0)).save(gt)
+                Image.new("RGB", (8, 8), (index + 1, 0, 0)).save(pred)
+                sample_id = db.add_sample(
+                    dataset_id,
+                    f"clip_{index:06d}",
+                    str(gt),
+                    str(gt),
+                    str(gt),
+                    {"video_name": "clip", "frame_index": index},
+                )
+                db.add_artifact(
+                    inference_job_id,
+                    sample_id,
+                    "gt",
+                    str(gt),
+                    "image/png",
+                    {"artifact_contract": "canonical-v1"},
+                )
+                db.add_artifact(
+                    inference_job_id,
+                    sample_id,
+                    "pred",
+                    str(pred),
+                    "image/png",
+                    {"artifact_contract": "canonical-v1"},
+                )
+            metric_job_id = db.add_run_job(
+                run_id,
+                "metric",
+                {
+                    "run_id": run_id,
+                    "inference_job_id": inference_job_id,
+                    "dataset_id": dataset_id,
+                    "metric_names": ["lpips_vit_patch"],
+                    "metric_device": "cuda:7",
+                },
+                device="cuda:7",
+            )
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+            self.assertTrue(db.set_run_metric_job(run_id, metric_job_id))
+            claimed = db.claim_next_job(
+                "factory-unavailable",
+                ["metric"],
+                device_filter="cuda:7",
+            )
+            self.assertEqual(int(claimed["id"]), metric_job_id)
+
+            unavailable = MetricUnavailable("metric weights are not ready")
+            unavailable.details = {"manifest": "missing"}
+            with patch(
+                "vfieval.pipeline.metrics_runner.create_metric",
+                side_effect=unavailable,
+            ) as factory:
+                result = run_metric_job(db, workspace, metric_job_id)
+
+            factory.assert_called_once_with("lpips_vit_patch", workspace, device="cuda:7")
+            self.assertEqual(result["summary"]["lpips_vit_patch"]["unavailable"], 2)
+            self.assertEqual(
+                result["performance"]["lpips_vit_patch"]["effective_batch_size"],
+                0,
+            )
+            rows = db.list_metric_results(inference_job_id)
+            self.assertEqual([row["status"] for row in rows], ["unavailable", "unavailable"])
+            self.assertTrue(all(row["details"]["device"] == "cuda:7" for row in rows))
+            self.assertTrue(all("weights" in row["details"]["reason"] for row in rows))
+            self.assertEqual(
+                int(db.get("SELECT COUNT(*) AS count FROM metric_cache")["count"]),
+                2,
+            )
+
     def test_frame_metric_uses_same_job_materialized_gt_not_sample_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -590,9 +690,10 @@ class MetricTests(unittest.TestCase):
                 metric_job_id,
             )
 
-            with patch("vfieval.pipeline.metrics_runner.sync_run_assets"), patch(
-                "vfieval.pipeline.metrics_runner.create_metric"
-            ) as create:
+            with patch(
+                "vfieval.media_assets.sync_run_assets",
+                side_effect=AssertionError("metric jobs must not resynchronize published assets"),
+            ), patch("vfieval.pipeline.metrics_runner.create_metric") as create:
                 result = run_metric_job(db, workspace, metric_job_id)
 
             create.assert_not_called()

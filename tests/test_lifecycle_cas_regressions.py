@@ -494,6 +494,81 @@ class LifecycleCasRegressionTests(unittest.TestCase):
             self.assertEqual(db.get("SELECT state FROM media_assets WHERE id = ?", (source_asset["id"],))["state"], "ready")
             self.assertEqual(db.get("SELECT state FROM media_assets WHERE id = ?", (output_asset["id"],))["state"], "unavailable")
 
+    def test_metric_phase_failures_preserve_published_run_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _workspace, db, model_id, dataset_id = self._workspace_db(root)
+            collection = ensure_collection(db, "Metric assets", "metric-assets-test")
+
+            for case, fail_claimed in (("queued", False), ("running", True)):
+                with self.subTest(case=case):
+                    run_id = db.create_run(
+                        f"metric-{case}",
+                        model_id,
+                        dataset_id,
+                        4,
+                        4,
+                        1,
+                        "cpu",
+                        "fp32",
+                        ["lpips_convnext"],
+                        create_inference_job=False,
+                    )
+                    self.assertTrue(db.mark_run_started(run_id, "running"))
+                    output_path = root / f"metric-{case}.mp4"
+                    output_path.write_bytes(b"published-output")
+                    output_asset = upsert_asset(
+                        db,
+                        collection_id=int(collection["id"]),
+                        source_key=f"run_artifact:metric-phase:{run_id}",
+                        source_kind="run_artifact",
+                        media_kind="video",
+                        role="pred",
+                        display_name=f"metric {case}",
+                        original_name=output_path.name,
+                        storage_path=output_path,
+                    )
+                    bind_run_asset(
+                        db,
+                        run_id,
+                        int(output_asset["id"]),
+                        "pred",
+                        video_name="clip",
+                        metadata={"artifact_id": run_id},
+                    )
+                    metric_job_id = db.add_run_job(
+                        run_id,
+                        "metric",
+                        {"run_id": run_id, "metric_names": ["lpips_convnext"]},
+                    )
+                    self.assertTrue(db.set_run_metric_job(run_id, metric_job_id))
+                    if fail_claimed:
+                        claimed = db.claim_next_job(f"metric-{case}", ["metric"])
+                        self.assertEqual(int(claimed["id"]), metric_job_id)
+                        self.assertTrue(db.mark_run_started(run_id, "metric_running"))
+                        self.assertTrue(
+                            db.fail_claimed_job_and_run(
+                                metric_job_id,
+                                run_id,
+                                {"type": "MetricCrash", "message": "metric failed"},
+                            )
+                        )
+                    else:
+                        self.assertEqual(db.get_run(run_id)["status"], "metric_queued")
+                        self.assertTrue(
+                            db.fail_run(
+                                run_id,
+                                {"type": "MetricCrash", "message": "metric failed"},
+                            )
+                        )
+                    self.assertEqual(
+                        db.get(
+                            "SELECT state FROM media_assets WHERE id = ?",
+                            (int(output_asset["id"]),),
+                        )["state"],
+                        "ready",
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

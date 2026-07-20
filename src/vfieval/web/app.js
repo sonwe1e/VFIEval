@@ -1908,6 +1908,12 @@ function renderJobDetail(job) {
 function renderJobError(job) {
   const message = job.error?.message || job.error?.type || "";
   if (!message) return "-";
+  if (job.status === "canceled" && [
+    "sibling shard failed the run",
+    "Run already failed",
+  ].includes(message)) {
+    return `<span class="muted" title="${escapeHtml(message)}">级联取消</span>`;
+  }
   return `<span title="${escapeHtml(message)}">${escapeHtml(message)}</span>`;
 }
 
@@ -1990,7 +1996,11 @@ function renderRunPurgeNotice(run) {
     return `<div class="message warn"><p><strong>${deleting ? "正在删除" : "正在清理产物"}</strong>: ${escapeHtml(phase)}。VFIEval 会等待 worker 完全停止并安全清理 Run 产物和缓存引用${deleting ? "，完成后再隐藏记录" : ""}。</p></div>`;
   }
   if (state === "failed") {
-    return `<div class="message error"><p><strong>删除清理失败</strong>: ${escapeHtml(request.error?.message || "unknown error")}。再次点击“删除记录”即可重试。</p></div>`;
+    const campaignId = Number(request.error?.campaign_id || 0);
+    const campaignAction = campaignId > 0 && request.error?.action === "open_campaign"
+      ? `<button type="button" class="secondary" data-open-campaign-dependency="${campaignId}">前往盲测记录</button>`
+      : "";
+    return `<div class="message error"><p><strong>删除清理失败</strong>: ${escapeHtml(request.error?.message || "unknown error")}。处理依赖后，再次点击“删除记录”即可重试。</p>${campaignAction}</div>`;
   }
   return "";
 }
@@ -4310,6 +4320,18 @@ async function refreshCatalog() {
 }
 
 document.addEventListener("click", (event) => {
+  const campaignDependency = event.target.closest?.("[data-open-campaign-dependency]");
+  if (campaignDependency) {
+    const campaignId = Number(campaignDependency.dataset.openCampaignDependency || 0);
+    (async () => {
+      if (!campaignId) return;
+      switchView("evaluations");
+      if (!window.VFIEvalStudio) throw new Error("Evaluation Studio 尚未加载");
+      await window.VFIEvalStudio.load();
+      await window.VFIEvalStudio.openCampaign(`v2:${campaignId}`);
+    })().catch((error) => toast(error.message));
+    return;
+  }
   const button = event.target.closest?.("[data-compare-input-variant]");
   if (!button) return;
   const tile = button.closest("[data-compare-input-slot]");

@@ -36,6 +36,27 @@
 .derived-video > div { display: flex; gap: .35rem; flex-wrap: wrap; justify-content: flex-end; }
 .studio-upload-advanced { margin: .8rem 0; }
 .studio-upload-advanced > summary { cursor: pointer; font-weight: 650; }
+.studio-analysis-head { display: flex; justify-content: space-between; align-items: flex-start; gap: .8rem; flex-wrap: wrap; }
+.objective-curve-controls { display: flex; gap: .6rem; flex-wrap: wrap; }
+.objective-curve-controls label { display: grid; gap: .25rem; min-width: 12rem; }
+.objective-curve-legend { display: flex; gap: .7rem 1.2rem; flex-wrap: wrap; margin: .7rem 0; }
+.objective-curve-legend span { display: inline-flex; align-items: center; gap: .4rem; }
+.objective-curve-legend i { width: 1.6rem; height: .22rem; border-radius: 999px; }
+.objective-curve-legend i.series-a { background: #55a7ff; }
+.objective-curve-legend i.series-b { background: #ff8f5a; }
+.objective-curve-plot { width: 100%; min-height: 260px; border: 1px solid var(--line, #384150); border-radius: 9px; background: color-mix(in srgb, var(--panel, #18202b) 88%, #000); overflow: hidden; }
+.objective-curve-plot svg { display: block; width: 100%; height: 300px; }
+.objective-curve-grid line { stroke: color-mix(in srgb, var(--line, #384150) 72%, transparent); stroke-width: .25; }
+.objective-curve-line { stroke-width: .7; vector-effect: non-scaling-stroke; stroke-linecap: round; stroke-linejoin: round; }
+.objective-curve-line.series-a { stroke: #55a7ff; }
+.objective-curve-line.series-b { stroke: #ff8f5a; }
+.objective-curve-dot.series-a { fill: #55a7ff; }
+.objective-curve-dot.series-b { fill: #ff8f5a; }
+.objective-curve-missing { fill: var(--panel, #18202b); stroke-width: .45; vector-effect: non-scaling-stroke; }
+.objective-curve-missing.series-a { stroke: #55a7ff; }
+.objective-curve-missing.series-b { stroke: #ff8f5a; }
+.objective-curve-dot:focus, .objective-curve-missing:focus { outline: none; stroke: #fff; stroke-width: .8; }
+.objective-curve-scale { display: flex; justify-content: space-between; gap: .6rem; margin-top: .35rem; font-variant-numeric: tabular-nums; }
 
 @media (max-width: 850px) {
   .studio-layout { grid-template-columns: 1fr; }
@@ -45,4 +66,7 @@
   .derived-video { flex-direction: column; }
   .derived-video > div { justify-content: flex-start; }
   .studio-item-grid { grid-template-columns: 1fr; }
+  .objective-curve-controls { display: grid; grid-template-columns: 1fr; width: 100%; }
+  .objective-curve-controls label { min-width: 0; }
+  .objective-curve-plot svg { height: 230px; }
 }
