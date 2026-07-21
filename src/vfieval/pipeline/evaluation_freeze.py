@@ -1769,6 +1769,9 @@ def _progress(callback: ProgressCallback | None, **payload: Any) -> None:
 def _resolve_executable(name: str, explicit: str | Path | None) -> str | None:
     if explicit not in {None, ""}:
         return shutil.which(str(explicit))
+    if name == "ffmpeg":
+        from vfieval.ffmpeg_exe import resolve_ffmpeg
+        return resolve_ffmpeg()
     return shutil.which(name)
 
 

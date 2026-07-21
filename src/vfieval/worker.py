@@ -96,7 +96,9 @@ def _module_error(name: str) -> str | None:
 
 
 def _decode_backend_capabilities() -> dict[str, dict[str, object]]:
-    ffmpeg = shutil.which("ffmpeg")
+    from vfieval.ffmpeg_exe import resolve_ffmpeg
+
+    ffmpeg = resolve_ffmpeg()
     ffmpeg_version = None
     ffmpeg_error = None
     if ffmpeg:

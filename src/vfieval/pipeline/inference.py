@@ -2157,7 +2157,9 @@ def _write_mp4_ffmpeg_pipe(
     target_height: int | None = None,
     target_width: int | None = None,
 ) -> bool:
-    ffmpeg = shutil.which("ffmpeg")
+    from vfieval.ffmpeg_exe import resolve_ffmpeg
+
+    ffmpeg = resolve_ffmpeg()
     if not ffmpeg or not frame_paths or any(path.suffix.lower() != ".png" for path in frame_paths):
         return False
     output_path.parent.mkdir(parents=True, exist_ok=True)

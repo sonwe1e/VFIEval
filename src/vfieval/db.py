@@ -4943,12 +4943,23 @@ class Database:
                       ON rj.run_id = r.id AND rj.job_id = j.id
                     WHERE j.status = 'queued'
                       AND j.kind IN ({placeholders})
-                      AND COALESCE(
-                          rj.device,
-                          json_extract(j.payload_json, '$.metric_device'),
-                          json_extract(j.payload_json, '$.device'),
-                          r.device
-                      ) = ?
+                      AND (
+                          COALESCE(
+                              rj.device,
+                              json_extract(j.payload_json, '$.metric_device'),
+                              json_extract(j.payload_json, '$.device'),
+                              r.device
+                          ) = ?
+                          OR (
+                              j.kind = 'finalize'
+                              AND COALESCE(
+                                  rj.device,
+                                  json_extract(j.payload_json, '$.metric_device'),
+                                  json_extract(j.payload_json, '$.device'),
+                                  r.device
+                              ) IS NULL
+                          )
+                      )
                       AND r.deleted_at IS NULL
                       AND r.artifact_cleaned_at IS NULL
                       AND (

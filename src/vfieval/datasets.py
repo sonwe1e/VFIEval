@@ -1431,9 +1431,11 @@ def _decode_video_ffmpeg(
     max_frames: int | None,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[list[Path], float, list[float | None]]:
-    ffmpeg = shutil.which("ffmpeg")
+    from vfieval.ffmpeg_exe import resolve_ffmpeg
+
+    ffmpeg = resolve_ffmpeg()
     if not ffmpeg:
-        raise RuntimeError("ffmpeg is not on PATH")
+        raise RuntimeError("ffmpeg is not available (set VFIEVAL_VIDEO_FFMPEG or add ffmpeg to PATH)")
     output_dir.mkdir(parents=True, exist_ok=True)
     pattern = output_dir / "%06d.png"
     command = [

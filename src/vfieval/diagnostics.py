@@ -164,9 +164,12 @@ def run_doctor(db: Database, workspace: WorkspaceConfig) -> dict[str, Any]:
     from vfieval.metrics.health import metrics_health
     from vfieval.worker import detect_capabilities
 
-    ffmpeg = _command_probe(["ffmpeg", "-hide_banner", "-version"])
+    from vfieval.ffmpeg_exe import resolve_ffmpeg
+
+    _ffmpeg_exe = resolve_ffmpeg() or "ffmpeg"
+    ffmpeg = _command_probe([_ffmpeg_exe, "-hide_banner", "-version"])
     ffprobe = _command_probe(["ffprobe", "-hide_banner", "-version"])
-    encoders = _command_probe(["ffmpeg", "-hide_banner", "-encoders"])
+    encoders = _command_probe([_ffmpeg_exe, "-hide_banner", "-encoders"])
     if encoders.get("available"):
         executable = str(encoders.get("path") or "ffmpeg")
         try:

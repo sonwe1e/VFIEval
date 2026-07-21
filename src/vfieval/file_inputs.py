@@ -1397,11 +1397,13 @@ def _executable_identity(path: str | None) -> dict[str, Any]:
 def decode_backend_identity(actual_backend: str) -> dict[str, Any]:
     """Return the concrete decoder identity that participates in cache keys."""
 
+    from vfieval.ffmpeg_exe import resolve_ffmpeg
+
     backend = normalize_decode_backend(actual_backend)
     if backend == "auto":
         raise ValueError("decoder identity requires a concrete backend")
     if backend == "ffmpeg":
-        executable = _executable_identity(shutil.which("ffmpeg"))
+        executable = _executable_identity(resolve_ffmpeg())
         timestamp_probe = _executable_identity(shutil.which("ffprobe"))
 
         return {
