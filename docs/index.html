@@ -1,0 +1,1588 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VFIEval — 视频插帧评测平台文档</title>
+<style>
+:root {
+  /* Neutrals */
+  --bg: #ffffff;
+  --bg-subtle: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #fbfbfd;
+  --text: #0f1729;
+  --text-secondary: #55606f;
+  --text-muted: #8a93a2;
+  --border: #e8eaef;
+  --border-strong: #d6dae2;
+  /* Brand */
+  --primary: #4f46e5;
+  --primary-hover: #4338ca;
+  --primary-soft: #eef1ff;
+  --primary-ring: rgba(79,70,229,0.16);
+  --accent: #7c3aed;
+  /* Semantic */
+  --success: #059669;
+  --warning: #b45309;
+  --danger: #dc2626;
+  /* Code */
+  --code-bg: #0f1729;
+  --code-text: #e6e9f2;
+  /* Effects */
+  --shadow-sm: 0 1px 2px rgba(15,23,41,0.05), 0 1px 3px rgba(15,23,41,0.05);
+  --shadow-md: 0 4px 6px -3px rgba(15,23,41,0.06), 0 12px 24px -10px rgba(15,23,41,0.12);
+  --shadow-lg: 0 16px 40px -12px rgba(15,23,41,0.18);
+  --radius-sm: 8px;
+  --radius: 14px;
+  --radius-lg: 22px;
+  --sidebar-width: 274px;
+  --maxw: 960px;
+  --gradient: linear-gradient(135deg, #4f46e5 0%, #7c3aed 52%, #a855f7 100%);
+  --gradient-soft: linear-gradient(135deg, #eef1ff 0%, #f4edff 100%);
+}
+[data-theme="dark"] {
+  --bg: #0a0e17;
+  --bg-subtle: #0f1420;
+  --surface: #131926;
+  --surface-2: #171e2d;
+  --text: #eef1f7;
+  --text-secondary: #a3adbd;
+  --text-muted: #6b7688;
+  --border: #232b3b;
+  --border-strong: #303a4d;
+  --primary: #818cf8;
+  --primary-hover: #a5b4fc;
+  --primary-soft: #1b1f3a;
+  --primary-ring: rgba(129,140,248,0.22);
+  --accent: #a78bfa;
+  --code-bg: #060911;
+  --code-text: #e6e9f2;
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.4);
+  --shadow-md: 0 8px 24px -12px rgba(0,0,0,0.6);
+  --shadow-lg: 0 20px 48px -16px rgba(0,0,0,0.7);
+  --gradient-soft: linear-gradient(135deg, #161a34 0%, #1d1733 100%);
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.7;
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  transition: background 0.3s, color 0.3s;
+}
+::selection { background: var(--primary-ring); }
+a { color: var(--primary); text-decoration: none; }
+a:hover { color: var(--primary-hover); }
+code, .code-block code, .file-tree, .formula-card {
+  font-family: "JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+/* ---------- Sidebar ---------- */
+.sidebar {
+  position: fixed;
+  top: 0; left: 0;
+  width: var(--sidebar-width);
+  height: 100vh;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  padding: 26px 0 90px;
+  overflow-y: auto;
+  z-index: 100;
+  transition: transform 0.3s, background 0.3s, border-color 0.3s;
+}
+.sidebar-header { padding: 0 24px 18px; margin-bottom: 10px; }
+.sidebar-logo {
+  font-size: 1.5rem;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+  background: var(--gradient);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.sidebar-version {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  margin-top: 4px;
+  letter-spacing: 0.3px;
+}
+.nav-group-label {
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.9px;
+  color: var(--text-muted);
+  padding: 16px 24px 6px;
+}
+.sidebar nav a {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 24px;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  border-left: 2px solid transparent;
+  transition: color 0.18s, background 0.18s, border-color 0.18s;
+}
+.sidebar nav a::before {
+  content: '';
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--border-strong);
+  transition: background 0.18s, transform 0.18s;
+}
+.sidebar nav a:hover { color: var(--text); background: var(--bg-subtle); }
+.sidebar nav a.active {
+  color: var(--primary);
+  border-left-color: var(--primary);
+  background: var(--primary-soft);
+  font-weight: 600;
+}
+.sidebar nav a.active::before { background: var(--primary); transform: scale(1.4); }
+.theme-toggle {
+  position: fixed;
+  bottom: 20px; left: 22px;
+  width: 42px; height: 42px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: var(--shadow-sm);
+  z-index: 110;
+  transition: border-color 0.2s, transform 0.2s;
+}
+.theme-toggle:hover { border-color: var(--primary); transform: translateY(-1px); }
+.theme-toggle svg { width: 18px; height: 18px; stroke: var(--text); fill: none; }
+
+/* ---------- Main ---------- */
+.main { margin-left: var(--sidebar-width); min-height: 100vh; }
+
+/* ---------- Hero ---------- */
+.hero {
+  position: relative;
+  overflow: hidden;
+  padding: 118px 64px 92px;
+  background: var(--gradient);
+  color: #fff;
+}
+.hero::before {
+  content: '';
+  position: absolute; inset: 0;
+  background:
+    radial-gradient(1200px 400px at 80% -10%, rgba(255,255,255,0.22), transparent 60%),
+    url("data:image/svg+xml,%3Csvg width='40' height='40' xmlns='http://www.w3.org/2000/svg'%3E%3Ccircle cx='1.5' cy='1.5' r='1' fill='rgba(255,255,255,0.10)'/%3E%3C/svg%3E");
+}
+.hero-content { position: relative; max-width: 780px; }
+.hero-eyebrow {
+  display: inline-block;
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 1.4px;
+  text-transform: uppercase;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: rgba(255,255,255,0.16);
+  border: 1px solid rgba(255,255,255,0.25);
+  margin-bottom: 22px;
+}
+.hero h1 { font-size: 3.6rem; font-weight: 800; letter-spacing: -1.5px; line-height: 1.05; margin-bottom: 18px; }
+.hero p { font-size: 1.2rem; line-height: 1.7; opacity: 0.94; margin-bottom: 34px; max-width: 640px; }
+.hero-badges { display: flex; gap: 10px; flex-wrap: wrap; }
+.badge {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 7px 15px;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 500;
+  background: rgba(255,255,255,0.14);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(255,255,255,0.22);
+}
+/* ---------- Sections ---------- */
+section {
+  padding: 84px 64px;
+  max-width: calc(var(--maxw) + 128px);
+  margin: 0 auto;
+}
+section + section { border-top: 1px solid var(--border); }
+.section-eyebrow {
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 1.2px;
+  text-transform: uppercase;
+  color: var(--primary);
+  margin-bottom: 10px;
+}
+section h2 {
+  font-size: 2.05rem;
+  font-weight: 750;
+  letter-spacing: -0.7px;
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+section h2 .section-icon {
+  display: inline-flex;
+  width: 40px; height: 40px;
+  border-radius: 11px;
+  background: var(--gradient-soft);
+  border: 1px solid var(--border);
+  align-items: center; justify-content: center;
+  flex-shrink: 0;
+}
+section h2 .section-icon svg { width: 21px; height: 21px; stroke: var(--primary); fill: none; }
+section .section-desc {
+  color: var(--text-secondary);
+  font-size: 1.08rem;
+  margin-bottom: 40px;
+  max-width: 680px;
+}
+h4 { font-size: 1.05rem; font-weight: 650; letter-spacing: -0.2px; }
+h5 { font-size: 0.95rem; font-weight: 650; }
+
+/* ---------- Cards ---------- */
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(248px, 1fr));
+  gap: 18px;
+  margin: 26px 0;
+}
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 26px 24px;
+  box-shadow: var(--shadow-sm);
+  transition: transform 0.22s, box-shadow 0.22s, border-color 0.22s;
+}
+.card:hover {
+  transform: translateY(-3px);
+  box-shadow: var(--shadow-md);
+  border-color: var(--border-strong);
+}
+.card-icon {
+  width: 46px; height: 46px;
+  border-radius: 12px;
+  background: var(--primary-soft);
+  display: flex; align-items: center; justify-content: center;
+  margin-bottom: 18px;
+}
+.card-icon svg { width: 22px; height: 22px; stroke: var(--primary); fill: none; }
+.card h3 { font-size: 1.06rem; font-weight: 650; margin-bottom: 8px; letter-spacing: -0.2px; }
+.card p { font-size: 0.9rem; color: var(--text-secondary); line-height: 1.65; }
+/* ---------- Tabs ---------- */
+.tabs { margin: 24px 0; }
+.tab-header {
+  display: flex;
+  gap: 4px;
+  padding: 5px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  overflow-x: auto;
+}
+.tab-btn {
+  padding: 8px 18px;
+  background: none;
+  border: none;
+  border-radius: 8px;
+  font-size: 0.88rem;
+  font-family: inherit;
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.18s, background 0.18s;
+}
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active {
+  color: var(--primary);
+  background: var(--surface);
+  font-weight: 600;
+  box-shadow: var(--shadow-sm);
+}
+.tab-panel { display: none; padding: 24px 2px 6px; animation: fadeIn 0.3s ease; }
+.tab-panel.active { display: block; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+/* ---------- Code ---------- */
+.code-block {
+  position: relative;
+  background: var(--code-bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  padding: 20px 22px;
+  margin: 16px 0;
+  overflow-x: auto;
+}
+.code-block code { font-size: 0.85rem; color: var(--code-text); line-height: 1.7; white-space: pre; }
+.code-block .copy-btn {
+  position: absolute;
+  top: 12px; right: 12px;
+  background: rgba(255,255,255,0.08);
+  border: 1px solid rgba(255,255,255,0.16);
+  border-radius: 7px;
+  padding: 4px 11px;
+  color: #aeb6c6;
+  font-size: 0.74rem;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.18s, color 0.18s;
+}
+.code-block .copy-btn:hover { background: rgba(255,255,255,0.16); color: #fff; }
+.kw { color: #c4b5fd; } .str { color: #6ee7b7; } .num { color: #fcd34d; }
+.cm { color: #6b7688; font-style: italic; } .fn { color: #7dd3fc; } .op { color: #9aa4b6; }
+code.inline {
+  background: var(--primary-soft);
+  color: var(--primary);
+  padding: 2px 7px;
+  border-radius: 6px;
+  font-size: 0.82em;
+}
+/* ---------- Collapsible ---------- */
+.collapsible {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin: 16px 0;
+  overflow: hidden;
+  background: var(--surface);
+}
+.collapsible-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 15px 20px;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.94rem;
+  user-select: none;
+  transition: background 0.18s;
+}
+.collapsible-header:hover { background: var(--bg-subtle); }
+.collapsible-header .chevron { width: 18px; height: 18px; stroke: var(--text-muted); fill: none; transition: transform 0.3s; }
+.collapsible.open .chevron { transform: rotate(180deg); }
+.collapsible-body { max-height: 0; overflow: hidden; transition: max-height 0.4s ease; }
+.collapsible.open .collapsible-body { max-height: 3000px; }
+.collapsible-content { padding: 4px 20px 22px; border-top: 1px solid var(--border); }
+
+/* ---------- Pipeline ---------- */
+.pipeline-container {
+  margin: 30px 0 8px;
+  padding: 26px 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow-x: auto;
+}
+.pipeline-svg { width: 100%; max-width: 900px; margin: 0 auto; display: block; }
+.pipeline-svg .node { cursor: pointer; transition: opacity 0.2s; }
+.pipeline-svg .node rect { rx: 9; ry: 9; stroke-width: 1.6; transition: all 0.2s; }
+.pipeline-svg .node:hover rect { stroke-width: 2.6; filter: brightness(1.04); }
+.pipeline-svg .node.highlighted rect { stroke-width: 2.8; filter: drop-shadow(0 0 7px currentColor); }
+.pipeline-svg .flow-line { fill: none; stroke-width: 1.8; stroke-dasharray: 7 4; animation: flowAnim 1.6s linear infinite; marker-end: url(#pipe-arrow); }
+@keyframes flowAnim { to { stroke-dashoffset: -22; } }
+.pipeline-svg text { font-family: inherit; font-size: 12px; fill: var(--text); }
+[data-theme="dark"] .pipeline-svg text { fill: #cbd5e1; }
+.pipeline-svg text.box-label,
+[data-theme="dark"] .pipeline-svg text.box-label { fill: #0f1729; }
+.pipeline-svg .lane-caption { font-size: 10px; fill: var(--text-muted); }
+
+/* ---------- Formula cards ---------- */
+.formula-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border-strong);
+  border-radius: 10px;
+  padding: 14px 18px;
+  margin: 10px 0;
+  transition: border-color 0.2s, background 0.2s, transform 0.2s;
+}
+.formula-card.active { border-left-color: var(--primary); background: var(--primary-soft); transform: translateX(3px); }
+.formula-card .step-num {
+  display: inline-flex; width: 22px; height: 22px;
+  border-radius: 7px;
+  background: var(--primary);
+  color: #fff;
+  font-size: 0.74rem; font-weight: 600;
+  align-items: center; justify-content: center;
+  margin-right: 10px;
+}
+.formula-label { font-weight: 600; font-size: 0.92rem; color: var(--text); margin-bottom: 6px; display: flex; align-items: center; }
+.formula-expr { color: var(--text-secondary); font-size: 0.82rem; font-family: "JetBrains Mono", monospace; padding-left: 32px; }
+/* ---------- Metric cards ---------- */
+.metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(206px, 1fr));
+  gap: 16px;
+  margin: 24px 0;
+}
+.metric-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 22px 20px;
+  box-shadow: var(--shadow-sm);
+  position: relative;
+  overflow: hidden;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+.metric-card::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px; background: var(--gradient); }
+.metric-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); }
+.metric-card .metric-name { font-weight: 700; font-size: 1rem; margin-bottom: 10px; letter-spacing: -0.2px; }
+.metric-card .metric-type {
+  font-size: 0.74rem; font-weight: 500;
+  padding: 3px 10px; border-radius: 999px;
+  background: var(--primary-soft); color: var(--primary);
+  display: inline-block; margin-bottom: 10px;
+}
+.metric-card .metric-range { font-size: 0.84rem; color: var(--text-secondary); font-weight: 500; }
+
+/* ---------- Step visualizer ---------- */
+.step-viz { display: flex; align-items: flex-start; overflow-x: auto; padding: 18px 4px; margin: 8px 0; }
+.step-viz .step { display: flex; flex-direction: column; align-items: center; min-width: 96px; text-align: center; }
+.step-viz .step .step-box {
+  min-width: 84px; height: 46px; padding: 0 10px;
+  border-radius: 10px;
+  background: var(--surface);
+  border: 1.5px solid var(--border-strong);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 0.72rem; font-weight: 600;
+  transition: all 0.3s;
+}
+.step-viz .step.active .step-box {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+  color: var(--primary);
+  transform: scale(1.06);
+  box-shadow: 0 0 0 4px var(--primary-ring);
+}
+.step-viz .step .step-label { font-size: 0.7rem; color: var(--text-muted); margin-top: 8px; max-width: 92px; }
+.step-viz .arrow { align-self: center; margin-top: 16px; padding: 0 4px; color: var(--text-muted); font-size: 1.1rem; flex-shrink: 0; }
+
+/* ---------- Table ---------- */
+.data-table { width: 100%; border-collapse: separate; border-spacing: 0; margin: 18px 0; font-size: 0.9rem; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.data-table th, .data-table td { padding: 11px 16px; text-align: left; border-bottom: 1px solid var(--border); }
+.data-table thead th { background: var(--bg-subtle); font-weight: 650; font-size: 0.82rem; letter-spacing: 0.2px; color: var(--text-secondary); }
+.data-table tbody tr:last-child td { border-bottom: none; }
+.data-table tbody tr { transition: background 0.15s; }
+.data-table tbody tr:hover { background: var(--bg-subtle); }
+.data-table td code { background: var(--primary-soft); color: var(--primary); padding: 2px 7px; border-radius: 5px; font-size: 0.8rem; }
+/* ---------- File tree ---------- */
+.file-tree { font-family: "JetBrains Mono", monospace; font-size: 0.84rem; padding: 18px; background: var(--surface-2); border-radius: var(--radius); border: 1px solid var(--border); }
+.file-tree .dir, .file-tree .file { padding: 3px 0; cursor: default; }
+.file-tree .dir { color: var(--primary); font-weight: 600; cursor: pointer; }
+.file-tree .dir::before { content: '📁 '; }
+.file-tree .dir.open::before { content: '📂 '; }
+.file-tree .file { color: var(--text-secondary); }
+.file-tree .file::before { content: '  📄 '; }
+.file-tree .children { padding-left: 20px; }
+.file-tree .children.hidden { display: none; }
+
+/* ---------- Workflow steps ---------- */
+.workflow-steps { display: flex; flex-direction: column; margin: 26px 0; }
+.workflow-step { display: flex; gap: 18px; align-items: flex-start; position: relative; padding-bottom: 26px; }
+.workflow-step::before { content: ''; position: absolute; left: 20px; top: 44px; bottom: -2px; width: 2px; background: var(--border); }
+.workflow-step:last-child { padding-bottom: 0; }
+.workflow-step:last-child::before { display: none; }
+.workflow-step .step-num {
+  width: 42px; height: 42px; border-radius: 12px;
+  background: var(--gradient); color: #fff;
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 0.95rem; flex-shrink: 0;
+  box-shadow: var(--shadow-sm);
+}
+.workflow-step .step-content { padding-top: 3px; }
+.workflow-step .step-content h4 { font-size: 1.02rem; margin-bottom: 5px; }
+.workflow-step .step-content p { font-size: 0.9rem; color: var(--text-secondary); line-height: 1.6; }
+
+/* ---------- Callout ---------- */
+.callout { border-radius: var(--radius); padding: 16px 20px; margin: 18px 0; border: 1px solid var(--border); font-size: 0.9rem; display: flex; gap: 12px; }
+.callout::before { font-size: 1.05rem; line-height: 1.5; flex-shrink: 0; }
+.callout > div { flex: 1; }
+.callout.info { background: var(--primary-soft); border-color: color-mix(in srgb, var(--primary) 26%, transparent); }
+.callout.info::before { content: 'ℹ️'; }
+.callout.warning { background: color-mix(in srgb, var(--warning) 10%, var(--surface)); border-color: color-mix(in srgb, var(--warning) 34%, transparent); }
+.callout.warning::before { content: '⚠️'; }
+.callout ul { margin-top: 8px; padding-left: 18px; }
+.callout li { margin: 3px 0; }
+
+/* ---------- Hamburger ---------- */
+.hamburger { display: none; position: fixed; top: 16px; left: 16px; z-index: 200; width: 42px; height: 42px; border-radius: 11px; background: var(--surface); border: 1px solid var(--border); cursor: pointer; align-items: center; justify-content: center; box-shadow: var(--shadow-sm); }
+.hamburger svg { width: 20px; height: 20px; stroke: var(--text); fill: none; }
+.scrim { display: none; position: fixed; inset: 0; background: rgba(8,12,20,0.5); z-index: 90; }
+.scrim.show { display: block; }
+
+/* ---------- Footer ---------- */
+.site-footer { padding: 48px 64px; text-align: center; color: var(--text-muted); font-size: 0.85rem; border-top: 1px solid var(--border); background: var(--surface-2); }
+.site-footer .brand { font-weight: 700; background: var(--gradient); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; }
+
+/* ---------- Responsive ---------- */
+@media (max-width: 940px) {
+  .sidebar { transform: translateX(-100%); }
+  .sidebar.open { transform: translateX(0); box-shadow: var(--shadow-lg); }
+  .hamburger { display: flex; }
+  .main { margin-left: 0; }
+  .theme-toggle { bottom: 16px; left: auto; right: 16px; }
+  .hero { padding: 84px 24px 60px; }
+  .hero h1 { font-size: 2.3rem; }
+  .hero p { font-size: 1.05rem; }
+  section { padding: 56px 24px; }
+  .pipeline-svg { min-width: 720px; }
+}
+</style>
+</head>
+<body>
+<button class="hamburger" onclick="toggleNav()" aria-label="打开导航">
+  <svg viewBox="0 0 24 24"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+</button>
+<div class="scrim" onclick="toggleNav()"></div>
+
+<aside class="sidebar">
+  <div class="sidebar-header">
+    <div class="sidebar-logo">VFIEval</div>
+    <div class="sidebar-version">视频插帧评测平台 · Documentation</div>
+  </div>
+  <nav>
+    <div class="nav-group-label">入门</div>
+    <a href="#overview">项目概览</a>
+    <a href="#quickstart">快速开始</a>
+    <a href="#workflow">评测流程</a>
+    <div class="nav-group-label">核心机制</div>
+    <a href="#model">模型接口</a>
+    <a href="#pipeline">后处理流水线</a>
+    <a href="#metrics">评测指标</a>
+    <div class="nav-group-label">进阶</div>
+    <a href="#modes">对比与盲测</a>
+    <a href="#architecture">性能与架构</a>
+    <a href="#api">API 参考</a>
+  </nav>
+</aside>
+<button class="theme-toggle" onclick="toggleTheme()" aria-label="切换主题">
+  <svg class="icon-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+  <svg class="icon-moon" viewBox="0 0 24 24" style="display:none"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+</button>
+
+<main class="main">
+
+<section class="hero" style="max-width:none; border:none; margin:0;">
+  <div class="hero-content">
+    <span class="hero-eyebrow">Video Frame Interpolation · Evaluation</span>
+    <h1>把评测这件事，做到公平。</h1>
+    <p>VFIEval 是一个本地的视频插帧模型评测平台。放入模型与视频，就能在完全一致的推理与后处理流水线下，获得感知质量指标、可视化对比与人类偏好排名。</p>
+    <div class="hero-badges">
+      <span class="badge"><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" fill="none"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg> CUDA / NPU / CPU</span>
+      <span class="badge"><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" fill="none"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/></svg> LPIPS · VMAF · CGVQM</span>
+      <span class="badge"><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" fill="none"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg> 盲测 A/B 评测</span>
+      <span class="badge"><svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" fill="none"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10"/></svg> 多卡并行推理</span>
+    </div>
+  </div>
+</section>
+<!-- ============ 项目概览 ============ -->
+<section id="overview">
+  <div class="section-eyebrow">Overview</div>
+  <h2><span class="section-icon"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></span>项目概览</h2>
+  <p class="section-desc">VFIEval 专注评测环节：推理、后处理、指标计算与可视化对比。它不训练模型，也不实现 PSNR——目标是让不同模型在同一条流水线下被公平衡量。</p>
+
+  <div class="card-grid">
+    <div class="card">
+      <div class="card-icon"><svg viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10"/></svg></div>
+      <h3>本地推理</h3>
+      <p>在 CUDA / NPU / CPU 上运行插帧模型，支持多卡并行、混合精度与 OOM 自动降批恢复。</p>
+    </div>
+    <div class="card">
+      <div class="card-icon"><svg viewBox="0 0 24 24"><path d="M4 4h16v16H4z"/><path d="M9 9h6v6H9z"/></svg></div>
+      <h3>统一后处理</h3>
+      <p>固定的 warp → mask → blend → pred 流水线，模型只需输出光流与掩码，保证跨模型公平对比。</p>
+    </div>
+    <div class="card">
+      <div class="card-icon"><svg viewBox="0 0 24 24"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/></svg></div>
+      <h3>感知质量指标</h3>
+      <p>LPIPS (ViT / ConvNeXt)、VMAF、CGVQM 四种客观指标，覆盖帧级感知距离与视频级主观质量。</p>
+    </div>
+    <div class="card">
+      <div class="card-icon"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg></div>
+      <h3>多轨对比 Compare</h3>
+      <p>同一 GT 对比多个模型的 Pred 输出，逐帧并排查看 flow / mask / warp 可视化层。</p>
+    </div>
+    <div class="card">
+      <div class="card-icon"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></div>
+      <h3>盲测 Campaign</h3>
+      <p>匿名 A/B 评测，多人评审 + Bradley-Terry 排名与 bootstrap 置信区间。</p>
+    </div>
+    <div class="card">
+      <div class="card-icon"><svg viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26"/></svg></div>
+      <h3>评分与反馈统计</h3>
+      <p>为每个 Run 记录 1–5 分评分与文字问题，按视频 / 模型 / checkpoint 聚合分析。</p>
+    </div>
+  </div>
+
+  <div class="callout info">
+    <div><strong>设计原则</strong>：模型的职责被压缩到最小——只输出光流与掩码 logits；warp、blend、compose 全部由平台统一执行。所有模型因此站在同一条起跑线上，指标差异只反映模型本身。</div>
+  </div>
+</section>
+<!-- ============ 快速开始 ============ -->
+<section id="quickstart">
+  <div class="section-eyebrow">Get Started</div>
+  <h2><span class="section-icon"><svg viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10"/></svg></span>快速开始</h2>
+  <p class="section-desc">安装环境、了解文件布局、确认硬件支持——三个标签页覆盖上手所需的全部信息。</p>
+
+  <div class="tabs">
+    <div class="tab-header">
+      <button class="tab-btn active" data-tab="install">安装与启动</button>
+      <button class="tab-btn" data-tab="files">文件结构</button>
+      <button class="tab-btn" data-tab="hardware">硬件支持</button>
+    </div>
+
+    <div class="tab-panel active" id="tab-install">
+      <h4 style="margin-bottom:12px">环境要求</h4>
+      <ul style="margin-bottom:22px; padding-left:20px; color:var(--text-secondary); font-size:0.9rem">
+        <li>Python ≥ 3.10</li>
+        <li>PyTorch（CUDA 或 NPU 版本）</li>
+        <li>FFmpeg（含 libvmaf，用于 VMAF 指标）</li>
+      </ul>
+
+      <h4 style="margin-bottom:12px">初始化与启动</h4>
+      <div class="code-block">
+        <button class="copy-btn" onclick="copyCode(this)">复制</button>
+        <code><span class="cm"># 设置路径</span>
+<span class="kw">$env:</span>PYTHONPATH<span class="op">=</span><span class="str">'src'</span>
+
+<span class="cm"># 初始化工作区</span>
+python <span class="op">-m</span> vfieval.cli init <span class="op">--workspace</span> .vfieval
+
+<span class="cm"># 启动服务</span>
+python <span class="op">-m</span> vfieval.cli <span class="op">--workspace</span> .vfieval serve <span class="op">--host</span> <span class="num">127.0.0.1</span> <span class="op">--port</span> <span class="num">8765</span></code>
+      </div>
+      <p style="font-size:0.9rem; color:var(--text-secondary); margin-top:12px">然后在浏览器打开 <code class="inline">http://127.0.0.1:8765</code></p>
+
+      <h4 style="margin-top:26px; margin-bottom:12px">准备指标资产</h4>
+      <div class="code-block">
+        <button class="copy-btn" onclick="copyCode(this)">复制</button>
+        <code><span class="cm"># 检查指标状态</span>
+python <span class="op">-m</span> vfieval.cli <span class="op">--workspace</span> .vfieval prepare-metrics <span class="op">--check-only</span>
+
+<span class="cm"># 自动下载指标资产</span>
+python <span class="op">-m</span> vfieval.cli <span class="op">--workspace</span> .vfieval prepare-metrics</code>
+      </div>
+    </div>
+
+    <div class="tab-panel" id="tab-files">
+      <h4 style="margin-bottom:12px">项目文件布局</h4>
+      <div class="file-tree" id="fileTree">
+        <div class="dir open" onclick="toggleDir(this)">项目根目录/
+          <div class="children">
+            <div class="dir open" onclick="toggleDir(this); event.stopPropagation()">models/ <span style="color:var(--text-muted); font-weight:normal">— 模型 Python 文件</span>
+              <div class="children">
+                <div class="file">my_model.py</div>
+                <div class="file">test_average.py</div>
+              </div>
+            </div>
+            <div class="dir" onclick="toggleDir(this); event.stopPropagation()">checkpoints/ <span style="color:var(--text-muted); font-weight:normal">— 模型权重</span>
+              <div class="children hidden">
+                <div class="dir" onclick="toggleDir(this); event.stopPropagation()">my_model/
+                  <div class="children hidden">
+                    <div class="file">latest.pth</div>
+                    <div class="file">epoch_100.safetensors</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="dir" onclick="toggleDir(this); event.stopPropagation()">videos/ <span style="color:var(--text-muted); font-weight:normal">— 视频数据集（按组）</span>
+              <div class="children hidden">
+                <div class="dir" onclick="toggleDir(this); event.stopPropagation()">anime_style/
+                  <div class="children hidden">
+                    <div class="file">clip_001.mp4</div>
+                    <div class="file">clip_002.mp4</div>
+                  </div>
+                </div>
+                <div class="dir" onclick="toggleDir(this); event.stopPropagation()">real_world/
+                  <div class="children hidden">
+                    <div class="file">scene_01.mkv</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="dir" onclick="toggleDir(this); event.stopPropagation()">set/metrics/ <span style="color:var(--text-muted); font-weight:normal">— 指标资产</span>
+              <div class="children hidden">
+                <div class="file">lpips_vit_patch/manifest.json</div>
+                <div class="file">lpips_convnext/manifest.json</div>
+                <div class="file">vmaf/manifest.json</div>
+                <div class="file">cgvqm/manifest.json</div>
+              </div>
+            </div>
+            <div class="dir" onclick="toggleDir(this); event.stopPropagation()">.vfieval/ <span style="color:var(--text-muted); font-weight:normal">— 工作区（自动生成）</span>
+              <div class="children hidden">
+                <div class="file">vfieval.sqlite</div>
+                <div class="file">runs/</div>
+                <div class="file">media/</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="tab-panel" id="tab-hardware">
+      <h4 style="margin-bottom:12px">支持的硬件</h4>
+      <table class="data-table">
+        <thead>
+          <tr><th>设备</th><th>精度</th><th>多卡</th><th>依赖</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>CUDA</strong></td><td>fp32 / fp16 / bf16</td><td>✅ multi_cuda</td><td>PyTorch + CUDA</td></tr>
+          <tr><td><strong>NPU（昇腾）</strong></td><td>fp32 / fp16 / bf16</td><td>✅ multi_npu</td><td>torch_npu</td></tr>
+          <tr><td><strong>CPU</strong></td><td>fp32</td><td>—</td><td>PyTorch</td></tr>
+        </tbody>
+      </table>
+      <div class="callout info">
+        <div>多卡模式优先按视频拆分工作负载；视频数量不足时按连续样本段（segment）分片到不同设备。</div>
+      </div>
+    </div>
+  </div>
+</section>
+<!-- ============ 评测流程 ============ -->
+<section id="workflow">
+  <div class="section-eyebrow">Workflow</div>
+  <h2><span class="section-icon"><svg viewBox="0 0 24 24"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></span>评测流程</h2>
+  <p class="section-desc">从放入文件到查看评测结果的完整路径。标准推理是主线，对比与盲测是可选的进阶评测模式（见下文「对比与盲测」）。</p>
+
+  <div class="workflow-steps">
+    <div class="workflow-step">
+      <div class="step-num">1</div>
+      <div class="step-content">
+        <h4>放置模型文件</h4>
+        <p>将模型 Python 文件放入 <code class="inline">models/</code>，权重放入 <code class="inline">checkpoints/{model_stem}/</code>。</p>
+      </div>
+    </div>
+    <div class="workflow-step">
+      <div class="step-num">2</div>
+      <div class="step-content">
+        <h4>准备视频数据集</h4>
+        <p>将测试视频按组放入 <code class="inline">videos/{组名}/</code>，支持 .mp4 / .mkv / .avi / .mov / .webm。一次任务可跨多个组。</p>
+      </div>
+    </div>
+    <div class="workflow-step">
+      <div class="step-num">3</div>
+      <div class="step-content">
+        <h4>启动服务</h4>
+        <p>运行 <code class="inline">python -m vfieval.cli serve</code>，打开浏览器访问 Web UI。</p>
+      </div>
+    </div>
+    <div class="workflow-step">
+      <div class="step-num">4</div>
+      <div class="step-content">
+        <h4>新建推理任务</h4>
+        <p>选择模型文件、权重、视频集、分辨率、设备与精度，勾选所需指标，点击开始。系统会先做预检（preflight）提示潜在问题。</p>
+      </div>
+    </div>
+    <div class="workflow-step">
+      <div class="step-num">5</div>
+      <div class="step-content">
+        <h4>查看结果</h4>
+        <p>在「运行记录」查看推理产物（Pred / GT / Diff 视频）、指标曲线与最差帧列表，并可为该 Run 打分留言。</p>
+      </div>
+    </div>
+  </div>
+</section>
+<!-- ============ 模型接口 ============ -->
+<section id="model">
+  <div class="section-eyebrow">Contract</div>
+  <h2><span class="section-icon"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></span>模型接口</h2>
+  <p class="section-desc">模型只需实现一个 <code class="inline">infer(img0, img1)</code>，输出光流和掩码 logits，平台负责其余所有后处理。</p>
+
+  <div class="tabs">
+    <div class="tab-header">
+      <button class="tab-btn active" data-tab="model-dict">Dict 返回（推荐）</button>
+      <button class="tab-btn" data-tab="model-tuple">Tuple 返回</button>
+    </div>
+
+    <div class="tab-panel active" id="tab-model-dict">
+      <div class="code-block">
+        <button class="copy-btn" onclick="copyCode(this)">复制</button>
+        <code><span class="kw">class</span> <span class="fn">Model</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, checkpoint_path<span class="op">=</span><span class="kw">None</span>, device<span class="op">=</span><span class="str">"cpu"</span>, metadata<span class="op">=</span><span class="kw">None</span>):
+        <span class="cm"># 加载权重（可选）</span>
+        ...
+
+    <span class="kw">def</span> <span class="fn">infer</span>(<span class="kw">self</span>, img0, img1):
+        <span class="cm"># img0, img1: [B, 3, H, W] RGB float [0,1], 已在 device 上</span>
+        <span class="kw">return</span> {
+            <span class="str">"flowt_0"</span>: flowt_0,   <span class="cm"># [B, 2, h, w] backward flow</span>
+            <span class="str">"flowt_1"</span>: flowt_1,   <span class="cm"># [B, 2, h, w] backward flow</span>
+            <span class="str">"mask0"</span>:   mask0,     <span class="cm"># [B, 1, h, w] logits</span>
+            <span class="str">"mask1"</span>:   mask1,     <span class="cm"># [B, 1, h, w] logits</span>
+        }</code>
+      </div>
+    </div>
+
+    <div class="tab-panel" id="tab-model-tuple">
+      <div class="code-block">
+        <button class="copy-btn" onclick="copyCode(this)">复制</button>
+        <code><span class="kw">class</span> <span class="fn">Model</span>:
+    <span class="kw">def</span> <span class="fn">infer</span>(<span class="kw">self</span>, img0, img1):
+        <span class="cm"># 按顺序返回 4 个张量</span>
+        <span class="kw">return</span> flowt_0, flowt_1, mask0, mask1</code>
+      </div>
+    </div>
+  </div>
+
+  <h4 style="margin-top:26px; margin-bottom:12px">输入 / 输出规格</h4>
+  <table class="data-table">
+    <thead><tr><th>参数</th><th>形状</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>img0</code> / <code>img1</code></td><td><code>[B, 3, H, W]</code></td><td>RGB 浮点张量，值域 [0,1]，已 resize 到推理分辨率，在目标 device 上</td></tr>
+      <tr><td><code>flowt_0</code> / <code>flowt_1</code></td><td><code>[B, 2, h, w]</code></td><td>Backward flow（像素坐标系），分辨率可低于输入</td></tr>
+      <tr><td><code>mask0</code> / <code>mask1</code></td><td><code>[B, 1, h, w]</code></td><td>Logits（不能提前 sigmoid），分辨率可低于输入</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warning">
+    <div>
+      <strong>契约约束</strong>
+      <ul style="font-size:0.9rem">
+        <li>mask 必须是 logits，不要 sigmoid——平台统一处理。</li>
+        <li>flow 使用 <code class="inline">target_pixel + flow</code> 约定（backward flow）。</li>
+        <li>输出低分辨率时，flow 会按 W/w 和 H/h 缩放位移后 resize 到输入分辨率。</li>
+        <li>输出必须与输入同 batch、同 device、同 dtype。</li>
+      </ul>
+    </div>
+  </div>
+</section>
+<!-- ============ 后处理流水线 ============ -->
+<section id="pipeline">
+  <div class="section-eyebrow">Post-processing</div>
+  <h2><span class="section-icon"><svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span>后处理流水线</h2>
+  <p class="section-desc">平台用一条固定的流水线，把模型输出的光流和掩码合成为最终插帧。此流程对所有模型一致、不可覆盖——这是「公平对比」的技术前提。</p>
+
+  <div class="pipeline-container">
+    <svg class="pipeline-svg" viewBox="0 0 900 330" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="pipe-arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="context-stroke"/>
+        </marker>
+      </defs>
+      <!-- img0 + flowt_0 -> Warp0 -->
+      <path class="flow-line" stroke="#4f46e5" d="M 92,60 L 210,60 L 210,74 L 236,74" />
+      <path class="flow-line" stroke="#d97706" d="M 92,96 L 210,96 L 210,84 L 236,84" />
+      <!-- flowt_1 + img1 -> Warp1 -->
+      <path class="flow-line" stroke="#d97706" d="M 92,214 L 210,214 L 210,204 L 236,204" />
+      <path class="flow-line" stroke="#4f46e5" d="M 92,250 L 210,250 L 210,214 L 236,214" />
+      <!-- Warp0 / Warp1 -> Blend -->
+      <path class="flow-line" stroke="#7c3aed" d="M 340,79 L 400,79 L 400,132 L 430,132" />
+      <path class="flow-line" stroke="#7c3aed" d="M 340,209 L 400,209 L 400,148 L 430,148" />
+      <!-- mask0 -> Blend -->
+      <path class="flow-line" stroke="#059669" d="M 480,262 L 480,168" />
+      <!-- Blend -> Pred -->
+      <path class="flow-line" stroke="#7c3aed" d="M 540,140 L 640,140 L 640,158" />
+      <!-- mask1 -> Pred -->
+      <path class="flow-line" stroke="#059669" d="M 690,262 L 690,198" />
+      <!-- img1 skip -> Pred -->
+      <path class="flow-line" stroke="#4f46e5" d="M 52,268 L 52,314 L 740,314 L 740,198" />
+      <!-- Pred -> Output -->
+      <path class="flow-line" stroke="#059669" d="M 750,170 L 810,170" />
+
+      <g class="node" data-step="input" onclick="highlightStep('input')">
+        <rect x="12" y="44" width="80" height="32" fill="#dbeafe" stroke="#4f46e5"/>
+        <text class="box-label" x="52" y="64" text-anchor="middle" font-weight="600">img0</text>
+      </g>
+      <g class="node" data-step="flow" onclick="highlightStep('flow')">
+        <rect x="12" y="80" width="80" height="32" fill="#fef3c7" stroke="#d97706"/>
+        <text class="box-label" x="52" y="100" text-anchor="middle" font-weight="600">flowt_0</text>
+      </g>
+      <g class="node" data-step="flow" onclick="highlightStep('flow')">
+        <rect x="12" y="198" width="80" height="32" fill="#fef3c7" stroke="#d97706"/>
+        <text class="box-label" x="52" y="218" text-anchor="middle" font-weight="600">flowt_1</text>
+      </g>
+      <g class="node" data-step="input" onclick="highlightStep('input')">
+        <rect x="12" y="234" width="80" height="32" fill="#dbeafe" stroke="#4f46e5"/>
+        <text class="box-label" x="52" y="254" text-anchor="middle" font-weight="600">img1</text>
+      </g>
+      <text x="52" y="34" text-anchor="middle" class="lane-caption">模型输出 + 输入帧</text>
+
+      <g class="node" data-step="warp" onclick="highlightStep('warp')">
+        <rect x="236" y="54" width="104" height="50" fill="#ede9fe" stroke="#7c3aed"/>
+        <text class="box-label" x="288" y="76" text-anchor="middle" font-size="11">Backward Warp</text>
+        <text class="box-label" x="288" y="92" text-anchor="middle" font-weight="600">warp0</text>
+      </g>
+      <g class="node" data-step="warp" onclick="highlightStep('warp')">
+        <rect x="236" y="184" width="104" height="50" fill="#ede9fe" stroke="#7c3aed"/>
+        <text class="box-label" x="288" y="206" text-anchor="middle" font-size="11">Backward Warp</text>
+        <text class="box-label" x="288" y="222" text-anchor="middle" font-weight="600">warp1</text>
+      </g>
+      <text x="288" y="128" text-anchor="middle" class="lane-caption">grid_sample</text>
+
+      <g class="node" data-step="blend" onclick="highlightStep('blend')">
+        <rect x="430" y="116" width="110" height="48" fill="#fce7f3" stroke="#db2777"/>
+        <text class="box-label" x="485" y="137" text-anchor="middle" font-size="11" font-weight="600">Blend</text>
+        <text class="box-label" x="485" y="153" text-anchor="middle" font-size="10">σ(mask0) 加权</text>
+      </g>
+      <g class="node" data-step="mask" onclick="highlightStep('mask')">
+        <rect x="440" y="262" width="80" height="30" fill="#d1fae5" stroke="#059669"/>
+        <text class="box-label" x="480" y="281" text-anchor="middle" font-size="11" font-weight="600">σ(mask0)</text>
+      </g>
+
+      <g class="node" data-step="pred" onclick="highlightStep('pred')">
+        <rect x="640" y="146" width="110" height="48" fill="#dcfce7" stroke="#059669"/>
+        <text class="box-label" x="695" y="167" text-anchor="middle" font-size="11" font-weight="600">Compose</text>
+        <text class="box-label" x="695" y="183" text-anchor="middle" font-size="10">σ(mask1) 加权</text>
+      </g>
+      <g class="node" data-step="mask" onclick="highlightStep('mask')">
+        <rect x="650" y="262" width="80" height="30" fill="#d1fae5" stroke="#059669"/>
+        <text class="box-label" x="690" y="281" text-anchor="middle" font-size="11" font-weight="600">σ(mask1)</text>
+      </g>
+
+      <g class="node" data-step="output" onclick="highlightStep('output')">
+        <rect x="810" y="152" width="78" height="36" fill="#059669" stroke="#047857"/>
+        <text x="849" y="174" text-anchor="middle" font-weight="600" fill="#ffffff">pred</text>
+      </g>
+      <text x="849" y="206" text-anchor="middle" class="lane-caption">clamp(0,1)</text>
+    </svg>
+  </div>
+  <p style="font-size:0.85rem; color:var(--text-muted); text-align:center; margin:4px 0 20px">点击任意节点，可在下方公式列表中高亮对应计算步骤。</p>
+
+  <h4 style="margin-bottom:12px">计算步骤</h4>
+  <div id="pipelineFormulas">
+    <div class="formula-card" data-step="warp">
+      <div class="formula-label"><span class="step-num">1</span>Backward Warp</div>
+      <div class="formula-expr">warp0 = grid_sample(img0, grid + flowt_0, mode='bilinear', padding='border', align_corners=True)</div>
+    </div>
+    <div class="formula-card" data-step="warp">
+      <div class="formula-label"><span class="step-num">2</span>Backward Warp</div>
+      <div class="formula-expr">warp1 = grid_sample(img1, grid + flowt_1, mode='bilinear', padding='border', align_corners=True)</div>
+    </div>
+    <div class="formula-card" data-step="mask">
+      <div class="formula-label"><span class="step-num">3</span>Mask Sigmoid</div>
+      <div class="formula-expr">mask0 = σ(mask0_logits)    mask1 = σ(mask1_logits)</div>
+    </div>
+    <div class="formula-card" data-step="blend">
+      <div class="formula-label"><span class="step-num">4</span>Blend</div>
+      <div class="formula-expr">blend = mask0 · warp0 + (1 − mask0) · warp1</div>
+    </div>
+    <div class="formula-card" data-step="pred">
+      <div class="formula-label"><span class="step-num">5</span>Compose</div>
+      <div class="formula-expr">pred = mask1 · img1 + (1 − mask1) · blend</div>
+    </div>
+    <div class="formula-card" data-step="output">
+      <div class="formula-label"><span class="step-num">6</span>Clamp</div>
+      <div class="formula-expr">output = clamp(pred, 0, 1)</div>
+    </div>
+  </div>
+
+  <div class="collapsible" style="margin-top:22px">
+    <div class="collapsible-header" onclick="toggleCollapsible(this)">
+      grid_sample 参数说明
+      <svg class="chevron" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
+    </div>
+    <div class="collapsible-body"><div class="collapsible-content">
+      <table class="data-table">
+        <thead><tr><th>参数</th><th>值</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>mode</code></td><td>bilinear</td><td>双线性插值采样</td></tr>
+          <tr><td><code>padding_mode</code></td><td>border</td><td>边界像素填充</td></tr>
+          <tr><td><code>align_corners</code></td><td>True</td><td>角点对齐</td></tr>
+        </tbody>
+      </table>
+      <p style="font-size:0.9rem; color:var(--text-secondary); margin-top:12px">低分辨率 flow 输出时，平台先按 W/w 和 H/h 缩放位移值，再 resize 到输入分辨率后执行 warp。</p>
+    </div></div>
+  </div>
+</section>
+<!-- ============ 评测指标 ============ -->
+<section id="metrics">
+  <div class="section-eyebrow">Metrics</div>
+  <h2><span class="section-icon"><svg viewBox="0 0 24 24"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-4"/></svg></span>评测指标</h2>
+  <p class="section-desc">四种客观质量指标，覆盖帧级感知距离与视频级主观质量。先理解「为什么不用 PSNR」，再逐个拆解每个指标怎么算、适合什么视频。</p>
+
+  <div class="callout info">
+    <div>
+      <strong>为什么不用 PSNR / SSIM？</strong>
+      <p style="margin-top:8px; font-size:0.9rem">插帧模型经常把物体「放到差不多对的位置」。PSNR 逐像素求差，物体只要平移一两个像素，误差就急剧放大——即使人眼看上去几乎完美。SSIM 关注局部结构，但对插帧最容易出问题的 <em>形变、鬼影、时间抖动</em> 并不敏感。VFIEval 因此不实现 PSNR，转而采用两类更贴近人眼的指标：</p>
+      <ul style="margin-top:8px; padding-left:20px; font-size:0.9rem">
+        <li><strong>感知特征距离</strong>（LPIPS 家族）：在深度网络的特征空间里比较，对轻微位移宽容，对纹理 / 结构失真敏感。</li>
+        <li><strong>学习型视频质量</strong>（VMAF / CGVQM）：直接拟合人类主观打分，并把「运动」和「时间维度」纳入考量。</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="metric-grid">
+    <div class="metric-card">
+      <div class="metric-name">LPIPS-ViT</div>
+      <div class="metric-type">逐帧感知距离</div>
+      <div class="metric-range">↓ 越低越好 · 0 = 完全一致</div>
+      <p style="font-size:0.8rem; color:var(--text-muted); margin-top:8px">DINOv2 ViT-S/14 · 全局结构</p>
+    </div>
+    <div class="metric-card">
+      <div class="metric-name">LPIPS-ConvNeXt</div>
+      <div class="metric-type">逐帧感知距离</div>
+      <div class="metric-range">↓ 越低越好 · 0 = 完全一致</div>
+      <p style="font-size:0.8rem; color:var(--text-muted); margin-top:8px">ConvNeXt V2 Tiny · 多尺度纹理</p>
+    </div>
+    <div class="metric-card">
+      <div class="metric-name">VMAF</div>
+      <div class="metric-type">视频级主观质量</div>
+      <div class="metric-range">↑ 越高越好 · [0, 100]</div>
+      <p style="font-size:0.8rem; color:var(--text-muted); margin-top:8px">FFmpeg libvmaf · Netflix</p>
+    </div>
+    <div class="metric-card">
+      <div class="metric-name">CGVQM</div>
+      <div class="metric-type">视频级质量距离</div>
+      <div class="metric-range">↓ 越低越好 · 学习型</div>
+      <p style="font-size:0.8rem; color:var(--text-muted); margin-top:8px">IntelLabs/CGVQM · 时空失真</p>
+    </div>
+  </div>
+
+  <div class="tabs" style="margin-top:32px">
+    <div class="tab-header">
+      <button class="tab-btn active" data-tab="m-vit">LPIPS-ViT</button>
+      <button class="tab-btn" data-tab="m-conv">LPIPS-ConvNeXt</button>
+      <button class="tab-btn" data-tab="m-vmaf">VMAF</button>
+      <button class="tab-btn" data-tab="m-cgvqm">CGVQM</button>
+    </div>
+    <!-- LPIPS-ViT -->
+    <div class="tab-panel active" id="tab-m-vit">
+      <h4 style="margin-bottom:8px">lpips_vit_patch — DINOv2 Patch Feature Distance</h4>
+      <p style="font-size:0.9rem; color:var(--text-secondary); margin-bottom:20px">把 GT 和 Pred 分别送进自监督视觉大模型 DINOv2，取出每个图像 patch 的特征向量，逐 patch 做 L2 归一化后求均方距离。<strong>比的是「特征空间的语义差异」而不是像素差</strong>——物体平移一两个像素几乎不影响得分，但结构 / 语义错乱会被明显放大。分数 0 表示两者在特征空间完全一致。</p>
+
+      <div class="step-viz" id="viz-vit">
+        <div class="step active"><div class="step-box">GT / Pred</div><div class="step-label">输入图像对</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">Resize</div><div class="step-label">max edge 518px</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">Pad</div><div class="step-label">mod 14 补齐</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">Norm</div><div class="step-label">ImageNet 归一化</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">DINOv2</div><div class="step-label">ViT-S/14 reg</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">L2 Norm</div><div class="step-label">per-patch</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">MSE</div><div class="step-label">均方距离</div></div>
+      </div>
+
+      <div class="collapsible">
+        <div class="collapsible-header" onclick="toggleCollapsible(this)">计算细节<svg class="chevron" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg></div>
+        <div class="collapsible-body"><div class="collapsible-content">
+          <table class="data-table">
+            <thead><tr><th>参数</th><th>值</th></tr></thead>
+            <tbody>
+              <tr><td>Backbone</td><td><code>dinov2_vits14_reg</code>（Facebook DINOv2 ViT-S/14 with registers）</td></tr>
+              <tr><td>输入预处理</td><td>Resize max edge → 518px（保持宽高比），Pad 到 14 的倍数</td></tr>
+              <tr><td>特征提取</td><td><code>forward_features</code> → 所有 patch tokens</td></tr>
+              <tr><td>归一化</td><td>per-patch L2 归一化</td></tr>
+              <tr><td>距离</td><td>所有 patch 的均方 L2 距离</td></tr>
+              <tr><td>权重文件</td><td><code>dinov2_vits14_reg4_pretrain.pth</code></td></tr>
+            </tbody>
+          </table>
+          <p style="margin-top:12px; font-size:0.9rem; color:var(--text-secondary)">按相同空间形状分组做批量推理。数值越低，感知质量越接近。</p>
+        </div></div>
+      </div>
+    </div>
+
+    <!-- LPIPS-ConvNeXt -->
+    <div class="tab-panel" id="tab-m-conv">
+      <h4 style="margin-bottom:8px">lpips_convnext — ConvNeXt Multi-Scale Feature Distance</h4>
+      <p style="font-size:0.9rem; color:var(--text-secondary); margin-bottom:20px">与 ViT 变体同为特征距离，但骨干换成卷积网络 ConvNeXt V2，取<strong>多个尺度</strong>的中间特征、逐通道归一化后各尺度求 MSE 再取均值。卷积的局部感受野让它对<strong>纹理、细小伪影、局部形变</strong>更敏感；ViT 变体则凭全局注意力更看重<strong>整体结构一致性</strong>。两者互补，建议同时开启。</p>
+
+      <div class="step-viz" id="viz-conv">
+        <div class="step active"><div class="step-box">GT / Pred</div><div class="step-label">输入图像对</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">Resize</div><div class="step-label">max edge 288px</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">Pad</div><div class="step-label">mod 32 补齐</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">Norm</div><div class="step-label">ImageNet 归一化</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">ConvNeXt</div><div class="step-label">V2 Tiny</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">Multi-Scale</div><div class="step-label">中间特征</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">Mean MSE</div><div class="step-label">跨尺度均值</div></div>
+      </div>
+
+      <div class="collapsible">
+        <div class="collapsible-header" onclick="toggleCollapsible(this)">计算细节<svg class="chevron" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg></div>
+        <div class="collapsible-body"><div class="collapsible-content">
+          <table class="data-table">
+            <thead><tr><th>参数</th><th>值</th></tr></thead>
+            <tbody>
+              <tr><td>Backbone</td><td><code>convnextv2_tiny.fcmae_ft_in22k_in1k</code> via timm</td></tr>
+              <tr><td>输入预处理</td><td>Resize max edge → 288px（保持宽高比），Pad 到 32 的倍数</td></tr>
+              <tr><td>特征提取</td><td><code>forward_intermediates</code> → 多尺度中间特征</td></tr>
+              <tr><td>归一化</td><td>per-channel L2 归一化</td></tr>
+              <tr><td>距离</td><td>每尺度均方 L2 距离，取跨尺度均值</td></tr>
+              <tr><td>权重文件</td><td><code>model.safetensors</code>（HuggingFace）</td></tr>
+            </tbody>
+          </table>
+        </div></div>
+      </div>
+    </div>
+    <!-- VMAF -->
+    <div class="tab-panel" id="tab-m-vmaf">
+      <h4 style="margin-bottom:8px">VMAF — Video Multi-Method Assessment Fusion</h4>
+      <p style="font-size:0.9rem; color:var(--text-secondary); margin-bottom:20px">Netflix 开源的<strong>全参考</strong>视频质量指标。核心思想：不用一条数学公式去猜质量，而是先抽取若干互补的画质特征，再用一个在<strong>真实人眼评分</strong>上训练过的模型，把这些特征「融合」成一个 0–100 的分数——尽量逼近真人打分。</p>
+
+      <div class="step-viz" id="viz-vmaf">
+        <div class="step active"><div class="step-box">Video Pair</div><div class="step-label">GT + Pred 视频</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">逐帧特征</div><div class="step-label">VIF · DLM · TI</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">SVM 融合</div><div class="step-label">人眼训练模型</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">帧级分数</div><div class="step-label">每帧 0–100</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">Pool Mean</div><div class="step-label">取均值</div></div>
+      </div>
+
+      <h5 style="margin:20px 0 10px">它到底在看什么？三类特征</h5>
+      <table class="data-table">
+        <thead><tr><th>特征</th><th>全称</th><th>捕捉的失真</th></tr></thead>
+        <tbody>
+          <tr><td><strong>VIF</strong></td><td>Visual Information Fidelity（多尺度）</td><td>信息保真度——细节 / 纹理丢了多少</td></tr>
+          <tr><td><strong>DLM</strong></td><td>Detail Loss Metric</td><td>结构与边缘的细节损失、模糊</td></tr>
+          <tr><td><strong>TI</strong></td><td>Temporal Information（相邻帧差）</td><td>运动强度，区分「静态好判断 / 高速运动更宽容」</td></tr>
+        </tbody>
+      </table>
+      <p style="font-size:0.9rem; color:var(--text-secondary); margin-top:10px">每帧算出这几个特征，喂进一个用主观评分（MOS）训练的 SVR 回归模型，得到该帧 VMAF；再对所有帧取均值（pooling）得整段视频分数。<strong>时间特征的加入</strong>是 VMAF 区别于纯图像指标的关键——它知道画面在动，也知道人眼在运动场景下对某些瑕疵没那么苛刻。</p>
+
+      <h5 style="margin:20px 0 10px">与传统指标的差异</h5>
+      <table class="data-table">
+        <thead><tr><th></th><th>PSNR</th><th>SSIM</th><th>VMAF</th></tr></thead>
+        <tbody>
+          <tr><td>依据</td><td>逐像素误差</td><td>局部结构统计</td><td><strong>人眼主观评分训练</strong></td></tr>
+          <tr><td>时间维度</td><td>无</td><td>无</td><td><strong>纳入运动特征</strong></td></tr>
+          <tr><td>特征数量</td><td>单一</td><td>单一</td><td><strong>多特征融合</strong></td></tr>
+          <tr><td>与人眼相关性</td><td>弱</td><td>中等</td><td><strong>强</strong></td></tr>
+          <tr><td>对轻微位移</td><td>非常敏感（易误判）</td><td>较敏感</td><td>相对稳健</td></tr>
+        </tbody>
+      </table>
+
+      <h5 style="margin:20px 0 10px">对什么样的视频最有价值？</h5>
+      <ul style="padding-left:20px; font-size:0.9rem; color:var(--text-secondary)">
+        <li><strong>高运动 / 影视实拍内容</strong>：VMAF 训练数据以流媒体实拍为主，判断运动模糊、压缩、缩放伪影很准。</li>
+        <li><strong>关心「观感」而非「像素精度」</strong>：插帧要的是流畅自然，VMAF 直接对齐主观体验。</li>
+        <li><strong>整段视频质量对比</strong>：给出视频级分数，适合横向比较不同模型的整体表现。</li>
+      </ul>
+      <div class="callout warning" style="margin-top:12px">
+        <div>
+          <strong>使用前提与局限</strong>
+          <ul style="font-size:0.9rem">
+            <li>需要 GT 与 Pred <strong>逐帧对齐、分辨率一致</strong>的两段视频，不支持单帧图片。</li>
+            <li>训练数据偏向自然实拍——对<strong>动画、屏幕内容、合成图形</strong>等分布外内容相关性下降，建议配合 LPIPS / CGVQM 一起看。</li>
+            <li>本平台使用默认 VMAF 模型；4K 内容如需更准的分数，可自行切换官方 4K 模型。</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="collapsible" style="margin-top:16px">
+        <div class="collapsible-header" onclick="toggleCollapsible(this)">计算细节（本平台实现）<svg class="chevron" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg></div>
+        <div class="collapsible-body"><div class="collapsible-content">
+          <table class="data-table">
+            <thead><tr><th>参数</th><th>值</th></tr></thead>
+            <tbody>
+              <tr><td>Backend</td><td>FFmpeg <code>libvmaf</code> filter</td></tr>
+              <tr><td>命令</td><td><code>ffmpeg -i distorted -i reference -lavfi "libvmaf=log_fmt=json:log_path=..." -f null -</code></td></tr>
+              <tr><td>输入顺序</td><td>第一路 = distorted (Pred)，第二路 = reference (GT)</td></tr>
+              <tr><td>分数来源</td><td><code>pooled_metrics.vmaf.mean</code>（帧级分数均值）</td></tr>
+              <tr><td>输入格式</td><td>.mp4, .mov, .mkv, .avi, .webm, .y4m</td></tr>
+              <tr><td>分数范围</td><td>0–100，越高越好，≈100 视觉无损</td></tr>
+              <tr><td>ffmpeg 路径</td><td>manifest 的 <code>ffmpeg_path</code> 或 <code>PATH</code>；也可用 <code>VFIEVAL_VIDEO_FFMPEG</code> 覆盖</td></tr>
+            </tbody>
+          </table>
+          <p style="margin-top:12px; font-size:0.9rem; color:var(--text-secondary)">VMAF 是视频级指标，只对视频文件评分，不产出可信的逐帧曲线；平台如实呈现为单个视频级摘要。要求 FFmpeg 编译时带 <code>libvmaf</code> 支持，否则该指标显示为不可用。</p>
+        </div></div>
+      </div>
+    </div>
+    <!-- CGVQM -->
+    <div class="tab-panel" id="tab-m-cgvqm">
+      <h4 style="margin-bottom:8px">CGVQM — Computer Graphics Video Quality Metric</h4>
+      <p style="font-size:0.9rem; color:var(--text-secondary); margin-bottom:20px">Intel Labs 提出的<strong>学习型全参考视频质量</strong>指标，用 3D 卷积网络在时空维度上比较 GT 与 Pred，专门针对<strong>渲染 / 合成类失真</strong>（鬼影、闪烁、时间抖动、上采样伪影）训练——这些恰恰是插帧最常见的问题。分数越低表示与参考越接近，是对 VMAF（偏自然实拍）的有益补充。</p>
+
+      <div class="step-viz" id="viz-cgvqm">
+        <div class="step active"><div class="step-box">Video Pair</div><div class="step-label">GT + Pred 视频</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">Resize</div><div class="step-label">long edge ≤720</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">Align</div><div class="step-label">patch_scale=4</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">CGVQM_2</div><div class="step-label">时空网络</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">Max Pool</div><div class="step-label">patch 聚合</div></div>
+        <div class="arrow">→</div>
+        <div class="step"><div class="step-box">Score</div><div class="step-label">最终分数</div></div>
+      </div>
+
+      <div class="collapsible">
+        <div class="collapsible-header" onclick="toggleCollapsible(this)">计算细节<svg class="chevron" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg></div>
+        <div class="collapsible-body"><div class="collapsible-content">
+          <table class="data-table">
+            <thead><tr><th>参数</th><th>值</th></tr></thead>
+            <tbody>
+              <tr><td>Backend</td><td>IntelLabs/CGVQM（subprocess）</td></tr>
+              <tr><td>预处理</td><td>长边缩放至 ≤720px，对齐到 patch_scale=4</td></tr>
+              <tr><td>通信协议</td><td>JSON over stdin/stdout</td></tr>
+              <tr><td>变体</td><td>CGVQM_2, patch_pool="max", patch_scale=4</td></tr>
+              <tr><td>帧数要求</td><td>GT 和 Pred 帧数必须严格一致</td></tr>
+            </tbody>
+          </table>
+          <p style="margin-top:12px; font-size:0.9rem; color:var(--text-secondary)">CGVQM 是 Intel Labs 开发的学习型时空视频质量指标，通过独立子进程以 JSON over stdin/stdout 协议调用。作为视频级指标，它不会伪造逐帧分数——只产出视频级摘要，且要求 GT 与 Pred 帧数严格一致。</p>
+        </div></div>
+      </div>
+    </div>
+  </div>
+  <h4 style="margin-top:36px; margin-bottom:12px">如何选择指标？</h4>
+  <table class="data-table">
+    <thead>
+      <tr><th>指标</th><th>粒度</th><th>方向</th><th>最擅长</th><th>建议场景</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>LPIPS-ViT</strong></td><td>逐帧</td><td>↓ 越低越好</td><td>整体结构 / 语义一致性</td><td>想定位「哪一帧崩了」，看逐帧曲线与最差帧</td></tr>
+      <tr><td><strong>LPIPS-ConvNeXt</strong></td><td>逐帧</td><td>↓ 越低越好</td><td>纹理 / 局部伪影 / 细小形变</td><td>与 ViT 同开，互补覆盖结构与纹理</td></tr>
+      <tr><td><strong>VMAF</strong></td><td>视频级</td><td>↑ 越高越好</td><td>自然实拍的整体观感</td><td>实拍 / 影视内容，横向比较模型整体质量</td></tr>
+      <tr><td><strong>CGVQM</strong></td><td>视频级</td><td>↓ 越低越好</td><td>时间抖动 / 鬼影 / 合成类失真</td><td>动画、渲染、上采样内容，或 VMAF 相关性不足时补充</td></tr>
+    </tbody>
+  </table>
+  <div class="callout info">
+    <div><strong>经验法则</strong>：逐帧问题定位用 LPIPS 双变体，整体质量排名用 VMAF（实拍）或 CGVQM（合成/动画）。单一指标都不是绝对真理——多指标交叉验证，必要时再用<a href="#modes">盲测 Campaign</a> 引入人类偏好。</div>
+  </div>
+
+  <div class="collapsible" style="margin-top:24px">
+    <div class="collapsible-header" onclick="toggleCollapsible(this)">指标资产准备与目录结构<svg class="chevron" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg></div>
+    <div class="collapsible-body"><div class="collapsible-content">
+      <div class="code-block">
+        <button class="copy-btn" onclick="copyCode(this)">复制</button>
+        <code><span class="cm"># 检查指标资产状态</span>
+python <span class="op">-m</span> vfieval.cli <span class="op">--workspace</span> .vfieval prepare-metrics <span class="op">--check-only</span>
+
+<span class="cm"># 自动下载所有指标资产</span>
+python <span class="op">-m</span> vfieval.cli <span class="op">--workspace</span> .vfieval prepare-metrics
+
+<span class="cm"># 验证单个指标</span>
+python <span class="op">-m</span> vfieval.cli <span class="op">--workspace</span> .vfieval smoke-metric <span class="op">--metric</span> vmaf \
+    <span class="op">--reference</span> gt.mp4 <span class="op">--distorted</span> pred.mp4</code>
+      </div>
+      <h5 style="margin:16px 0 8px">资产目录</h5>
+      <div class="file-tree">
+        <div class="dir open" onclick="toggleDir(this)">set/metrics/
+          <div class="children">
+            <div class="dir" onclick="toggleDir(this); event.stopPropagation()">lpips_vit_patch/
+              <div class="children hidden">
+                <div class="file">manifest.json</div>
+                <div class="file">dinov2/ (repo checkout)</div>
+                <div class="file">dinov2_vits14_reg4_pretrain.pth</div>
+              </div>
+            </div>
+            <div class="dir" onclick="toggleDir(this); event.stopPropagation()">lpips_convnext/
+              <div class="children hidden">
+                <div class="file">manifest.json</div>
+                <div class="file">model.safetensors</div>
+              </div>
+            </div>
+            <div class="dir" onclick="toggleDir(this); event.stopPropagation()">vmaf/
+              <div class="children hidden">
+                <div class="file">manifest.json</div>
+              </div>
+            </div>
+            <div class="dir" onclick="toggleDir(this); event.stopPropagation()">cgvqm/
+              <div class="children hidden">
+                <div class="file">manifest.json</div>
+                <div class="file">CGVQM/ (repo checkout)</div>
+                <div class="file">run_cgvqm_vfieval.py</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="callout info">
+        <div><code class="inline">prepare-metrics</code> 只下载资产文件，不安装 Python 包。<code class="inline">timm</code>、<code class="inline">safetensors</code>、<code class="inline">av</code> 等依赖需手动安装。</div>
+      </div>
+    </div></div>
+  </div>
+</section>
+<!-- ============ 对比与盲测 ============ -->
+<section id="modes">
+  <div class="section-eyebrow">Evaluation Modes</div>
+  <h2><span class="section-icon"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>对比与盲测</h2>
+  <p class="section-desc">除标准推理外，平台提供两种进阶评测模式：客观的多轨可视化对比，以及引入人类偏好的匿名盲测。</p>
+
+  <h4 style="margin-bottom:12px">多轨对比 Compare</h4>
+  <p style="font-size:0.9rem; color:var(--text-secondary); margin-bottom:16px">从已完成的 Run 中挑选多个模型的 Pred 输出，与同一个 GT 逐帧并排对比。GT 取自视频组源片，Pred 各成一条 track（predA / predB / …），还能叠加 flow / mask / warp 可视化层。</p>
+  <div class="card-grid" style="grid-template-columns: repeat(auto-fit, minmax(240px, 1fr))">
+    <div class="card">
+      <h3 style="font-size:0.98rem">同源 GT，多路 Pred</h3>
+      <p>一个 GT 对比 N 个模型输出，track 标签冲突自动去重，逐帧时间线互不干扰。</p>
+    </div>
+    <div class="card">
+      <h3 style="font-size:0.98rem">可视化层</h3>
+      <p>并排查看 flow / mask / warp / blend，直观定位模型在哪一步出了问题。</p>
+    </div>
+    <div class="card">
+      <h3 style="font-size:0.98rem">服务端资源</h3>
+      <p>GT 与 Pred 均来自服务端已有资源，不信任客户端传入的路径，保证可复现。</p>
+    </div>
+  </div>
+
+  <h4 style="margin-top:36px; margin-bottom:12px">盲测 Campaign</h4>
+  <p style="font-size:0.9rem; color:var(--text-secondary); margin-bottom:8px">匿名 A/B 评测，把「哪个模型更好」交给人来判断，得到客观可信的人类偏好排名。</p>
+  <div class="workflow-steps">
+    <div class="workflow-step">
+      <div class="step-num">1</div>
+      <div class="step-content"><h4>创建 Campaign</h4><p>在 Evaluation Studio 中选择两个已完成 Run 的 Track 作为方法 A 和 B。</p></div>
+    </div>
+    <div class="workflow-step">
+      <div class="step-num">2</div>
+      <div class="step-content"><h4>确认视频矩阵</h4><p>系统展示两方法共有视频的对齐情况（帧数、尺寸、FPS 必须严格一致）。</p></div>
+    </div>
+    <div class="workflow-step">
+      <div class="step-num">3</div>
+      <div class="step-content"><h4>发布评测</h4><p>冻结 GT / A / B 视频到评测包并生成参与链接，之后删除源 Run 也不影响评测。</p></div>
+    </div>
+    <div class="workflow-step">
+      <div class="step-num">4</div>
+      <div class="step-content"><h4>参与者评审</h4><p>匿名界面，wipe 对比或完整视图，投票 A 更好 / B 更好 / 平局，可选填评分（1–5，0.25 步长）。</p></div>
+    </div>
+    <div class="workflow-step">
+      <div class="step-num">5</div>
+      <div class="step-content"><h4>统计分析</h4><p>Bradley-Terry 排名 + 固定种子 bootstrap 置信区间，平局计半胜。客观与主观指标分开展示。</p></div>
+    </div>
+  </div>
+  <div class="callout info">
+    <div><strong>隐私保护</strong>：参与者只看到匿名的「方案 A」和「方案 B」，不暴露模型名称、checkpoint、Run ID 或真实方法标签。左右随机分配且稳定。</div>
+  </div>
+</section>
+<!-- ============ 性能与架构 ============ -->
+<section id="architecture">
+  <div class="section-eyebrow">Performance</div>
+  <h2><span class="section-icon"><svg viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10"/></svg></span>性能与架构</h2>
+  <p class="section-desc">三级流水线并行设计，让设备在等待 CPU 工作时不空转，最大化利用率。</p>
+
+  <h4 style="margin-bottom:16px">推理流水线</h4>
+  <div class="step-viz">
+    <div class="step active"><div class="step-box" style="min-width:110px">Prefetch</div><div class="step-label">CPU 解码 + resize<br>2 workers ahead</div></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="step-box" style="min-width:110px">Inference</div><div class="step-label">GPU/NPU 推理<br>autocast + batch</div></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="step-box" style="min-width:110px">Async Save</div><div class="step-label">PNG 编码 + 视频<br>8 workers bounded</div></div>
+  </div>
+
+  <div class="card-grid" style="margin-top:32px">
+    <div class="card">
+      <h3>多卡分片</h3>
+      <p>优先按视频拆分到不同设备；视频不足时将长视频切为连续 sample segment 分片。各 shard 独立写帧，finalize job 统一合并视频。</p>
+    </div>
+    <div class="card">
+      <h3>指标缓存</h3>
+      <p>SHA-256 key 绑定 metric 名称、适配器版本、文件身份（path + size + mtime + sha256）与设备。更换权重或版本后自动失效旧缓存。</p>
+    </div>
+    <div class="card">
+      <h3>OOM 恢复</h3>
+      <p>GPU 内存不足时自动将 batch size 减半重试，最低降到 1。不回退 CPU——失败时明确报告设备与原因。</p>
+    </div>
+    <div class="card">
+      <h3>进度与取消</h3>
+      <p>实时进度更新（每 max(1, total/200) 样本写入一次）。支持随时取消正在运行的推理或评测任务。</p>
+    </div>
+  </div>
+</section>
+<!-- ============ API 参考 ============ -->
+<section id="api">
+  <div class="section-eyebrow">Reference</div>
+  <h2><span class="section-icon"><svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></span>API 参考</h2>
+  <p class="section-desc">核心 REST API 端点，支持自动化集成。</p>
+
+  <div class="collapsible">
+    <div class="collapsible-header" onclick="toggleCollapsible(this)">推理任务 API<svg class="chevron" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg></div>
+    <div class="collapsible-body"><div class="collapsible-content">
+      <table class="data-table">
+        <thead><tr><th>方法</th><th>端点</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>POST</code></td><td>/api/runs</td><td>创建推理或对比任务</td></tr>
+          <tr><td><code>GET</code></td><td>/api/runs</td><td>查询运行列表</td></tr>
+          <tr><td><code>GET</code></td><td>/api/runs/{id}</td><td>获取运行详情</td></tr>
+          <tr><td><code>POST</code></td><td>/api/runs/{id}/cancel</td><td>取消运行</td></tr>
+          <tr><td><code>POST</code></td><td>/api/runs/{id}/retry</td><td>精确重试</td></tr>
+          <tr><td><code>POST</code></td><td>/api/runs/{id}/clone</td><td>按当前输入克隆</td></tr>
+        </tbody>
+      </table>
+      <h5 style="margin-top:16px; margin-bottom:8px">创建推理任务示例</h5>
+      <div class="code-block">
+        <button class="copy-btn" onclick="copyCode(this)">复制</button>
+        <code>POST /api/runs
+{
+  <span class="str">"run_type"</span>: <span class="str">"model_inference"</span>,
+  <span class="str">"model_file"</span>: <span class="str">"my_model.py"</span>,
+  <span class="str">"video_group"</span>: <span class="str">"anime_style"</span>,
+  <span class="str">"checkpoint"</span>: <span class="str">"my_model/latest.pth"</span>,
+  <span class="str">"device"</span>: <span class="str">"auto"</span>,
+  <span class="str">"precision"</span>: <span class="str">"fp16"</span>,
+  <span class="str">"metrics"</span>: [<span class="str">"lpips_vit_patch"</span>, <span class="str">"vmaf"</span>]
+}</code>
+      </div>
+    </div></div>
+  </div>
+
+  <div class="collapsible">
+    <div class="collapsible-header" onclick="toggleCollapsible(this)">资源查询 API<svg class="chevron" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg></div>
+    <div class="collapsible-body"><div class="collapsible-content">
+      <table class="data-table">
+        <thead><tr><th>方法</th><th>端点</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>GET</code></td><td>/api/model-files</td><td>列出可用模型文件</td></tr>
+          <tr><td><code>GET</code></td><td>/api/checkpoints?model_file=...</td><td>模型权重列表</td></tr>
+          <tr><td><code>GET</code></td><td>/api/video-groups</td><td>视频集列表</td></tr>
+          <tr><td><code>GET</code></td><td>/api/devices</td><td>可用计算设备</td></tr>
+          <tr><td><code>GET</code></td><td>/api/metrics/health</td><td>指标资产状态</td></tr>
+          <tr><td><code>GET</code></td><td>/api/health</td><td>服务健康状态</td></tr>
+        </tbody>
+      </table>
+    </div></div>
+  </div>
+
+  <div class="collapsible">
+    <div class="collapsible-header" onclick="toggleCollapsible(this)">结果查询 API<svg class="chevron" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg></div>
+    <div class="collapsible-body"><div class="collapsible-content">
+      <table class="data-table">
+        <thead><tr><th>方法</th><th>端点</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td><code>GET</code></td><td>/api/runs/{id}/videos</td><td>运行的视频列表</td></tr>
+          <tr><td><code>GET</code></td><td>/api/runs/{id}/videos/{name}/timeline</td><td>视频时间线与指标曲线</td></tr>
+          <tr><td><code>GET</code></td><td>/api/runs/{id}/samples/{sid}</td><td>样本详情与产物</td></tr>
+          <tr><td><code>GET</code></td><td>/api/runs/{id}/metric-summary</td><td>指标摘要</td></tr>
+          <tr><td><code>GET</code></td><td>/api/files/{artifact_id}</td><td>获取产物文件</td></tr>
+        </tbody>
+      </table>
+    </div></div>
+  </div>
+</section>
+</main>
+
+<footer class="site-footer">
+  <p><span class="brand">VFIEval</span> — 本地视频插帧评测平台</p>
+  <p style="margin-top:6px">由 @sonwe1e 开发维护</p>
+</footer>
+
+<script>
+// Theme
+function toggleTheme() {
+  const html = document.documentElement;
+  const isDark = html.getAttribute('data-theme') === 'dark';
+  html.setAttribute('data-theme', isDark ? 'light' : 'dark');
+  localStorage.setItem('vfieval-theme', isDark ? 'light' : 'dark');
+  document.querySelector('.icon-sun').style.display = isDark ? '' : 'none';
+  document.querySelector('.icon-moon').style.display = isDark ? 'none' : '';
+}
+(function initTheme() {
+  const saved = localStorage.getItem('vfieval-theme');
+  const prefer = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  const theme = saved || prefer;
+  document.documentElement.setAttribute('data-theme', theme);
+  if (theme === 'dark') {
+    document.querySelector('.icon-sun').style.display = 'none';
+    document.querySelector('.icon-moon').style.display = '';
+  }
+})();
+
+// Mobile nav
+function toggleNav() {
+  document.querySelector('.sidebar').classList.toggle('open');
+  document.querySelector('.scrim').classList.toggle('show');
+}
+
+// Tabs
+document.querySelectorAll('.tab-header').forEach(header => {
+  header.addEventListener('click', e => {
+    const btn = e.target.closest('.tab-btn');
+    if (!btn) return;
+    const container = header.closest('.tabs');
+    container.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    container.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    const panel = document.getElementById('tab-' + btn.getAttribute('data-tab'));
+    if (panel) panel.classList.add('active');
+  });
+});
+
+// Collapsible
+function toggleCollapsible(header) { header.parentElement.classList.toggle('open'); }
+
+// File tree
+function toggleDir(el) {
+  el.classList.toggle('open');
+  const children = el.querySelector(':scope > .children');
+  if (children) children.classList.toggle('hidden');
+}
+
+// Copy
+function copyCode(btn) {
+  const code = btn.parentElement.querySelector('code');
+  navigator.clipboard.writeText(code.textContent).then(() => {
+    btn.textContent = '已复制';
+    setTimeout(() => { btn.textContent = '复制'; }, 1500);
+  });
+}
+
+// Pipeline highlight
+function highlightStep(step) {
+  document.querySelectorAll('.pipeline-svg .node').forEach(n => n.classList.remove('highlighted'));
+  document.querySelectorAll(`.pipeline-svg .node[data-step="${step}"]`).forEach(n => n.classList.add('highlighted'));
+  document.querySelectorAll('.formula-card').forEach(c => c.classList.remove('active'));
+  document.querySelectorAll(`.formula-card[data-step="${step}"]`).forEach(c => c.classList.add('active'));
+}
+
+// Scroll spy
+const sections = document.querySelectorAll('section[id]');
+const navLinks = document.querySelectorAll('.sidebar nav a');
+const spy = new IntersectionObserver(entries => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      navLinks.forEach(link => link.classList.remove('active'));
+      const active = document.querySelector(`.sidebar nav a[href="#${entry.target.id}"]`);
+      if (active) active.classList.add('active');
+    }
+  });
+}, { rootMargin: '-20% 0px -70% 0px' });
+sections.forEach(s => spy.observe(s));
+
+// Close mobile nav on link click
+document.querySelectorAll('.sidebar nav a').forEach(link => {
+  link.addEventListener('click', () => {
+    document.querySelector('.sidebar').classList.remove('open');
+    document.querySelector('.scrim').classList.remove('show');
+  });
+});
+
+// Step visualizer auto-animation
+function animateSteps(vizId) {
+  const viz = document.getElementById(vizId);
+  if (!viz) return;
+  const steps = viz.querySelectorAll('.step');
+  if (!steps.length) return;
+  let current = 0;
+  setInterval(() => {
+    steps.forEach(s => s.classList.remove('active'));
+    steps[current].classList.add('active');
+    current = (current + 1) % steps.length;
+  }, 1200);
+}
+['viz-vit', 'viz-conv', 'viz-vmaf', 'viz-cgvqm'].forEach(animateSteps);
+
+// Scroll reveal
+const revealObserver = new IntersectionObserver(entries => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      entry.target.style.opacity = '1';
+      entry.target.style.transform = 'none';
+      revealObserver.unobserve(entry.target);
+    }
+  });
+}, { threshold: 0.08 });
+document.querySelectorAll('.card, .workflow-step, .metric-card').forEach(el => {
+  el.style.opacity = '0';
+  el.style.transform = 'translateY(18px)';
+  el.style.transition = 'opacity 0.5s ease, transform 0.5s ease';
+  revealObserver.observe(el);
+});
+</script>
+</body>
+</html>
