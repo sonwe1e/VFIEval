@@ -2031,6 +2031,9 @@ def _write_feature_manifest(metric_dir: Path, metric_name: str, weights_path: st
 def _write_cgvqm_manifest(metric_dir: Path, command: list[str] | None = None) -> Path:
     (metric_dir / "CGVQM").mkdir(parents=True, exist_ok=True)
     (metric_dir / "weights").mkdir(parents=True, exist_ok=True)
+    backbone_path = metric_dir / "torch_home" / "hub" / "checkpoints" / "r3d_18-b3b3357e.pth"
+    backbone_path.parent.mkdir(parents=True, exist_ok=True)
+    backbone_path.write_bytes(b"")
     manifest_path = metric_dir / "manifest.json"
     manifest_path.write_text(
         json.dumps(
@@ -2040,6 +2043,7 @@ def _write_cgvqm_manifest(metric_dir: Path, command: list[str] | None = None) ->
                 "implementation_mode": "cgvqm_wrapper",
                 "repo_dir": "CGVQM",
                 "weights_path": "weights",
+                "backbone_weights_path": "torch_home/hub/checkpoints/r3d_18-b3b3357e.pth",
                 "device_policy": "require_run_device",
                 "driver": {"command": command or [sys.executable, "driver.py"]},
                 "env": {},

@@ -3022,6 +3022,9 @@ class Model:
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
             (manifest_path.parent / "weights").mkdir()
             (manifest_path.parent / "CGVQM").mkdir()
+            backbone_path = manifest_path.parent / "torch_home" / "hub" / "checkpoints" / "r3d_18-b3b3357e.pth"
+            backbone_path.parent.mkdir(parents=True, exist_ok=True)
+            backbone_path.write_bytes(b"")
             manifest_path.write_text(
                 json.dumps(
                     {
@@ -3030,6 +3033,7 @@ class Model:
                         "implementation_mode": "cgvqm_wrapper",
                         "repo_dir": "CGVQM",
                         "weights_path": "weights",
+                        "backbone_weights_path": "torch_home/hub/checkpoints/r3d_18-b3b3357e.pth",
                         "device_policy": "require_run_device",
                         "driver": {"command": ["missing-driver.exe"]},
                         "env": {},

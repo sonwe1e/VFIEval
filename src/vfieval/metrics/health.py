@@ -40,6 +40,8 @@ CONVNEXT_TINY_WEIGHTS_URL = (
     "https://huggingface.co/timm/convnextv2_tiny.fcmae_ft_in22k_in1k/resolve/main/model.safetensors"
 )
 CGVQM_REPO_URL = "https://github.com/IntelLabs/CGVQM/archive/refs/heads/main.zip"
+R3D_18_WEIGHTS_URL = "https://download.pytorch.org/models/r3d_18-b3b3357e.pth"
+R3D_18_WEIGHTS_SUBPATH = "torch_home/hub/checkpoints/r3d_18-b3b3357e.pth"
 
 METRIC_REQUIREMENTS = {
     "lpips_vit_patch": {
@@ -356,6 +358,7 @@ def _prepare_downloaded_metric(
         downloads.append(_download_file(CONVNEXT_TINY_WEIGHTS_URL, metric_dir / "model.safetensors", downloader))
     elif metric_name == "cgvqm":
         downloads.append(_download_and_extract(CGVQM_REPO_URL, metric_dir / "CGVQM", downloader))
+        downloads.append(_download_file(R3D_18_WEIGHTS_URL, metric_dir / R3D_18_WEIGHTS_SUBPATH, downloader))
         wrapper_path = metric_dir / "run_cgvqm_vfieval.py"
         _atomic_write_text(wrapper_path, _cgvqm_wrapper_source())
         downloads.append({"url": "vfieval-generated-wrapper", "target": str(wrapper_path.resolve()), "status": "written"})
@@ -386,7 +389,7 @@ def _declared_download_targets(metric_name: str) -> tuple[str, ...]:
     if metric_name == "lpips_convnext":
         return ("model.safetensors", "manifest.json")
     if metric_name == "cgvqm":
-        return ("CGVQM", "run_cgvqm_vfieval.py", "manifest.json")
+        return ("CGVQM", "run_cgvqm_vfieval.py", "manifest.json", R3D_18_WEIGHTS_SUBPATH)
     return ("manifest.json",)
 
 
@@ -409,7 +412,9 @@ def _downloaded_manifest_assets_exist(metric_name: str, metric_dir: Path, manife
         driver = manifest.get("driver") if isinstance(manifest.get("driver"), dict) else {}
         command = driver.get("command") if isinstance(driver.get("command"), list) else []
         wrapper_path = _resolve_manifest_file_path(metric_dir, str(command[1] if len(command) > 1 else "run_cgvqm_vfieval.py"))
-        return repo_path.exists() and wrapper_path.exists()
+        backbone_rel = str(manifest.get("backbone_weights_path") or R3D_18_WEIGHTS_SUBPATH)
+        backbone_path = _resolve_manifest_file_path(metric_dir, backbone_rel)
+        return repo_path.exists() and wrapper_path.exists() and backbone_path.exists()
     return True
 
 
@@ -515,10 +520,12 @@ def _downloaded_manifest(metric_name: str, metric_dir: Path | None = None) -> di
             "implementation_mode": "cgvqm_wrapper",
             "repo_dir": "CGVQM",
             "weights_path": "run_cgvqm_vfieval.py",
+            "backbone_weights_path": R3D_18_WEIGHTS_SUBPATH,
             "device_policy": "require_run_device",
             "video_eval_long_edge": 720,
             "source_url": {
                 "repo": CGVQM_REPO_URL,
+                "backbone_weights": R3D_18_WEIGHTS_URL,
                 "wrapper": "vfieval-generated-wrapper",
             },
             "driver": {
@@ -1091,8 +1098,10 @@ def _cgvqm_health(
 
     repo_dir = _resolve_manifest_file_path(manifest_path.parent, str(manifest["repo_dir"]))
     weights_path = _resolve_manifest_file_path(manifest_path.parent, str(manifest["weights_path"]))
-    expected_paths.extend([str(repo_dir.resolve()), str(weights_path.resolve())])
-    missing_assets = [path for path in (repo_dir, weights_path) if not path.exists()]
+    backbone_weights_rel = str(manifest.get("backbone_weights_path") or R3D_18_WEIGHTS_SUBPATH)
+    backbone_weights = _resolve_manifest_file_path(manifest_path.parent, backbone_weights_rel)
+    expected_paths.extend([str(repo_dir.resolve()), str(weights_path.resolve()), str(backbone_weights.resolve())])
+    missing_assets = [path for path in (repo_dir, weights_path, backbone_weights) if not path.exists()]
     if missing_assets:
         return _status(
             metric_name,
@@ -1102,8 +1111,14 @@ def _cgvqm_health(
             manifest_path=manifest_path,
             expected_paths=expected_paths,
             asset_version=str(manifest.get("asset_version") or METRIC_ASSET_VERSION),
-            extra=_cgvqm_status_extra(requirement, manifest_path, manifest, repo_dir=repo_dir, weights_path=weights_path),
+            extra=_cgvqm_status_extra(requirement, manifest_path, manifest, repo_dir=repo_dir, weights_path=weights_path, backbone_weights=backbone_weights),
         )
+
+    # Inject TORCH_HOME so the subprocess uses the pre-downloaded R3D_18 backbone
+    # weights instead of attempting a live download (which fails with ERRNO 99 on
+    # network-restricted servers).
+    torch_home = str(backbone_weights.parent.parent.parent.resolve())
+    merged_env = {**dict(manifest.get("env") or {}), "TORCH_HOME": torch_home}
 
     missing_packages = _missing_packages(requirement.get("packages", ()))
     if missing_packages:
@@ -1119,7 +1134,7 @@ def _cgvqm_health(
             manifest_path=manifest_path,
             expected_paths=expected_paths,
             asset_version=str(manifest.get("asset_version") or METRIC_ASSET_VERSION),
-            extra=_cgvqm_status_extra(requirement, manifest_path, manifest, repo_dir=repo_dir, weights_path=weights_path),
+            extra=_cgvqm_status_extra(requirement, manifest_path, manifest, repo_dir=repo_dir, weights_path=weights_path, backbone_weights=backbone_weights),
         )
 
     driver_command = _resolve_driver_command(manifest_path.parent, manifest["driver"]["command"])
@@ -1137,8 +1152,8 @@ def _cgvqm_health(
             expected_paths=expected_paths,
             asset_version=str(manifest.get("asset_version") or METRIC_ASSET_VERSION),
             driver_command=driver_command,
-            env=dict(manifest.get("env") or {}),
-            extra=_cgvqm_status_extra(requirement, manifest_path, manifest, repo_dir=repo_dir, weights_path=weights_path),
+            env=merged_env,
+            extra=_cgvqm_status_extra(requirement, manifest_path, manifest, repo_dir=repo_dir, weights_path=weights_path, backbone_weights=backbone_weights),
         )
     driver_command[0] = resolved_executable
     return _status(
@@ -1150,10 +1165,10 @@ def _cgvqm_health(
         expected_paths=expected_paths,
         asset_version=str(manifest.get("asset_version") or METRIC_ASSET_VERSION),
         driver_command=driver_command,
-        env=dict(manifest.get("env") or {}),
+        env=merged_env,
         resolved_executable=resolved_executable,
         executable_source=executable_source,
-        extra=_cgvqm_status_extra(requirement, manifest_path, manifest, repo_dir=repo_dir, weights_path=weights_path),
+        extra=_cgvqm_status_extra(requirement, manifest_path, manifest, repo_dir=repo_dir, weights_path=weights_path, backbone_weights=backbone_weights),
     )
 
 
@@ -1539,11 +1554,19 @@ def _cgvqm_status_extra(
     *,
     repo_dir: Path | None = None,
     weights_path: Path | None = None,
+    backbone_weights: Path | None = None,
 ) -> dict[str, Any]:
     manifest = manifest or {}
+    backbone_rel = str(manifest.get("backbone_weights_path") or R3D_18_WEIGHTS_SUBPATH)
+    resolved_backbone = (
+        str(backbone_weights.resolve())
+        if backbone_weights is not None
+        else str(_resolve_manifest_file_path(manifest_path.parent, backbone_rel).resolve())
+    )
     return {
         "repo_dir": str(repo_dir.resolve()) if repo_dir is not None else (str(_resolve_manifest_file_path(manifest_path.parent, str(manifest.get("repo_dir"))).resolve()) if manifest.get("repo_dir") else None),
         "weights_path": str(weights_path.resolve()) if weights_path is not None else (str(_resolve_manifest_file_path(manifest_path.parent, str(manifest.get("weights_path") or "run_cgvqm_vfieval.py")).resolve())),
+        "backbone_weights_path": resolved_backbone,
         "device_policy": manifest.get("device_policy") or requirement.get("device_policy"),
         "video_eval_long_edge": int(manifest.get("video_eval_long_edge") or 720),
         "eval_resolution": {
