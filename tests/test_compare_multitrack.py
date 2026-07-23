@@ -13,11 +13,33 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from vfieval.pipeline.inference import run_inference_job
+from vfieval import compare_inputs
 
 from v13_test_utils import add_completed_pred_run, get_json, make_workspace, post_json, start_server, stop_server, write_mp4
 
 
 class CompareMultitrackTests(unittest.TestCase):
+    def test_video_compare_probe_uses_fast_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, _db = make_workspace(tmp)
+            video_path = Path(tmp) / "clip.mp4"
+            video_path.write_bytes(b"placeholder")
+            with patch(
+                "vfieval.compare_inputs.inspect_video",
+                return_value={
+                    "decodable": True,
+                    "frame_count": 3,
+                    "width": 8,
+                    "height": 6,
+                    "fps": 24.0,
+                    "duration_seconds": 0.125,
+                },
+            ) as inspect_video:
+                result = compare_inputs.inspect_compare_path(workspace, video_path)
+
+            inspect_video.assert_called_once_with(video_path.resolve(), workspace, exact=False)
+            self.assertEqual(result["frame_count"], 3)
+
     def test_structured_compare_writes_track_scoped_video_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"VFIEVAL_PROJECT_ROOT": tmp}, clear=False):
             workspace, db = make_workspace(tmp)

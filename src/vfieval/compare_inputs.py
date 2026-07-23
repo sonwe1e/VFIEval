@@ -47,7 +47,7 @@ def _is_relative_to(path: Path, root: Path) -> bool:
 def inspect_compare_path(workspace: WorkspaceConfig, path: Path) -> dict[str, Any]:
     path = path.resolve()
     if path.is_file():
-        info = inspect_video(path, workspace, exact=True)
+        info = inspect_video(path, workspace, exact=False)
         if not info.get("decodable"):
             raise RuntimeError(info.get("error") or f"video is not decodable: {path}")
         return {

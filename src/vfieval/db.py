@@ -1140,6 +1140,38 @@ class Database:
             )
             return int(cur.lastrowid)
 
+    def batch_add_samples(
+        self,
+        dataset_id: int,
+        rows: list[dict[str, Any]],
+    ) -> None:
+        """Insert multiple samples in one transaction.  Each row must have
+        ``name``, ``img0_path``, ``img1_path``, and optionally ``gt_path``
+        and ``metadata``.  Uses INSERT OR REPLACE so re-scanning is safe."""
+        if not rows:
+            return
+        now = utc_ts()
+        with self.connection() as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO samples
+                    (dataset_id, name, img0_path, img1_path, gt_path, metadata_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        dataset_id,
+                        row["name"],
+                        str(Path(row["img0_path"]).resolve()),
+                        str(Path(row["img1_path"]).resolve()),
+                        str(Path(row["gt_path"]).resolve()) if row.get("gt_path") else None,
+                        _json(row.get("metadata")),
+                        now,
+                    )
+                    for row in rows
+                ],
+            )
+
     def list_samples(self, dataset_id: int) -> list[dict[str, Any]]:
         rows = self.query("SELECT * FROM samples WHERE dataset_id = ? ORDER BY name", (dataset_id,))
         for row in rows:

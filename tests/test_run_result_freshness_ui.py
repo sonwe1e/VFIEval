@@ -60,6 +60,16 @@ class RunResultFreshnessUiTests(unittest.TestCase):
         )[0]
         self.assertNotIn("renderMetricPoints", detail_body)
 
+    def test_run_list_and_dual_lpips_timeline_keep_updates_scoped(self) -> None:
+        self.assertIn("function renderRunProgress(run)", self.app_js)
+        self.assertIn("设备 ·", self.app_js)
+        self.assertIn("启动中…", self.app_js)
+        self.assertIn('const LPIPS_PAIR = ["lpips_vit_patch", "lpips_convnext"]', self.app_js)
+        self.assertIn("function renderDualLpipsCharts", self.app_js)
+        self.assertIn("function _tryUpdateChartMarkers", self.app_js)
+        self.assertIn("_tryUpdateChartMarkers(chart, video, selectedIndex, metricName)", self.app_js)
+        self.assertIn("dual-chart-row", self.styles)
+
     def test_metric_batch_override_is_optional_advanced_setting(self) -> None:
         self.assertIn('name="metric_batch_size_per_device"', self.index_html)
         self.assertIn("metric_batch_size_per_device: data.metric_batch_size_per_device", self.app_js)

@@ -94,6 +94,7 @@ def _video_stability_policy(fps: float) -> dict[str, Any]:
             "keyint_min_frames": gop_frames,
             "scene_cut_threshold": 0,
             "open_gop": False,
+            "b_frames": 0,
         },
         "prediction_remux": {
             "first_keyframe_tolerance_seconds": REMUX_FIRST_KEYFRAME_TOLERANCE_SECONDS,
@@ -1314,9 +1315,11 @@ class _RawVideoSink:
             int(self.gop_policy.get("keyint_min_frames") or gop_frames),
         )
         scene_cut_threshold = int(self.gop_policy.get("scene_cut_threshold") or 0)
+        open_gop = bool(self.gop_policy.get("open_gop"))
+        b_frames = max(0, int(self.gop_policy.get("b_frames") or 0))
         x264_params = (
             f"keyint={gop_frames}:min-keyint={keyint_min}:"
-            f"scenecut={scene_cut_threshold}:open-gop=0"
+            f"scenecut={scene_cut_threshold}:open-gop={int(open_gop)}:bframes={b_frames}"
         )
         return [
             self.ffmpeg,
@@ -1346,6 +1349,8 @@ class _RawVideoSink:
             "veryfast",
             "-crf",
             "18",
+            "-bf",
+            str(b_frames),
             "-g",
             str(gop_frames),
             "-keyint_min",

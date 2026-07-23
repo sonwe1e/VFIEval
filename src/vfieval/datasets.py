@@ -382,7 +382,7 @@ def scan_compare_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: i
     compare_name = compare_video_name(reference_path, distorted_path)
     reference_slot = _alignment_source_slot(alignment_plan, "gt", 0) if alignment_plan else None
     distorted_slot = _alignment_source_slot(alignment_plan, "pred", 0) if alignment_plan else None
-    added = 0
+    sample_rows: list[dict] = []
     for frame_index, (reference_frame, distorted_frame) in enumerate(zip(reference_frames, distorted_frames)):
         reference_frame, distorted_frame = _align_compare_frames(
             db=db,
@@ -396,14 +396,12 @@ def scan_compare_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: i
             reference_slot=reference_slot,
             distorted_slot=distorted_slot,
         )
-        name = f"compare_{compare_name}_{frame_index:06d}"
-        db.add_sample(
-            dataset_id=dataset_id,
-            name=name,
-            img0_path=str(reference_frame.resolve()),
-            img1_path=str(distorted_frame.resolve()),
-            gt_path=str(reference_frame.resolve()),
-            metadata={
+        sample_rows.append({
+            "name": f"compare_{compare_name}_{frame_index:06d}",
+            "img0_path": str(reference_frame.resolve()),
+            "img1_path": str(distorted_frame.resolve()),
+            "gt_path": str(reference_frame.resolve()),
+            "metadata": {
                 "source_type": "compare",
                 "compare_group": compare_name,
                 "video_name": compare_name,
@@ -419,8 +417,9 @@ def scan_compare_dataset(db: Database, workspace: WorkspaceConfig, dataset_id: i
                 },
                 **({"alignment_fingerprint": alignment_plan.get("fingerprint")} if alignment_plan else {}),
             },
-        )
-        added += 1
+        })
+    db.batch_add_samples(dataset_id, sample_rows)
+    added = len(sample_rows)
 
     db.update_dataset_scan_info(
         dataset_id,
@@ -546,6 +545,7 @@ def _scan_multitrack_compare_dataset(
     added = 0
     scanned_tracks: list[dict[str, Any]] = []
     reference_slot = _alignment_source_slot(alignment_plan, "gt", 0) if alignment_plan else None
+    all_sample_rows: list[dict] = []
 
     for track_index, track in enumerate(tracks):
         distorted_path = resolve_compare_source_path(workspace, str(track.get("distorted_path") or ""))
@@ -619,13 +619,12 @@ def _scan_multitrack_compare_dataset(
                 distorted_slot=distorted_slot,
             )
             sample_index = track_index * len(track_reference_frames) + frame_index
-            db.add_sample(
-                dataset_id=dataset_id,
-                name=f"{video_token}__{track_token}__{frame_index:06d}",
-                img0_path=str(reference_frame.resolve()),
-                img1_path=str(distorted_frame.resolve()),
-                gt_path=str(reference_frame.resolve()),
-                metadata={
+            all_sample_rows.append({
+                "name": f"{video_token}__{track_token}__{frame_index:06d}",
+                "img0_path": str(reference_frame.resolve()),
+                "img1_path": str(distorted_frame.resolve()),
+                "gt_path": str(reference_frame.resolve()),
+                "metadata": {
                     "source_type": "compare",
                     "compare_group": video_name,
                     "video_name": video_name,
@@ -646,8 +645,10 @@ def _scan_multitrack_compare_dataset(
                         "pred": distorted_timestamps[frame_index] if frame_index < len(distorted_timestamps) else None,
                     },
                 },
-            )
+            })
             added += 1
+
+    db.batch_add_samples(dataset_id, all_sample_rows)
 
     db.update_dataset_scan_info(
         dataset_id,

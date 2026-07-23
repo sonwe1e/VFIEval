@@ -1070,6 +1070,21 @@ th {
   padding-bottom: 6px;
 }
 
+.dual-chart-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.dual-chart-row .chart {
+  flex: 1;
+  min-width: 0;
+}
+
+.dual-chart-row .chart svg {
+  height: 140px;
+}
+
 .overview-plot {
   position: relative;
   height: 86px;

@@ -212,11 +212,12 @@ class AlignmentPlanTests(unittest.TestCase):
             pred_dir = Path(tmp) / "pred"
             gt_dir.mkdir()
             pred_dir.mkdir()
-            Image.new("RGB", (8, 6), (1, 2, 3)).save(gt_dir / "000000.png")
-            Image.new("RGB", (4, 3), (3, 2, 1)).save(pred_dir / "000000.png")
+            for index in range(2):
+                Image.new("RGB", (8, 6), (1 + index, 2, 3)).save(gt_dir / f"{index:06d}.png")
+                Image.new("RGB", (4, 3), (3, 2 + index, 1)).save(pred_dir / f"{index:06d}.png")
             plan = plan_alignment(
-                _source(8, 6, frames=1, slot="gt"),
-                [_source(4, 3, frames=1, slot="pred_a")],
+                _source(8, 6, frames=2, slot="gt"),
+                [_source(4, 3, frames=2, slot="pred_a")],
             )
             dataset_id = db.create_dataset(
                 "aligned-compare",
@@ -232,8 +233,10 @@ class AlignmentPlanTests(unittest.TestCase):
                 },
             )
 
-            self.assertEqual(scan_dataset(db, workspace, dataset_id), 1)
-            sample = db.list_samples(dataset_id)[0]
+            self.assertEqual(scan_dataset(db, workspace, dataset_id), 2)
+            samples = db.list_samples(dataset_id)
+            self.assertEqual([sample["name"] for sample in samples], ["compare_gt_vs_pred_000000", "compare_gt_vs_pred_000001"])
+            sample = samples[0]
             with Image.open(sample["gt_path"]) as image:
                 self.assertEqual(image.size, (4, 3))
             with Image.open(sample["img1_path"]) as image:

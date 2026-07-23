@@ -14,6 +14,8 @@ const STATUS_LABELS = {
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "canceled"]);
 const METRICS = ["lpips_vit_patch", "lpips_convnext", "vmaf", "cgvqm"];
+const LPIPS_PAIR = ["lpips_vit_patch", "lpips_convnext"];
+const LPIPS_PAIR_SET = new Set(LPIPS_PAIR);
 const TIMELINE_WINDOW_SIZE = 160;
 const PREVIEW_GROUPS_MODEL = {
   images: { label: "图像", items: [["gt", "GT"], ["pred", "Pred"], ["difference", "Diff"]] },
@@ -2150,7 +2152,7 @@ function renderRuns() {
     { label: "状态", render: (run) => runStatusDisplay(run) },
     { label: "类型", render: (run) => escapeHtml(run.metadata?.run_type || "model_inference") },
     { label: "来源", render: (run) => escapeHtml(runSourceLabel(run)) },
-    { label: "进度", render: (run) => `${escapeHtml(run.progress_current || 0)}/${escapeHtml(run.progress_total || 0)}` },
+    { label: "进度", render: (run) => renderRunProgress(run) },
     { label: "操作", render: (run) => `<button class="view-detail-btn" data-run-id="${run.id}" type="button">查看详情 →</button>` },
   ], { rowAttrs: (run) => `data-run-id="${run.id}" class="clickable-row"` });
   const pager = `
@@ -2311,7 +2313,20 @@ function renderJobProgress(job) {
   const total = Number(job.progress_total || 0);
   if (total > 0) return `${escapeHtml(current)}/${escapeHtml(total)}`;
   if (current > 0) return escapeHtml(current);
+  if (job.status === "running") return "启动中…";
   return "-";
+}
+
+function renderRunProgress(run) {
+  const current = Number(run.progress_current || 0);
+  const total = Number(run.progress_total || 0);
+  const devices = run.metadata?.devices || [];
+  if (run.status === "running" && devices.length > 1) {
+    const progressText = total > 0 ? `${current}/${total}` : "启动中…";
+    return `<span title="${escapeHtml(devices.join(", "))}">${escapeHtml(String(devices.length))}设备 · ${escapeHtml(String(progressText))}</span>`;
+  }
+  if (run.status === "running" && total === 0) return "启动中…";
+  return `${escapeHtml(String(current))}/${escapeHtml(String(total))}`;
 }
 
 function renderJobLabel(job) {
@@ -3184,6 +3199,10 @@ function metricLineSegments(values, min, max) {
   return segments;
 }
 
+function renderDualLpipsCharts(video, selectedIndex) {
+  return `<div class="dual-chart-row">${LPIPS_PAIR.map((name) => renderMetricChart(video, selectedIndex, name)).join("")}</div>`;
+}
+
 function renderWorstMetricPoints(video, samples, metricName, min, max) {
   const worstFrames = new Set((video.worst_samples?.[metricName] || []).map((row) => Number(row.frame_index)));
   return samples.map((sample, index) => {
@@ -3346,6 +3365,15 @@ function renderTimelineWindowNav(video) {
   `;
 }
 
+function _buildFrameChartHtml(video, selectedIndex, metricName) {
+  const names = metricNamesForVideo(video);
+  const isDual = LPIPS_PAIR.every((n) => names.includes(n)) && LPIPS_PAIR_SET.has(metricName);
+  if (isDual) {
+    return `${renderMetricOverview(video, LPIPS_PAIR[0], selectedIndex)}${renderDualLpipsCharts(video, selectedIndex)}${renderWorstSamples(video, metricName)}`;
+  }
+  return `${renderMetricOverview(video, metricName, selectedIndex)}${renderMetricChart(video, selectedIndex, metricName)}${renderWorstSamples(video, metricName)}`;
+}
+
 function renderFrameRegion(video, selectedIndex, metricName) {
   const samples = video.samples || [];
   const sample = samples[selectedIndex] || null;
@@ -3360,9 +3388,7 @@ function renderFrameRegion(video, selectedIndex, metricName) {
     ${renderMetricToolbar(video, metricName)}
     ${renderTimelineWindowNav(video)}
     <div id="frame-chart">
-      ${renderMetricOverview(video, metricName, selectedIndex)}
-      ${renderMetricChart(video, selectedIndex, metricName)}
-      ${renderWorstSamples(video, metricName)}
+      ${_buildFrameChartHtml(video, selectedIndex, metricName)}
     </div>
     <div class="sample-controls">
       <button class="secondary" data-sample-step="-1" type="button">上一帧</button>
@@ -3402,6 +3428,59 @@ function renderVideoTimeline(video) {
   `;
 }
 
+function _tryUpdateChartMarkers(chart, video, selectedIndex, metricName) {
+  // Fast path: update only SVG position markers without rebuilding innerHTML.
+  // Returns false when the chart DOM doesn't match the current state (different
+  // video, metric, or window) and a full rebuild is required instead.
+  const overviewEl = chart.querySelector(".overview-chart");
+  if (overviewEl && overviewEl.dataset.overviewVideo !== video.video_name) return false;
+  const chartEls = Array.from(chart.querySelectorAll(".chart[data-chart-video]"));
+  if (!chartEls.length) return false;
+  for (const el of chartEls) {
+    if (el.dataset.chartVideo !== video.video_name) return false;
+  }
+  const samples = video.samples || [];
+  const total = Number(video.sample_count || samples.length);
+  const windowStart = Number(video.window_start || 0);
+  const globalIndex = windowStart + selectedIndex;
+  // Update overview current-marker
+  if (overviewEl) {
+    const markerX = total <= 1 ? 50 : (globalIndex / (total - 1)) * 100;
+    const m = overviewEl.querySelector(".current-marker");
+    if (m) { m.setAttribute("x1", markerX.toFixed(2)); m.setAttribute("x2", markerX.toFixed(2)); }
+  }
+  // Update per-chart markers and selected-point
+  for (const chartEl of chartEls) {
+    const headStrong = chartEl.querySelector(".chart-head strong");
+    const chartMetric = headStrong ? headStrong.textContent : metricName;
+    if (!chartMetric) continue;
+    const values = samples.map((s) => {
+      const mv = s.metrics?.[chartMetric];
+      return mv?.status === "completed" && mv.value !== null ? Number(mv.value) : null;
+    });
+    const valid = values.filter((v) => v !== null && Number.isFinite(v));
+    if (!valid.length) continue;
+    const min = Math.min(...valid);
+    const max = Math.max(...valid);
+    const markerX = samples.length <= 1 ? 50 : 4 + (selectedIndex / (samples.length - 1)) * 92;
+    const sv = values[selectedIndex];
+    const selectedY = sv === null || !Number.isFinite(sv)
+      ? 46
+      : 42 - (max === min ? 0.5 : (sv - min) / (max - min)) * 30;
+    const mainSvg = chartEl.querySelector(".metric-chart-svg");
+    if (mainSvg) {
+      const m = mainSvg.querySelector(".current-marker");
+      if (m) { m.setAttribute("x1", markerX.toFixed(2)); m.setAttribute("x2", markerX.toFixed(2)); }
+    }
+    const point = chartEl.querySelector(".selected-metric-point");
+    if (point) {
+      point.style.left = `${markerX.toFixed(2)}%`;
+      point.style.top = `${((selectedY / 56) * 100).toFixed(2)}%`;
+    }
+  }
+  return true;
+}
+
 function updateFrameRegion() {
   const region = document.getElementById("frame-region");
   if (!region || !state.selectedRun) return false;
@@ -3418,10 +3497,18 @@ function updateFrameRegion() {
   const counter = region.querySelector("#frame-counter");
   const slider = region.querySelector("[data-sample-range]");
   if (!chart || !preview) return false;
-  chart.innerHTML = `${renderMetricOverview(video, metricName, selectedIndex)}${renderMetricChart(video, selectedIndex, metricName)}${renderWorstSamples(video, metricName)}`;
-  preview.innerHTML = samples[selectedIndex] ? renderSamplePreview(samples[selectedIndex], video) : "<p class=\"muted\">没有样本。</p>";
   const windowStart = Number(video.window_start || 0);
   const total = Number(video.sample_count || samples.length);
+  // Fast path: only update SVG markers when chart structure is already correct.
+  if (_tryUpdateChartMarkers(chart, video, selectedIndex, metricName)) {
+    preview.innerHTML = samples[selectedIndex] ? renderSamplePreview(samples[selectedIndex], video) : "<p class=\"muted\">没有样本。</p>";
+    if (counter) counter.textContent = `${windowStart + selectedIndex + 1}/${total || 0}`;
+    if (slider && Number(slider.value) !== windowStart + selectedIndex) slider.value = String(windowStart + selectedIndex);
+    return true;
+  }
+  // Full rebuild when structure has changed (new video, metric, or window).
+  chart.innerHTML = _buildFrameChartHtml(video, selectedIndex, metricName);
+  preview.innerHTML = samples[selectedIndex] ? renderSamplePreview(samples[selectedIndex], video) : "<p class=\"muted\">没有样本。</p>";
   if (counter) counter.textContent = `${windowStart + selectedIndex + 1}/${total || 0}`;
   // Only sync the slider's value when the change did not originate from the
   // slider itself; overwriting it mid-drag would fight the pointer.

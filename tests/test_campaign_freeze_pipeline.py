@@ -124,6 +124,7 @@ class CampaignFreezePipelineTests(unittest.TestCase):
         self.assertEqual(encoding["keyint_min_frames"], 24)
         self.assertEqual(encoding["scene_cut_threshold"], 0)
         self.assertFalse(encoding["open_gop"])
+        self.assertEqual(encoding["b_frames"], 0)
         self.assertEqual(len(policy["fingerprint"]), 64)
         self.assertEqual(
             policy["fingerprint"],
@@ -148,7 +149,8 @@ class CampaignFreezePipelineTests(unittest.TestCase):
         self.assertEqual(command[command.index("-g") + 1], "24")
         self.assertEqual(command[command.index("-keyint_min") + 1], "24")
         self.assertEqual(command[command.index("-sc_threshold") + 1], "0")
-        self.assertIn("keyint=24:min-keyint=24:scenecut=0:open-gop=0", command)
+        self.assertEqual(command[command.index("-bf") + 1], "0")
+        self.assertIn("keyint=24:min-keyint=24:scenecut=0:open-gop=0:bframes=0", command)
         self.assertEqual(command[command.index("-pix_fmt") + 1], "rgb24")
         self.assertIn("yuv420p", command)
         self.assertIn("+faststart", command)
