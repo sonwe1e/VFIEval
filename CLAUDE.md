@@ -4,13 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Finding What To Change
 
-Before reading source files to locate a change, consult `NAVIGATION.md`. It is a subsystem-indexed map: for each feature (Compare, Feedback, Inference, Metrics, Runs, ...) it lists the exact files, functions, line anchors, DB tables/methods, HTTP routes, and tests involved. Start there to jump straight to the relevant code instead of scanning the large files (`server.py`, `db.py`, `app.js` are each 2k–3.4k lines). Update `NAVIGATION.md` when you add or move a subsystem.
+Before reading source files to locate a change, consult `NAVIGATION.md`. It is a subsystem-indexed map: for each feature (Compare, Feedback, Inference, Metrics, Runs, ...) it lists the exact files, functions, line anchors, DB tables/methods, HTTP routes, and tests involved. Start there to jump straight to the relevant code instead of scanning the large files (`server.py`, `db.py`, `app.js` are each 2k–4.4k lines). Update `NAVIGATION.md` when you add or move a subsystem.
+
+`README.md` describes product behavior for users; `AGENTS.md` defines stable contracts and working boundaries; `REPO_LAYOUT.md` defines folder policy. Keep this file for architecture prose and invariants, `NAVIGATION.md` for lookup — do not duplicate file/function-level detail here.
 
 ## Project Overview
 
 VFIEval is a local video frame interpolation (VFI) evaluation platform. It runs inference on user-provided model files against video datasets, performs post-processing (warp/blend/pred from flow+mask outputs), computes quality metrics, and serves results through a web UI. It does not train models and does not implement PSNR.
 
-V13 makes Compare a first-class evaluation surface: GT and Pred are picked from server-resident resources (`videos/` groups and completed-run pred artifacts), one GT can be compared against multiple Pred tracks (`predA`, `predB`, ...), `flow`/`mask`/`warp` layers can be shown side-by-side, and sample/video APIs no longer materialize the entire run timeline per request. Linux NPU and CUDA servers are the only supported deployment targets in V13; Windows-specific hardening is deferred.
+Compare is a first-class evaluation surface: GT and Pred are picked from server-resident resources (Media Items, `videos/` groups, completed-run pred artifacts, uploaded media), one GT can be compared against up to two Pred tracks (`predA`, `predB`), and `flow`/`mask`/`warp` layers can be shown side-by-side. Sample/video APIs read only the rows they need; the full-run timeline endpoint exists only for compatibility/debug. Linux NPU and CUDA servers are the only supported deployment targets; Windows-specific hardening is deferred.
 
 ## Commands
 
@@ -21,10 +23,10 @@ python -m unittest discover -s tests
 # Run a single test
 python -m unittest tests.test_end_to_end
 
-# Compare-flow tests (V13)
+# Compare-flow tests
 python -m unittest tests.test_compare_multitrack tests.test_compare_sources_api tests.test_db_indices
 
-# Run feedback tests (V13)
+# Run feedback tests
 python -m unittest tests.test_run_feedback
 
 # Start the server (main development workflow)
@@ -79,7 +81,7 @@ Set `$env:PYTHONPATH='src'` before running any vfieval commands outside of `pip 
 - `models/*.py` — User model files (scanned by UI)
 - `checkpoints/{model_stem}/` — Model weights
 - `videos/{group_name}/` — Video datasets grouped by style/source
-- `set/metrics/` — Metric asset manifests and weights
+- `set/metrics/` — Metric asset manifests and weights (gitignored, produced by `prepare-metrics`)
 - `.vfieval/` — Workspace (SQLite DB, run outputs, decoded frame cache)
 
 ### Model Contract
@@ -90,7 +92,7 @@ Outputs: dict with `flowt_0 [B,2,h,w]`, `flowt_1 [B,2,h,w]`, `mask0 [B,1,h,w]`, 
 
 ### Supported Metrics
 
-`lpips_vit_patch`, `lpips_convnext`, `vmaf`, `cgvqm` — defined in `src/vfieval/metrics/names.py`. Frame-level metrics (lpips_*) produce per-sample timeline curves. Video-level metrics (vmaf, cgvqm) produce per-video summaries only.
+`lpips_vit_patch`, `lpips_convnext`, `vmaf`, `cgvqm` — defined in `src/vfieval/metrics/names.py`. Frame-level metrics (lpips_*) produce per-sample timeline curves. Video-level metrics (vmaf, cgvqm) produce per-video summaries only. Metric assets are prepared by `prepare-metrics` into `set/metrics/`; health checks gate evaluation before any driver subprocess runs.
 
 ### Inference Pipeline Concurrency
 
@@ -108,57 +110,14 @@ Outputs: dict with `flowt_0 [B,2,h,w]`, `flowt_1 [B,2,h,w]`, `mask0 [B,1,h,w]`, 
 - `preflight_run` promotes these into `warnings` and the `model` field. Mismatched checkpoint keys surface as a `CheckpointLoadReport` warning with truncated missing/unexpected key lists.
 - `run_inference_job` extracts `_last_load_report` from the loaded model, writes `run_dir/logs/model_load.log`, and includes `model_load` in `result_json`. The Run Detail UI renders a summary panel and warns on any mismatch.
 
-### Compare API Surface (V13)
+## Subsystem Invariants
 
-Compare uses server-resident sources only. Raw string descriptors are rejected — `resolve_compare_descriptor` requires a dict with a `kind` field.
+Rules that are easy to break and not obvious from the code; for file/function-level detail see `NAVIGATION.md`.
 
-- `GET /api/compare-sources/gt` — enumerates `videos/{group}/*` clips via `file_inputs.list_video_groups`. Each row: `{ group, video, path, frame_count, width, height, fps }`.
-- `GET /api/compare-sources/pred[?run_id=...]` — enumerates `kind='pred_video'` artifacts from completed (non-cleaned) runs via `db.list_runs` + `db.list_run_artifacts`. Each row: `{ run_id, run_name, video, artifact_id, frame_count, width, height, fps, created_at }`.
-- `GET /api/compare-sources/{flow,mask}?run_id=...&video=...` — enumerates per-video `flowt_*` / `mask*` / `warp*` / `blend` artifact groups for the picker.
-
-Structured Compare payload accepted by `POST /api/runs` (`run_type: "video_compare"`):
-
-```json
-{
-  "run_type": "video_compare",
-  "reference": { "kind": "video_group", "group": "anime", "video": "clip01.mp4" },
-  "distorted": [
-    { "kind": "run_artifact", "run_id": 12, "video": "clip01.mp4", "label": "ModelA" },
-    { "kind": "run_artifact", "run_id": 17, "video": "clip01.mp4", "label": "ModelB" }
-  ],
-  "extra_layers": [
-    { "source": "run_artifact", "run_id": 12, "kinds": ["flowt_0", "mask0"] }
-  ],
-  "metrics": ["lpips_vit_patch", "vmaf"]
-}
-```
-
-Descriptor resolution lives in `compare_inputs.resolve_compare_descriptor(workspace, db, descriptor)` — the server never trusts a client-supplied `path` for Pred / flow / mask sources, and raw string descriptors are rejected with `"compare source descriptor must be an object with a 'kind' field"`. Multi-track Compare writes `pred.mp4` / `diff.mp4` under `.vfieval/runs/{run_id}/videos/{video_name}/{track_label}/`; the shared `gt.mp4` lives one level up. Sample names encode `{video_stem}__{track_label}__{frame_index:06d}` so per-track timelines work without schema changes.
-
-### Timeline And Sample API Performance (V13)
-
-- `_run_videos`, `_run_video_timeline`, and `_run_sample_payload` read only the rows they need — they do not call `_run_timeline()` internally.
-- Required indices in `db.py` schema string:
-  - `idx_artifacts_sample` on `artifacts(sample_id, kind)`
-  - `idx_metric_results_sample` on `metric_results(sample_id, metric_name)`
-  - `idx_run_jobs_device` on `run_jobs(device)`
-- Sample- and video-level handlers use `db.list_artifacts_by_sample`, `db.list_metrics_by_sample`, and `db.list_samples_by_video`. `/api/runs/{id}/timeline` remains as a compatibility/debug endpoint and returns `X-Deprecated: use /videos`.
-
-### Multi-Group Inference (V13)
-
-One inference task can span multiple `videos/` groups. `datasets._resolve_video_entries` / `VideoEntry` and `file_inputs.resolve_video_selection` accept either a single `video_group` (legacy) or a `video_groups` list. Single-group runs stay byte-identical to legacy behavior — dataset root is the group folder, clip names stay bare — so cache and reference keys remain compatible. Only multi-group runs root at `videos/` and qualify clips as `group/file`. The infer form sends `video_group` (single) or `video_groups` (multi); the frontend uses a `#video-group-picker` multi-checkbox with per-group video tables. Default run name is `model-checkpoint-videogroup` (`server._default_run_name`).
-
-### Run Feedback + Statistics (V13)
-
-Runs carry user feedback (rating 1–5 and/or free-text issue). Table `run_feedback` (id, run_id FK CASCADE, username, rating INT nullable, issue TEXT, metadata_json, created_at) is in both SCHEMA and `_migrate`, indexed by `idx_run_feedback_run(run_id, created_at)`.
-
-- DB methods: `add_run_feedback`, `list_run_feedback(run_id)`, `delete_run_feedback(run_id, feedback_id)` (scoped by run_id), `list_all_feedback`, `feedback_stats` (overall + rating_distribution + by_user + by_run).
-- Server: `_create_run_feedback` validates rating 1–5 and requires a rating or issue; `_feedback_overview` wraps `feedback_stats` and adds recent entries. Routes: `POST/GET /api/runs/{id}/feedback`, `DELETE /api/runs/{id}/feedback/{fid}`, `GET /api/feedback`. `_run_detail` includes `run["feedback"]`.
-- Frontend: `renderRunFeedback` panel in run detail, a "统计" nav view (`#view-stats`) with `loadStats`/`renderStats`, plus `submitRunFeedback`/`deleteRunFeedback`. Tests in `tests/test_run_feedback.py`.
-
-### Compare Track-Label Dedup (V13)
-
-Sample names are `{video_token}__{track_token}__{frame}` with `UNIQUE(dataset_id, name)` + `INSERT OR REPLACE`. Two selected preds sharing a sanitized track token silently overwrote each other (symptom: 1 GT + 1 pred instead of 2). `server._dedupe_track_labels(distorted_tracks)` bumps colliding labels to `{base}#{index+1}` (dedup on the sanitized token, not the raw label) before building `compare_tracks`. Regression test in `tests/test_compare_multitrack.py`.
+- **Compare**: server-resident sources only — `resolve_compare_descriptor` requires a dict with a `kind` field and rejects raw string descriptors; the server never trusts a client-supplied `path` for Pred/flow/mask sources. Sample names encode `{video_stem}__{track_label}__{frame_index:06d}` under `UNIQUE(dataset_id, name)` + `INSERT OR REPLACE`, so colliding sanitized track tokens would silently overwrite each other — `server._dedupe_track_labels` bumps collisions on the sanitized token (not the raw label) before tracks are built. Multi-track Compare writes per-track `pred.mp4`/`diff.mp4` under `.vfieval/runs/{run_id}/videos/{video}/{track_label}/`; the shared `gt.mp4` lives one level up.
+- **Scoped reads**: `_run_videos`, `_run_video_timeline`, and `_run_sample_payload` must not call `_run_timeline()` internally — they read only the rows they need. `/api/runs/{id}/timeline` stays as a compatibility/debug endpoint returning `X-Deprecated`. Required indices are listed in `NAVIGATION.md` §9; adding a core column or index requires editing both the schema string and `_migrate` in `db.py`.
+- **Multi-group inference**: single-group runs stay byte-identical to legacy behavior (dataset root = group folder, bare clip names) so cache and reference keys remain compatible. Only multi-group runs root at `videos/` and qualify clips as `group/file`. The infer form sends `video_group` (single) or `video_groups` (multi).
+- **Run feedback + statistics**: see `NAVIGATION.md` §1. Rating is 1–5 in 0.25 steps (rating or issue required), rows are content-scoped (video/track/model/checkpoint; Compare tracks chase back to the source Run), and run cleanup cascades feedback deletion.
 
 ## Testing Notes
 
