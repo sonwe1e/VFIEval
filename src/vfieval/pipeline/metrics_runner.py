@@ -19,6 +19,7 @@ from vfieval.metrics.health import metric_cache_config, metric_requires_video_in
 from vfieval.pipeline.inference import RunCanceled
 from vfieval.pipeline.artifact_integrity import strict_video_pair_issue
 from vfieval.media_assets import bind_metric_result, run_asset_pair
+from vfieval.process_control import CancelCheck
 
 METRIC_CACHE_VERSION = "metric-cache-v3"
 
@@ -196,6 +197,7 @@ def run_metric_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> dic
                                 metric_device=metric_device,
                                 alignment_context=video_input.get("alignment_context") or _metric_alignment_context(dataset),
                                 retry=bool(payload.get("retry")),
+                                cancel_check=lambda: _raise_if_canceled(db, run_id, job_id),
                             )
                         details = {
                             "video_name": video_name,
@@ -380,6 +382,8 @@ def _run_frame_metric_batches(
     if pending:
         try:
             metric = create_metric(metric_name, workspace, device=metric_device)
+        except RunCanceled:
+            raise
         except MetricUnavailable as exc:
             unavailable_reason = str(exc)
             effective_batch = 0
@@ -434,6 +438,8 @@ def _run_frame_metric_batches(
             effective_batch = min(effective_batch, size)
             offset += size
             _publish_metric_progress(db, job_id, run_id, current + len(outcomes), total, job_payload)
+        except RunCanceled:
+            raise
         except MetricBatchOutOfMemory as exc:
             if size > 1:
                 batch_size = max(1, size // 2)
@@ -1396,6 +1402,7 @@ def _evaluate_with_cache(
     metric_device: str = "cpu",
     alignment_context: dict[str, str] | None = None,
     retry: bool = False,
+    cancel_check: CancelCheck | None = None,
 ) -> tuple[str, float | None, dict[str, Any]]:
     config = {
         "cache_version": METRIC_CACHE_VERSION,
@@ -1411,10 +1418,20 @@ def _evaluate_with_cache(
 
     work_dir = workspace.tmp_dir / "metrics" / metric_name / hashlib.sha1(cache_key.encode("utf-8")).hexdigest()
     try:
-        metric = create_metric(metric_name, workspace, device=metric_device)
+        if cancel_check is not None and metric_requires_video_input(metric_name):
+            metric = create_metric(
+                metric_name,
+                workspace,
+                device=metric_device,
+                cancel_check=cancel_check,
+            )
+        else:
+            metric = create_metric(metric_name, workspace, device=metric_device)
         result = metric.evaluate(reference_path, distorted_path, work_dir)
         db.set_metric_cache(cache_key, metric_name, result.status, result.value, result.details)
         return result.status, result.value, result.details
+    except RunCanceled:
+        raise
     except MetricUnavailable as exc:
         details = {
             **dict(getattr(exc, "details", {}) or {}),

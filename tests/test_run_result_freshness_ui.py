@@ -10,7 +10,12 @@ ROOT = Path(__file__).resolve().parents[1]
 class RunResultFreshnessUiTests(unittest.TestCase):
     def setUp(self) -> None:
         web = ROOT / "src" / "vfieval" / "web"
-        self.app_js = (web / "app.js").read_text(encoding="utf-8")
+        self.app_js = "\n".join(
+            (
+                (web / "app.js").read_text(encoding="utf-8"),
+                (web / "run-detail.js").read_text(encoding="utf-8"),
+            )
+        )
         self.index_html = (web / "index.html").read_text(encoding="utf-8")
         self.styles = (web / "styles.css").read_text(encoding="utf-8")
 

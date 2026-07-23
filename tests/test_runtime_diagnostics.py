@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import threading
 import unittest
@@ -13,6 +14,7 @@ from unittest.mock import MagicMock, patch
 from vfieval.catalog_sync import CatalogSyncCoordinator
 from vfieval.config import WorkspaceConfig
 from vfieval.db import Database, artifact_storage_metadata, utc_ts
+from vfieval.diagnostics import health_snapshot, run_doctor
 from vfieval.evaluations_v2 import ensure_v2_schema
 from vfieval.run_cleanup import RunCleanupService
 from vfieval.server import _make_handler, _run_detail
@@ -41,6 +43,78 @@ def _new_run(
 
 
 class RuntimeDiagnosticsTests(unittest.TestCase):
+    def test_health_readiness_rejects_storage_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            usage = SimpleNamespace(
+                total=10 * 1024**3,
+                used=9.5 * 1024**3,
+                free=512 * 1024**2,
+            )
+
+            with patch("vfieval.diagnostics.shutil.disk_usage", return_value=usage):
+                health = health_snapshot(db, workspace)
+
+            self.assertFalse(health["ready"])
+            self.assertIn("storage_error", health["reasons"])
+
+    def test_doctor_marks_missing_media_tools_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = WorkspaceConfig.from_root(Path(tmp) / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            metric_health = {
+                "asset_root": "<assets>",
+                "metrics": {
+                    "vmaf": {"status": "available", "available": True},
+                },
+            }
+            with (
+                patch("vfieval.diagnostics.shutil.which", return_value=None),
+                patch(
+                    "vfieval.metrics.health.metrics_health",
+                    return_value=metric_health,
+                ),
+                patch(
+                    "vfieval.worker.detect_capabilities",
+                    return_value={"cpu": True, "cuda": [], "npu": []},
+                ),
+            ):
+                report = run_doctor(db, workspace)
+
+            self.assertFalse(report["ok"])
+            self.assertIn("ffmpeg", report["summary"]["unavailable"])
+            self.assertIn("ffprobe", report["summary"]["unavailable"])
+            self.assertIn("ffmpeg_encoders", report["summary"]["unavailable"])
+
+    def test_health_readiness_rejects_stale_queue_without_consumer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workspace = WorkspaceConfig.from_root(root / ".vfieval")
+            workspace.ensure()
+            db = Database(workspace.db_path)
+            db.init()
+            job_id = db.create_job("metric", {})
+            with db.connection() as conn:
+                conn.execute(
+                    "UPDATE jobs SET created_at = ? WHERE id = ?",
+                    (utc_ts() - 600.0, job_id),
+                )
+
+            health = health_snapshot(db, workspace)
+
+            self.assertTrue(health["live"])
+            self.assertFalse(health["ready"])
+            self.assertFalse(health["ok"])
+            self.assertIn("queued_jobs_stale", health["reasons"])
+            self.assertIn("queued_jobs_without_consumer", health["reasons"])
+            self.assertEqual(health["queues"]["queued"], 1)
+            self.assertEqual(health["queues"]["by_kind"]["metric"]["count"], 1)
+
     def test_precomputed_bulk_sizes_do_not_stat_during_sqlite_flush(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -213,15 +287,20 @@ class RuntimeDiagnosticsTests(unittest.TestCase):
             )
             self.assertEqual(sync_calls, [True])
             self.assertTrue(request_id)
+            self.assertTrue(payload["live"])
+            self.assertFalse(payload["ready"])
+            self.assertFalse(payload["ok"])
+            self.assertIn("campaign_cleanup_failed", payload["reasons"])
             self.assertIn("build_id", payload["release"])
             self.assertIn("latest_migration", payload["schema"])
             self.assertGreater(payload["storage"]["total_bytes"], 0)
             self.assertIn("running", payload["leases"])
+            self.assertIn("queued", payload["queues"])
             self.assertFalse(payload["maintenance"]["job_recovery"]["running"])
             cleanup_service.process_pending.assert_not_called()
 
     def test_frontend_displays_actual_artifact_bytes_against_budget(self) -> None:
-        app_js = (Path(__file__).parents[1] / "src" / "vfieval" / "web" / "app.js").read_text(
+        app_js = (Path(__file__).parents[1] / "src" / "vfieval" / "web" / "run-detail.js").read_text(
             encoding="utf-8"
         )
         self.assertIn("renderArtifactStorageDiagnostic(run.artifact_storage)", app_js)

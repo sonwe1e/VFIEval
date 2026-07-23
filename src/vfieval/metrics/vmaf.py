@@ -7,6 +7,7 @@ from pathlib import Path
 from vfieval.config import WorkspaceConfig
 from vfieval.metrics.base import MetricResult, MetricUnavailable
 from vfieval.metrics.health import metric_health
+from vfieval.process_control import CancelCheck, run_cancellable
 
 
 VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".y4m"}
@@ -15,8 +16,14 @@ VIDEO_SUFFIXES = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".y4m"}
 class VmafMetric:
     name = "vmaf"
 
-    def __init__(self, workspace: WorkspaceConfig | None = None):
+    def __init__(
+        self,
+        workspace: WorkspaceConfig | None = None,
+        *,
+        cancel_check: CancelCheck | None = None,
+    ):
         self.workspace = workspace or WorkspaceConfig.from_root()
+        self.cancel_check = cancel_check
 
     def evaluate(self, reference: Path, distorted: Path, work_dir: Path) -> MetricResult:
         if reference.suffix.lower() not in VIDEO_SUFFIXES or distorted.suffix.lower() not in VIDEO_SUFFIXES:
@@ -47,7 +54,14 @@ class VmafMetric:
             "-",
         ]
         try:
-            completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=600)
+            if self.cancel_check is None:
+                completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=600)
+            else:
+                completed = run_cancellable(
+                    command,
+                    timeout=600,
+                    cancel_check=self.cancel_check,
+                )
         except subprocess.TimeoutExpired:
             raise RuntimeError("ffmpeg vmaf timed out after 600 seconds")
         if completed.returncode != 0:

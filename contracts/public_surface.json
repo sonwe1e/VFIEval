@@ -1,0 +1,102 @@
+{
+  "cli_entrypoint": "vfieval = \"vfieval.cli:main\"",
+  "cli_commands": [
+    "benchmark",
+    "create-dataset",
+    "diagnostics",
+    "doctor",
+    "enqueue-inference",
+    "enqueue-metrics",
+    "init",
+    "jobs",
+    "prepare-metrics",
+    "register-model",
+    "scan-dataset",
+    "serve",
+    "smoke-metric",
+    "worker"
+  ],
+  "route_anchors": [
+    {
+      "name": "health",
+      "source": "path == \"/api/health\"",
+      "navigation": "GET /api/health"
+    },
+    {
+      "name": "preflight",
+      "source": "\"/api/preflight\", \"/api/preflight/quick\"",
+      "navigation": "POST /api/preflight"
+    },
+    {
+      "name": "run creation and listing",
+      "source": "path == \"/api/runs\"",
+      "navigation": "POST /api/runs"
+    },
+    {
+      "name": "large folder-video selection snapshot",
+      "source": "path == \"/api/video-selections\"",
+      "navigation": "POST /api/video-selections"
+    },
+    {
+      "name": "large folder-video selection page",
+      "source": "r\"/api/video-selections/([A-Za-z0-9_-]{32,128})\"",
+      "navigation": "GET /api/video-selections/{token}"
+    },
+    {
+      "name": "item-first media selection",
+      "source": "path == \"/api/media/items\"",
+      "navigation": "GET /api/media/items"
+    },
+    {
+      "name": "large item selection snapshot",
+      "source": "path == \"/api/media/item-selections\"",
+      "navigation": "POST /api/media/item-selections"
+    },
+    {
+      "name": "large item selection page",
+      "source": "r\"/api/media/item-selections/([A-Za-z0-9_-]{32,128})\"",
+      "navigation": "GET /api/media/item-selections/{token}"
+    },
+    {
+      "name": "item predictions",
+      "source": "r\"/api/media/items/(\\d+)/predictions\"",
+      "navigation": "GET /api/media/items/{id}/predictions"
+    },
+    {
+      "name": "campaign v2 creation",
+      "source": "path == \"/api/evaluation-campaigns/v2\"",
+      "navigation": "POST /api/evaluation-campaigns/v2"
+    },
+    {
+      "name": "blind participant",
+      "source": "r\"/api/blind/([A-Za-z0-9_-]+)",
+      "navigation": "/api/blind/{token}"
+    },
+    {
+      "name": "job claim",
+      "source": "path == \"/api/jobs/claim\"",
+      "navigation": "POST /api/jobs/claim"
+    },
+    {
+      "name": "job callbacks",
+      "source": "r\"/api/jobs/(\\d+)/(complete|fail|progress)\"",
+      "navigation": "POST /api/jobs/{id}/{progress,complete,fail,heartbeat}"
+    }
+  ],
+  "web_entrypoints": [
+    "index.html",
+    "blind.html"
+  ],
+  "required_web_assets": [
+    "app.js",
+    "blind.css",
+    "blind.js",
+    "compare.js",
+    "media.js",
+    "run-detail.js",
+    "shared.js",
+    "studio.css",
+    "studio.js",
+    "styles.css"
+  ]
+}

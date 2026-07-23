@@ -59,6 +59,8 @@ class JobLeaseTests(unittest.TestCase):
             with db.connection() as conn:
                 conn.execute("DROP INDEX IF EXISTS idx_jobs_running_heartbeat")
                 conn.execute("ALTER TABLE jobs DROP COLUMN heartbeat_at")
+                conn.execute("ALTER TABLE jobs DROP COLUMN lease_token")
+                conn.execute("ALTER TABLE jobs DROP COLUMN claim_attempt")
 
             db.init()
 
@@ -72,6 +74,8 @@ class JobLeaseTests(unittest.TestCase):
                     for row in conn.execute("PRAGMA index_list(jobs)").fetchall()
                 }
             self.assertIn("heartbeat_at", columns)
+            self.assertIn("claim_attempt", columns)
+            self.assertIn("lease_token", columns)
             self.assertIn("idx_jobs_running_heartbeat", indexes)
 
     def test_claim_and_heartbeat_are_worker_fenced(self) -> None:
@@ -82,12 +86,107 @@ class JobLeaseTests(unittest.TestCase):
             claimed = db.claim_next_job("owner", ["decode"])
             self.assertEqual(int(claimed["id"]), job_id)
             self.assertIsNotNone(claimed["heartbeat_at"])
+            fence = {
+                "attempt": int(claimed["claim_attempt"]),
+                "lease_token": str(claimed["lease_token"]),
+            }
 
             self._set_heartbeat(db, job_id, 100.0)
-            self.assertFalse(db.heartbeat_job(job_id, "late-owner"))
+            self.assertFalse(db.heartbeat_job(job_id, "late-owner", **fence))
             self.assertEqual(db.get_job(job_id)["heartbeat_at"], 100.0)
-            self.assertTrue(db.heartbeat_job(job_id, "owner"))
+            self.assertTrue(db.heartbeat_job(job_id, "owner", **fence))
             self.assertGreater(float(db.get_job(job_id)["heartbeat_at"]), 100.0)
+
+    def test_reclaimed_job_rejects_every_callback_from_stale_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _workspace, db = self._workspace_db(Path(tmp))
+            db.register_worker("owner", "decode", {})
+            job_id = db.create_job("decode", {})
+            first = db.claim_next_job("owner", ["decode"])
+            self.assertEqual(int(first["claim_attempt"]), 1)
+
+            with db.connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'queued', worker_id = NULL,
+                        started_at = NULL, heartbeat_at = NULL
+                    WHERE id = ?
+                    """,
+                    (job_id,),
+                )
+            second = db.claim_next_job("owner", ["decode"])
+            self.assertEqual(int(second["claim_attempt"]), 2)
+            self.assertNotEqual(first["lease_token"], second["lease_token"])
+            stale = {
+                "worker_id": "owner",
+                "attempt": int(first["claim_attempt"]),
+                "lease_token": str(first["lease_token"]),
+            }
+            self.assertFalse(db.heartbeat_job(job_id, **stale))
+            self.assertFalse(db.update_job_progress(job_id, 1, 1, **stale))
+            self.assertFalse(db.complete_job(job_id, {"stale": True}, **stale))
+            self.assertFalse(db.fail_job(job_id, {"message": "stale"}, **stale))
+
+            current = {
+                "worker_id": "owner",
+                "attempt": int(second["claim_attempt"]),
+                "lease_token": str(second["lease_token"]),
+            }
+            self.assertTrue(db.update_job_progress(job_id, 1, 1, **current))
+            self.assertTrue(db.complete_job(job_id, {"done": True}, **current))
+
+    def test_stale_attempt_cannot_commit_atomic_run_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _workspace, db = self._workspace_db(root)
+            run_id = self._run(db, root)
+            job_id = int(db.get_run(run_id)["inference_job_id"])
+            first = db.claim_next_job("same-worker", ["inference"])
+            with db.connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE jobs
+                    SET status = 'queued', worker_id = NULL,
+                        started_at = NULL, heartbeat_at = NULL
+                    WHERE id = ?
+                    """,
+                    (job_id,),
+                )
+            second = db.claim_next_job("same-worker", ["inference"])
+            self.assertTrue(db.mark_run_started(run_id, "running"))
+
+            self.assertFalse(
+                db.complete_run_inference(
+                    run_id,
+                    {"samples": 1},
+                    {},
+                    "completed",
+                    source_job_id=job_id,
+                    source_job_result={"samples": 1},
+                    source_worker_id="same-worker",
+                    source_attempt=int(first["claim_attempt"]),
+                    source_lease_token=str(first["lease_token"]),
+                )
+            )
+            self.assertEqual(db.get_run(run_id)["status"], "running")
+            self.assertEqual(db.get_job(job_id)["status"], "running")
+
+            self.assertTrue(
+                db.complete_run_inference(
+                    run_id,
+                    {"samples": 1},
+                    {},
+                    "completed",
+                    source_job_id=job_id,
+                    source_job_result={"samples": 1},
+                    source_worker_id="same-worker",
+                    source_attempt=int(second["claim_attempt"]),
+                    source_lease_token=str(second["lease_token"]),
+                )
+            )
+            self.assertEqual(db.get_run(run_id)["status"], "completed")
+            self.assertEqual(db.get_job(job_id)["status"], "completed")
 
     def test_http_heartbeat_requires_and_enforces_current_worker_owner(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -95,7 +194,8 @@ class JobLeaseTests(unittest.TestCase):
             db.register_worker("owner", "decode", {})
             db.register_worker("wrong-owner", "decode", {})
             job_id = db.create_job("decode", {})
-            self.assertEqual(int(db.claim_next_job("owner", ["decode"])["id"]), job_id)
+            claimed = db.claim_next_job("owner", ["decode"])
+            self.assertEqual(int(claimed["id"]), job_id)
             self._set_heartbeat(db, job_id, 100.0)
             server = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler(db, workspace))
             thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -118,10 +218,14 @@ class JobLeaseTests(unittest.TestCase):
             try:
                 missing_status, missing = post({})
                 self.assertEqual(missing_status, 400, missing)
-                wrong_status, wrong = post({"worker_id": "wrong-owner"})
+                fence = {
+                    "attempt": int(claimed["claim_attempt"]),
+                    "lease_token": str(claimed["lease_token"]),
+                }
+                wrong_status, wrong = post({"worker_id": "wrong-owner", **fence})
                 self.assertEqual(wrong_status, 409, wrong)
                 self.assertEqual(db.get_job(job_id)["heartbeat_at"], 100.0)
-                owner_status, owner = post({"worker_id": "owner"})
+                owner_status, owner = post({"worker_id": "owner", **fence})
                 self.assertEqual(owner_status, 200, owner)
                 self.assertGreater(float(db.get_job(job_id)["heartbeat_at"]), 100.0)
             finally:
@@ -134,13 +238,16 @@ class JobLeaseTests(unittest.TestCase):
             _workspace, db = self._workspace_db(Path(tmp))
             db.register_worker("owner", "decode", {})
             job_id = db.create_job("decode", {})
-            self.assertEqual(int(db.claim_next_job("owner", ["decode"])["id"]), job_id)
+            claimed = db.claim_next_job("owner", ["decode"])
+            self.assertEqual(int(claimed["id"]), job_id)
             self._set_heartbeat(db, job_id, 100.0)
 
             heartbeat = JobLeaseHeartbeat(
                 db,
                 job_id,
                 "owner",
+                int(claimed["claim_attempt"]),
+                str(claimed["lease_token"]),
                 interval_seconds=0.05,
             )
             self.assertTrue(heartbeat.start())
@@ -162,7 +269,14 @@ class JobLeaseTests(unittest.TestCase):
             events: list[tuple[str, int, str]] = []
 
             class RecordingHeartbeat:
-                def __init__(self, _db: Database, claimed_job_id: int, worker_id: str) -> None:
+                def __init__(
+                    self,
+                    _db: Database,
+                    claimed_job_id: int,
+                    worker_id: str,
+                    _attempt: int,
+                    _lease_token: str,
+                ) -> None:
                     self.job_id = claimed_job_id
                     self.worker_id = worker_id
 
@@ -211,10 +325,8 @@ class JobLeaseTests(unittest.TestCase):
                 shard_index=2,
             )
             self.assertTrue(db.mark_run_started(run_id, "running"))
-            self.assertEqual(
-                int(db.claim_next_job("lost-worker", ["inference"])["id"]),
-                lost_job_id,
-            )
+            lost_claim = db.claim_next_job("lost-worker", ["inference"])
+            self.assertEqual(int(lost_claim["id"]), lost_job_id)
             self.assertEqual(
                 int(db.claim_next_job("healthy-worker", ["inference"])["id"]),
                 running_sibling_id,
@@ -241,7 +353,14 @@ class JobLeaseTests(unittest.TestCase):
             self.assertEqual(queued["status"], "canceled")
             self.assertEqual(queued["error"]["message"], "sibling shard failed the run")
             self.assertFalse(db.update_job_progress(running_sibling_id, 1, 1))
-            self.assertFalse(db.heartbeat_job(lost_job_id, "lost-worker"))
+            self.assertFalse(
+                db.heartbeat_job(
+                    lost_job_id,
+                    "lost-worker",
+                    int(lost_claim["claim_attempt"]),
+                    str(lost_claim["lease_token"]),
+                )
+            )
             self.assertEqual(recover_stale_jobs(db, now=observed_at), [])
 
     def test_fresh_heartbeat_and_completed_job_win_recovery_races(self) -> None:
@@ -250,9 +369,17 @@ class JobLeaseTests(unittest.TestCase):
             observed_at = time.time()
 
             fresh_id = db.create_job("decode", {})
-            self.assertEqual(int(db.claim_next_job("fresh", ["decode"])["id"]), fresh_id)
+            fresh_claim = db.claim_next_job("fresh", ["decode"])
+            self.assertEqual(int(fresh_claim["id"]), fresh_id)
             self._set_heartbeat(db, fresh_id, observed_at - 1000.0)
-            self.assertTrue(db.heartbeat_job(fresh_id, "fresh"))
+            self.assertTrue(
+                db.heartbeat_job(
+                    fresh_id,
+                    "fresh",
+                    int(fresh_claim["claim_attempt"]),
+                    str(fresh_claim["lease_token"]),
+                )
+            )
             self.assertEqual(recover_stale_jobs(db, now=observed_at), [])
 
             completed_id = db.create_job("decode", {})

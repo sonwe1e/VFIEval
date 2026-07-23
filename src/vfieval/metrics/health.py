@@ -34,13 +34,22 @@ _HEALTH_CACHE_LOCK = threading.Lock()
 _HEALTH_CACHE: dict[tuple[str, str], dict[str, Any]] = {}
 _FEATURE_VALIDATION_CACHE: dict[str, dict[str, Any]] = {}
 
-DINO_REPO_URL = "https://github.com/facebookresearch/dinov2/archive/refs/heads/main.zip"
+DINO_REPO_REVISION = "7764ea0f912e53c92e82eb78a2a1631e92725fc8"
+DINO_REPO_URL = f"https://github.com/facebookresearch/dinov2/archive/{DINO_REPO_REVISION}.zip"
+DINO_REPO_SHA256 = "04276715cddb29d45d05bff3a6fc132224dc27749b279ac98ad2ce4620e20d48"
 DINO_VITS14_REG_WEIGHTS_URL = "https://dl.fbaipublicfiles.com/dinov2/dinov2_vits14/dinov2_vits14_reg4_pretrain.pth"
+DINO_VITS14_REG_WEIGHTS_SHA256 = "f433177089a681826f849f194ece3bb48f4d63fb38d32fc837e3dc7a4e5641fb"
+CONVNEXT_TINY_REVISION = "b1dd46230e80bf4cc3fa0c3c905db2c3ec53a817"
 CONVNEXT_TINY_WEIGHTS_URL = (
-    "https://huggingface.co/timm/convnextv2_tiny.fcmae_ft_in22k_in1k/resolve/main/model.safetensors"
+    "https://huggingface.co/timm/convnextv2_tiny.fcmae_ft_in22k_in1k/"
+    f"resolve/{CONVNEXT_TINY_REVISION}/model.safetensors"
 )
-CGVQM_REPO_URL = "https://github.com/IntelLabs/CGVQM/archive/refs/heads/main.zip"
+CONVNEXT_TINY_WEIGHTS_SHA256 = "6652fd90fc9c23977659e58515778e16fbbcd43f0b01fc693089cebe6d64c2a9"
+CGVQM_REPO_REVISION = "8302ff45b4ff5a691682baf23f7c007d6b591e98"
+CGVQM_REPO_URL = f"https://github.com/IntelLabs/CGVQM/archive/{CGVQM_REPO_REVISION}.zip"
+CGVQM_REPO_SHA256 = "4612db37dab5140ecbaec945c91c93722edc50acc0016d9b2cc52e0ef085fcbf"
 R3D_18_WEIGHTS_URL = "https://download.pytorch.org/models/r3d_18-b3b3357e.pth"
+R3D_18_WEIGHTS_SHA256 = "b3b3357ead25631ec9c57362ff2128a92d0427e01e2cd184951a44380c3f2e9d"
 R3D_18_WEIGHTS_SUBPATH = "torch_home/hub/checkpoints/r3d_18-b3b3357e.pth"
 
 METRIC_REQUIREMENTS = {
@@ -286,6 +295,8 @@ def metric_cache_config(workspace: WorkspaceConfig, metric_name: str) -> dict[st
         "pad_multiple": health.get("pad_multiple"),
         "normalize": health.get("normalize"),
         "source_url": health.get("source_url"),
+        "source_revision": health.get("source_revision"),
+        "source_sha256": health.get("source_sha256"),
         "video_eval_long_edge": health.get("video_eval_long_edge"),
         "device_policy": health.get("device_policy"),
         "repo_dir": _path_fingerprint(health.get("repo_dir")) if health.get("repo_dir") else None,
@@ -347,29 +358,151 @@ def _prepare_downloaded_metric(
                         _atomic_write_text(manifest_path, json.dumps(pinned, indent=2))
                 return {"manifest_path": manifest_path, "downloads": [{"metric_name": metric_name, "status": "skipped"}]}
 
-    if force:
-        _remove_declared_metric_assets(metric_name, metric_dir)
+    stage_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f".{metric_name}.staging-",
+            dir=str(metric_dir.parent),
+        )
+    )
+    try:
+        downloads = _download_metric_into_stage(
+            metric_name,
+            stage_dir,
+            downloader=downloader,
+        )
+        staged_manifest = _downloaded_manifest(metric_name, stage_dir)
+        staged_manifest_path = stage_dir / "manifest.json"
+        _atomic_write_text(staged_manifest_path, json.dumps(staged_manifest, indent=2))
+        if not _downloaded_manifest_assets_exist(metric_name, stage_dir, staged_manifest):
+            raise RuntimeError(f"{metric_name} staging validation did not find every declared asset")
+        _activate_metric_stage(stage_dir, metric_dir)
+    finally:
+        if stage_dir.exists():
+            shutil.rmtree(stage_dir)
 
+    final_downloads = [
+        {
+            "metric_name": metric_name,
+            **row,
+            "target": _remap_staged_target(row.get("target"), stage_dir, metric_dir),
+        }
+        for row in downloads
+    ]
+    return {"manifest_path": manifest_path, "downloads": final_downloads}
+
+
+def _download_metric_into_stage(
+    metric_name: str,
+    stage_dir: Path,
+    *,
+    downloader: Any | None,
+) -> list[dict[str, Any]]:
+    expected = None if downloader is not None else _expected_download_hashes(metric_name)
     downloads: list[dict[str, Any]] = []
     if metric_name == "lpips_vit_patch":
-        downloads.append(_download_and_extract(DINO_REPO_URL, metric_dir / "dinov2", downloader))
-        downloads.append(_download_file(DINO_VITS14_REG_WEIGHTS_URL, metric_dir / "dinov2_vits14_reg.pth", downloader))
+        downloads.append(
+            _download_and_extract(
+                DINO_REPO_URL,
+                stage_dir / "dinov2",
+                downloader,
+                expected_sha256=(expected or {}).get("repo"),
+            )
+        )
+        downloads.append(
+            _download_file(
+                DINO_VITS14_REG_WEIGHTS_URL,
+                stage_dir / "dinov2_vits14_reg.pth",
+                downloader,
+                expected_sha256=(expected or {}).get("weights"),
+            )
+        )
     elif metric_name == "lpips_convnext":
-        downloads.append(_download_file(CONVNEXT_TINY_WEIGHTS_URL, metric_dir / "model.safetensors", downloader))
+        downloads.append(
+            _download_file(
+                CONVNEXT_TINY_WEIGHTS_URL,
+                stage_dir / "model.safetensors",
+                downloader,
+                expected_sha256=(expected or {}).get("weights"),
+            )
+        )
     elif metric_name == "cgvqm":
-        downloads.append(_download_and_extract(CGVQM_REPO_URL, metric_dir / "CGVQM", downloader))
-        downloads.append(_download_file(R3D_18_WEIGHTS_URL, metric_dir / R3D_18_WEIGHTS_SUBPATH, downloader))
-        wrapper_path = metric_dir / "run_cgvqm_vfieval.py"
+        downloads.append(
+            _download_and_extract(
+                CGVQM_REPO_URL,
+                stage_dir / "CGVQM",
+                downloader,
+                expected_sha256=(expected or {}).get("repo"),
+            )
+        )
+        downloads.append(
+            _download_file(
+                R3D_18_WEIGHTS_URL,
+                stage_dir / R3D_18_WEIGHTS_SUBPATH,
+                downloader,
+                expected_sha256=(expected or {}).get("backbone_weights"),
+            )
+        )
+        wrapper_path = stage_dir / "run_cgvqm_vfieval.py"
         _atomic_write_text(wrapper_path, _cgvqm_wrapper_source())
-        downloads.append({"url": "vfieval-generated-wrapper", "target": str(wrapper_path.resolve()), "status": "written"})
+        downloads.append(
+            {
+                "url": "vfieval-generated-wrapper",
+                "target": str(wrapper_path.resolve()),
+                "status": "written",
+            }
+        )
     else:
         raise ValueError(f"unsupported downloadable metric: {metric_name}")
+    return downloads
 
-    manifest_path.write_text(
-        json.dumps(_downloaded_manifest(metric_name, metric_dir), indent=2),
-        encoding="utf-8",
+
+def _expected_download_hashes(metric_name: str) -> dict[str, str]:
+    if metric_name == "lpips_vit_patch":
+        return {
+            "repo": DINO_REPO_SHA256,
+            "weights": DINO_VITS14_REG_WEIGHTS_SHA256,
+        }
+    if metric_name == "lpips_convnext":
+        return {"weights": CONVNEXT_TINY_WEIGHTS_SHA256}
+    if metric_name == "cgvqm":
+        return {
+            "repo": CGVQM_REPO_SHA256,
+            "backbone_weights": R3D_18_WEIGHTS_SHA256,
+        }
+    return {}
+
+
+def _activate_metric_stage(stage_dir: Path, metric_dir: Path) -> None:
+    backup_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f".{metric_dir.name}.previous-",
+            dir=str(metric_dir.parent),
+        )
     )
-    return {"manifest_path": manifest_path, "downloads": [{"metric_name": metric_name, **row} for row in downloads]}
+    backup_dir.rmdir()
+    had_existing = metric_dir.exists()
+    if had_existing:
+        metric_dir.replace(backup_dir)
+    try:
+        stage_dir.replace(metric_dir)
+    except Exception:
+        if had_existing and backup_dir.exists() and not metric_dir.exists():
+            backup_dir.replace(metric_dir)
+        raise
+    else:
+        if backup_dir.exists():
+            shutil.rmtree(backup_dir)
+
+
+def _remap_staged_target(value: Any, stage_dir: Path, metric_dir: Path) -> str:
+    text = str(value or "")
+    if not text:
+        return text
+    try:
+        relative = Path(text).resolve().relative_to(stage_dir.resolve())
+    except ValueError:
+        return text
+    return str((metric_dir / relative).resolve())
 
 
 def _remove_declared_metric_assets(metric_name: str, metric_dir: Path) -> None:
@@ -418,21 +551,40 @@ def _downloaded_manifest_assets_exist(metric_name: str, metric_dir: Path, manife
     return True
 
 
-def _download_file(url: str, target: Path, downloader: Any | None) -> dict[str, Any]:
+def _download_file(
+    url: str,
+    target: Path,
+    downloader: Any | None,
+    *,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(delete=False, dir=str(target.parent), suffix=".tmp") as handle:
         tmp_path = Path(handle.name)
     try:
         _run_downloader(url, tmp_path, downloader)
+        actual_sha256 = _verify_download_sha256(tmp_path, expected_sha256)
         tmp_path.replace(target)
     except Exception:
         if tmp_path.exists():
             tmp_path.unlink()
         raise
-    return {"url": url, "target": str(target.resolve()), "status": "downloaded"}
+    return {
+        "url": url,
+        "target": str(target.resolve()),
+        "status": "downloaded",
+        "sha256": actual_sha256,
+        "verified": expected_sha256 is not None,
+    }
 
 
-def _download_and_extract(url: str, target_dir: Path, downloader: Any | None) -> dict[str, Any]:
+def _download_and_extract(
+    url: str,
+    target_dir: Path,
+    downloader: Any | None,
+    *,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
     target_dir.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(delete=False, dir=str(target_dir.parent), suffix=".zip") as handle:
         archive_path = Path(handle.name)
@@ -440,8 +592,9 @@ def _download_and_extract(url: str, target_dir: Path, downloader: Any | None) ->
     staged_dir = target_dir.with_name(f"{target_dir.name}.download")
     try:
         _run_downloader(url, archive_path, downloader)
+        actual_sha256 = _verify_download_sha256(archive_path, expected_sha256)
         with zipfile.ZipFile(archive_path) as archive:
-            archive.extractall(extract_root)
+            _safe_extract_zip(archive, extract_root)
         children = [child for child in extract_root.iterdir()]
         source_dir = children[0] if len(children) == 1 and children[0].is_dir() else extract_root
         if staged_dir.exists():
@@ -459,7 +612,39 @@ def _download_and_extract(url: str, target_dir: Path, downloader: Any | None) ->
             archive_path.unlink()
         if extract_root.exists():
             shutil.rmtree(extract_root)
-    return {"url": url, "target": str(target_dir.resolve()), "status": "downloaded"}
+    return {
+        "url": url,
+        "target": str(target_dir.resolve()),
+        "status": "downloaded",
+        "sha256": actual_sha256,
+        "verified": expected_sha256 is not None,
+    }
+
+
+def _verify_download_sha256(path: Path, expected_sha256: str | None) -> str:
+    actual = _file_sha256(path)
+    if expected_sha256 is None:
+        return actual
+    expected = str(expected_sha256).strip().lower()
+    if len(expected) != 64 or any(character not in "0123456789abcdef" for character in expected):
+        raise ValueError("expected download SHA-256 must contain exactly 64 hexadecimal characters")
+    if actual.lower() != expected:
+        raise ValueError(
+            f"download SHA-256 mismatch for {path.name}: expected {expected}, got {actual.lower()}"
+        )
+    return actual
+
+
+def _safe_extract_zip(archive: zipfile.ZipFile, target_dir: Path) -> None:
+    resolved_target = target_dir.resolve()
+    for member in archive.infolist():
+        member_path = (resolved_target / member.filename).resolve()
+        if not _is_relative_to(member_path, resolved_target):
+            raise ValueError(f"metric archive contains an unsafe path: {member.filename}")
+        unix_mode = (int(member.external_attr) >> 16) & 0o170000
+        if unix_mode == 0o120000:
+            raise ValueError(f"metric archive contains an unsupported symbolic link: {member.filename}")
+    archive.extractall(resolved_target)
 
 
 def _run_downloader(url: str, target: Path, downloader: Any | None) -> None:
@@ -495,6 +680,11 @@ def _downloaded_manifest(metric_name: str, metric_dir: Path | None = None) -> di
                 "repo": DINO_REPO_URL,
                 "weights": DINO_VITS14_REG_WEIGHTS_URL,
             },
+            "source_revision": {"repo": DINO_REPO_REVISION},
+            "source_sha256": {
+                "repo": DINO_REPO_SHA256,
+                "weights": DINO_VITS14_REG_WEIGHTS_SHA256,
+            },
         }
         return _pin_feature_manifest_assets(metric_name, metric_dir, manifest) if metric_dir else manifest
     if metric_name == "lpips_convnext":
@@ -511,6 +701,8 @@ def _downloaded_manifest(metric_name: str, metric_dir: Path | None = None) -> di
             "source_url": {
                 "weights": CONVNEXT_TINY_WEIGHTS_URL,
             },
+            "source_revision": {"weights": CONVNEXT_TINY_REVISION},
+            "source_sha256": {"weights": CONVNEXT_TINY_WEIGHTS_SHA256},
         }
         return _pin_feature_manifest_assets(metric_name, metric_dir, manifest) if metric_dir else manifest
     if metric_name == "cgvqm":
@@ -527,6 +719,11 @@ def _downloaded_manifest(metric_name: str, metric_dir: Path | None = None) -> di
                 "repo": CGVQM_REPO_URL,
                 "backbone_weights": R3D_18_WEIGHTS_URL,
                 "wrapper": "vfieval-generated-wrapper",
+            },
+            "source_revision": {"repo": CGVQM_REPO_REVISION},
+            "source_sha256": {
+                "repo": CGVQM_REPO_SHA256,
+                "backbone_weights": R3D_18_WEIGHTS_SHA256,
             },
             "driver": {
                 "command": ["python", "run_cgvqm_vfieval.py"],
@@ -1538,6 +1735,8 @@ def _feature_status_extra(
         "pad_multiple": int(manifest.get("pad_multiple") or (14 if requirement.get("backbone") == "dinov2_vits14_reg" else 32)),
         "normalize": manifest.get("normalize") or "imagenet",
         "source_url": manifest.get("source_url"),
+        "source_revision": manifest.get("source_revision"),
+        "source_sha256": manifest.get("source_sha256"),
         "device_policy": manifest.get("device_policy") or requirement.get("device_policy"),
         "manifest_fingerprint": manifest_fingerprint,
         "driver_fingerprint": driver_fingerprint,
@@ -1574,6 +1773,8 @@ def _cgvqm_status_extra(
             "value": int(manifest.get("video_eval_long_edge") or 720),
         },
         "source_url": manifest.get("source_url"),
+        "source_revision": manifest.get("source_revision"),
+        "source_sha256": manifest.get("source_sha256"),
     }
 
 

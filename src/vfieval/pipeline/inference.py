@@ -12,7 +12,7 @@ from collections import OrderedDict, defaultdict
 from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import numpy as np
 import torch
@@ -35,6 +35,7 @@ from vfieval.pipeline.postprocess import (
     compose_interpolated,
 )
 from vfieval.pipeline.visualize import save_difference, save_extra_tensor, save_preview_image, save_rgb_tensor
+from vfieval.process_control import terminate_process
 
 
 VALID_PRECISIONS = {"fp32", "fp16", "bf16"}
@@ -705,6 +706,7 @@ def run_inference_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> 
             integrity_report = _encode_and_validate_video_artifacts(
                 db,
                 job_id,
+                run_id,
                 run_dir,
                 video_groups,
                 integrity_report,
@@ -960,6 +962,7 @@ def _run_video_compare_job(
         integrity_report = _encode_and_validate_video_artifacts(
             db,
             job_id,
+            run_id,
             run_dir,
             video_groups,
             integrity_report,
@@ -1396,6 +1399,7 @@ def _log_failed_job_integrity(
 def _encode_and_validate_video_artifacts(
     db: Database,
     job_id: int,
+    run_id: int | None,
     run_dir: Path,
     video_groups: dict[str, dict[str, Any]],
     job_integrity: dict[str, Any],
@@ -1415,7 +1419,10 @@ def _encode_and_validate_video_artifacts(
             publish_pred_video=publish_pred_video,
             preview_height=preview_height,
             preview_width=preview_width,
+            cancel_check=lambda: _raise_if_canceled(db, run_id, job_id),
         )
+    except RunCanceled:
+        raise
     except Exception as exc:
         report = merge_integrity_reports(
             "job_artifacts",
@@ -1686,6 +1693,7 @@ def _attach_optional_video_preview(
     *,
     preview_height: int | None,
     preview_width: int | None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> None:
     metadata.update({"artifact_contract": ARTIFACT_CONTRACT})
     if preview_height is None or preview_width is None or not frame_paths:
@@ -1709,12 +1717,13 @@ def _attach_optional_video_preview(
         if (canonical_height, canonical_width) == (resolved_preview_height, resolved_preview_width):
             return
         preview_path = canonical_path.parent / "preview" / canonical_path.name
-        _write_mp4(
+        _write_mp4_with_options(
             frame_paths,
             preview_path,
             fps,
             target_height=resolved_preview_height,
             target_width=resolved_preview_width,
+            cancel_check=cancel_check,
         )
         metadata.update(
             {
@@ -1724,6 +1733,8 @@ def _attach_optional_video_preview(
                 "preview_resize": "lanczos",
             }
         )
+    except RunCanceled:
+        raise
     except Exception as exc:
         metadata["preview_warning"] = {
             "type": type(exc).__name__,
@@ -1740,6 +1751,7 @@ def _write_video_artifacts(
     publish_pred_video: bool = True,
     preview_height: int | None = None,
     preview_width: int | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> None:
     directory_names = _unique_sanitized_tokens(
         [
@@ -1748,6 +1760,8 @@ def _write_video_artifacts(
         ]
     )
     for group_key, group in video_groups.items():
+        if cancel_check is not None:
+            cancel_check()
         frames = sorted(group["frames"], key=lambda item: item["order"])
         if not frames:
             continue
@@ -1765,6 +1779,7 @@ def _write_video_artifacts(
                 publish_pred_video=publish_pred_video,
                 preview_height=preview_height,
                 preview_width=preview_width,
+                cancel_check=cancel_check,
             )
             continue
         video_dir = run_dir / "videos" / video_name
@@ -1773,7 +1788,12 @@ def _write_video_artifacts(
         pred_video_path = None
         if publish_pred_video:
             pred_video_path = video_dir / "pred.mp4"
-            _write_mp4(pred_frame_paths, pred_video_path, fps)
+            _write_mp4_with_options(
+                pred_frame_paths,
+                pred_video_path,
+                fps,
+                cancel_check=cancel_check,
+            )
             pred_metadata = _video_artifact_metadata(group["video_name"], frames, pred_frame_paths, fps)
             pred_metadata.update(_source_mapping_metadata(group, frames))
             _attach_optional_video_preview(
@@ -1783,6 +1803,7 @@ def _write_video_artifacts(
                 fps,
                 preview_height=preview_height,
                 preview_width=preview_width,
+                cancel_check=cancel_check,
             )
             db.add_artifact(
                 job_id,
@@ -1797,7 +1818,12 @@ def _write_video_artifacts(
         if len(gt_paths) == len(frames):
             gt_frame_paths = [Path(path) for path in gt_paths]
             gt_video_path = video_dir / "gt.mp4"
-            _write_mp4(gt_frame_paths, gt_video_path, fps)
+            _write_mp4_with_options(
+                gt_frame_paths,
+                gt_video_path,
+                fps,
+                cancel_check=cancel_check,
+            )
             gt_metadata = _video_artifact_metadata(group["video_name"], frames, gt_frame_paths, fps)
             _attach_optional_video_preview(
                 gt_frame_paths,
@@ -1806,6 +1832,7 @@ def _write_video_artifacts(
                 fps,
                 preview_height=preview_height,
                 preview_width=preview_width,
+                cancel_check=cancel_check,
             )
             db.add_artifact(
                 job_id,
@@ -1820,7 +1847,12 @@ def _write_video_artifacts(
         if len(diff_paths) == len(frames):
             diff_frame_paths = [Path(path) for path in diff_paths]
             diff_video_path = video_dir / "diff.mp4"
-            _write_mp4(diff_frame_paths, diff_video_path, fps)
+            _write_mp4_with_options(
+                diff_frame_paths,
+                diff_video_path,
+                fps,
+                cancel_check=cancel_check,
+            )
             diff_metadata = _video_artifact_metadata(group["video_name"], frames, diff_frame_paths, fps)
             _attach_optional_video_preview(
                 diff_frame_paths,
@@ -1829,6 +1861,7 @@ def _write_video_artifacts(
                 fps,
                 preview_height=preview_height,
                 preview_width=preview_width,
+                cancel_check=cancel_check,
             )
             db.add_artifact(
                 job_id,
@@ -1862,6 +1895,7 @@ def _write_multitrack_compare_video_artifacts(
     publish_pred_video: bool = True,
     preview_height: int | None = None,
     preview_width: int | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> None:
     video_dir = run_dir / "videos" / video_name
     tracks: dict[str, list[dict[str, Any]]] = {}
@@ -1887,9 +1921,16 @@ def _write_multitrack_compare_video_artifacts(
     gt_video_path = None
     ordered_gt = [gt_by_order[index] for index in sorted(gt_by_order)]
     if ordered_gt:
+        if cancel_check is not None:
+            cancel_check()
         gt_frame_paths = ordered_gt
         gt_video_path = video_dir / "gt.mp4"
-        _write_mp4(gt_frame_paths, gt_video_path, fps)
+        _write_mp4_with_options(
+            gt_frame_paths,
+            gt_video_path,
+            fps,
+            cancel_check=cancel_check,
+        )
         gt_metadata = _video_artifact_metadata(group["video_name"], frames, gt_frame_paths, fps)
         _attach_optional_video_preview(
             gt_frame_paths,
@@ -1898,6 +1939,7 @@ def _write_multitrack_compare_video_artifacts(
             fps,
             preview_height=preview_height,
             preview_width=preview_width,
+            cancel_check=cancel_check,
         )
         db.add_artifact(
             job_id,
@@ -1910,6 +1952,8 @@ def _write_multitrack_compare_video_artifacts(
 
     manifest_tracks = []
     for track_key, track_frames in sorted(tracks.items()):
+        if cancel_check is not None:
+            cancel_check()
         ordered = sorted(track_frames, key=lambda item: item["order"])
         if not ordered:
             continue
@@ -1920,10 +1964,20 @@ def _write_multitrack_compare_video_artifacts(
         pred_video_path = None
         if publish_pred_video:
             pred_video_path = track_dir / "pred.mp4"
-            _write_mp4(pred_frame_paths, pred_video_path, fps)
+            _write_mp4_with_options(
+                pred_frame_paths,
+                pred_video_path,
+                fps,
+                cancel_check=cancel_check,
+            )
         diff_frame_paths = [Path(frame["diff_path"]) for frame in ordered]
         diff_video_path = track_dir / "diff.mp4"
-        _write_mp4(diff_frame_paths, diff_video_path, fps)
+        _write_mp4_with_options(
+            diff_frame_paths,
+            diff_video_path,
+            fps,
+            cancel_check=cancel_check,
+        )
         track_metadata = {
             "compare_track_label": track_label,
             "compare_track_key": track_key,
@@ -1942,6 +1996,7 @@ def _write_multitrack_compare_video_artifacts(
                 fps,
                 preview_height=preview_height,
                 preview_width=preview_width,
+                cancel_check=cancel_check,
             )
             db.add_artifact(
                 job_id,
@@ -1962,6 +2017,7 @@ def _write_multitrack_compare_video_artifacts(
             fps,
             preview_height=preview_height,
             preview_width=preview_width,
+            cancel_check=cancel_check,
         )
         db.add_artifact(
             job_id,
@@ -2080,6 +2136,24 @@ def _copy_ordered_frames(frame_paths: list[Path], output_dir: Path) -> list[Path
     return copied
 
 
+def _write_mp4_with_options(
+    frame_paths: list[Path],
+    output_path: Path,
+    fps: float,
+    *,
+    target_height: int | None = None,
+    target_width: int | None = None,
+    cancel_check: Callable[[], None] | None = None,
+) -> None:
+    options: dict[str, Any] = {}
+    if target_height is not None or target_width is not None:
+        options["target_height"] = target_height
+        options["target_width"] = target_width
+    if cancel_check is not None:
+        options["cancel_check"] = cancel_check
+    _write_mp4(frame_paths, output_path, fps, **options)
+
+
 def _write_mp4(
     frame_paths: list[Path],
     output_path: Path,
@@ -2087,6 +2161,7 @@ def _write_mp4(
     *,
     target_height: int | None = None,
     target_width: int | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> None:
     if not frame_paths:
         raise RuntimeError(f"cannot create video artifact without frames: {output_path}")
@@ -2095,12 +2170,15 @@ def _write_mp4(
         target_height=target_height,
         target_width=target_width,
     )
+    if cancel_check is not None:
+        cancel_check()
     if _write_mp4_ffmpeg_pipe(
         frame_paths,
         output_path,
         fps,
         target_height=target_height,
         target_width=target_width,
+        cancel_check=cancel_check,
     ):
         return
     _write_mp4_cv2(
@@ -2109,6 +2187,7 @@ def _write_mp4(
         fps,
         target_height=target_height,
         target_width=target_width,
+        cancel_check=cancel_check,
     )
 
 
@@ -2156,6 +2235,7 @@ def _write_mp4_ffmpeg_pipe(
     *,
     target_height: int | None = None,
     target_width: int | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> bool:
     from vfieval.ffmpeg_exe import resolve_ffmpeg
 
@@ -2198,42 +2278,83 @@ def _write_mp4_ffmpeg_pipe(
         pixel_format_index = command.index("-pix_fmt")
         command[pixel_format_index:pixel_format_index] = ["-vf", ",".join(filters)]
     process = None
+    feeder = None
+    feeder_errors: list[BaseException] = []
     stderr: bytes | str | None = b""
     try:
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         assert process.stdin is not None
         stdin = process.stdin
-        for path in frame_paths:
-            with path.open("rb") as handle:
-                shutil.copyfileobj(handle, stdin, length=1024 * 1024)
-        stdin.close()
         process.stdin = None
-        _, stderr = process.communicate(timeout=600)
+
+        def feed_frames() -> None:
+            try:
+                for path in frame_paths:
+                    if cancel_check is not None:
+                        cancel_check()
+                    with path.open("rb") as handle:
+                        while True:
+                            chunk = handle.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            if cancel_check is not None:
+                                cancel_check()
+                            stdin.write(chunk)
+                stdin.flush()
+            except BaseException as exc:
+                feeder_errors.append(exc)
+            finally:
+                try:
+                    stdin.close()
+                except OSError:
+                    pass
+
+        feeder = threading.Thread(
+            target=feed_frames,
+            name=f"vfieval-ffmpeg-feed-{output_path.name}",
+            daemon=True,
+        )
+        feeder.start()
+        deadline = time.monotonic() + 600.0
+        while True:
+            if cancel_check is not None:
+                cancel_check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, 600)
+            try:
+                _, stderr = process.communicate(timeout=min(0.2, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        feeder.join(timeout=2)
+        if feeder.is_alive():
+            raise RuntimeError("ffmpeg frame feeder did not stop after the encoder exited")
+        if feeder_errors and process.returncode == 0:
+            raise feeder_errors[0]
         if process.returncode == 0 and output_path.is_file() and output_path.stat().st_size > 0:
             return True
+    except RunCanceled:
+        if process is not None:
+            terminate_process(process)
+        if feeder is not None:
+            feeder.join(timeout=2)
+        output_path.unlink(missing_ok=True)
+        raise
     except subprocess.TimeoutExpired as exc:
         if process is not None:
-            try:
-                process.kill()
-                process.communicate(timeout=5)
-            except Exception:
-                pass
+            _, stderr = terminate_process(process)
+        if feeder is not None:
+            feeder.join(timeout=2)
         output_path.unlink(missing_ok=True)
         raise RuntimeError("ffmpeg timed out while encoding browser-compatible H.264 video") from exc
     except Exception as exc:
-        stderr = b""
         if process is not None:
-            try:
-                if process.stdin is not None and not process.stdin.closed:
-                    process.stdin.close()
-                process.stdin = None
-                _, stderr = process.communicate(timeout=10)
-            except Exception:
-                try:
-                    process.kill()
-                    _, stderr = process.communicate(timeout=5)
-                except Exception:
-                    pass
+            _, terminated_stderr = terminate_process(process)
+            if terminated_stderr:
+                stderr = terminated_stderr
+        if feeder is not None:
+            feeder.join(timeout=2)
         output_path.unlink(missing_ok=True)
         detail = _ffmpeg_error_detail(stderr) or str(exc)
         raise RuntimeError(f"failed to encode browser-compatible H.264 video with ffmpeg/libx264: {detail}") from exc
@@ -2268,6 +2389,7 @@ def _write_mp4_cv2(
     *,
     target_height: int | None = None,
     target_width: int | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> None:
     try:
         import cv2
@@ -2294,8 +2416,12 @@ def _write_mp4_cv2(
             "install ffmpeg with the libx264 encoder or provide OpenCV with AVC support"
         )
     try:
+        if cancel_check is not None:
+            cancel_check()
         writer.write(_resize_video_frame(first, width, height))
         for frame_path in frame_paths[1:]:
+            if cancel_check is not None:
+                cancel_check()
             frame = cv2.imread(str(frame_path), cv2.IMREAD_COLOR)
             if frame is None:
                 raise RuntimeError(f"failed to read video frame: {frame_path}")

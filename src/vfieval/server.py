@@ -13,14 +13,15 @@ import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
+from vfieval.api_validation import pagination_params, query_int, query_value
 from vfieval.catalog_sync import CatalogSyncCoordinator
 from vfieval.config import WorkspaceConfig
 from vfieval.datasets import _sample_token, scan_dataset
 from vfieval.db import Database
-from vfieval.diagnostics import health_snapshot, release_info
+from vfieval.diagnostics import release_info
 from vfieval.file_inputs import (
     DECODE_STRATEGY_VERSION,
     MIDPOINT_TRIPLET_CONTRACT,
@@ -60,6 +61,14 @@ from vfieval.input_identity import (
     validate_input_identity,
 )
 from vfieval.job_leases import JobRecoveryService
+from vfieval.job_api import (
+    JobApiError,
+    claim_job_request,
+    create_job_request,
+    heartbeat_job_request,
+    job_callback_request,
+    register_worker_request,
+)
 from vfieval.media_assets import (
     bind_run_asset,
     create_collection,
@@ -89,22 +98,54 @@ from vfieval.media_items import (
     resolve_media_item_compare,
     resolve_item_member,
 )
-from vfieval.orchestration import open_worker_admission, shutdown_worker_processes, start_decode_worker
-from vfieval.run_cleanup import RunCleanupService, RunPurgePreviewError, register_run_cache_refs
+from vfieval.orchestration import (
+    JobSupervisor,
+    open_worker_admission,
+    shutdown_worker_processes,
+    start_decode_worker,
+    start_workers_for_run,
+    wake_job_supervisor,
+)
+from vfieval.run_cleanup import (
+    CacheCoordinationUnavailable,
+    RunCleanupService,
+    RunPurgePreviewError,
+    register_run_cache_refs,
+)
 from vfieval.runtime_logging import (
     close_runtime_logging,
     configure_runtime_logging,
     log_event,
     runtime_logger,
 )
+from vfieval.runtime_api import runtime_health_payload
 from vfieval.storage_budget import (
     StorageCapacityError,
     ensure_storage_capacity,
     storage_capacity,
 )
+from vfieval.selection_tokens import (
+    SelectionTokenExpired,
+    create_selection_snapshot,
+    list_methods_for_selection_snapshot,
+    selection_snapshot_page,
+)
+from vfieval.submissions import (
+    SubmissionConflict,
+    idempotent_create,
+    submission_fingerprint,
+)
+from vfieval.video_selection_tokens import (
+    VideoSelectionTokenExpired,
+    create_video_selection_snapshot,
+    ensure_video_selection_schema,
+    expand_video_selection_payload,
+    video_selection_membership,
+    video_selection_snapshot_page,
+)
 from vfieval.pipeline.inference import DEFAULT_VISUALIZE_HEIGHT, DEFAULT_VISUALIZE_WIDTH
 from vfieval.performance import recommend_execution_profile
-from vfieval.worker import WorkerOptions, detect_capabilities, run_worker
+from vfieval.worker import detect_capabilities
 from vfieval.uploads import (
     UPLOAD_CHUNK_SIZE,
     complete_upload_session,
@@ -144,8 +185,7 @@ from vfieval.evaluations_v2 import (
     ensure_v2_schema,
     get_campaign_v2,
     get_preparation_v2,
-    legacy_campaigns_readonly,
-    list_campaigns_v2,
+    list_campaign_summaries_page,
     list_campaign_purge_requests_v2,
     preview_campaign_v2,
     process_campaign_purge_requests_v2,
@@ -280,6 +320,7 @@ def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -
     log_path = configure_runtime_logging(workspace)
     cleanup_stale_uploads(db, workspace)
     ensure_v2_schema(db)
+    ensure_video_selection_schema(db)
     cleanup_service = RunCleanupService(db, workspace)
     catalog_sync = CatalogSyncCoordinator(db, workspace)
     preparation_stop = threading.Event()
@@ -288,6 +329,7 @@ def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -
         db,
         on_recovered=lambda rows: _log_recovered_jobs(rows),
     )
+    job_supervisor = JobSupervisor(db, workspace)
     handler = _make_handler(
         db,
         workspace,
@@ -295,6 +337,7 @@ def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -
         catalog_sync=catalog_sync,
         preparation_wake_event=preparation_wake,
         job_recovery=job_recovery,
+        job_supervisor=job_supervisor,
     )
     try:
         max_http_threads = max(1, int(os.getenv("VFIEVAL_HTTP_MAX_THREADS", "64")))
@@ -317,6 +360,7 @@ def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -
     )
     preparation_thread.start()
     job_recovery.start()
+    job_supervisor.start()
     catalog_sync.request_sync(include_runs=True)
     build = release_info()
     log_event(
@@ -338,6 +382,7 @@ def run_server(db: Database, workspace: WorkspaceConfig, host: str, port: int) -
         cleanup_stop.set()
         preparation_stop.set()
         preparation_wake.set()
+        job_supervisor.stop(timeout=5)
         job_recovery.stop(timeout=5)
         cleanup_thread.join(timeout=5)
         preparation_thread.join(timeout=30)
@@ -544,11 +589,13 @@ def _make_handler(
     catalog_sync: CatalogSyncCoordinator | None = None,
     preparation_wake_event: threading.Event | None = None,
     job_recovery: JobRecoveryService | None = None,
+    job_supervisor: JobSupervisor | None = None,
 ):
     # Schema/backfill is cheap and idempotent. Catalog reconciliation itself is
     # owned by the coordinator: production starts it in the background and all
     # catalog GET routes remain read-only SQLite snapshots.
     ensure_v2_schema(db)
+    ensure_video_selection_schema(db)
     if catalog_sync is None:
         # Direct handler construction is primarily used by deterministic test
         # servers. Production passes a coordinator and schedules this work in
@@ -556,8 +603,16 @@ def _make_handler(
         catalog_sync = CatalogSyncCoordinator(db, workspace)
         catalog_sync.request_sync(include_runs=True)
         catalog_sync.wait()
+    owns_cleanup_service = cleanup_service is None
     cleanup_service = cleanup_service or RunCleanupService(db, workspace)
-    cleanup_service.ensure_backfilled()
+    if owns_cleanup_service:
+        # Direct handler construction is used by embedded/test servers that do
+        # not own the production cleanup-loop lifecycle. Finish the tiny local
+        # coordination synchronously so no daemon thread can retain the SQLite
+        # file after that server is discarded.
+        cleanup_service.backfill_cache_catalog()
+    else:
+        cleanup_service.start_cache_coordination()
     preflight_cache_lock = threading.Lock()
     preflight_cache: dict[str, dict[str, Any]] = {}
 
@@ -658,28 +713,29 @@ def _make_handler(
                     return self._send_static("index.html")
                 if re.fullmatch(r"/evaluate/[A-Za-z0-9_-]+", path):
                     return self._send_static("blind.html")
-                if path in {"/app.js", "/styles.css", "/studio.js", "/studio.css", "/blind.js", "/blind.css"}:
+                if path in {
+                    "/app.js",
+                    "/shared.js",
+                    "/compare.js",
+                    "/run-detail.js",
+                    "/media.js",
+                    "/styles.css",
+                    "/studio.js",
+                    "/studio.css",
+                    "/blind.js",
+                    "/blind.css",
+                }:
                     return self._send_static(path.lstrip("/"))
                 if path == "/api/health":
-                    health = health_snapshot(db, workspace)
                     return self._json(
-                        {
-                            "ok": health["ok"],
-                            "metrics": list(METRIC_NAMES),
-                            "release": health["release"],
-                            "schema": health["schema"],
-                            "storage": health["storage"],
-                            "leases": health["leases"],
-                            "maintenance": {
-                                "catalog": catalog_sync.status(),
-                                "job_recovery": (
-                                    job_recovery.status()
-                                    if job_recovery is not None
-                                    else {"running": False, "leases": health["leases"]}
-                                ),
-                                **db.cleanup_backlog_counts(),
-                            },
-                        }
+                        runtime_health_payload(
+                            db,
+                            workspace,
+                            catalog_sync=catalog_sync,
+                            cleanup_service=cleanup_service,
+                            job_recovery=job_recovery,
+                            job_supervisor=job_supervisor,
+                        )
                     )
                 if path == "/api/storage/gc/preview":
                     return self._json(
@@ -752,13 +808,36 @@ def _make_handler(
                             page_size=int(query.get("page_size", ["50"])[0] or 50),
                         )
                     )
+                match = re.fullmatch(
+                    r"/api/media/item-selections/([A-Za-z0-9_-]{32,128})",
+                    path,
+                )
+                if match:
+                    try:
+                        return self._json(
+                            selection_snapshot_page(
+                                db,
+                                match.group(1),
+                                page=int(query.get("page", ["1"])[0] or 1),
+                                page_size=int(query.get("page_size", ["100"])[0] or 100),
+                            )
+                        )
+                    except SelectionTokenExpired as exc:
+                        return self._error(HTTPStatus.GONE, str(exc), type(exc).__name__)
                 match = re.fullmatch(r"/api/media/items/(\d+)/predictions", path)
                 if match:
                     return self._json(list_item_predictions(db, int(match.group(1))))
                 if path == "/api/media/methods":
                     item_ids = _query_int_values(query, "item_id")
+                    selection_token = str(query.get("selection_token", [""])[0] or "").strip()
+                    if item_ids and selection_token:
+                        raise ValueError("provide either item_id or selection_token, not both")
+                    if selection_token:
+                        return self._json(
+                            list_methods_for_selection_snapshot(db, selection_token)
+                        )
                     if not item_ids:
-                        raise ValueError("at least one item_id is required")
+                        raise ValueError("at least one item_id or selection_token is required")
                     return self._json(list_methods_for_items(db, item_ids))
                 if path == "/api/media/unbound-predictions":
                     return self._json(
@@ -784,9 +863,15 @@ def _make_handler(
                 if match:
                     return self._json(get_upload_session(db, match.group(1)))
                 if path == "/api/evaluation-campaigns":
-                    campaigns = [*list_campaigns_v2(db), *legacy_campaigns_readonly(db)]
-                    campaigns.sort(key=lambda row: float(row.get("created_at") or 0), reverse=True)
-                    return self._json({"campaigns": campaigns})
+                    return self._json(
+                        list_campaign_summaries_page(
+                            db,
+                            page=int(query.get("page", ["1"])[0] or 1),
+                            page_size=int(query.get("page_size", ["50"])[0] or 50),
+                            query=query.get("q", [""])[0],
+                            status=query.get("status", [""])[0],
+                        )
+                    )
                 if path == "/api/evaluation-cleanup-requests":
                     include_completed = query.get("include_completed", ["0"])[0] in {
                         "1",
@@ -934,21 +1019,84 @@ def _make_handler(
                                 page_size=200,
                             )["videos"]
                     return self._json(groups)
+                match = re.fullmatch(
+                    r"/api/video-selections/([A-Za-z0-9_-]{32,128})",
+                    path,
+                )
+                if match:
+                    try:
+                        page, page_size = pagination_params(
+                            query,
+                            default_page_size=100,
+                        )
+                        return self._json(
+                            video_selection_snapshot_page(
+                                db,
+                                workspace,
+                                match.group(1),
+                                page=page,
+                                page_size=page_size,
+                            )
+                        )
+                    except VideoSelectionTokenExpired as exc:
+                        return self._error(
+                            HTTPStatus.GONE,
+                            str(exc),
+                            type(exc).__name__,
+                        )
                 match = re.fullmatch(r"/api/video-groups/([^/]+)/videos", path)
                 if match:
                     group_name = unquote(match.group(1))
-                    frame_step = max(1, int(query.get("frame_step", ["1"])[0] or 1))
-                    max_frames = _optional_int(query.get("max_frames", [None])[0])
+                    page, page_size = pagination_params(
+                        query,
+                        default_page_size=50,
+                    )
+                    frame_step = query_int(
+                        query,
+                        "frame_step",
+                        default=1,
+                        minimum=1,
+                        clamp=True,
+                    )
+                    max_frames = _optional_int(
+                        query_value(query, "max_frames", "")
+                    )
                     payload = list_folder_group_videos(
                         db,
                         group_name,
                         frame_step=frame_step,
                         max_frames=max_frames,
-                        page=int(query.get("page", ["1"])[0] or 1),
-                        page_size=int(query.get("page_size", ["50"])[0] or 50),
-                        query=query.get("q", [""])[0],
-                        sort=query.get("sort", ["name"])[0],
+                        page=page,
+                        page_size=page_size,
+                        query=query_value(query, "q", ""),
+                        sort=query_value(query, "sort", "name"),
                     )
+                    selection_token = str(
+                        query.get("video_selection_token", [""])[0] or ""
+                    ).strip()
+                    if selection_token:
+                        try:
+                            membership = video_selection_membership(
+                                db,
+                                selection_token,
+                                video_group=group_name,
+                                video_names=[
+                                    str(row.get("name") or "")
+                                    for row in payload.get("videos") or []
+                                ],
+                            )
+                        except VideoSelectionTokenExpired as exc:
+                            return self._error(
+                                HTTPStatus.GONE,
+                                str(exc),
+                                type(exc).__name__,
+                            )
+                        selected_names = membership.pop("selected_names")
+                        for row in payload.get("videos") or []:
+                            row["selected"] = (
+                                str(row.get("name") or "") in selected_names
+                            )
+                        payload["selection"] = membership
                     return self._json(payload)
                 match = re.fullmatch(r"/api/media/assets/(\d+)/thumbnail", path)
                 if match:
@@ -1108,6 +1256,17 @@ def _make_handler(
                 if match:
                     return self._send_sample_file(int(match.group(1)), match.group(2))
                 self._error(HTTPStatus.NOT_FOUND, "not found")
+            except CacheCoordinationUnavailable as exc:
+                self._json(
+                    {
+                        "error": {
+                            "type": type(exc).__name__,
+                            "code": exc.code,
+                            "message": str(exc),
+                        }
+                    },
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
             except KeyError as exc:
                 self._error(HTTPStatus.NOT_FOUND, str(exc), type(exc).__name__)
             except FileNotFoundError as exc:
@@ -1145,6 +1304,17 @@ def _make_handler(
                             preview_token=str(body.get("preview_token") or ""),
                             require_preview_token=True,
                         )
+                    except CacheCoordinationUnavailable as exc:
+                        return self._json(
+                            {
+                                "error": {
+                                    "type": type(exc).__name__,
+                                    "code": exc.code,
+                                    "message": str(exc),
+                                }
+                            },
+                            status=HTTPStatus.SERVICE_UNAVAILABLE,
+                        )
                     except ValueError as exc:
                         return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
                     return self._json(result)
@@ -1153,6 +1323,34 @@ def _make_handler(
                         include_runs=body.get("include_runs", True) is not False
                     )
                     return self._json(requested, status=HTTPStatus.ACCEPTED)
+                if path == "/api/video-selections":
+                    try:
+                        selection = create_video_selection_snapshot(
+                            db,
+                            workspace,
+                            video_groups=body.get("video_groups"),
+                            query=body.get("q") or "",
+                            base_selection_token=str(
+                                body.get("base_selection_token") or ""
+                            ),
+                            operation=str(body.get("operation") or ""),
+                            video_group=str(body.get("video_group") or ""),
+                            video_names=body.get("video_names"),
+                        )
+                    except VideoSelectionTokenExpired as exc:
+                        return self._error(
+                            HTTPStatus.GONE,
+                            str(exc),
+                            type(exc).__name__,
+                        )
+                    return self._json(selection, status=HTTPStatus.CREATED)
+                if path == "/api/media/item-selections":
+                    selection = create_selection_snapshot(
+                        db,
+                        group_id=body.get("group_id"),
+                        query=str(body.get("q") or ""),
+                    )
+                    return self._json(selection, status=HTTPStatus.CREATED)
                 if path == "/api/media/collections":
                     try:
                         collection = create_collection(
@@ -1221,6 +1419,17 @@ def _make_handler(
                 if path == "/api/evaluation-campaigns/v2":
                     try:
                         campaign = create_campaign_v2(db, workspace, body)
+                    except SubmissionConflict as exc:
+                        return self._json(
+                            {
+                                "error": {
+                                    "type": type(exc).__name__,
+                                    "code": exc.code,
+                                    "message": str(exc),
+                                }
+                            },
+                            status=HTTPStatus.CONFLICT,
+                        )
                     except ValueError as exc:
                         return self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
                     return self._json({"campaign": campaign}, status=HTTPStatus.CREATED)
@@ -1376,14 +1585,12 @@ def _make_handler(
                     )
                     return self._json({"experiment_id": experiment_id}, status=HTTPStatus.CREATED)
                 if path == "/api/workers/register":
-                    worker_id = body["worker_id"]
-                    role = body.get("role", "remote")
-                    db.register_worker(worker_id, role, body.get("capabilities") or {})
-                    return self._json({"worker_id": worker_id, "worker": db.get_worker(worker_id)})
+                    return self._json(register_worker_request(db, body))
                 if path in {"/api/preflight", "/api/preflight/quick"}:
                     if path == "/api/preflight/quick":
                         body = dict(body)
                         body["preflight_level"] = "quick"
+                    body = expand_video_selection_payload(db, workspace, body)
                     prepared = source_assets_to_video_payload(db, workspace, body)
                     prepared = _prepare_media_item_compare_payload(db, workspace, prepared)
                     preflight_level = str(prepared.get("preflight_level") or "deep").strip().lower()
@@ -1420,22 +1627,49 @@ def _make_handler(
                     # Even Runs without a detailed workload estimate must retain
                     # the configured emergency free-space margin.
                     ensure_storage_capacity(db, workspace, requested_bytes=0)
-                    body = source_assets_to_video_payload(db, workspace, body)
-                    body = _prepare_media_item_compare_payload(db, workspace, body)
-                    # These fields are server-owned trust material.  A client
-                    # may present only the opaque token; validated signatures
-                    # are injected below after the token is checked.
-                    body.pop("_preflight_result", None)
-                    body.pop("_preflight_physical_inputs", None)
-                    stored_preflight = cached_preflight(body)
-                    if stored_preflight is not None:
-                        body["_preflight_result"] = stored_preflight
+
+                    def prepare_submitted_run(request: dict) -> dict:
+                        prepared = expand_video_selection_payload(
+                            db,
+                            workspace,
+                            request,
+                        )
+                        prepared = source_assets_to_video_payload(
+                            db,
+                            workspace,
+                            prepared,
+                        )
+                        prepared = _prepare_media_item_compare_payload(
+                            db,
+                            workspace,
+                            prepared,
+                        )
+                        # These fields are server-owned trust material. A
+                        # client may present only the opaque token; validated
+                        # signatures are injected after the submission claim.
+                        prepared.pop("_preflight_result", None)
+                        prepared.pop("_preflight_physical_inputs", None)
+                        stored_preflight = cached_preflight(prepared)
+                        if stored_preflight is not None:
+                            prepared["_preflight_result"] = stored_preflight
+                        return prepared
+
                     run_type = str(body.get("run_type") or "")
                     if run_type == "video_compare":
-                        created = _create_video_compare_run(db, workspace, body)
+                        created = _create_video_compare_run(
+                            db,
+                            workspace,
+                            body,
+                            prepare=prepare_submitted_run,
+                        )
                         return self._json(created, status=HTTPStatus.CREATED)
                     if body.get("model_file") or body.get("video_group") or body.get("source_assets"):
-                        created = _create_run_from_files(db, workspace, body)
+                        created = _create_run_from_files(
+                            db,
+                            workspace,
+                            body,
+                            prepare=prepare_submitted_run,
+                        )
                         return self._json(created, status=HTTPStatus.CREATED)
                     metrics = list(body.get("metrics") or [])
                     unsupported = [name for name in metrics if name not in METRIC_NAMES]
@@ -1443,21 +1677,15 @@ def _make_handler(
                         return self._error(HTTPStatus.BAD_REQUEST, f"unsupported metrics: {', '.join(unsupported)}")
                     model_id = int(body["model_id"])
                     dataset_id = int(body["dataset_id"])
-                    default_name = f"model-{model_id}-dataset-{dataset_id}"
-                    run_id = db.create_run(
-                        name=body.get("name") or default_name,
-                        experiment_id=_optional_int(body.get("experiment_id")),
+                    created = _create_registered_run(
+                        db,
+                        body,
                         model_id=model_id,
                         dataset_id=dataset_id,
-                        height=int(body["height"]),
-                        width=int(body["width"]),
-                        batch_size=int(body.get("batch_size", 1)),
-                        device=body.get("device", "auto"),
-                        precision=body.get("precision", "fp32"),
                         metrics=metrics,
-                        metadata=body.get("metadata") or {},
                     )
-                    return self._json({"run_id": run_id, "run": db.get_run(run_id)}, status=HTTPStatus.CREATED)
+                    wake_job_supervisor(db)
+                    return self._json(created, status=HTTPStatus.CREATED)
                 match = re.fullmatch(r"/api/datasets/(\d+)/scan", path)
                 if match:
                     dataset_id = int(match.group(1))
@@ -1494,6 +1722,7 @@ def _make_handler(
                         request = cleanup_service.request_delete(run_id)
                         return self._json(_purge_response(request), status=HTTPStatus.ACCEPTED)
                     try:
+                        cleanup_service.assert_artifact_cleanup_eligible(run_id)
                         cleanup_service.consume_run_purge_preview(
                             body.get("preview_token"),
                             request_type="cleanup_artifacts",
@@ -1571,54 +1800,54 @@ def _make_handler(
                         status=HTTPStatus.ACCEPTED,
                     )
                 if path == "/api/jobs":
-                    kind = body["kind"]
-                    if kind not in {"decode", "inference", "metric"}:
-                        return self._error(HTTPStatus.BAD_REQUEST, "kind must be decode, inference, or metric")
-                    job_id = db.create_job(kind, body.get("payload") or {})
-                    return self._json({"job_id": job_id, "kind": kind}, status=HTTPStatus.CREATED)
+                    payload, status = create_job_request(db, body)
+                    return self._json(payload, status=status)
                 if path == "/api/jobs/claim":
-                    worker_id = body["worker_id"]
-                    role = body.get("role", "remote")
-                    kinds = list(body.get("kinds") or [])
-                    db.register_worker(worker_id, role, body.get("capabilities") or {})
-                    job = db.claim_next_job(worker_id, kinds)
-                    return self._json({"job": job})
+                    return self._json(claim_job_request(db, body))
                 match = re.fullmatch(r"/api/jobs/(\d+)/(complete|fail|progress)", path)
                 if match:
-                    job_id = int(match.group(1))
-                    action = match.group(2)
-                    if action == "complete":
-                        accepted = db.complete_job(job_id, body.get("result") or {})
-                    elif action == "fail":
-                        accepted = db.fail_job(job_id, body.get("error") or {})
-                    else:
-                        accepted = db.update_job_progress(job_id, int(body.get("current", 0)), body.get("total"))
-                    if not accepted:
-                        return self._error(
-                            HTTPStatus.CONFLICT,
-                            f"job {job_id} state rejected {action}",
-                            "JobStateConflict",
+                    return self._json(
+                        job_callback_request(
+                            db,
+                            int(match.group(1)),
+                            match.group(2),
+                            body,
                         )
-                    return self._json({"job_id": job_id, "status": action})
+                    )
                 match = re.fullmatch(r"/api/jobs/(\d+)/heartbeat", path)
                 if match:
-                    job_id = int(match.group(1))
-                    worker_id = str(body.get("worker_id") or "").strip()
-                    if not worker_id:
-                        return self._error(
-                            HTTPStatus.BAD_REQUEST,
-                            "worker_id is required for an owner-fenced Job heartbeat",
-                            "WorkerIdRequired",
+                    return self._json(
+                        heartbeat_job_request(
+                            db,
+                            int(match.group(1)),
+                            body,
                         )
-                    if not db.heartbeat_job(job_id, worker_id):
-                        return self._error(
-                            HTTPStatus.CONFLICT,
-                            "job lease is no longer owned by this worker; stop the stale worker",
-                            "JobLeaseLost",
-                        )
-                    db.touch_worker(worker_id, body.get("capabilities") or None)
-                    return self._json({"job_id": job_id, "status": "heartbeat"})
+                    )
                 self._error(HTTPStatus.NOT_FOUND, "not found")
+            except JobApiError as exc:
+                self._error(exc.status, str(exc), exc.code)
+            except SubmissionConflict as exc:
+                self._json(
+                    {
+                        "error": {
+                            "type": type(exc).__name__,
+                            "code": exc.code,
+                            "message": str(exc),
+                        }
+                    },
+                    status=HTTPStatus.CONFLICT,
+                )
+            except CacheCoordinationUnavailable as exc:
+                self._json(
+                    {
+                        "error": {
+                            "type": type(exc).__name__,
+                            "code": exc.code,
+                            "message": str(exc),
+                        }
+                    },
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
             except EvaluationConflict as exc:
                 self._error(HTTPStatus.CONFLICT, str(exc), type(exc).__name__)
             except RunPurgePreviewError as exc:
@@ -1638,6 +1867,8 @@ def _make_handler(
                 self._json(exc.public_payload(), status=HTTPStatus.CONFLICT)
             except StorageCapacityError as exc:
                 self._json(exc.public_payload(), status=HTTPStatus.INSUFFICIENT_STORAGE)
+            except VideoSelectionTokenExpired as exc:
+                self._error(HTTPStatus.GONE, str(exc), type(exc).__name__)
             except ValueError as exc:
                 self._error(HTTPStatus.BAD_REQUEST, str(exc), type(exc).__name__)
             except KeyError as exc:
@@ -1740,6 +1971,17 @@ def _make_handler(
                 )
                 request = cleanup_service.request_delete(run_id)
                 return self._json(_purge_response(request), status=HTTPStatus.ACCEPTED)
+            except CacheCoordinationUnavailable as exc:
+                self._json(
+                    {
+                        "error": {
+                            "type": type(exc).__name__,
+                            "code": exc.code,
+                            "message": str(exc),
+                        }
+                    },
+                    status=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
             except KeyError as exc:
                 self._error(HTTPStatus.NOT_FOUND, str(exc), type(exc).__name__)
             except EvaluationConflict as exc:
@@ -2532,7 +2774,58 @@ def _find_run_sample_by_frame(db: Database, run_id: int, video_name: str, frame_
     return None
 
 
-def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict) -> dict:
+def _create_registered_run(
+    db: Database,
+    body: dict,
+    *,
+    model_id: int,
+    dataset_id: int,
+    metrics: list[str],
+) -> dict:
+    submitted_body = dict(body)
+    creation_body = {
+        **submitted_body,
+        "_submission_marker": _submission_marker(submitted_body),
+    }
+
+    def create() -> dict:
+        default_name = f"model-{model_id}-dataset-{dataset_id}"
+        run_id = db.create_run(
+            name=creation_body.get("name") or default_name,
+            experiment_id=_optional_int(creation_body.get("experiment_id")),
+            model_id=model_id,
+            dataset_id=dataset_id,
+            height=int(creation_body["height"]),
+            width=int(creation_body["width"]),
+            batch_size=int(creation_body.get("batch_size", 1)),
+            device=creation_body.get("device", "auto"),
+            precision=creation_body.get("precision", "fp32"),
+            metrics=metrics,
+            metadata=_metadata_with_submission(
+                creation_body.get("metadata") or {},
+                creation_body,
+            ),
+        )
+        return {"run_id": run_id, "run": db.get_run(run_id)}
+
+    return idempotent_create(
+        db,
+        scope="run",
+        body=submitted_body,
+        resource_type="run",
+        create=create,
+        resource_id=lambda result: int(result["run_id"]),
+        replay=lambda run_id: {"run_id": run_id, "run": db.get_run(run_id)},
+        mark_replay=_mark_submission_result,
+        recover=lambda submission_id, fingerprint: _recover_run_submission(
+            db,
+            submission_id,
+            fingerprint,
+        ),
+    )
+
+
+def _create_run_from_files_once(db: Database, workspace: WorkspaceConfig, body: dict) -> dict:
     artifact_profile = str(body.get("artifact_profile") or "evaluation")
     if artifact_profile not in {"evaluation", "diagnostic", "benchmark"}:
         raise ValueError("artifact_profile must be evaluation, diagnostic, or benchmark")
@@ -2829,6 +3122,7 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         "workload": workload,
         "input_identity": input_identity,
     }
+    metadata.update(_submission_marker_from_creation_body(body))
     if body.get("retry_of_run_id") is not None:
         metadata["retry_of_run_id"] = int(body["retry_of_run_id"])
     if body.get("clone_of_run_id") is not None:
@@ -2895,6 +3189,41 @@ def _create_run_from_files(db: Database, workspace: WorkspaceConfig, body: dict)
         raise RuntimeError(f"run {run_id} rejected decode progress initialization")
     start_decode_worker(db, workspace)
     return {"run_id": run_id, "run": db.get_run(run_id), "preflight": preflight}
+
+
+def _create_run_from_files(
+    db: Database,
+    workspace: WorkspaceConfig,
+    body: dict,
+    *,
+    prepare: Callable[[dict], dict] | None = None,
+) -> dict:
+    submitted_body = dict(body)
+
+    def create() -> dict:
+        creation_body = (
+            prepare(dict(submitted_body))
+            if prepare is not None
+            else expand_video_selection_payload(db, workspace, dict(submitted_body))
+        )
+        creation_body["_submission_marker"] = _submission_marker(submitted_body)
+        return _create_run_from_files_once(db, workspace, creation_body)
+
+    return idempotent_create(
+        db,
+        scope="run",
+        body=submitted_body,
+        resource_type="run",
+        create=create,
+        resource_id=lambda result: int(result["run_id"]),
+        replay=lambda run_id: {"run_id": run_id, "run": db.get_run(run_id)},
+        mark_replay=_mark_submission_result,
+        recover=lambda submission_id, fingerprint: _recover_run_submission(
+            db,
+            submission_id,
+            fingerprint,
+        ),
+    )
 
 
 def _dedupe_track_labels(distorted_tracks: list[dict[str, Any]]) -> list[str]:
@@ -3141,7 +3470,7 @@ def _legacy_reusable_member_id(
     return int(rows[0]["id"]) if rows else None
 
 
-def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: dict) -> dict:
+def _create_video_compare_run_once(db: Database, workspace: WorkspaceConfig, body: dict) -> dict:
     body = _prepare_media_item_compare_payload(db, workspace, dict(body))
     payload = dict(body)
     payload["run_type"] = "video_compare"
@@ -3296,6 +3625,7 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
         },
         "preflight": preflight,
     }
+    metadata.update(_submission_marker_from_creation_body(body))
     if body.get("retry_of_run_id") is not None:
         metadata["retry_of_run_id"] = int(body["retry_of_run_id"])
     run_id = db.create_run(
@@ -3368,8 +3698,109 @@ def _create_video_compare_run(db: Database, workspace: WorkspaceConfig, body: di
                     "alignment_fingerprint": alignment_plan.get("fingerprint"),
                 },
             )
-    _start_local_inference_worker(db, workspace)
+    _start_local_inference_worker(db, workspace, run_id=run_id)
     return {"run_id": run_id, "run": db.get_run(run_id), "preflight": preflight}
+
+
+def _create_video_compare_run(
+    db: Database,
+    workspace: WorkspaceConfig,
+    body: dict,
+    *,
+    prepare: Callable[[dict], dict] | None = None,
+) -> dict:
+    submitted_body = dict(body)
+
+    def create() -> dict:
+        creation_body = (
+            prepare(dict(submitted_body))
+            if prepare is not None
+            else dict(submitted_body)
+        )
+        creation_body["_submission_marker"] = _submission_marker(submitted_body)
+        return _create_video_compare_run_once(db, workspace, creation_body)
+
+    return idempotent_create(
+        db,
+        scope="run",
+        body=submitted_body,
+        resource_type="run",
+        create=create,
+        resource_id=lambda result: int(result["run_id"]),
+        replay=lambda run_id: {"run_id": run_id, "run": db.get_run(run_id)},
+        mark_replay=_mark_submission_result,
+        recover=lambda submission_id, fingerprint: _recover_run_submission(
+            db,
+            submission_id,
+            fingerprint,
+        ),
+    )
+
+
+def _submission_marker(body: dict) -> dict[str, str]:
+    submission_id = str(body.get("submission_id") or "").strip()
+    if not submission_id:
+        return {}
+    return {
+        "submission_id": submission_id,
+        "submission_fingerprint": submission_fingerprint(body),
+    }
+
+
+def _submission_marker_from_creation_body(body: dict) -> dict[str, str]:
+    marker = body.get("_submission_marker")
+    if not isinstance(marker, dict):
+        return {}
+    submission_id = str(marker.get("submission_id") or "").strip()
+    fingerprint = str(marker.get("submission_fingerprint") or "").strip()
+    if not submission_id or not fingerprint:
+        return {}
+    return {
+        "submission_id": submission_id,
+        "submission_fingerprint": fingerprint,
+    }
+
+
+def _metadata_with_submission(metadata: dict, body: dict) -> dict:
+    return {
+        **dict(metadata),
+        **_submission_marker_from_creation_body(body),
+    }
+
+
+def _recover_run_submission(
+    db: Database,
+    submission_id: str,
+    fingerprint: str,
+) -> dict | None:
+    rows = db.query(
+        """
+        SELECT id
+        FROM runs
+        WHERE json_extract(metadata_json, '$.submission_id') = ?
+          AND json_extract(metadata_json, '$.submission_fingerprint') = ?
+        ORDER BY id
+        LIMIT 2
+        """,
+        (str(submission_id), str(fingerprint)),
+    )
+    if not rows:
+        return None
+    if len(rows) > 1:
+        raise SubmissionConflict(
+            "multiple Runs match the stale submission reservation",
+            code="submission_recovery_ambiguous",
+        )
+    run_id = int(rows[0]["id"])
+    return {"run_id": run_id, "run": db.get_run(run_id)}
+
+
+def _mark_submission_result(result: dict, replayed: bool, submission_id: str) -> dict:
+    return {
+        **result,
+        "submission_id": submission_id,
+        "idempotent_replay": bool(replayed),
+    }
 
 
 def _normalize_preflight_file_identity(value: Any) -> dict[str, Any]:
@@ -4052,16 +4483,20 @@ def _preflight_error_message(preflight: dict) -> str:
     return "；".join(messages) or "预检查失败"
 
 
-def _start_local_inference_worker(db: Database, workspace: WorkspaceConfig, count: int = 1) -> None:
-    def _target(index: int) -> None:
-        run_worker(
-            db,
-            workspace,
-            WorkerOptions(role="all", once=True, worker_id=f"local-ui-worker-{index}"),
-        )
-
-    for index in range(max(1, int(count))):
-        threading.Thread(target=_target, args=(index,), daemon=True).start()
+def _start_local_inference_worker(
+    db: Database,
+    workspace: WorkspaceConfig,
+    count: int = 1,
+    *,
+    run_id: int | None = None,
+) -> None:
+    """Compatibility entry point routed through the shared Job supervisor."""
+    if run_id is not None:
+        start_workers_for_run(db, workspace, int(run_id))
+        return
+    if wake_job_supervisor(db):
+        return
+    raise RuntimeError("a run_id is required when no Job supervisor is active")
 
 
 def _selection_hash(selected_videos: list[str], frame_step: int, max_frames: int | None) -> str:
@@ -5332,7 +5767,9 @@ def _retry_run_metrics(db: Database, run_id: int) -> dict:
         raise ValueError("Run has no failed or unavailable metrics to retry")
     from vfieval.pipeline.metric_jobs import create_metric_wave
 
-    return create_metric_wave(db, run_id, failed_names, source="retry", retry=True)
+    wave = create_metric_wave(db, run_id, failed_names, source="retry", retry=True)
+    wake_job_supervisor(db)
+    return wave
 
 
 def _dashboard(db: Database) -> dict:

@@ -46,3 +46,8 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+
+# Browser test dependencies and reports
+node_modules/
+playwright-report/
+test-results/

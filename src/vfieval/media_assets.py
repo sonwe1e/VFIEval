@@ -789,64 +789,98 @@ def list_folder_group_videos(
     """Page one folder group without touching source files or thumbnails."""
 
     group = str(group_name or "").strip()
-    rows = db.query(
-        """
-        SELECT a.* FROM media_assets a
-        JOIN media_collections c ON c.id = a.collection_id
-        WHERE a.source_kind = 'folder'
-          AND a.state = 'ready'
-          AND a.deleted_at IS NULL
-          AND json_extract(c.metadata_json, '$.video_group') = ?
-        ORDER BY a.display_name, a.id
-        """,
-        (group,),
-    )
-    decoded = [_decode_asset(row) for row in rows]
-    all_names = [str(row.get("display_name") or row.get("original_name") or "") for row in decoded]
     needle = str(query or "").strip().lower()
-    filtered = [
-        row
-        for row in decoded
-        if not needle
-        or needle in str(row.get("display_name") or row.get("original_name") or "").lower()
-    ]
     step = max(1, int(frame_step or 1))
     limit = int(max_frames) if max_frames not in {None, ""} else None
-
-    def triplets(row: dict[str, Any]) -> int:
-        frame_count = int(row.get("frame_count") or 0)
-        effective = min(frame_count, limit) if limit is not None else frame_count
-        # ``frame_step`` is the symmetric distance from the GT center to each
-        # source frame, not a stride between samples. Every real center in
-        # [step, N-step) is eligible, so an N-frame source has N - 2*step
-        # samples. Never advertise a clamped boundary sample in the picker.
-        return max(0, effective - 2 * step)
-
-    key_name = str(sort or "name").lstrip("-")
-    sort_keys = {
-        "name": lambda row: str(row.get("display_name") or "").lower(),
-        "duration": lambda row: float((row.get("metadata") or {}).get("duration_seconds") or 0.0),
-        "frame_count": lambda row: int(row.get("frame_count") or 0),
-        "resolution": lambda row: int(row.get("width") or 0) * int(row.get("height") or 0),
-        "triplets": triplets,
-    }
-    filtered.sort(key=sort_keys.get(key_name, sort_keys["name"]), reverse=str(sort).startswith("-"))
     page_size = min(200, max(1, int(page_size or 50)))
     page = max(1, int(page or 1))
-    total = len(filtered)
+    base_where = """
+        a.source_kind = 'folder'
+        AND a.media_kind = 'video'
+        AND a.state = 'ready'
+        AND a.deleted_at IS NULL
+        AND json_extract(c.metadata_json, '$.source_kind') = 'folder'
+        AND json_extract(c.metadata_json, '$.video_group') = ?
+    """
+    filtered_where = base_where
+    params: list[Any] = [group]
+    if needle:
+        filtered_where += " AND lower(a.display_name) LIKE ?"
+        params.append(f"%{needle}%")
+    total_row = db.get(
+        f"""
+        SELECT COUNT(*) AS filtered_count,
+               (
+                   SELECT COUNT(*)
+                   FROM media_assets all_assets
+                   JOIN media_collections all_collections
+                     ON all_collections.id = all_assets.collection_id
+                   WHERE all_assets.source_kind = 'folder'
+                     AND all_assets.media_kind = 'video'
+                     AND all_assets.state = 'ready'
+                     AND all_assets.deleted_at IS NULL
+                     AND json_extract(
+                         all_collections.metadata_json, '$.source_kind'
+                     ) = 'folder'
+                     AND json_extract(
+                         all_collections.metadata_json, '$.video_group'
+                     ) = ?
+               ) AS video_count
+        FROM media_assets a
+        JOIN media_collections c ON c.id = a.collection_id
+        WHERE {filtered_where}
+        """,
+        (group, *params),
+    )
+    total = int((total_row or {}).get("filtered_count") or 0)
+    video_count = int((total_row or {}).get("video_count") or 0)
     total_pages = max(1, (total + page_size - 1) // page_size)
     page = min(page, total_pages)
     start = (page - 1) * page_size
-    visible = filtered[start : start + page_size]
+    effective_frames = (
+        "COALESCE(a.frame_count, 0)"
+        if limit is None
+        else f"MIN(COALESCE(a.frame_count, 0), {max(0, limit)})"
+    )
+    triplet_expression = f"MAX(0, ({effective_frames}) - {2 * step})"
+    sort_expressions = {
+        "name": "lower(a.display_name)",
+        "duration": (
+            "CAST(COALESCE(json_extract(a.metadata_json, '$.duration_seconds'), 0) "
+            "AS REAL)"
+        ),
+        "frame_count": "COALESCE(a.frame_count, 0)",
+        "resolution": "COALESCE(a.width, 0) * COALESCE(a.height, 0)",
+        "triplets": triplet_expression,
+    }
+    key_name = str(sort or "name").lstrip("-")
+    sort_expression = sort_expressions.get(key_name, sort_expressions["name"])
+    direction = "DESC" if str(sort).startswith("-") else "ASC"
+    visible = [
+        _decode_asset(row)
+        for row in db.query(
+            f"""
+            SELECT a.*
+            FROM media_assets a
+            JOIN media_collections c ON c.id = a.collection_id
+            WHERE {filtered_where}
+            ORDER BY {sort_expression} {direction}, lower(a.display_name), a.id
+            LIMIT ? OFFSET ?
+            """,
+            (*params, page_size, start),
+        )
+    ]
     videos = []
     for row in visible:
         metadata = row.get("metadata") or {}
         name = str(row.get("display_name") or row.get("original_name") or "")
+        frame_count = int(row.get("frame_count") or 0)
+        effective = min(frame_count, limit) if limit is not None else frame_count
         videos.append(
             {
                 "name": name,
-                "frame_count": int(row.get("frame_count") or 0),
-                "container_frame_count": int(row.get("frame_count") or 0),
+                "frame_count": frame_count,
+                "container_frame_count": frame_count,
                 "frame_count_source": metadata.get("frame_count_source") or "catalog",
                 "duration_seconds": float(metadata.get("duration_seconds") or 0.0),
                 "fps": row.get("fps"),
@@ -854,27 +888,25 @@ def list_folder_group_videos(
                 "height": int(row.get("height") or 0),
                 "decodable": True,
                 "error": None,
-                "valid_triplets": triplets(row),
+                # ``frame_step`` is the symmetric distance from the GT center,
+                # not a sample stride. Never advertise clamped boundary rows.
+                "valid_triplets": max(0, effective - 2 * step),
                 "cache_status": "深度预检时检查",
                 "metadata_source": metadata.get("metadata_source") or "catalog",
                 "thumbnail_url": f"/api/media/assets/{int(row['id'])}/thumbnail",
                 "asset_id": int(row["id"]),
             }
         )
-    filtered_names = [str(row.get("display_name") or row.get("original_name") or "") for row in filtered]
     return {
         "name": group,
         "path": None,
-        "video_count": len(decoded),
+        "video_count": video_count,
         "filtered_count": total,
         "page": page,
         "page_size": page_size,
         "total_pages": total_pages,
         "query": query,
         "sort": sort,
-        "all_video_names": all_names,
-        "filtered_video_names": filtered_names,
-        "asset_ids": {str(row.get("display_name") or row.get("original_name") or ""): int(row["id"]) for row in decoded},
         "videos": videos,
     }
 

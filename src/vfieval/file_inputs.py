@@ -126,7 +126,6 @@ def list_video_group_videos(
 ) -> dict[str, Any]:
     folder = resolve_video_group(workspace, video_group)
     all_paths = _iter_videos(folder)
-    all_names = [path.name for path in all_paths]
     normalized_query = query.strip().lower()
     paths = [
         path for path in all_paths
@@ -161,8 +160,6 @@ def list_video_group_videos(
         "total_pages": max(1, (total + page_size - 1) // page_size),
         "query": query,
         "sort": sort,
-        "all_video_names": all_names,
-        "filtered_video_names": [path.name for path in paths],
         "videos": paged,
     }
 

@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import os
 import platform
-import shutil
 import socket
 import subprocess
+import threading
 import time
 import traceback
 from dataclasses import dataclass
@@ -16,7 +16,11 @@ from vfieval.db import Database
 from vfieval.devices import list_npu_devices, npu_unavailable_reason, prepare_worker_device, supported_precisions
 from vfieval.job_errors import describe_job_failure, enrich_job_error
 from vfieval.job_leases import JobLeaseHeartbeat
-from vfieval.orchestration import create_inference_jobs_for_run, start_workers_for_run
+from vfieval.orchestration import (
+    create_inference_jobs_for_run,
+    start_workers_for_run,
+    wake_job_supervisor,
+)
 from vfieval.pipeline.decode_runner import run_decode_job
 from vfieval.pipeline.inference import RunCanceled, run_inference_job
 from vfieval.pipeline.finalize_runner import run_finalize_job
@@ -43,6 +47,10 @@ class WorkerOptions:
     worker_id: str | None = None
     device_filter: str | None = None
     idle_timeout: float | None = None
+    stop_event: threading.Event | None = None
+    wake_event: threading.Event | None = None
+    capability_refresh_interval: float = 300.0
+    worker_heartbeat_interval: float = 15.0
 
 
 def detect_capabilities() -> dict[str, object]:
@@ -141,52 +149,85 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
         capabilities["device_filter"] = options.device_filter
     db.register_worker(worker_id, options.role, capabilities)
     last_activity = time.time()
+    last_capability_refresh = time.monotonic()
+    last_worker_touch = last_capability_refresh
 
     while True:
-        capabilities = detect_capabilities()
-        if options.device_filter:
-            capabilities["device_filter"] = options.device_filter
-        db.register_worker(worker_id, options.role, capabilities)
+        if options.stop_event is not None and options.stop_event.is_set():
+            return
+        observed_at = time.monotonic()
+        if observed_at - last_capability_refresh >= max(
+            5.0,
+            float(options.capability_refresh_interval),
+        ):
+            capabilities = detect_capabilities()
+            if options.device_filter:
+                capabilities["device_filter"] = options.device_filter
+            db.register_worker(worker_id, options.role, capabilities)
+            last_capability_refresh = observed_at
+            last_worker_touch = observed_at
+        elif observed_at - last_worker_touch >= max(
+            1.0,
+            float(options.worker_heartbeat_interval),
+        ):
+            db.touch_worker(worker_id)
+            last_worker_touch = observed_at
         job = db.claim_next_job(worker_id, ROLE_KINDS[options.role], device_filter=options.device_filter)
         if job is None:
             if options.once:
                 return
             if options.idle_timeout is not None and time.time() - last_activity >= options.idle_timeout:
                 return
-            time.sleep(options.poll_interval)
+            timeout = max(0.05, float(options.poll_interval))
+            if options.wake_event is not None:
+                options.wake_event.wait(timeout)
+                options.wake_event.clear()
+            elif options.stop_event is not None:
+                options.stop_event.wait(timeout)
+            else:
+                time.sleep(timeout)
             continue
         last_activity = time.time()
 
-        heartbeat = JobLeaseHeartbeat(db, int(job["id"]), worker_id)
+        job_db = db.fenced_job(job)
+        heartbeat = JobLeaseHeartbeat(
+            db,
+            int(job["id"]),
+            worker_id,
+            int(job["claim_attempt"]),
+            str(job["lease_token"]),
+        )
         try:
             if not heartbeat.start():
                 raise RuntimeError(f"Job {job['id']} rejected its worker heartbeat lease")
             if job["kind"] == "decode":
-                result = run_decode_job(db, workspace, int(job["id"]))
+                result = run_decode_job(job_db, workspace, int(job["id"]))
                 run_id = job.get("payload", {}).get("run_id")
                 if run_id is not None:
                     inference_job_ids = create_inference_jobs_for_run(
-                        db,
+                        job_db,
                         int(run_id),
                         source_job_id=int(job["id"]),
                         source_job_result=result,
                     )
                     if not inference_job_ids:
-                        _raise_rejected_handoff(db, int(run_id), int(job["id"]), "inference")
-                    _complete_claimed_job(db, job, result)
+                        _raise_rejected_handoff(job_db, int(run_id), int(job["id"]), "inference")
+                    _complete_claimed_job(job_db, job, result)
                     start_workers_for_run(db, workspace, int(run_id))
                 else:
-                    _complete_claimed_job(db, job, result)
+                    _complete_claimed_job(job_db, job, result)
             elif job["kind"] == "inference":
-                result = run_inference_job(db, workspace, int(job["id"]))
+                result = run_inference_job(job_db, workspace, int(job["id"]))
                 run_id = job.get("payload", {}).get("run_id")
                 if run_id is not None and int(job.get("payload", {}).get("shard_count") or 1) > 1:
-                    db.maybe_complete_multi_run_inference(
+                    job_db.maybe_complete_multi_run_inference(
                         int(run_id),
                         source_job_id=int(job["id"]),
                         source_job_result=result.__dict__,
                     )
-                _complete_claimed_job(db, job, result.__dict__)
+                _complete_claimed_job(job_db, job, result.__dict__)
+                if run_id is not None:
+                    wake_job_supervisor(db)
                 if run_id is not None and result.performance:
                     from vfieval.performance import execution_profile_identity, record_execution_profile
 
@@ -227,22 +268,25 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
                             },
                         )
             elif job["kind"] == "metric":
-                result = run_metric_job(db, workspace, int(job["id"]))
+                result = run_metric_job(job_db, workspace, int(job["id"]))
                 payload = job.get("payload") or {}
                 if payload.get("metric_wave_id") and payload.get("run_id") is not None:
                     from vfieval.pipeline.metric_jobs import maybe_complete_metric_wave
 
                     maybe_complete_metric_wave(
-                        db,
+                        job_db,
                         int(payload["run_id"]),
                         str(payload["metric_wave_id"]),
                         source_job_id=int(job["id"]),
                         source_job_result=result,
                     )
-                _complete_claimed_job(db, job, result)
+                _complete_claimed_job(job_db, job, result)
             elif job["kind"] == "finalize":
-                result = run_finalize_job(db, workspace, int(job["id"]))
-                _complete_claimed_job(db, job, result)
+                result = run_finalize_job(job_db, workspace, int(job["id"]))
+                _complete_claimed_job(job_db, job, result)
+                run_id = job.get("payload", {}).get("run_id")
+                if run_id is not None:
+                    wake_job_supervisor(db)
             else:
                 raise ValueError(f"unsupported job kind {job['kind']}")
         except RunCanceled:
@@ -294,8 +338,10 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
                 },
             )
             if run_id is not None:
-                if not db.fail_claimed_job_and_run(int(job["id"]), int(run_id), error):
+                if not job_db.fail_claimed_job_and_run(int(job["id"]), int(run_id), error):
                     run = db.get_run(int(run_id))
+                    stored_job: dict[str, object] = {}
+                    claim_still_matches = False
                     if run["status"] in {"cancel_requested", "canceled"}:
                         db.converge_run_cancellation(int(run_id), int(job["id"]))
                     elif run["status"] == "failed":
@@ -303,14 +349,27 @@ def run_worker(db: Database, workspace: WorkspaceConfig, options: WorkerOptions)
                             int(job["id"]),
                             {"message": "Run already failed", "type": "RunCanceled"},
                         )
-                    elif run["status"] not in {"completed"}:
+                    else:
+                        stored_job = db.get_job(int(job["id"]))
+                        claim_still_matches = (
+                            str(stored_job.get("worker_id") or "") == worker_id
+                            and int(stored_job.get("claim_attempt") or 0)
+                            == int(job["claim_attempt"])
+                            and str(stored_job.get("lease_token") or "")
+                            == str(job["lease_token"])
+                        )
+                    if (
+                        run["status"] not in {"completed", "failed", "cancel_requested", "canceled"}
+                        and claim_still_matches
+                        and str(stored_job.get("status") or "") == "completed"
+                    ):
                         # The source Job may already have completed atomically
                         # with a phase handoff. A later local failure (for
                         # example spawning the next worker) must still fail the
                         # active Run instead of leaving it queued forever.
                         db.fail_run(int(run_id), error)
             else:
-                db.fail_job(int(job["id"]), error)
+                job_db.fail_job(int(job["id"]), error)
             if options.once:
                 return
         else:

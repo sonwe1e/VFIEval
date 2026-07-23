@@ -6,6 +6,7 @@ import shutil
 import sqlite3
 import stat as stat_module
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
@@ -66,7 +67,7 @@ def artifact_storage_metadata(
     return result
 
 
-LATEST_SCHEMA_VERSION = "2026-07-job-heartbeat-leases"
+LATEST_SCHEMA_VERSION = "2026-07-media-identity-invariants"
 
 
 RUN_TERMINAL_STATUSES = {"completed", "failed", "canceled"}
@@ -209,6 +210,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     status TEXT NOT NULL,
     payload_json TEXT NOT NULL DEFAULT '{}',
     worker_id TEXT,
+    claim_attempt INTEGER NOT NULL DEFAULT 0,
+    lease_token TEXT,
     progress_current INTEGER NOT NULL DEFAULT 0,
     progress_total INTEGER NOT NULL DEFAULT 0,
     result_json TEXT NOT NULL DEFAULT '{}',
@@ -413,6 +416,23 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     version TEXT PRIMARY KEY,
     applied_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS submission_keys (
+    scope TEXT NOT NULL,
+    submission_id TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending', 'completed')),
+    claim_token TEXT NOT NULL,
+    lease_expires_at REAL NOT NULL DEFAULT 0,
+    resource_type TEXT NOT NULL DEFAULT '',
+    resource_id INTEGER,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(scope, submission_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_submission_keys_status
+ON submission_keys(status, updated_at);
 
 CREATE TABLE IF NOT EXISTS media_collections (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -700,6 +720,560 @@ CREATE INDEX IF NOT EXISTS idx_evaluation_votes_evaluator ON evaluation_votes(ev
 """
 
 
+_MEDIA_IDENTITY_INVARIANT_QUERIES: tuple[tuple[str, str], ...] = (
+    (
+        "media_item_parent_missing",
+        """
+        SELECT item.id AS violation_id
+        FROM media_items item
+        LEFT JOIN media_assets asset ON asset.id = item.canonical_gt_asset_id
+        WHERE asset.id IS NULL
+        """,
+    ),
+    (
+        "media_item_member_parent_missing",
+        """
+        SELECT member.id AS violation_id
+        FROM media_item_members member
+        LEFT JOIN media_items item ON item.id = member.item_id
+        LEFT JOIN media_assets asset ON asset.id = member.asset_id
+        WHERE item.id IS NULL OR asset.id IS NULL
+        """,
+    ),
+    (
+        "run_media_item_binding_parent_missing",
+        """
+        SELECT binding.id AS violation_id
+        FROM run_media_item_bindings binding
+        LEFT JOIN runs run ON run.id = binding.run_id
+        LEFT JOIN media_items item ON item.id = binding.item_id
+        LEFT JOIN media_item_members original
+          ON original.id = binding.original_member_id
+        LEFT JOIN media_item_members active
+          ON active.id = binding.active_member_id
+        WHERE run.id IS NULL
+           OR item.id IS NULL
+           OR original.id IS NULL
+           OR active.id IS NULL
+        """,
+    ),
+    (
+        "canonical_member_asset_mismatch",
+        """
+        SELECT mim.id AS violation_id
+        FROM media_item_members mim
+        JOIN media_items mi ON mi.id = mim.item_id
+        WHERE mim.member_role = 'canonical_gt'
+          AND mim.asset_id != mi.canonical_gt_asset_id
+        """,
+    ),
+    (
+        "member_asset_role_mismatch",
+        """
+        SELECT mim.id AS violation_id
+        FROM media_item_members mim
+        JOIN media_assets asset ON asset.id = mim.asset_id
+        WHERE (
+            mim.member_role IN ('canonical_gt', 'evaluation_gt')
+            AND asset.role != 'gt'
+        ) OR (
+            mim.member_role IN (
+                'model_pred', 'external_pred', 'compare_snapshot', 'evaluation_pred'
+            )
+            AND asset.role != 'pred'
+        )
+        """,
+    ),
+    (
+        "binding_member_item_mismatch",
+        """
+        SELECT binding.id AS violation_id
+        FROM run_media_item_bindings binding
+        JOIN media_item_members original ON original.id = binding.original_member_id
+        JOIN media_item_members active ON active.id = binding.active_member_id
+        WHERE original.item_id != binding.item_id
+           OR active.item_id != binding.item_id
+        """,
+    ),
+    (
+        "binding_original_role_mismatch",
+        """
+        SELECT binding.id AS violation_id
+        FROM run_media_item_bindings binding
+        JOIN media_item_members original ON original.id = binding.original_member_id
+        WHERE (
+            binding.binding_role IN ('source', 'compare_gt')
+            AND original.member_role != 'canonical_gt'
+        ) OR (
+            binding.binding_role = 'pred_output'
+            AND original.member_role != 'model_pred'
+        ) OR (
+            binding.binding_role = 'compare_pred'
+            AND original.member_role NOT IN ('model_pred', 'external_pred')
+        )
+        """,
+    ),
+    (
+        "binding_active_role_mismatch",
+        """
+        SELECT binding.id AS violation_id
+        FROM run_media_item_bindings binding
+        JOIN media_item_members active ON active.id = binding.active_member_id
+        WHERE (
+            binding.binding_role IN ('source', 'compare_gt')
+            AND active.member_role != 'canonical_gt'
+        ) OR (
+            binding.binding_role = 'pred_output'
+            AND active.member_role != 'model_pred'
+        ) OR (
+            binding.binding_role = 'compare_pred'
+            AND active.member_role NOT IN (
+                'model_pred', 'external_pred', 'compare_snapshot'
+            )
+        )
+        """,
+    ),
+    (
+        "binding_slot_mismatch",
+        """
+        SELECT id AS violation_id
+        FROM run_media_item_bindings
+        WHERE (binding_role = 'pred_output' AND slot != '')
+           OR (binding_role IN ('compare_gt', 'compare_pred') AND trim(slot) = '')
+        """,
+    ),
+    (
+        "binding_active_identity_mismatch",
+        """
+        SELECT binding.id AS violation_id
+        FROM run_media_item_bindings binding
+        JOIN media_item_members active ON active.id = binding.active_member_id
+        WHERE active.member_role != 'compare_snapshot'
+          AND binding.active_member_id != binding.original_member_id
+        """,
+    ),
+    (
+        "compare_snapshot_binding_mismatch",
+        """
+        SELECT binding.id AS violation_id
+        FROM run_media_item_bindings binding
+        JOIN media_item_members active ON active.id = binding.active_member_id
+        WHERE active.member_role = 'compare_snapshot'
+          AND (
+              binding.binding_role != 'compare_pred'
+              OR active.producer_kind != 'video_compare'
+              OR active.producer_run_id IS NULL
+              OR active.producer_run_id != binding.run_id
+              OR COALESCE(
+                  CASE
+                      WHEN json_valid(active.metadata_json)
+                      THEN CAST(
+                          json_extract(active.metadata_json, '$.source_member_id')
+                          AS INTEGER
+                      )
+                  END,
+                  -1
+              ) != binding.original_member_id
+          )
+        """,
+    ),
+)
+
+
+_MEDIA_IDENTITY_INVARIANT_TRIGGERS = """
+DROP TRIGGER IF EXISTS trg_media_item_members_validate_insert;
+DROP TRIGGER IF EXISTS trg_media_item_members_validate_update;
+DROP TRIGGER IF EXISTS trg_media_items_validate_canonical_update;
+DROP TRIGGER IF EXISTS trg_media_assets_validate_member_role_update;
+DROP TRIGGER IF EXISTS trg_run_media_item_bindings_validate_insert;
+DROP TRIGGER IF EXISTS trg_run_media_item_bindings_validate_update;
+
+CREATE TRIGGER trg_media_item_members_validate_insert
+BEFORE INSERT ON media_item_members
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM media_assets asset
+        WHERE asset.id = NEW.asset_id
+          AND (
+              (
+                  NEW.member_role IN ('canonical_gt', 'evaluation_gt')
+                  AND asset.role = 'gt'
+              )
+              OR (
+                  NEW.member_role IN (
+                      'model_pred', 'external_pred',
+                      'compare_snapshot', 'evaluation_pred'
+                  )
+                  AND asset.role = 'pred'
+              )
+          )
+    ) THEN RAISE(ABORT, 'media_identity: member asset role mismatch') END;
+
+    SELECT CASE WHEN NEW.member_role = 'canonical_gt' AND NOT EXISTS (
+        SELECT 1
+        FROM media_items item
+        WHERE item.id = NEW.item_id
+          AND item.canonical_gt_asset_id = NEW.asset_id
+    ) THEN RAISE(ABORT, 'media_identity: canonical GT member asset mismatch') END;
+END;
+
+CREATE TRIGGER trg_media_item_members_validate_update
+BEFORE UPDATE OF id, item_id, asset_id, member_role, producer_kind,
+                 producer_run_id, metadata_json
+ON media_item_members
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM media_assets asset
+        WHERE asset.id = NEW.asset_id
+          AND (
+              (
+                  NEW.member_role IN ('canonical_gt', 'evaluation_gt')
+                  AND asset.role = 'gt'
+              )
+              OR (
+                  NEW.member_role IN (
+                      'model_pred', 'external_pred',
+                      'compare_snapshot', 'evaluation_pred'
+                  )
+                  AND asset.role = 'pred'
+              )
+          )
+    ) THEN RAISE(ABORT, 'media_identity: member asset role mismatch') END;
+
+    SELECT CASE WHEN NEW.member_role = 'canonical_gt' AND NOT EXISTS (
+        SELECT 1
+        FROM media_items item
+        WHERE item.id = NEW.item_id
+          AND item.canonical_gt_asset_id = NEW.asset_id
+    ) THEN RAISE(ABORT, 'media_identity: canonical GT member asset mismatch') END;
+
+    SELECT CASE WHEN EXISTS (
+        SELECT 1
+        FROM run_media_item_bindings binding
+        WHERE binding.original_member_id = OLD.id
+          AND (
+              binding.item_id != NEW.item_id
+              OR (
+                  binding.binding_role IN ('source', 'compare_gt')
+                  AND NEW.member_role != 'canonical_gt'
+              )
+              OR (
+                  binding.binding_role = 'pred_output'
+                  AND NEW.member_role != 'model_pred'
+              )
+              OR (
+                  binding.binding_role = 'compare_pred'
+                  AND NEW.member_role NOT IN ('model_pred', 'external_pred')
+              )
+          )
+    ) THEN RAISE(ABORT, 'media_identity: original binding member mismatch') END;
+
+    SELECT CASE WHEN EXISTS (
+        SELECT 1
+        FROM run_media_item_bindings binding
+        WHERE binding.active_member_id = OLD.id
+          AND (
+              binding.item_id != NEW.item_id
+              OR (
+                  binding.binding_role IN ('source', 'compare_gt')
+                  AND NEW.member_role != 'canonical_gt'
+              )
+              OR (
+                  binding.binding_role = 'pred_output'
+                  AND NEW.member_role != 'model_pred'
+              )
+              OR (
+                  binding.binding_role = 'compare_pred'
+                  AND NEW.member_role NOT IN (
+                      'model_pred', 'external_pred', 'compare_snapshot'
+                  )
+              )
+              OR (
+                  NEW.member_role != 'compare_snapshot'
+                  AND binding.active_member_id != binding.original_member_id
+              )
+              OR (
+                  NEW.member_role = 'compare_snapshot'
+                  AND (
+                      binding.binding_role != 'compare_pred'
+                      OR NEW.producer_kind != 'video_compare'
+                      OR NEW.producer_run_id IS NULL
+                      OR NEW.producer_run_id != binding.run_id
+                      OR COALESCE(
+                          CASE
+                              WHEN json_valid(NEW.metadata_json)
+                              THEN CAST(
+                                  json_extract(
+                                      NEW.metadata_json,
+                                      '$.source_member_id'
+                                  ) AS INTEGER
+                              )
+                          END,
+                          -1
+                      ) != binding.original_member_id
+                  )
+              )
+          )
+    ) THEN RAISE(ABORT, 'media_identity: active binding member mismatch') END;
+END;
+
+CREATE TRIGGER trg_media_items_validate_canonical_update
+BEFORE UPDATE OF canonical_gt_asset_id ON media_items
+BEGIN
+    SELECT CASE WHEN EXISTS (
+        SELECT 1
+        FROM media_item_members member
+        WHERE member.item_id = OLD.id
+          AND member.member_role = 'canonical_gt'
+          AND member.asset_id != NEW.canonical_gt_asset_id
+    ) THEN RAISE(ABORT, 'media_identity: canonical GT item asset mismatch') END;
+END;
+
+CREATE TRIGGER trg_media_assets_validate_member_role_update
+BEFORE UPDATE OF role ON media_assets
+BEGIN
+    SELECT CASE WHEN EXISTS (
+        SELECT 1
+        FROM media_item_members member
+        WHERE member.asset_id = OLD.id
+          AND (
+              (
+                  member.member_role IN ('canonical_gt', 'evaluation_gt')
+                  AND NEW.role != 'gt'
+              )
+              OR (
+                  member.member_role IN (
+                      'model_pred', 'external_pred',
+                      'compare_snapshot', 'evaluation_pred'
+                  )
+                  AND NEW.role != 'pred'
+              )
+          )
+    ) THEN RAISE(ABORT, 'media_identity: asset role used by member') END;
+END;
+
+CREATE TRIGGER trg_run_media_item_bindings_validate_insert
+BEFORE INSERT ON run_media_item_bindings
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM media_item_members original
+        JOIN media_item_members active ON active.id = NEW.active_member_id
+        WHERE original.id = NEW.original_member_id
+          AND original.item_id = NEW.item_id
+          AND active.item_id = NEW.item_id
+    ) THEN RAISE(ABORT, 'media_identity: binding member belongs to another Item') END;
+
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM media_item_members original
+        WHERE original.id = NEW.original_member_id
+          AND (
+              (
+                  NEW.binding_role IN ('source', 'compare_gt')
+                  AND original.member_role = 'canonical_gt'
+              )
+              OR (
+                  NEW.binding_role = 'pred_output'
+                  AND original.member_role = 'model_pred'
+              )
+              OR (
+                  NEW.binding_role = 'compare_pred'
+                  AND original.member_role IN ('model_pred', 'external_pred')
+              )
+          )
+    ) THEN RAISE(ABORT, 'media_identity: original binding role mismatch') END;
+
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM media_item_members active
+        WHERE active.id = NEW.active_member_id
+          AND (
+              (
+                  NEW.binding_role IN ('source', 'compare_gt')
+                  AND active.member_role = 'canonical_gt'
+              )
+              OR (
+                  NEW.binding_role = 'pred_output'
+                  AND active.member_role = 'model_pred'
+              )
+              OR (
+                  NEW.binding_role = 'compare_pred'
+                  AND active.member_role IN (
+                      'model_pred', 'external_pred', 'compare_snapshot'
+                  )
+              )
+          )
+    ) THEN RAISE(ABORT, 'media_identity: active binding role mismatch') END;
+
+    SELECT CASE WHEN (
+        (NEW.binding_role = 'pred_output' AND NEW.slot != '')
+        OR (
+            NEW.binding_role IN ('compare_gt', 'compare_pred')
+            AND trim(NEW.slot) = ''
+        )
+    ) THEN RAISE(ABORT, 'media_identity: binding slot mismatch') END;
+
+    SELECT CASE WHEN EXISTS (
+        SELECT 1
+        FROM media_item_members active
+        WHERE active.id = NEW.active_member_id
+          AND active.member_role != 'compare_snapshot'
+          AND NEW.active_member_id != NEW.original_member_id
+    ) THEN RAISE(ABORT, 'media_identity: active member must preserve original identity') END;
+
+    SELECT CASE WHEN EXISTS (
+        SELECT 1
+        FROM media_item_members active
+        WHERE active.id = NEW.active_member_id
+          AND active.member_role = 'compare_snapshot'
+          AND (
+              NEW.binding_role != 'compare_pred'
+              OR active.producer_kind != 'video_compare'
+              OR active.producer_run_id IS NULL
+              OR active.producer_run_id != NEW.run_id
+              OR COALESCE(
+                  CASE
+                      WHEN json_valid(active.metadata_json)
+                      THEN CAST(
+                          json_extract(
+                              active.metadata_json,
+                              '$.source_member_id'
+                          ) AS INTEGER
+                      )
+                  END,
+                  -1
+              ) != NEW.original_member_id
+          )
+    ) THEN RAISE(ABORT, 'media_identity: invalid Compare snapshot replacement') END;
+END;
+
+CREATE TRIGGER trg_run_media_item_bindings_validate_update
+BEFORE UPDATE OF run_id, item_id, binding_role, slot,
+                 original_member_id, active_member_id
+ON run_media_item_bindings
+BEGIN
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM media_item_members original
+        JOIN media_item_members active ON active.id = NEW.active_member_id
+        WHERE original.id = NEW.original_member_id
+          AND original.item_id = NEW.item_id
+          AND active.item_id = NEW.item_id
+    ) THEN RAISE(ABORT, 'media_identity: binding member belongs to another Item') END;
+
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM media_item_members original
+        WHERE original.id = NEW.original_member_id
+          AND (
+              (
+                  NEW.binding_role IN ('source', 'compare_gt')
+                  AND original.member_role = 'canonical_gt'
+              )
+              OR (
+                  NEW.binding_role = 'pred_output'
+                  AND original.member_role = 'model_pred'
+              )
+              OR (
+                  NEW.binding_role = 'compare_pred'
+                  AND original.member_role IN ('model_pred', 'external_pred')
+              )
+          )
+    ) THEN RAISE(ABORT, 'media_identity: original binding role mismatch') END;
+
+    SELECT CASE WHEN NOT EXISTS (
+        SELECT 1
+        FROM media_item_members active
+        WHERE active.id = NEW.active_member_id
+          AND (
+              (
+                  NEW.binding_role IN ('source', 'compare_gt')
+                  AND active.member_role = 'canonical_gt'
+              )
+              OR (
+                  NEW.binding_role = 'pred_output'
+                  AND active.member_role = 'model_pred'
+              )
+              OR (
+                  NEW.binding_role = 'compare_pred'
+                  AND active.member_role IN (
+                      'model_pred', 'external_pred', 'compare_snapshot'
+                  )
+              )
+          )
+    ) THEN RAISE(ABORT, 'media_identity: active binding role mismatch') END;
+
+    SELECT CASE WHEN (
+        (NEW.binding_role = 'pred_output' AND NEW.slot != '')
+        OR (
+            NEW.binding_role IN ('compare_gt', 'compare_pred')
+            AND trim(NEW.slot) = ''
+        )
+    ) THEN RAISE(ABORT, 'media_identity: binding slot mismatch') END;
+
+    SELECT CASE WHEN EXISTS (
+        SELECT 1
+        FROM media_item_members active
+        WHERE active.id = NEW.active_member_id
+          AND active.member_role != 'compare_snapshot'
+          AND NEW.active_member_id != NEW.original_member_id
+    ) THEN RAISE(ABORT, 'media_identity: active member must preserve original identity') END;
+
+    SELECT CASE WHEN EXISTS (
+        SELECT 1
+        FROM media_item_members active
+        WHERE active.id = NEW.active_member_id
+          AND active.member_role = 'compare_snapshot'
+          AND (
+              NEW.binding_role != 'compare_pred'
+              OR active.producer_kind != 'video_compare'
+              OR active.producer_run_id IS NULL
+              OR active.producer_run_id != NEW.run_id
+              OR COALESCE(
+                  CASE
+                      WHEN json_valid(active.metadata_json)
+                      THEN CAST(
+                          json_extract(
+                              active.metadata_json,
+                              '$.source_member_id'
+                          ) AS INTEGER
+                      )
+                  END,
+                  -1
+              ) != NEW.original_member_id
+          )
+    ) THEN RAISE(ABORT, 'media_identity: invalid Compare snapshot replacement') END;
+END;
+"""
+
+
+def _validate_media_identity_invariants(conn: sqlite3.Connection) -> None:
+    violations: list[str] = []
+    for code, query in _MEDIA_IDENTITY_INVARIANT_QUERIES:
+        count_row = conn.execute(
+            f"SELECT COUNT(*) AS count FROM ({query}) AS violations"
+        ).fetchone()
+        count = int(count_row["count"] if count_row is not None else 0)
+        if count <= 0:
+            continue
+        examples = [
+            int(row["violation_id"])
+            for row in conn.execute(
+                f"SELECT violation_id FROM ({query}) AS violations LIMIT 5"
+            ).fetchall()
+        ]
+        violations.append(f"{code}: count={count}, ids={examples}")
+    if violations:
+        raise RuntimeError(
+            "media identity invariant migration blocked; "
+            "repair inconsistent rows before retry: "
+            + "; ".join(violations)
+        )
+
+
 class Database:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
@@ -859,6 +1433,21 @@ class Database:
             );
             CREATE INDEX IF NOT EXISTS idx_decode_cache_build_locks_expiry
             ON decode_cache_build_locks(expires_at, cache_key);
+            CREATE TABLE IF NOT EXISTS submission_keys (
+                scope TEXT NOT NULL,
+                submission_id TEXT NOT NULL,
+                request_fingerprint TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('pending', 'completed')),
+                claim_token TEXT NOT NULL,
+                lease_expires_at REAL NOT NULL DEFAULT 0,
+                resource_type TEXT NOT NULL DEFAULT '',
+                resource_id INTEGER,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(scope, submission_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_submission_keys_status
+            ON submission_keys(status, updated_at);
             """
         )
         feedback_columns = {row["name"] for row in conn.execute("PRAGMA table_info(run_feedback)").fetchall()}
@@ -903,6 +1492,19 @@ class Database:
         job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
         if "heartbeat_at" not in job_columns:
             conn.execute("ALTER TABLE jobs ADD COLUMN heartbeat_at REAL")
+        if "claim_attempt" not in job_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN claim_attempt INTEGER NOT NULL DEFAULT 0")
+        if "lease_token" not in job_columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN lease_token TEXT")
+        submission_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(submission_keys)").fetchall()
+        }
+        if "lease_expires_at" not in submission_columns:
+            conn.execute(
+                "ALTER TABLE submission_keys "
+                "ADD COLUMN lease_expires_at REAL NOT NULL DEFAULT 0"
+            )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_jobs_running_heartbeat "
             "ON jobs(status, heartbeat_at, started_at, id)"
@@ -918,11 +1520,151 @@ class Database:
         profile_columns = {row["name"] for row in conn.execute("PRAGMA table_info(execution_profiles)").fetchall()}
         if "device_model" not in profile_columns:
             conn.execute("ALTER TABLE execution_profiles ADD COLUMN device_model TEXT NOT NULL DEFAULT ''")
+        _validate_media_identity_invariants(conn)
+        conn.executescript(_MEDIA_IDENTITY_INVARIANT_TRIGGERS)
 
     def query(self, sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
         with self.connection() as conn:
             rows = conn.execute(sql, tuple(params)).fetchall()
         return [dict(row) for row in rows]
+
+    def begin_submission(
+        self,
+        scope: str,
+        submission_id: str,
+        request_fingerprint: str,
+        *,
+        lease_seconds: float = 5 * 60.0,
+    ) -> dict[str, Any]:
+        now = utc_ts()
+        lease_expires_at = now + max(1.0, float(lease_seconds))
+        claim_token = uuid.uuid4().hex
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            inserted = conn.execute(
+                """
+                INSERT OR IGNORE INTO submission_keys(
+                    scope, submission_id, request_fingerprint, status,
+                    claim_token, lease_expires_at, resource_type, resource_id,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, 'pending', ?, ?, '', NULL, ?, ?)
+                """,
+                (
+                    str(scope),
+                    str(submission_id),
+                    str(request_fingerprint),
+                    claim_token,
+                    lease_expires_at,
+                    now,
+                    now,
+                ),
+            ).rowcount
+            row = conn.execute(
+                "SELECT * FROM submission_keys WHERE scope = ? AND submission_id = ?",
+                (str(scope), str(submission_id)),
+            ).fetchone()
+            reclaimed = 0
+            if (
+                not inserted
+                and row is not None
+                and str(row["request_fingerprint"]) == str(request_fingerprint)
+                and str(row["status"]) == "pending"
+                and float(row["lease_expires_at"] or 0.0) <= now
+            ):
+                reclaimed = conn.execute(
+                    """
+                    UPDATE submission_keys
+                    SET claim_token = ?, lease_expires_at = ?, updated_at = ?
+                    WHERE scope = ? AND submission_id = ?
+                      AND request_fingerprint = ? AND status = 'pending'
+                      AND claim_token = ? AND lease_expires_at <= ?
+                    """,
+                    (
+                        claim_token,
+                        lease_expires_at,
+                        now,
+                        str(scope),
+                        str(submission_id),
+                        str(request_fingerprint),
+                        str(row["claim_token"]),
+                        now,
+                    ),
+                ).rowcount
+                if reclaimed:
+                    row = conn.execute(
+                        "SELECT * FROM submission_keys WHERE scope = ? AND submission_id = ?",
+                        (str(scope), str(submission_id)),
+                    ).fetchone()
+        if row is None:
+            raise RuntimeError("submission reservation disappeared")
+        result = dict(row)
+        if inserted:
+            result["state"] = "claimed"
+            result["reclaimed"] = False
+        elif reclaimed:
+            result["state"] = "claimed"
+            result["reclaimed"] = True
+        elif str(result["request_fingerprint"]) != str(request_fingerprint):
+            result["state"] = "conflict"
+        elif str(result["status"]) == "completed":
+            result["state"] = "completed"
+        else:
+            result["state"] = "pending"
+        return result
+
+    def get_submission(self, scope: str, submission_id: str) -> dict[str, Any] | None:
+        return self.get(
+            "SELECT * FROM submission_keys WHERE scope = ? AND submission_id = ?",
+            (str(scope), str(submission_id)),
+        )
+
+    def complete_submission(
+        self,
+        scope: str,
+        submission_id: str,
+        claim_token: str,
+        *,
+        resource_type: str,
+        resource_id: int,
+    ) -> bool:
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE submission_keys
+                SET status = 'completed',
+                    resource_type = ?,
+                    resource_id = ?,
+                    updated_at = ?
+                WHERE scope = ? AND submission_id = ?
+                  AND status = 'pending' AND claim_token = ?
+                """,
+                (
+                    str(resource_type),
+                    int(resource_id),
+                    utc_ts(),
+                    str(scope),
+                    str(submission_id),
+                    str(claim_token),
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def abandon_submission(
+        self,
+        scope: str,
+        submission_id: str,
+        claim_token: str,
+    ) -> bool:
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """
+                DELETE FROM submission_keys
+                WHERE scope = ? AND submission_id = ?
+                  AND status = 'pending' AND claim_token = ?
+                """,
+                (str(scope), str(submission_id), str(claim_token)),
+            )
+        return cursor.rowcount == 1
 
     def get(self, sql: str, params: Iterable[Any] = ()) -> dict[str, Any] | None:
         rows = self.query(sql, params)
@@ -1535,13 +2277,21 @@ class Database:
         source_status: str | None,
         source_job_result: dict[str, Any] | None,
         now: float,
+        source_worker_id: str | None = None,
+        source_attempt: int | None = None,
+        source_lease_token: str | None = None,
     ) -> bool:
         if source_job_id is None:
             return True
+        fence_sql, fence_params = Database._job_fence_sql(
+            source_worker_id,
+            source_attempt,
+            source_lease_token,
+        )
         if source_status == "completed":
             row = conn.execute(
-                "SELECT result_json FROM jobs WHERE id = ?",
-                (int(source_job_id),),
+                f"SELECT result_json FROM jobs WHERE id = ? {fence_sql}",
+                (int(source_job_id), *fence_params),
             ).fetchone()
             return bool(
                 row is not None
@@ -1550,12 +2300,13 @@ class Database:
         if source_status != "running":
             return False
         cur = conn.execute(
-            """
+            f"""
             UPDATE jobs
             SET status = 'completed', result_json = ?, finished_at = ?
             WHERE id = ? AND status = 'running'
+              {fence_sql}
             """,
-            (_json(source_job_result), now, int(source_job_id)),
+            (_json(source_job_result), now, int(source_job_id), *fence_params),
         )
         return bool(cur.rowcount)
 
@@ -1566,6 +2317,9 @@ class Database:
         *,
         source_job_id: int | None = None,
         source_job_result: dict[str, Any] | None = None,
+        source_worker_id: str | None = None,
+        source_attempt: int | None = None,
+        source_lease_token: str | None = None,
     ) -> list[int]:
         """Atomically publish the decode -> inference handoff.
 
@@ -1637,6 +2391,9 @@ class Database:
                     source_status,
                     source_job_result,
                     now,
+                    source_worker_id,
+                    source_attempt,
+                    source_lease_token,
                 ):
                     raise RuntimeError(f"decode Job {source_job_id} rejected inference handoff completion")
                 conn.execute(
@@ -1683,6 +2440,9 @@ class Database:
                     source_status,
                     source_job_result,
                     now,
+                    source_worker_id,
+                    source_attempt,
+                    source_lease_token,
                 ):
                     raise RuntimeError(f"decode Job {source_job_id} rejected inference handoff completion")
                 conn.execute(
@@ -1756,6 +2516,9 @@ class Database:
                 source_status,
                 source_job_result,
                 now,
+                source_worker_id,
+                source_attempt,
+                source_lease_token,
             ):
                 raise RuntimeError(f"decode Job {source_job_id} rejected inference handoff completion")
             return job_ids
@@ -1769,6 +2532,7 @@ class Database:
         rows = self.query(
             f"""
             SELECT rj.*, j.kind, j.status, j.payload_json, j.worker_id,
+                   j.claim_attempt, j.lease_token,
                    j.progress_current, j.progress_total, j.result_json, j.error_json,
                    j.started_at, j.heartbeat_at, j.finished_at
             FROM run_jobs rj
@@ -1901,9 +2665,28 @@ class Database:
             """,
             tuple([*params, page_size, (page - 1) * page_size]),
         )
+        purge_requests: dict[int, dict[str, Any]] = {}
+        run_ids = [int(row["id"]) for row in rows]
+        if run_ids:
+            placeholders = ",".join("?" for _ in run_ids)
+            purge_rows = self.query(
+                f"""
+                SELECT *
+                FROM run_purge_requests
+                WHERE run_id IN ({placeholders})
+                ORDER BY run_id, id DESC
+                """,
+                tuple(run_ids),
+            )
+            for purge_row in purge_rows:
+                run_id = int(purge_row["run_id"])
+                if run_id in purge_requests:
+                    continue
+                self._decode_run_purge_request(purge_row)
+                purge_requests[run_id] = purge_row
         for row in rows:
             self._decode_run(row)
-            row["purge_request"] = self.get_run_purge_request(int(row["id"]))
+            row["purge_request"] = purge_requests.get(int(row["id"]))
         return {
             "runs": rows,
             "page": page,
@@ -2248,6 +3031,9 @@ class Database:
         expected_content_revision: int | None = None,
         source_job_id: int | None = None,
         source_job_result: dict[str, Any] | None = None,
+        source_worker_id: str | None = None,
+        source_attempt: int | None = None,
+        source_lease_token: str | None = None,
     ) -> list[int]:
         """Atomically publish a complete metric wave and its Run phase.
 
@@ -2412,6 +3198,9 @@ class Database:
                 source_job_status,
                 source_job_result,
                 now,
+                source_worker_id,
+                source_attempt,
+                source_lease_token,
             ):
                 raise RuntimeError(f"source Job {source_job_id} rejected metric wave completion")
             return job_ids
@@ -2425,6 +3214,9 @@ class Database:
         *,
         source_job_id: int | None = None,
         source_job_result: dict[str, Any] | None = None,
+        source_worker_id: str | None = None,
+        source_attempt: int | None = None,
+        source_lease_token: str | None = None,
     ) -> bool:
         sources = RUN_INFERENCE_COMPLETION_SOURCES.get(status)
         if sources is None:
@@ -2463,6 +3255,9 @@ class Database:
                 source_job_status,
                 source_job_result,
                 now,
+                source_worker_id,
+                source_attempt,
+                source_lease_token,
             ):
                 conn.rollback()
                 return False
@@ -2475,6 +3270,9 @@ class Database:
         *,
         source_job_id: int | None = None,
         source_job_result: dict[str, Any] | None = None,
+        source_worker_id: str | None = None,
+        source_attempt: int | None = None,
+        source_lease_token: str | None = None,
     ) -> bool:
         now = utc_ts()
         with self.connection() as conn:
@@ -2507,6 +3305,9 @@ class Database:
                 source_job_status,
                 source_job_result,
                 now,
+                source_worker_id,
+                source_attempt,
+                source_lease_token,
             ):
                 conn.rollback()
                 return False
@@ -2521,6 +3322,9 @@ class Database:
         *,
         source_job_id: int | None = None,
         source_job_result: dict[str, Any] | None = None,
+        source_worker_id: str | None = None,
+        source_attempt: int | None = None,
+        source_lease_token: str | None = None,
     ) -> bool:
         """Publish a metric wave once even when shards finish concurrently."""
         now = utc_ts()
@@ -2591,6 +3395,9 @@ class Database:
                 source_job_status,
                 source_job_result,
                 now,
+                source_worker_id,
+                source_attempt,
+                source_lease_token,
             ):
                 conn.rollback()
                 return False
@@ -2717,6 +3524,10 @@ class Database:
         job_id: int,
         run_id: int,
         error: dict[str, Any],
+        *,
+        worker_id: str | None = None,
+        attempt: int | None = None,
+        lease_token: str | None = None,
     ) -> bool:
         """Atomically fail an active Run and its currently claimed Job.
 
@@ -2725,14 +3536,21 @@ class Database:
         neither object and the caller must converge cancellation instead.
         """
         now = utc_ts()
+        fence_sql, fence_params = self._job_fence_sql(worker_id, attempt, lease_token)
+        associated_fence_sql = (
+            fence_sql.replace("worker_id", "j.worker_id")
+            .replace("claim_attempt", "j.claim_attempt")
+            .replace("lease_token", "j.lease_token")
+        )
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             associated_job = conn.execute(
-                """
+                f"""
                 SELECT j.status, r.status AS run_status
                 FROM jobs j
                 JOIN runs r ON r.id = ?
                 WHERE j.id = ?
+                  {associated_fence_sql}
                   AND (
                       EXISTS (
                           SELECT 1 FROM run_jobs rj
@@ -2743,7 +3561,7 @@ class Database:
                       OR CAST(json_extract(j.payload_json, '$.run_id') AS INTEGER) = r.id
                   )
                 """,
-                (int(run_id), int(job_id)),
+                (int(run_id), int(job_id), *fence_params),
             ).fetchone()
             if associated_job is None or str(associated_job["status"] or "") != "running":
                 return False
@@ -2765,12 +3583,13 @@ class Database:
             if cur.rowcount != 1:
                 return False
             conn.execute(
-                """
+                f"""
                 UPDATE jobs
                 SET status = 'failed', error_json = ?, finished_at = ?
                 WHERE id = ? AND status = 'running'
+                  {fence_sql}
                 """,
-                (_json(error), now, int(job_id)),
+                (_json(error), now, int(job_id), *fence_params),
             )
             conn.execute(
                 """
@@ -4409,6 +5228,9 @@ class Database:
         *,
         source_job_id: int | None = None,
         source_job_result: dict[str, Any] | None = None,
+        source_worker_id: str | None = None,
+        source_attempt: int | None = None,
+        source_lease_token: str | None = None,
     ) -> bool:
         run = self.get_run(run_id)
         if run["status"] in {"cancel_requested", "canceled"}:
@@ -4442,7 +5264,13 @@ class Database:
             return True
         if any(job["status"] != "completed" for job in jobs):
             if source_job_id is not None and source_original_status == "running":
-                if not self.complete_job(int(source_job_id), source_job_result):
+                if not self.complete_job(
+                    int(source_job_id),
+                    source_job_result,
+                    worker_id=source_worker_id,
+                    attempt=source_attempt,
+                    lease_token=source_lease_token,
+                ):
                     return False
             self.update_run_progress_from_jobs(run_id)
             return False
@@ -4472,6 +5300,9 @@ class Database:
                 [int(job["job_id"]) for job in jobs],
                 source_job_id=source_job_id,
                 source_job_result=source_job_result,
+                source_worker_id=source_worker_id,
+                source_attempt=source_attempt,
+                source_lease_token=source_lease_token,
             )
             if not advanced and source_job_id is not None and source_original_status == "running":
                 raise RuntimeError(f"run {run_id} rejected atomic finalize handoff")
@@ -4490,6 +5321,9 @@ class Database:
                     artifact_summary=artifact_summary,
                     source_job_id=source_job_id,
                     source_job_result=source_job_result,
+                    source_worker_id=source_worker_id,
+                    source_attempt=source_attempt,
+                    source_lease_token=source_lease_token,
                 )
             except ValueError:
                 if source_job_id is not None and source_original_status == "running":
@@ -4503,6 +5337,9 @@ class Database:
                 "completed",
                 source_job_id=source_job_id,
                 source_job_result=source_job_result,
+                source_worker_id=source_worker_id,
+                source_attempt=source_attempt,
+                source_lease_token=source_lease_token,
             )
             if not advanced and source_job_id is not None and source_original_status == "running":
                 raise RuntimeError(f"run {run_id} rejected atomic inference completion")
@@ -4518,6 +5355,9 @@ class Database:
         *,
         source_job_id: int | None = None,
         source_job_result: dict[str, Any] | None = None,
+        source_worker_id: str | None = None,
+        source_attempt: int | None = None,
+        source_lease_token: str | None = None,
     ) -> bool:
         """Atomically publish a finalize Job and the ``finalize_queued`` state."""
         source_ids = sorted({int(job_id) for job_id in inference_job_ids})
@@ -4641,6 +5481,9 @@ class Database:
                         source_job_status,
                         source_job_result,
                         now,
+                        source_worker_id,
+                        source_attempt,
+                        source_lease_token,
                     ):
                         raise RuntimeError(f"source Job {source_job_id} rejected finalize handoff completion")
                     return True
@@ -4651,6 +5494,9 @@ class Database:
                         source_job_status,
                         source_job_result,
                         now,
+                        source_worker_id,
+                        source_attempt,
+                        source_lease_token,
                     ):
                         raise RuntimeError(f"source Job {source_job_id} rejected finalize handoff completion")
                     return True
@@ -4698,6 +5544,9 @@ class Database:
                 source_job_status,
                 source_job_result,
                 now,
+                source_worker_id,
+                source_attempt,
+                source_lease_token,
             ):
                 raise RuntimeError(f"source Job {source_job_id} rejected finalize handoff completion")
             return True
@@ -4823,6 +5672,26 @@ class Database:
         worker = self.get_worker(worker_id)
         self.register_worker(worker_id, worker["role"], capabilities or worker.get("capabilities") or {})
 
+    @staticmethod
+    def _job_fence_sql(
+        worker_id: str | None,
+        attempt: int | None,
+        lease_token: str | None,
+    ) -> tuple[str, tuple[Any, ...]]:
+        """Build an optional ownership fence for a running Job mutation.
+
+        Direct database maintenance and historical tests may omit the fence.
+        Worker-facing paths always provide all three values.
+        """
+        if worker_id is None and attempt is None and lease_token is None:
+            return "", ()
+        if worker_id is None or attempt is None or not str(lease_token or "").strip():
+            raise ValueError("worker_id, attempt, and lease_token must be provided together")
+        return (
+            "AND worker_id = ? AND claim_attempt = ? AND lease_token = ?",
+            (str(worker_id), int(attempt), str(lease_token)),
+        )
+
     def create_job(self, kind: str, payload: dict[str, Any], progress_total: int = 0) -> int:
         now = utc_ts()
         with self.connection() as conn:
@@ -4943,12 +5812,60 @@ class Database:
             self._decode_job(row)
         return rows
 
+    def queued_job_requirements(self, limit: int = 1000) -> list[dict[str, Any]]:
+        """Return the role/device slots needed by currently queued Jobs.
+
+        This query is intentionally SQLite-only and does not claim work.  The
+        Job supervisor uses it both at startup and after an enqueue wake-up.
+        """
+        rows = self.query(
+            """
+            SELECT
+                j.id AS job_id,
+                j.kind AS role,
+                COALESCE(
+                    (
+                        SELECT rj.device
+                        FROM run_jobs rj
+                        WHERE rj.job_id = j.id
+                        ORDER BY rj.run_id
+                        LIMIT 1
+                    ),
+                    json_extract(j.payload_json, '$.metric_device'),
+                    json_extract(j.payload_json, '$.device'),
+                    (
+                        SELECT r.device
+                        FROM runs r
+                        WHERE r.id = CAST(json_extract(j.payload_json, '$.run_id') AS INTEGER)
+                        LIMIT 1
+                    )
+                ) AS device
+            FROM jobs j
+            WHERE j.status = 'queued'
+              AND j.kind IN ('decode', 'inference', 'finalize', 'metric')
+            ORDER BY j.created_at, j.id
+            LIMIT ?
+            """,
+            (max(1, min(int(limit), 10000)),),
+        )
+        return [
+            {
+                "job_id": int(row["job_id"]),
+                "role": str(row["role"]),
+                "device": str(row["device"]) if row.get("device") is not None else None,
+            }
+            for row in rows
+        ]
+
     def get_job(self, job_id: int) -> dict[str, Any]:
         row = self.get("SELECT * FROM jobs WHERE id = ?", (job_id,))
         if row is None:
             raise KeyError(f"job {job_id} not found")
         self._decode_job(row)
         return row
+
+    def fenced_job(self, job: dict[str, Any]) -> "_JobLeaseDatabaseView":
+        return _JobLeaseDatabaseView(self, job)
 
     def claim_next_job(self, worker_id: str, kinds: list[str], device_filter: str | None = None) -> dict[str, Any] | None:
         if not kinds:
@@ -5073,13 +5990,16 @@ class Database:
                     "UPDATE run_jobs SET device = COALESCE(device, ?) WHERE job_id = ? AND role = 'metric'",
                     (device_filter, int(row["id"])),
                 )
+            claim_attempt = int(row["claim_attempt"] or 0) + 1
+            lease_token = uuid.uuid4().hex
             cur = conn.execute(
                 """
                 UPDATE jobs
-                SET status = 'running', worker_id = ?, started_at = ?, heartbeat_at = ?
+                SET status = 'running', worker_id = ?, claim_attempt = ?,
+                    lease_token = ?, started_at = ?, heartbeat_at = ?
                 WHERE id = ? AND status = 'queued'
                 """,
-                (worker_id, now, now, int(row["id"])),
+                (worker_id, claim_attempt, lease_token, now, now, int(row["id"])),
             )
             if cur.rowcount != 1:
                 conn.commit()
@@ -5094,6 +6014,10 @@ class Database:
         current: int,
         total: int | None = None,
         result: dict[str, Any] | None = None,
+        *,
+        worker_id: str | None = None,
+        attempt: int | None = None,
+        lease_token: str | None = None,
     ) -> bool:
         now = utc_ts()
         assignments = ["progress_current = ?", "heartbeat_at = ?"]
@@ -5104,13 +6028,16 @@ class Database:
         if result is not None:
             assignments.append("result_json = ?")
             params.append(_json(result))
+        fence_sql, fence_params = self._job_fence_sql(worker_id, attempt, lease_token)
         params.append(int(job_id))
+        params.extend(fence_params)
         with self.connection() as conn:
             cur = conn.execute(
                 f"""
                 UPDATE jobs
                 SET {', '.join(assignments)}
                 WHERE id = ? AND status = 'running'
+                  {fence_sql}
                   AND NOT EXISTS (
                       SELECT 1
                       FROM run_jobs rj
@@ -5132,14 +6059,24 @@ class Database:
             )
             return bool(cur.rowcount)
 
-    def complete_job(self, job_id: int, result: dict[str, Any] | None = None) -> bool:
+    def complete_job(
+        self,
+        job_id: int,
+        result: dict[str, Any] | None = None,
+        *,
+        worker_id: str | None = None,
+        attempt: int | None = None,
+        lease_token: str | None = None,
+    ) -> bool:
         now = utc_ts()
+        fence_sql, fence_params = self._job_fence_sql(worker_id, attempt, lease_token)
         with self.connection() as conn:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE jobs
                 SET status = 'completed', result_json = ?, finished_at = ?
                 WHERE id = ? AND status = 'running'
+                  {fence_sql}
                   AND NOT EXISTS (
                       SELECT 1
                       FROM run_jobs rj
@@ -5157,7 +6094,7 @@ class Database:
                         AND r.status IN ('failed', 'cancel_requested', 'canceled')
                   )
                 """,
-                (_json(result), now, job_id),
+                (_json(result), now, job_id, *fence_params),
             )
             if cur.rowcount:
                 return True
@@ -5166,8 +6103,12 @@ class Database:
             # replay as idempotent; conflicting or terminal callbacks remain
             # rejected and cannot overwrite the stored result.
             row = conn.execute(
-                "SELECT status, result_json FROM jobs WHERE id = ?",
-                (job_id,),
+                f"""
+                SELECT status, result_json
+                FROM jobs
+                WHERE id = ? {fence_sql}
+                """,
+                (job_id, *fence_params),
             ).fetchone()
             return bool(
                 row is not None
@@ -5175,14 +6116,24 @@ class Database:
                 and _loads(row["result_json"]) == _loads(_json(result))
             )
 
-    def fail_job(self, job_id: int, error: dict[str, Any]) -> bool:
+    def fail_job(
+        self,
+        job_id: int,
+        error: dict[str, Any],
+        *,
+        worker_id: str | None = None,
+        attempt: int | None = None,
+        lease_token: str | None = None,
+    ) -> bool:
         now = utc_ts()
+        fence_sql, fence_params = self._job_fence_sql(worker_id, attempt, lease_token)
         with self.connection() as conn:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE jobs
                 SET status = 'failed', error_json = ?, finished_at = ?
                 WHERE id = ? AND status = 'running'
+                  {fence_sql}
                   AND NOT EXISTS (
                       SELECT 1
                       FROM run_jobs rj
@@ -5200,11 +6151,17 @@ class Database:
                         AND r.status IN ('cancel_requested', 'canceled')
                   )
                 """,
-                (_json(error), now, job_id),
+                (_json(error), now, job_id, *fence_params),
             )
             return bool(cur.rowcount)
 
-    def heartbeat_job(self, job_id: int, worker_id: str) -> bool:
+    def heartbeat_job(
+        self,
+        job_id: int,
+        worker_id: str,
+        attempt: int,
+        lease_token: str,
+    ) -> bool:
         """Renew a running Job lease owned by ``worker_id``.
 
         Worker ownership is a fencing token: a late heartbeat from an old
@@ -5212,14 +6169,20 @@ class Database:
         claimed by another worker.
         """
         now = utc_ts()
+        fence_sql, fence_params = self._job_fence_sql(
+            str(worker_id),
+            attempt,
+            lease_token,
+        )
         with self.connection() as conn:
             cur = conn.execute(
-                """
+                f"""
                 UPDATE jobs
                 SET started_at = COALESCE(started_at, ?), heartbeat_at = ?
-                WHERE id = ? AND status = 'running' AND worker_id = ?
+                WHERE id = ? AND status = 'running'
+                  {fence_sql}
                 """,
-                (now, now, int(job_id), str(worker_id)),
+                (now, now, int(job_id), *fence_params),
             )
             if cur.rowcount:
                 conn.execute(
@@ -5868,3 +6831,101 @@ class Database:
     @staticmethod
     def _decode_cache_entry(row: dict[str, Any]) -> None:
         row["metadata"] = _loads(row.pop("metadata_json", None))
+
+
+class _JobLeaseDatabaseView:
+    """Delegate database access while fencing mutations for one claimed Job."""
+
+    _SOURCE_HANDOFF_METHODS = {
+        "publish_inference_jobs",
+        "publish_metric_wave",
+        "complete_run_inference",
+        "complete_run_metrics",
+        "complete_run_metric_wave",
+        "maybe_complete_multi_run_inference",
+        "queue_run_finalize",
+    }
+
+    def __init__(self, db: Database, job: dict[str, Any]) -> None:
+        self._db = db
+        self.job_id = int(job["id"])
+        self.worker_id = str(job.get("worker_id") or "")
+        self.attempt = int(job.get("claim_attempt") or 0)
+        self.lease_token = str(job.get("lease_token") or "")
+        if not self.worker_id or self.attempt <= 0 or not self.lease_token:
+            raise ValueError(f"Job {self.job_id} does not carry a complete claim fence")
+
+    def _fence(self) -> dict[str, Any]:
+        return {
+            "worker_id": self.worker_id,
+            "attempt": self.attempt,
+            "lease_token": self.lease_token,
+        }
+
+    def _source_fence(self) -> dict[str, Any]:
+        return {
+            "source_worker_id": self.worker_id,
+            "source_attempt": self.attempt,
+            "source_lease_token": self.lease_token,
+        }
+
+    def update_job_progress(
+        self,
+        job_id: int,
+        current: int,
+        total: int | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> bool:
+        return self._db.update_job_progress(
+            job_id,
+            current,
+            total,
+            result,
+            **self._fence(),
+        )
+
+    def complete_job(self, job_id: int, result: dict[str, Any] | None = None) -> bool:
+        return self._db.complete_job(job_id, result, **self._fence())
+
+    def fail_job(self, job_id: int, error: dict[str, Any]) -> bool:
+        return self._db.fail_job(job_id, error, **self._fence())
+
+    def fail_claimed_job_and_run(
+        self,
+        job_id: int,
+        run_id: int,
+        error: dict[str, Any],
+    ) -> bool:
+        return self._db.fail_claimed_job_and_run(
+            job_id,
+            run_id,
+            error,
+            **self._fence(),
+        )
+
+    def heartbeat_job(
+        self,
+        job_id: int,
+        worker_id: str | None = None,
+        attempt: int | None = None,
+        lease_token: str | None = None,
+    ) -> bool:
+        return self._db.heartbeat_job(
+            job_id,
+            self.worker_id,
+            self.attempt,
+            self.lease_token,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        target = getattr(self._db, name)
+        if name not in self._SOURCE_HANDOFF_METHODS:
+            return target
+
+        def call_with_source_fence(*args: Any, **kwargs: Any) -> Any:
+            source_job_id = kwargs.get("source_job_id")
+            if source_job_id is not None and int(source_job_id) == self.job_id:
+                kwargs.update(self._source_fence())
+            return target(*args, **kwargs)
+
+        return call_with_source_fence

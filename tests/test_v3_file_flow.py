@@ -396,7 +396,18 @@ class Model:
                 self.assertIn("thumbnail_url", video_payload["videos"][0])
                 paged = _get(base_url, "/api/video-groups/test_style/videos?page=1&page_size=2&q=motion")
                 self.assertLessEqual(len(paged["videos"]), 2)
-                self.assertIn("all_video_names", paged)
+                self.assertNotIn("all_video_names", paged)
+                self.assertNotIn("filtered_video_names", paged)
+                video_selection = _post(
+                    base_url,
+                    "/api/video-selections",
+                    {
+                        "video_groups": ["test_style"],
+                        "q": selected_video,
+                    },
+                )
+                self.assertEqual(video_selection["total"], 1)
+                video_selection_token = video_selection["video_selection_token"]
                 checkpoint_payload = _get(base_url, "/api/checkpoints?model_file=test_checkpoint.py")
                 self.assertIn("test_checkpoint/latest.pth", [row["relative_path"] for row in checkpoint_payload])
                 devices_payload = _get(base_url, "/api/devices")
@@ -407,7 +418,7 @@ class Model:
                     {
                         "model_file": "test_average.py",
                         "video_group": "test_style",
-                        "selected_videos": [selected_video],
+                        "video_selection_token": video_selection_token,
                         "device": "cpu",
                         "precision": "fp32",
                         "max_frames": 4,
@@ -420,7 +431,7 @@ class Model:
                     {
                         "model_file": "test_average.py",
                         "video_group": "test_style",
-                        "selected_videos": [selected_video],
+                        "video_selection_token": video_selection_token,
                         "device": "cpu",
                         "precision": "fp32",
                         "batch_size": 2,
@@ -1054,15 +1065,27 @@ class Model:
             thread.start()
             base_url = f"http://127.0.0.1:{server.server_address[1]}"
             try:
-                with urllib.request.urlopen(f"{base_url}/app.js", timeout=30) as response:
-                    app_js = response.read().decode("utf-8")
-                self.assertIn("const url = artifact.preview_url || artifact.original_url;", app_js)
-                self.assertIn("const href = artifact.original_url || url;", app_js)
-                self.assertIn('<img src="${escapeHtml(url)}" alt="${escapeHtml(label)}" loading="lazy">', app_js)
-                self.assertIn('href="${escapeHtml(item.original_url || `/api/files/${item.id}`)}"', app_js)
-                self.assertIn('src="${escapeHtml(item.preview_url || `/api/files/${item.id}`)}"', app_js)
-                self.assertIn('<video controls playsinline preload="metadata" src="${escapeHtml(previewUrl)}"', app_js)
-                self.assertIn('href="${escapeHtml(originalUrl)}"', app_js)
+                with urllib.request.urlopen(f"{base_url}/run-detail.js", timeout=30) as response:
+                    run_detail_js = response.read().decode("utf-8")
+                self.assertIn("const url = artifact.preview_url || artifact.original_url;", run_detail_js)
+                self.assertIn("const href = artifact.original_url || url;", run_detail_js)
+                self.assertIn(
+                    '<img src="${escapeHtml(url)}" alt="${escapeHtml(label)}" loading="lazy">',
+                    run_detail_js,
+                )
+                self.assertIn(
+                    'href="${escapeHtml(item.original_url || `/api/files/${item.id}`)}"',
+                    run_detail_js,
+                )
+                self.assertIn(
+                    'src="${escapeHtml(item.preview_url || `/api/files/${item.id}`)}"',
+                    run_detail_js,
+                )
+                self.assertIn(
+                    '<video controls playsinline preload="metadata" src="${escapeHtml(previewUrl)}"',
+                    run_detail_js,
+                )
+                self.assertIn('href="${escapeHtml(originalUrl)}"', run_detail_js)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -1109,13 +1132,13 @@ class Model:
             thread.start()
             base_url = f"http://127.0.0.1:{server.server_address[1]}"
             try:
-                with urllib.request.urlopen(f"{base_url}/app.js", timeout=30) as response:
-                    app_js = response.read().decode("utf-8")
+                with urllib.request.urlopen(f"{base_url}/run-detail.js", timeout=30) as response:
+                    run_detail_js = response.read().decode("utf-8")
 
-                self.assertIn("function renderOutputHealthReport(run)", app_js)
-                self.assertIn("run?.result?.output_health", app_js)
-                self.assertIn("Output health", app_js)
-                self.assertIn("renderOutputHealthReport(run)", app_js)
+                self.assertIn("function renderOutputHealthReport(run)", run_detail_js)
+                self.assertIn("run?.result?.output_health", run_detail_js)
+                self.assertIn("Output health", run_detail_js)
+                self.assertIn("renderOutputHealthReport(run)", run_detail_js)
             finally:
                 server.shutdown()
                 server.server_close()
@@ -1132,14 +1155,26 @@ class Model:
             thread.start()
             base_url = f"http://127.0.0.1:{server.server_address[1]}"
             try:
-                with urllib.request.urlopen(f"{base_url}/app.js", timeout=30) as response:
-                    app_js = response.read().decode("utf-8")
+                with urllib.request.urlopen(f"{base_url}/run-detail.js", timeout=30) as response:
+                    run_detail_js = response.read().decode("utf-8")
 
-                self.assertIn("async function loadRunVideosPage(runId, page = 1)", app_js)
-                self.assertIn("/api/runs/${runId}/videos?page=${page}&page_size=20", app_js)
-                self.assertIn("renderRunVideosPager()", app_js)
-                self.assertIn('data-run-videos-page="${Number(page.page || 1) - 1}"', app_js)
-                self.assertIn('data-run-videos-page="${Number(page.page || 1) + 1}"', app_js)
+                self.assertIn(
+                    "async function loadRunVideosPage(runId, page = 1)",
+                    run_detail_js,
+                )
+                self.assertIn(
+                    "/api/runs/${runId}/videos?page=${page}&page_size=20",
+                    run_detail_js,
+                )
+                self.assertIn("renderRunVideosPager()", run_detail_js)
+                self.assertIn(
+                    'data-run-videos-page="${Number(page.page || 1) - 1}"',
+                    run_detail_js,
+                )
+                self.assertIn(
+                    'data-run-videos-page="${Number(page.page || 1) + 1}"',
+                    run_detail_js,
+                )
             finally:
                 server.shutdown()
                 server.server_close()
@@ -1182,12 +1217,18 @@ class Model:
                 self.assertIn("preview_url", sample_detail["extra_artifacts"][0])
                 self.assertTrue(sample_detail["extra_artifacts"][0]["preview_url"].startswith("/api/files/"))
 
-                with urllib.request.urlopen(f"{base_url}/app.js", timeout=30) as response:
-                    app_js = response.read().decode("utf-8")
-                self.assertIn("expandedExtraArtifactsBySample", app_js)
-                self.assertIn('data-extra-toggle="${escapeHtml(sample.sample_id)}"', app_js)
-                self.assertIn('展开后按需加载 extra_* 预览。', app_js)
-                self.assertIn('state.expandedExtraArtifactsBySample[sample.sample_id]', app_js)
+                with urllib.request.urlopen(f"{base_url}/run-detail.js", timeout=30) as response:
+                    run_detail_js = response.read().decode("utf-8")
+                self.assertIn("expandedExtraArtifactsBySample", run_detail_js)
+                self.assertIn(
+                    'data-extra-toggle="${escapeHtml(sample.sample_id)}"',
+                    run_detail_js,
+                )
+                self.assertIn('展开后按需加载 extra_* 预览。', run_detail_js)
+                self.assertIn(
+                    'state.expandedExtraArtifactsBySample[sample.sample_id]',
+                    run_detail_js,
+                )
             finally:
                 server.shutdown()
                 server.server_close()
@@ -1204,12 +1245,18 @@ class Model:
             thread.start()
             base_url = f"http://127.0.0.1:{server.server_address[1]}"
             try:
-                with urllib.request.urlopen(f"{base_url}/app.js", timeout=30) as response:
-                    app_js = response.read().decode("utf-8")
-                self.assertIn("sample.has_artifacts === false", app_js)
-                self.assertIn("这个 Run 的产物已清理；如需重新查看预览，请重试重新生成。", app_js)
-                self.assertIn("renderCleanedArtifactsNotice", app_js)
-                self.assertIn("!detail && sample.has_artifacts !== false", app_js)
+                with urllib.request.urlopen(f"{base_url}/run-detail.js", timeout=30) as response:
+                    run_detail_js = response.read().decode("utf-8")
+                self.assertIn("sample.has_artifacts === false", run_detail_js)
+                self.assertIn(
+                    "这个 Run 的产物已清理；如需重新查看预览，请重试重新生成。",
+                    run_detail_js,
+                )
+                self.assertIn("renderCleanedArtifactsNotice", run_detail_js)
+                self.assertIn(
+                    "!detail && sample.has_artifacts !== false",
+                    run_detail_js,
+                )
             finally:
                 server.shutdown()
                 server.server_close()
@@ -1623,16 +1670,9 @@ class Model:
 
                     output_dir = Path(str(running_run["metadata"]["output_dir"]))
                     self.assertTrue(output_dir.exists())
-                    cleanup_preview = _post(
-                        base_url,
-                        "/api/run-purge/preview",
-                        {"request_type": "cleanup_artifacts", "run_ids": [run_id]},
-                    )
                     request = urllib.request.Request(
                         f"{base_url}/api/runs/{run_id}/cleanup-artifacts",
-                        data=json.dumps(
-                            {"preview_token": cleanup_preview["preview_token"]}
-                        ).encode("utf-8"),
+                        data=b"{}",
                         headers={"Content-Type": "application/json"},
                         method="POST",
                     )

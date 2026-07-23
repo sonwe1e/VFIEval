@@ -84,7 +84,15 @@ def run_finalize_job(db: Database, workspace: WorkspaceConfig, job_id: int) -> d
                 merged,
                 preview_height=preview_height,
                 preview_width=preview_width,
+                cancel_check=lambda: _require_finalizing(
+                    db,
+                    run_id,
+                    job_id,
+                    "video encoding",
+                ),
             )
+        except RunCanceled:
+            raise
         except Exception as exc:
             encoding_integrity = merge_integrity_reports(
                 "finalize",

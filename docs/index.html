@@ -604,8 +604,8 @@ code.inline {
     </div>
     <div class="card">
       <div class="card-icon"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg></div>
-      <h3>多轨对比 Compare</h3>
-      <p>同一 GT 对比多个模型的 Pred 输出，逐帧并排查看 flow / mask / warp 可视化层。</p>
+      <h3>双轨对比 Compare</h3>
+      <p>同一 GT 与 1–2 份 Pred 严格对比，逐帧并排查看 flow / mask / warp 可视化层。</p>
     </div>
     <div class="card">
       <div class="card-icon"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></div>
@@ -651,7 +651,7 @@ code.inline {
 <span class="kw">$env:</span>PYTHONPATH<span class="op">=</span><span class="str">'src'</span>
 
 <span class="cm"># 初始化工作区</span>
-python <span class="op">-m</span> vfieval.cli init <span class="op">--workspace</span> .vfieval
+python <span class="op">-m</span> vfieval.cli <span class="op">--workspace</span> .vfieval init
 
 <span class="cm"># 启动服务</span>
 python <span class="op">-m</span> vfieval.cli <span class="op">--workspace</span> .vfieval serve <span class="op">--host</span> <span class="num">127.0.0.1</span> <span class="op">--port</span> <span class="num">8765</span></code>
@@ -1295,7 +1295,7 @@ python <span class="op">-m</span> vfieval.cli <span class="op">--workspace</span
         </div>
       </div>
       <div class="callout info">
-        <div><code class="inline">prepare-metrics</code> 只下载资产文件，不安装 Python 包。<code class="inline">timm</code>、<code class="inline">safetensors</code>、<code class="inline">av</code> 等依赖需手动安装。</div>
+        <div><code class="inline">prepare-metrics</code> 只下载资产文件，不安装 Python 包。<code class="inline">--check-only</code> 不创建或迁移工作区数据库；退出码 0 表示健康或完成、2 表示能力不可用、1 表示准备或执行失败。<code class="inline">timm</code>、<code class="inline">safetensors</code>、<code class="inline">av</code> 等依赖需手动安装。</div>
       </div>
     </div></div>
   </div>
@@ -1304,22 +1304,22 @@ python <span class="op">-m</span> vfieval.cli <span class="op">--workspace</span
 <section id="modes">
   <div class="section-eyebrow">Evaluation Modes</div>
   <h2><span class="section-icon"><svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>对比与盲测</h2>
-  <p class="section-desc">除标准推理外，平台提供两种进阶评测模式：客观的多轨可视化对比，以及引入人类偏好的匿名盲测。</p>
+  <p class="section-desc">除标准推理外，平台提供两种进阶评测模式：客观的双轨可视化对比，以及引入人类偏好的匿名盲测。</p>
 
-  <h4 style="margin-bottom:12px">多轨对比 Compare</h4>
-  <p style="font-size:0.9rem; color:var(--text-secondary); margin-bottom:16px">从已完成的 Run 中挑选多个模型的 Pred 输出，与同一个 GT 逐帧并排对比。GT 取自视频组源片，Pred 各成一条 track（predA / predB / …），还能叠加 flow / mask / warp 可视化层。</p>
+  <h4 style="margin-bottom:12px">双轨对比 Compare</h4>
+  <p style="font-size:0.9rem; color:var(--text-secondary); margin-bottom:16px">从同一个 Media Item 选择 GT 与 1–2 份可复用 Pred，逐帧并排对比，并按需叠加 flow / mask / warp 可视化层。</p>
   <div class="card-grid" style="grid-template-columns: repeat(auto-fit, minmax(240px, 1fr))">
     <div class="card">
-      <h3 style="font-size:0.98rem">同源 GT，多路 Pred</h3>
-      <p>一个 GT 对比 N 个模型输出，track 标签冲突自动去重，逐帧时间线互不干扰。</p>
+      <h3 style="font-size:0.98rem">Item-first，最多双 Pred</h3>
+      <p>一个 GT Item 对比一至两个属于该 Item 的 Pred 成员，拒绝跨 Item 组合。</p>
     </div>
     <div class="card">
       <h3 style="font-size:0.98rem">可视化层</h3>
       <p>并排查看 flow / mask / warp / blend，直观定位模型在哪一步出了问题。</p>
     </div>
     <div class="card">
-      <h3 style="font-size:0.98rem">服务端资源</h3>
-      <p>GT 与 Pred 均来自服务端已有资源，不信任客户端传入的路径，保证可复现。</p>
+      <h3 style="font-size:0.98rem">严格时间身份</h3>
+      <p>源帧顺序、帧数、FPS 与可用时间戳必须一致；空间尺寸按记录指纹的 LANCZOS Alignment Plan 显式归一化。</p>
     </div>
   </div>
 
@@ -1433,7 +1433,7 @@ python <span class="op">-m</span> vfieval.cli <span class="op">--workspace</span
           <tr><td><code>GET</code></td><td>/api/video-groups</td><td>视频集列表</td></tr>
           <tr><td><code>GET</code></td><td>/api/devices</td><td>可用计算设备</td></tr>
           <tr><td><code>GET</code></td><td>/api/metrics/health</td><td>指标资产状态</td></tr>
-          <tr><td><code>GET</code></td><td>/api/health</td><td>服务健康状态</td></tr>
+          <tr><td><code>GET</code></td><td>/api/health</td><td>进程存活、readiness、队列消费者与维护状态</td></tr>
         </tbody>
       </table>
     </div></div>

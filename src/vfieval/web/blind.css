@@ -116,6 +116,22 @@ legend { margin-bottom: .55rem; font-weight: 650; }
 #toast.show { transform: translate(-50%, 0); }
 #message-panel { border-color: var(--danger); }
 
+.request-diagnostic {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  border-color: var(--danger);
+}
+
+.request-diagnostic.hidden { display: none; }
+.request-diagnostic-copy { display: flex; flex-wrap: wrap; gap: 8px; flex: 0 0 auto; }
+.request-diagnostic p { margin: 4px 0 0; }
+.request-diagnostic-ids {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
 @supports not ((clip-path: inset(0 50% 0 0)) or (-webkit-clip-path: inset(0 50% 0 0))) {
   #view-wipe { opacity: .55; cursor: not-allowed; }
   .media-grid.view-wipe + .wipe-control-shell { display: none; }

@@ -36,3 +36,59 @@ jobs:
           done
       - name: Committed whitespace check
         run: git diff --check HEAD^ HEAD
+
+  release-wheel:
+    needs: cpu-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install system media tools
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install runtime and release tools
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[test,release]"
+      - name: Build reproducible commit-identified wheel
+        env:
+          VFIEVAL_BUILD_COMMIT: ${{ github.sha }}
+        run: python tools/build_release.py --require-clean --verify-reproducible --out-dir dist
+      - name: Install wheel in an isolated environment
+        run: |
+          python -m venv .wheel-smoke
+          .wheel-smoke/bin/python -m pip install --upgrade pip
+          .wheel-smoke/bin/python -m pip install --force-reinstall dist/vfieval-*.whl
+          .wheel-smoke/bin/python -m pip check
+      - name: Smoke CLI, static assets, and service startup
+        run: |
+          cd "$RUNNER_TEMP"
+          "$GITHUB_WORKSPACE/.wheel-smoke/bin/python" "$GITHUB_WORKSPACE/tools/release_smoke.py" \
+            --expect-build-id "$GITHUB_SHA" \
+            --forbid-source-root "$GITHUB_WORKSPACE/src"
+      - name: Verify build left the checkout clean
+        run: git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vfieval-wheel-${{ github.sha }}
+          path: |
+            dist/*.whl
+            dist/*.sha256
+
+  browser-tests:
+    needs: cpu-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - name: Install locked browser-test dependencies
+        run: npm ci
+      - name: Install Chromium and required system libraries
+        run: npx playwright install --with-deps chromium
+      - name: Run real-browser workflow tests
+        run: npm run test:browser

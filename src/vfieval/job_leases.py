@@ -25,12 +25,16 @@ class JobLeaseHeartbeat:
         db: Database,
         job_id: int,
         worker_id: str,
+        attempt: int,
+        lease_token: str,
         *,
         interval_seconds: float = DEFAULT_JOB_HEARTBEAT_INTERVAL_SECONDS,
     ) -> None:
         self.db = db
         self.job_id = int(job_id)
         self.worker_id = str(worker_id)
+        self.attempt = int(attempt)
+        self.lease_token = str(lease_token)
         self.interval_seconds = max(0.05, float(interval_seconds))
         self._stop_event = threading.Event()
         self._lost_event = threading.Event()
@@ -50,7 +54,12 @@ class JobLeaseHeartbeat:
             return not self.lease_lost
         self._stop_event.clear()
         self._lost_event.clear()
-        if not self.db.heartbeat_job(self.job_id, self.worker_id):
+        if not self.db.heartbeat_job(
+            self.job_id,
+            self.worker_id,
+            self.attempt,
+            self.lease_token,
+        ):
             self._lost_event.set()
             return False
         self._thread = threading.Thread(
@@ -72,7 +81,12 @@ class JobLeaseHeartbeat:
     def _run(self) -> None:
         while not self._stop_event.wait(self.interval_seconds):
             try:
-                accepted = self.db.heartbeat_job(self.job_id, self.worker_id)
+                accepted = self.db.heartbeat_job(
+                    self.job_id,
+                    self.worker_id,
+                    self.attempt,
+                    self.lease_token,
+                )
             except Exception as exc:  # SQLite contention is retried on the next pulse.
                 self._last_error = f"{type(exc).__name__}: {exc}"
                 continue

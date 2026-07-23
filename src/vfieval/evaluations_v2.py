@@ -12,10 +12,11 @@ import statistics
 import threading
 import time
 import uuid
+import weakref
 from collections import Counter, defaultdict
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from urllib.parse import quote
 
 from PIL import Image
@@ -47,7 +48,13 @@ from vfieval.pipeline.evaluation_freeze import (
     freeze_campaign_media,
 )
 from vfieval.run_cleanup import cache_lease
+from vfieval.selection_tokens import resolve_selection_snapshot
 from vfieval.storage_budget import campaign_requested_bytes, ensure_storage_capacity
+from vfieval.submissions import (
+    SubmissionConflict,
+    idempotent_create,
+    submission_fingerprint,
+)
 
 
 LEGACY_COPY_FREEZE_PIPELINE_VERSION = "campaign-freeze-legacy-copy-v1"
@@ -198,6 +205,24 @@ CREATE TABLE IF NOT EXISTS evaluation_purge_requests_v2 (
     updated_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS media_item_selection_snapshots (
+    token_hash TEXT PRIMARY KEY,
+    collection_id INTEGER NOT NULL,
+    query_text TEXT NOT NULL DEFAULT '',
+    item_count INTEGER NOT NULL CHECK(item_count >= 0),
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS media_item_selection_snapshot_items (
+    token_hash TEXT NOT NULL
+        REFERENCES media_item_selection_snapshots(token_hash) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+    media_item_id INTEGER NOT NULL,
+    PRIMARY KEY(token_hash, ordinal),
+    UNIQUE(token_hash, media_item_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_eval_methods_v2_run
 ON evaluation_methods_v2(source_run_id, source_track_label);
 CREATE INDEX IF NOT EXISTS idx_eval_items_v2_campaign
@@ -214,6 +239,10 @@ CREATE INDEX IF NOT EXISTS idx_eval_votes_v2_evaluator
 ON evaluation_votes_v2(evaluator_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_eval_purge_requests_v2_status
 ON evaluation_purge_requests_v2(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_media_item_selection_snapshots_expiry
+ON media_item_selection_snapshots(expires_at);
+CREATE INDEX IF NOT EXISTS idx_media_item_selection_snapshot_items_item
+ON media_item_selection_snapshot_items(media_item_id, token_hash);
 """
 
 
@@ -245,6 +274,12 @@ PREPARATION_CLAIM_STALE_SECONDS = 10 * 60
 CAMPAIGN_PURGE_CLAIM_STALE_SECONDS = 10 * 60
 _PREPARATION_RUNNER_LOCK = threading.Lock()
 _PUBLISH_REQUEST_LOCK = threading.Lock()
+CAMPAIGN_V2_SCHEMA_VERSION = "2026-07-campaign-v2-selection-snapshots"
+_CAMPAIGN_SCHEMA_LOCK = threading.Lock()
+_CAMPAIGN_SCHEMA_READY: weakref.WeakSet[Database] = weakref.WeakSet()
+_CAMPAIGN_SUMMARY_STATUSES = frozenset(
+    {"draft", "preparing", "published", "failed", "closed", "archived"}
+)
 
 
 def _json(value: Any) -> str:
@@ -258,69 +293,313 @@ def _loads(value: str | None, default: Any | None = None) -> Any:
 
 
 def ensure_v2_schema(db: Database) -> None:
-    """Install V2 tables without modifying or guessing at legacy campaign rows."""
-    _ensure_evaluation_package_media_kind(db)
-    _ensure_evaluation_methods_v2_slots(db)
-    with db.connection() as conn:
-        conn.executescript(CAMPAIGN_V2_SCHEMA)
+    """Apply Campaign V2 migrations once per database, with backup and validation."""
+
+    if db in _CAMPAIGN_SCHEMA_READY:
+        return
+    with _CAMPAIGN_SCHEMA_LOCK:
+        if db in _CAMPAIGN_SCHEMA_READY:
+            return
+        if _campaign_schema_version_applied(db):
+            _CAMPAIGN_SCHEMA_READY.add(db)
+            return
+        _backup_before_campaign_schema_upgrade(db)
+        conn = db.connect()
+        try:
+            _begin_campaign_schema_transaction(conn)
+            # Another process may have completed the migration while this
+            # process was making the backup and waiting for the exclusive lock.
+            if not _campaign_schema_version_applied_on_connection(conn):
+                _apply_v2_schema(db, conn)
+                _validate_v2_schema(conn)
+                _validate_campaign_foreign_keys(conn)
+                conn.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (CAMPAIGN_V2_SCHEMA_VERSION, utc_ts()),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            _rollback_campaign_schema_transaction(conn)
+            raise
+        finally:
+            _restore_campaign_schema_pragmas(conn)
+            conn.close()
+        _CAMPAIGN_SCHEMA_READY.add(db)
+
+
+def _campaign_schema_version_applied_on_connection(conn: sqlite3.Connection) -> bool:
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+    ).fetchone()
+    if has_table is None:
+        return False
+    return (
+        conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version = ?",
+            (CAMPAIGN_V2_SCHEMA_VERSION,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _begin_campaign_schema_transaction(conn: sqlite3.Connection) -> None:
+    # Both table-rebuild migrations rely on legacy rename behavior so child
+    # foreign keys continue to reference the replacement table name.
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    conn.execute("BEGIN EXCLUSIVE")
+
+
+def _rollback_campaign_schema_transaction(conn: sqlite3.Connection) -> None:
+    if not conn.in_transaction:
+        return
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.Error:
+        # Preserve the original migration exception. Closing the connection is
+        # still a final rollback boundary if SQLite rejected the explicit one.
+        pass
+
+
+def _restore_campaign_schema_pragmas(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("PRAGMA legacy_alter_table=OFF")
+        conn.execute("PRAGMA foreign_keys=ON")
+    except sqlite3.Error:
+        pass
+
+
+def _validate_campaign_foreign_keys(conn: sqlite3.Connection) -> None:
+    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError(
+            "Campaign V2 migration failed foreign-key validation: "
+            f"{len(violations)} violation(s)"
+        )
+
+
+def _run_campaign_schema_step(
+    db: Database,
+    operation: Callable[[sqlite3.Connection], None],
+    *,
+    validate_schema: bool = False,
+) -> None:
+    """Keep legacy helper entry points atomic when called directly."""
+
+    conn = db.connect()
+    try:
+        _begin_campaign_schema_transaction(conn)
+        operation(conn)
+        if validate_schema:
+            _validate_v2_schema(conn)
+        _validate_campaign_foreign_keys(conn)
+        conn.execute("COMMIT")
+    except Exception:
+        _rollback_campaign_schema_transaction(conn)
+        raise
+    finally:
+        _restore_campaign_schema_pragmas(conn)
+        conn.close()
+
+
+def _iter_sql_statements(script: str) -> Iterable[str]:
+    """Yield complete statements so sqlite3 executescript cannot auto-commit."""
+
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if not sqlite3.complete_statement(buffer):
+            continue
+        statement = buffer.strip()
+        buffer = ""
+        if statement:
+            yield statement
+    if buffer.strip():
+        raise RuntimeError("Campaign V2 schema contains an incomplete SQL statement")
+
+
+def _execute_schema_statements(conn: sqlite3.Connection, script: str) -> None:
+    for statement in _iter_sql_statements(script):
+        conn.execute(statement)
+
+
+def _validate_v2_schema(conn: sqlite3.Connection) -> None:
+    required_columns = {
+        "evaluation_campaigns_v2": {"name"},
+        "evaluation_preparations_v2": {"claim_token"},
+        "evaluation_purge_requests_v2": {"claim_token"},
+        "evaluation_items_v2": {"media_item_id"},
+        "evaluation_bindings_v2": {"source_member_id", "frozen_member_id"},
+        "evaluation_votes_v2": {"rating_a", "rating_b"},
+    }
+    for table_name, expected_columns in required_columns.items():
         columns = {
             str(row["name"])
-            for row in conn.execute("PRAGMA table_info(evaluation_campaigns_v2)").fetchall()
+            for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
         }
-        if "name" not in columns:
-            conn.execute("ALTER TABLE evaluation_campaigns_v2 ADD COLUMN name TEXT NOT NULL DEFAULT ''")
-            conn.execute(
-                "UPDATE evaluation_campaigns_v2 SET name = public_title WHERE name = ''"
+        missing = sorted(expected_columns - columns)
+        if missing:
+            raise RuntimeError(
+                f"Campaign V2 migration validation failed: {table_name} "
+                f"is missing column(s) {', '.join(missing)}"
             )
-        preparation_columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(evaluation_preparations_v2)").fetchall()
-        }
-        if "claim_token" not in preparation_columns:
-            conn.execute(
-                "ALTER TABLE evaluation_preparations_v2 ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''"
-            )
-        purge_columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(evaluation_purge_requests_v2)").fetchall()
-        }
-        if "claim_token" not in purge_columns:
-            conn.execute(
-                "ALTER TABLE evaluation_purge_requests_v2 ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''"
-            )
-        item_columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(evaluation_items_v2)").fetchall()
-        }
-        if "media_item_id" not in item_columns:
-            conn.execute("ALTER TABLE evaluation_items_v2 ADD COLUMN media_item_id INTEGER")
-        binding_columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(evaluation_bindings_v2)").fetchall()
-        }
-        if "source_member_id" not in binding_columns:
-            conn.execute("ALTER TABLE evaluation_bindings_v2 ADD COLUMN source_member_id INTEGER")
-        if "frozen_member_id" not in binding_columns:
-            conn.execute("ALTER TABLE evaluation_bindings_v2 ADD COLUMN frozen_member_id INTEGER")
-        vote_columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(evaluation_votes_v2)").fetchall()
-        }
-        if "rating_a" not in vote_columns:
-            conn.execute("ALTER TABLE evaluation_votes_v2 ADD COLUMN rating_a REAL")
-        if "rating_b" not in vote_columns:
-            conn.execute("ALTER TABLE evaluation_votes_v2 ADD COLUMN rating_b REAL")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_eval_items_v2_media_item "
-            "ON evaluation_items_v2(media_item_id, campaign_id)"
+
+    media_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'media_assets'"
+    ).fetchone()
+    if media_sql_row is None or "evaluation_package" not in str(media_sql_row["sql"] or ""):
+        raise RuntimeError(
+            "Campaign V2 migration validation failed: media_assets source_kind "
+            "does not accept evaluation_package"
         )
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_eval_bindings_v2_source_member "
-            "ON evaluation_bindings_v2(source_member_id, item_id)"
+    methods_sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'evaluation_methods_v2'"
+    ).fetchone()
+    if methods_sql_row is None or "'c'" not in str(methods_sql_row["sql"] or ""):
+        raise RuntimeError(
+            "Campaign V2 migration validation failed: evaluation method slots "
+            "were not upgraded"
+        )
+    temporary_tables = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ("
+        "'media_assets_before_evaluation_v2', "
+        "'evaluation_methods_v2_slots_upgrade'"
+        ")"
+    ).fetchall()
+    if temporary_tables:
+        names = ", ".join(str(row["name"]) for row in temporary_tables)
+        raise RuntimeError(
+            f"Campaign V2 migration validation failed: temporary table(s) remain: {names}"
+        )
+    integrity_rows = conn.execute("PRAGMA integrity_check").fetchall()
+    integrity_errors = [
+        str(row[0]) for row in integrity_rows if str(row[0]).casefold() != "ok"
+    ]
+    if integrity_errors:
+        raise RuntimeError(
+            "Campaign V2 migration failed integrity validation: "
+            + "; ".join(integrity_errors[:5])
         )
 
 
-def _ensure_evaluation_methods_v2_slots(db: Database) -> None:
+def _campaign_schema_version_applied(db: Database) -> bool:
+    with db.connection() as conn:
+        return _campaign_schema_version_applied_on_connection(conn)
+
+
+def _backup_before_campaign_schema_upgrade(db: Database) -> Path | None:
+    with db.connection() as conn:
+        table_names = {
+            str(row["name"])
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name IN ('runs', 'media_assets', 'evaluation_campaigns_v2')"
+            ).fetchall()
+        }
+        has_user_state = "evaluation_campaigns_v2" in table_names
+        for table_name in ("runs", "media_assets"):
+            if table_name in table_names:
+                row = conn.execute(f"SELECT 1 FROM {table_name} LIMIT 1").fetchone()
+                has_user_state = has_user_state or row is not None
+        if not has_user_state or not db.db_path.exists():
+            return None
+        conn.execute("PRAGMA wal_checkpoint(FULL)")
+
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+    backup_dir = db.db_path.parent / "backups" / f"{stamp}_campaign_v2"
+    if backup_dir.exists():
+        backup_dir = backup_dir.with_name(f"{backup_dir.name}_{uuid.uuid4().hex[:8]}")
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    target = backup_dir / db.db_path.name
+    shutil.copy2(db.db_path, target)
+    return target
+
+
+def _apply_v2_schema(
+    db: Database,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """Install V2 tables without modifying or guessing at legacy campaign rows."""
+    if conn is None:
+        _run_campaign_schema_step(
+            db,
+            lambda active_conn: _apply_v2_schema(db, active_conn),
+            validate_schema=True,
+        )
+        return
+
+    _ensure_evaluation_package_media_kind(db, conn)
+    _ensure_evaluation_methods_v2_slots(db, conn)
+    _execute_schema_statements(conn, CAMPAIGN_V2_SCHEMA)
+    columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(evaluation_campaigns_v2)").fetchall()
+    }
+    if "name" not in columns:
+        conn.execute(
+            "ALTER TABLE evaluation_campaigns_v2 "
+            "ADD COLUMN name TEXT NOT NULL DEFAULT ''"
+        )
+        conn.execute("UPDATE evaluation_campaigns_v2 SET name = public_title WHERE name = ''")
+    preparation_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(evaluation_preparations_v2)").fetchall()
+    }
+    if "claim_token" not in preparation_columns:
+        conn.execute(
+            "ALTER TABLE evaluation_preparations_v2 "
+            "ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''"
+        )
+    purge_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(evaluation_purge_requests_v2)").fetchall()
+    }
+    if "claim_token" not in purge_columns:
+        conn.execute(
+            "ALTER TABLE evaluation_purge_requests_v2 "
+            "ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''"
+        )
+    item_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(evaluation_items_v2)").fetchall()
+    }
+    if "media_item_id" not in item_columns:
+        conn.execute("ALTER TABLE evaluation_items_v2 ADD COLUMN media_item_id INTEGER")
+    binding_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(evaluation_bindings_v2)").fetchall()
+    }
+    if "source_member_id" not in binding_columns:
+        conn.execute(
+            "ALTER TABLE evaluation_bindings_v2 ADD COLUMN source_member_id INTEGER"
+        )
+    if "frozen_member_id" not in binding_columns:
+        conn.execute(
+            "ALTER TABLE evaluation_bindings_v2 ADD COLUMN frozen_member_id INTEGER"
+        )
+    vote_columns = {
+        str(row["name"])
+        for row in conn.execute("PRAGMA table_info(evaluation_votes_v2)").fetchall()
+    }
+    if "rating_a" not in vote_columns:
+        conn.execute("ALTER TABLE evaluation_votes_v2 ADD COLUMN rating_a REAL")
+    if "rating_b" not in vote_columns:
+        conn.execute("ALTER TABLE evaluation_votes_v2 ADD COLUMN rating_b REAL")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_eval_items_v2_media_item "
+        "ON evaluation_items_v2(media_item_id, campaign_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_eval_bindings_v2_source_member "
+        "ON evaluation_bindings_v2(source_member_id, item_id)"
+    )
+
+
+def _ensure_evaluation_methods_v2_slots(
+    db: Database,
+    conn: sqlite3.Connection | None = None,
+) -> None:
     """Expand the slot CHECK from ('a','b') to ('a','b','c','d','e').
 
     SQLite cannot alter CHECK constraints in-place.  The migration follows the
@@ -329,169 +608,139 @@ def _ensure_evaluation_methods_v2_slots(db: Database) -> None:
     The UNIQUE index on (campaign_id, slot) is rebuilt automatically via the
     new table definition.
     """
-    conn = db.connect()
-    try:
-        sql_row = conn.execute(
-            "SELECT sql FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'evaluation_methods_v2'"
-        ).fetchone()
-        current_sql = str(sql_row["sql"] or "") if sql_row else ""
-        # Already upgraded or table doesn't exist yet — nothing to do.
-        if not current_sql or "'c'" in current_sql:
-            return
-        conn.execute("PRAGMA foreign_keys=OFF")
-        conn.execute("PRAGMA legacy_alter_table=ON")
-        conn.execute("BEGIN EXCLUSIVE")
-        # Re-check under the exclusive lock.
-        sql_row = conn.execute(
-            "SELECT sql FROM sqlite_master "
-            "WHERE type = 'table' AND name = 'evaluation_methods_v2'"
-        ).fetchone()
-        current_sql = str(sql_row["sql"] or "") if sql_row else ""
-        if current_sql and "'c'" not in current_sql:
-            conn.execute(
-                "ALTER TABLE evaluation_methods_v2 "
-                "RENAME TO evaluation_methods_v2_slots_upgrade"
-            )
-            conn.execute(
-                """
-                CREATE TABLE evaluation_methods_v2 (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    campaign_id INTEGER NOT NULL
-                        REFERENCES evaluation_campaigns_v2(id) ON DELETE CASCADE,
-                    slot TEXT NOT NULL CHECK(slot IN ('a', 'b', 'c', 'd', 'e')),
-                    source_kind TEXT NOT NULL CHECK(source_kind IN ('run_track', 'upload')),
-                    source_run_id INTEGER,
-                    source_track_label TEXT NOT NULL DEFAULT '',
-                    label_snapshot TEXT NOT NULL,
-                    model_snapshot TEXT NOT NULL DEFAULT '',
-                    checkpoint_snapshot TEXT NOT NULL DEFAULT '',
-                    source_spec_json TEXT NOT NULL DEFAULT '{}',
-                    created_at REAL NOT NULL,
-                    UNIQUE(campaign_id, slot)
-                )
-                """
-            )
-            conn.execute(
-                """
-                INSERT INTO evaluation_methods_v2(
-                    id, campaign_id, slot, source_kind, source_run_id,
-                    source_track_label, label_snapshot, model_snapshot,
-                    checkpoint_snapshot, source_spec_json, created_at
-                )
-                SELECT
-                    id, campaign_id, slot, source_kind, source_run_id,
-                    source_track_label, label_snapshot, model_snapshot,
-                    checkpoint_snapshot, source_spec_json, created_at
-                FROM evaluation_methods_v2_slots_upgrade
-                """
-            )
-            conn.execute("DROP TABLE evaluation_methods_v2_slots_upgrade")
-        conn.execute("COMMIT")
-    except Exception:
-        try:
-            conn.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
-    finally:
-        try:
-            conn.execute("PRAGMA legacy_alter_table=OFF")
-            conn.execute("PRAGMA foreign_keys=ON")
-        except Exception:
-            pass
-        conn.close()
+    if conn is None:
+        _run_campaign_schema_step(
+            db,
+            lambda active_conn: _ensure_evaluation_methods_v2_slots(db, active_conn),
+        )
+        return
+
+    sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master "
+        "WHERE type = 'table' AND name = 'evaluation_methods_v2'"
+    ).fetchone()
+    current_sql = str(sql_row["sql"] or "") if sql_row else ""
+    if not current_sql or "'c'" in current_sql:
+        return
+    conn.execute(
+        "ALTER TABLE evaluation_methods_v2 "
+        "RENAME TO evaluation_methods_v2_slots_upgrade"
+    )
+    conn.execute(
+        """
+        CREATE TABLE evaluation_methods_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_id INTEGER NOT NULL
+                REFERENCES evaluation_campaigns_v2(id) ON DELETE CASCADE,
+            slot TEXT NOT NULL CHECK(slot IN ('a', 'b', 'c', 'd', 'e')),
+            source_kind TEXT NOT NULL CHECK(source_kind IN ('run_track', 'upload')),
+            source_run_id INTEGER,
+            source_track_label TEXT NOT NULL DEFAULT '',
+            label_snapshot TEXT NOT NULL,
+            model_snapshot TEXT NOT NULL DEFAULT '',
+            checkpoint_snapshot TEXT NOT NULL DEFAULT '',
+            source_spec_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            UNIQUE(campaign_id, slot)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO evaluation_methods_v2(
+            id, campaign_id, slot, source_kind, source_run_id,
+            source_track_label, label_snapshot, model_snapshot,
+            checkpoint_snapshot, source_spec_json, created_at
+        )
+        SELECT
+            id, campaign_id, slot, source_kind, source_run_id,
+            source_track_label, label_snapshot, model_snapshot,
+            checkpoint_snapshot, source_spec_json, created_at
+        FROM evaluation_methods_v2_slots_upgrade
+        """
+    )
+    conn.execute("DROP TABLE evaluation_methods_v2_slots_upgrade")
 
 
-def _ensure_evaluation_package_media_kind(db: Database) -> None:
+def _ensure_evaluation_package_media_kind(
+    db: Database,
+    conn: sqlite3.Connection | None = None,
+) -> None:
     """Expand the media identity CHECK while retaining ids and foreign keys.
 
     SQLite cannot alter CHECK constraints in place.  The migration uses its
     documented legacy rename mode so child foreign keys continue to reference
     the replacement ``media_assets`` table rather than the temporary name.
     """
-    conn = db.connect()
-    try:
-        sql_row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'media_assets'"
-        ).fetchone()
-        if sql_row is None or "evaluation_package" in str(sql_row["sql"] or ""):
-            return
-        conn.execute("PRAGMA foreign_keys=OFF")
-        conn.execute("PRAGMA legacy_alter_table=ON")
-        conn.execute("BEGIN EXCLUSIVE")
-        sql_row = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'media_assets'"
-        ).fetchone()
-        if sql_row is not None and "evaluation_package" not in str(sql_row["sql"] or ""):
-            conn.execute("ALTER TABLE media_assets RENAME TO media_assets_before_evaluation_v2")
-            conn.execute(
-                """
-                CREATE TABLE media_assets (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    collection_id INTEGER REFERENCES media_collections(id) ON DELETE SET NULL,
-                    source_key TEXT NOT NULL UNIQUE,
-                    source_kind TEXT NOT NULL CHECK(source_kind IN (
-                        'folder', 'upload', 'run_artifact', 'evaluation_package'
-                    )),
-                    media_kind TEXT NOT NULL CHECK(media_kind IN ('video', 'frame_sequence')),
-                    role TEXT NOT NULL CHECK(role IN ('source', 'gt', 'pred')),
-                    display_name TEXT NOT NULL,
-                    original_name TEXT NOT NULL DEFAULT '',
-                    state TEXT NOT NULL DEFAULT 'ready',
-                    content_sha256 TEXT,
-                    size_bytes INTEGER NOT NULL DEFAULT 0,
-                    storage_path TEXT NOT NULL,
-                    mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
-                    frame_count INTEGER NOT NULL DEFAULT 0,
-                    width INTEGER NOT NULL DEFAULT 0,
-                    height INTEGER NOT NULL DEFAULT 0,
-                    fps REAL,
-                    provenance_json TEXT NOT NULL DEFAULT '{}',
-                    metadata_json TEXT NOT NULL DEFAULT '{}',
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    deleted_at REAL,
-                    UNIQUE(collection_id, display_name)
-                )
-                """
-            )
-            conn.execute(
-                """
-                INSERT INTO media_assets(
-                    id, collection_id, source_key, source_kind, media_kind, role,
-                    display_name, original_name, state, content_sha256, size_bytes,
-                    storage_path, mime_type, frame_count, width, height, fps,
-                    provenance_json, metadata_json, created_at, updated_at, deleted_at
-                )
-                SELECT id, collection_id, source_key, source_kind, media_kind, role,
-                       display_name, original_name, state, content_sha256, size_bytes,
-                       storage_path, mime_type, frame_count, width, height, fps,
-                       provenance_json, metadata_json, created_at, updated_at, deleted_at
-                FROM media_assets_before_evaluation_v2
-                """
-            )
-            conn.execute("DROP TABLE media_assets_before_evaluation_v2")
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_media_assets_catalog
-                ON media_assets(state, role, source_kind, collection_id, display_name)
-                """
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_media_assets_hash ON media_assets(content_sha256)"
-            )
-        conn.commit()
-        conn.execute("PRAGMA legacy_alter_table=OFF")
-        conn.execute("PRAGMA foreign_keys=ON")
-        violations = conn.execute("PRAGMA foreign_key_check").fetchall()
-        if violations:
-            raise RuntimeError("media_assets evaluation-package migration broke foreign keys")
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+    if conn is None:
+        _run_campaign_schema_step(
+            db,
+            lambda active_conn: _ensure_evaluation_package_media_kind(db, active_conn),
+        )
+        return
+
+    sql_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'media_assets'"
+    ).fetchone()
+    if sql_row is None or "evaluation_package" in str(sql_row["sql"] or ""):
+        return
+    conn.execute("ALTER TABLE media_assets RENAME TO media_assets_before_evaluation_v2")
+    conn.execute(
+        """
+        CREATE TABLE media_assets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            collection_id INTEGER REFERENCES media_collections(id) ON DELETE SET NULL,
+            source_key TEXT NOT NULL UNIQUE,
+            source_kind TEXT NOT NULL CHECK(source_kind IN (
+                'folder', 'upload', 'run_artifact', 'evaluation_package'
+            )),
+            media_kind TEXT NOT NULL CHECK(media_kind IN ('video', 'frame_sequence')),
+            role TEXT NOT NULL CHECK(role IN ('source', 'gt', 'pred')),
+            display_name TEXT NOT NULL,
+            original_name TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL DEFAULT 'ready',
+            content_sha256 TEXT,
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            storage_path TEXT NOT NULL,
+            mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+            frame_count INTEGER NOT NULL DEFAULT 0,
+            width INTEGER NOT NULL DEFAULT 0,
+            height INTEGER NOT NULL DEFAULT 0,
+            fps REAL,
+            provenance_json TEXT NOT NULL DEFAULT '{}',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            deleted_at REAL,
+            UNIQUE(collection_id, display_name)
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO media_assets(
+            id, collection_id, source_key, source_kind, media_kind, role,
+            display_name, original_name, state, content_sha256, size_bytes,
+            storage_path, mime_type, frame_count, width, height, fps,
+            provenance_json, metadata_json, created_at, updated_at, deleted_at
+        )
+        SELECT id, collection_id, source_key, source_kind, media_kind, role,
+               display_name, original_name, state, content_sha256, size_bytes,
+               storage_path, mime_type, frame_count, width, height, fps,
+               provenance_json, metadata_json, created_at, updated_at, deleted_at
+        FROM media_assets_before_evaluation_v2
+        """
+    )
+    conn.execute("DROP TABLE media_assets_before_evaluation_v2")
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_media_assets_catalog
+        ON media_assets(state, role, source_kind, collection_id, display_name)
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_media_assets_hash ON media_assets(content_sha256)"
+    )
 
 
 def _token() -> str:
@@ -1271,20 +1520,33 @@ def _campaign_item_alignment(
     return plan, reference, decoded
 
 
-def _preview_item_campaign_v2(
-    db: Database,
-    workspace: WorkspaceConfig,
-    body: dict[str, Any],
-) -> dict[str, Any]:
+def _campaign_media_item_ids(db: Database, body: dict[str, Any]) -> list[int]:
     raw_item_ids = body.get("media_item_ids")
+    selection_token = str(body.get("selection_token") or "").strip()
+    if raw_item_ids is not None and selection_token:
+        raise ValueError("provide either media_item_ids or selection_token, not both")
+    if selection_token:
+        snapshot = resolve_selection_snapshot(db, selection_token, require_non_empty=True)
+        return [int(value) for value in snapshot["media_item_ids"]]
     if not isinstance(raw_item_ids, list) or not raw_item_ids:
-        raise ValueError("Campaign V2 requires a non-empty media_item_ids list")
+        raise ValueError(
+            "Campaign V2 requires a non-empty media_item_ids list or selection_token"
+        )
     try:
         item_ids = list(dict.fromkeys(int(value) for value in raw_item_ids))
     except (TypeError, ValueError) as exc:
         raise ValueError("media_item_ids must contain positive integers") from exc
     if any(value <= 0 for value in item_ids):
         raise ValueError("media_item_ids must contain positive integers")
+    return item_ids
+
+
+def _preview_item_campaign_v2(
+    db: Database,
+    workspace: WorkspaceConfig,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    item_ids = _campaign_media_item_ids(db, body)
     items = [get_media_item(db, item_id) for item_id in item_ids]
     collection_ids = {int(item["collection_id"]) for item in items}
     if len(collection_ids) != 1:
@@ -1424,7 +1686,7 @@ def _preview_item_campaign_v2(
 
 def preview_campaign_v2(db: Database, workspace: WorkspaceConfig, body: dict[str, Any]) -> dict[str, Any]:
     ensure_v2_schema(db)
-    if body.get("media_item_ids") is not None:
+    if body.get("media_item_ids") is not None or "selection_token" in body:
         return _preview_item_campaign_v2(db, workspace, body)
     methods = _normalize_method_specs(body)
     left = _method_output_rows(db, workspace, methods[0])
@@ -1543,7 +1805,7 @@ def _create_item_campaign_v2(
     target_votes = int(body.get("target_votes") or 3)
     if target_votes < 1 or target_votes > 1000:
         raise ValueError("target_votes must be between 1 and 1000")
-    requested_ids = [int(value) for value in body.get("media_item_ids") or []]
+    requested_ids = _campaign_media_item_ids(db, body)
     rows_by_id = {int(row["media_item_id"]): row for row in preview["items"]}
     selected_rows = [rows_by_id[item_id] for item_id in requested_ids if item_id in rows_by_id]
     if len(selected_rows) != len(set(requested_ids)):
@@ -1573,6 +1835,7 @@ def _create_item_campaign_v2(
             "evaluation_contract": MIDPOINT_TRIPLET_CONTRACT,
         }
     )
+    _persist_campaign_submission_marker(config, body)
     with db.connection() as conn:
         cur = conn.execute(
             """
@@ -1653,9 +1916,13 @@ def _create_item_campaign_v2(
     return get_campaign_v2(db, campaign_id)
 
 
-def create_campaign_v2(db: Database, workspace: WorkspaceConfig, body: dict[str, Any]) -> dict[str, Any]:
+def _create_campaign_v2_once(
+    db: Database,
+    workspace: WorkspaceConfig,
+    body: dict[str, Any],
+) -> dict[str, Any]:
     ensure_v2_schema(db)
-    if body.get("media_item_ids") is not None:
+    if body.get("media_item_ids") is not None or "selection_token" in body:
         return _create_item_campaign_v2(db, workspace, body)
     preview = preview_campaign_v2(db, workspace, body)
     name = str(body.get("name") or "").strip()
@@ -1688,6 +1955,7 @@ def create_campaign_v2(db: Database, workspace: WorkspaceConfig, body: dict[str,
     seed = int(body.get("seed") if body.get("seed") is not None else random.SystemRandom().randrange(2**31))
     config = dict(body.get("metadata") or {})
     config["evaluation_contract"] = MIDPOINT_TRIPLET_CONTRACT
+    _persist_campaign_submission_marker(config, body)
     with db.connection() as conn:
         cur = conn.execute(
             """
@@ -1768,6 +2036,83 @@ def create_campaign_v2(db: Database, workspace: WorkspaceConfig, body: dict[str,
     return get_campaign_v2(db, campaign_id)
 
 
+def create_campaign_v2(
+    db: Database,
+    workspace: WorkspaceConfig,
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    ensure_v2_schema(db)
+    submission_id = str(body.get("submission_id") or "").strip()
+    create_body = dict(body)
+    if submission_id:
+        create_body["_submission_marker"] = {
+            "submission_id": submission_id,
+            "request_fingerprint": submission_fingerprint(body),
+        }
+    return idempotent_create(
+        db,
+        scope="campaign",
+        body=body,
+        resource_type="campaign",
+        create=lambda: _create_campaign_v2_once(db, workspace, create_body),
+        resource_id=lambda campaign: int(campaign["id"]),
+        replay=lambda campaign_id: get_campaign_v2(db, campaign_id),
+        mark_replay=lambda campaign, replayed, submission_id: {
+            **campaign,
+            "submission_id": submission_id,
+            "idempotent_replay": bool(replayed),
+        },
+        recover=lambda recovered_submission_id, fingerprint: _recover_campaign_submission(
+            db,
+            recovered_submission_id,
+            fingerprint,
+        ),
+    )
+
+
+def _persist_campaign_submission_marker(
+    config: dict[str, Any],
+    body: dict[str, Any],
+) -> None:
+    marker = body.get("_submission_marker")
+    if not isinstance(marker, dict):
+        return
+    submission_id = str(marker.get("submission_id") or "").strip()
+    fingerprint = str(marker.get("request_fingerprint") or "").strip()
+    if not submission_id or not fingerprint:
+        return
+    config["_submission"] = {
+        "submission_id": submission_id,
+        "request_fingerprint": fingerprint,
+    }
+
+
+def _recover_campaign_submission(
+    db: Database,
+    submission_id: str,
+    fingerprint: str,
+) -> dict[str, Any] | None:
+    rows = db.query(
+        """
+        SELECT id
+        FROM evaluation_campaigns_v2
+        WHERE json_extract(config_json, '$._submission.submission_id') = ?
+          AND json_extract(config_json, '$._submission.request_fingerprint') = ?
+        ORDER BY id
+        LIMIT 2
+        """,
+        (str(submission_id), str(fingerprint)),
+    )
+    if not rows:
+        return None
+    if len(rows) > 1:
+        raise SubmissionConflict(
+            "submission marker resolved to more than one Campaign",
+            code="submission_resource_ambiguous",
+        )
+    return get_campaign_v2(db, int(rows[0]["id"]))
+
+
 def _decode_json_fields(row: dict[str, Any], names: Iterable[str]) -> dict[str, Any]:
     for name in names:
         row[name.removesuffix("_json")] = _loads(row.pop(name, None))
@@ -1845,6 +2190,243 @@ def list_campaigns_v2(db: Database) -> list[dict[str, Any]]:
         get_campaign_v2(db, int(row["id"]))
         for row in db.query("SELECT id FROM evaluation_campaigns_v2 ORDER BY id DESC")
     ]
+
+
+def _campaign_summary_statuses(
+    value: str | Iterable[str],
+) -> tuple[str, ...]:
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return ()
+        parts = [part.strip() for part in raw.split(",")]
+    else:
+        parts = [str(part).strip() for part in value]
+        if not parts:
+            return ()
+    if any(not part for part in parts):
+        raise ValueError("campaign status filter contains an empty value")
+    statuses = tuple(dict.fromkeys(parts))
+    if any(status not in _CAMPAIGN_SUMMARY_STATUSES for status in statuses):
+        allowed = ", ".join(sorted(_CAMPAIGN_SUMMARY_STATUSES))
+        raise ValueError(f"campaign status filter must use only: {allowed}")
+    return statuses
+
+
+def list_campaign_summaries_v2(
+    db: Database,
+    *,
+    query: str = "",
+    status: str | Iterable[str] = "",
+) -> list[dict[str, Any]]:
+    """Return list-only Campaign V2 rows without loading bindings or analysis."""
+
+    ensure_v2_schema(db)
+    clauses: list[str] = []
+    params: list[Any] = []
+    query = str(query or "").strip()
+    if query:
+        pattern = f"%{query}%"
+        clauses.append(
+            "(c.name LIKE ? OR c.public_title LIKE ? OR CAST(c.id AS TEXT) = ?)"
+        )
+        params.extend((pattern, pattern, query.lstrip("#")))
+    statuses = _campaign_summary_statuses(status)
+    if statuses:
+        placeholders = ", ".join("?" for _ in statuses)
+        clauses.append(f"c.status IN ({placeholders})")
+        params.extend(statuses)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = db.query(
+        f"""
+        SELECT
+            c.id,
+            c.public_token,
+            c.name,
+            c.public_title,
+            c.status,
+            c.target_votes,
+            c.vote_revision,
+            c.created_at,
+            c.updated_at,
+            c.published_at,
+            c.closed_at,
+            c.archived_at,
+            p.state AS preparation_status,
+            COALESCE(items.item_count, 0) AS item_count,
+            COALESCE(tasks.task_count, 0) AS task_count,
+            COALESCE(votes.vote_count, 0) AS vote_count
+        FROM evaluation_campaigns_v2 c
+        LEFT JOIN evaluation_preparations_v2 p ON p.campaign_id = c.id
+        LEFT JOIN (
+            SELECT campaign_id, COUNT(*) AS item_count
+            FROM evaluation_items_v2
+            GROUP BY campaign_id
+        ) items ON items.campaign_id = c.id
+        LEFT JOIN (
+            SELECT campaign_id, COUNT(*) AS task_count
+            FROM evaluation_tasks_v2
+            GROUP BY campaign_id
+        ) tasks ON tasks.campaign_id = c.id
+        LEFT JOIN (
+            SELECT t.campaign_id, COUNT(v.id) AS vote_count
+            FROM evaluation_tasks_v2 t
+            JOIN evaluation_votes_v2 v ON v.task_id = t.id
+            GROUP BY t.campaign_id
+        ) votes ON votes.campaign_id = c.id
+        {where}
+        ORDER BY c.created_at DESC, c.id DESC
+        """,
+        tuple(params),
+    )
+    for row in rows:
+        row.update(
+            {
+                "schema_version": 2,
+                "campaign_key": f"v2:{int(row['id'])}",
+                "tasks": int(row["task_count"]),
+                "votes": int(row["vote_count"]),
+                "share_token": str(row["public_token"]),
+                "share_url": f"/evaluate/{row['public_token']}",
+                "read_only": row["status"] in {"published", "closed", "archived"},
+            }
+        )
+    return rows
+
+
+def legacy_campaign_summaries_readonly(
+    db: Database,
+    *,
+    query: str = "",
+    status: str | Iterable[str] = "",
+) -> list[dict[str, Any]]:
+    """Return compatibility summaries for legacy Campaigns in one query."""
+
+    clauses: list[str] = []
+    params: list[Any] = []
+    query = str(query or "").strip()
+    if query:
+        pattern = f"%{query}%"
+        clauses.append(
+            "(c.name LIKE ? "
+            "OR COALESCE(json_extract(c.metadata_json, '$.public_title'), '') LIKE ? "
+            "OR CAST(c.id AS TEXT) = ?)"
+        )
+        params.extend((pattern, pattern, query.lstrip("#")))
+    statuses = _campaign_summary_statuses(status)
+    effective_status = (
+        "CASE WHEN COALESCE(json_extract(c.metadata_json, '$.archived_at'), '') != '' "
+        "THEN 'archived' ELSE c.status END"
+    )
+    if statuses:
+        placeholders = ", ".join("?" for _ in statuses)
+        clauses.append(f"{effective_status} IN ({placeholders})")
+        params.extend(statuses)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = db.query(
+        f"""
+        SELECT
+            c.id,
+            c.name,
+            c.campaign_type,
+            {effective_status} AS status,
+            c.target_votes,
+            c.metadata_json,
+            c.created_at,
+            c.updated_at,
+            COALESCE(candidates.candidate_count, 0) AS candidate_count,
+            COALESCE(candidates.item_count, 0) AS item_count,
+            COALESCE(tasks.task_count, 0) AS task_count,
+            COALESCE(votes.vote_count, 0) AS vote_count
+        FROM evaluation_campaigns c
+        LEFT JOIN (
+            SELECT
+                campaign_id,
+                COUNT(*) AS candidate_count,
+                COUNT(DISTINCT video_name) AS item_count
+            FROM evaluation_candidates
+            GROUP BY campaign_id
+        ) candidates ON candidates.campaign_id = c.id
+        LEFT JOIN (
+            SELECT campaign_id, COUNT(*) AS task_count
+            FROM evaluation_tasks
+            GROUP BY campaign_id
+        ) tasks ON tasks.campaign_id = c.id
+        LEFT JOIN (
+            SELECT t.campaign_id, COUNT(v.id) AS vote_count
+            FROM evaluation_tasks t
+            JOIN evaluation_votes v ON v.task_id = t.id
+            GROUP BY t.campaign_id
+        ) votes ON votes.campaign_id = c.id
+        {where}
+        ORDER BY c.created_at DESC, c.id DESC
+        """,
+        tuple(params),
+    )
+    for row in rows:
+        metadata = _loads(row.pop("metadata_json", None))
+        candidate_count = int(row.pop("candidate_count"))
+        row.update(
+            {
+                "schema_version": 1,
+                "campaign_key": f"v1:{int(row['id'])}",
+                "metadata": metadata,
+                "public_title": str(
+                    metadata.get("public_title") or "匿名视频质量评测"
+                ),
+                "candidates": candidate_count,
+                "tasks": int(row["task_count"]),
+                "votes": int(row["vote_count"]),
+                "item_count": int(row.pop("item_count")),
+                "archived": row["status"] == "archived",
+                "read_only": True,
+                "allowed_actions": (
+                    ["export"]
+                    if row["status"] == "archived"
+                    else ["export", "archive"]
+                ),
+            }
+        )
+    return rows
+
+
+def list_campaign_summaries_page(
+    db: Database,
+    *,
+    page: int = 1,
+    page_size: int = 50,
+    query: str = "",
+    status: str = "",
+) -> dict[str, Any]:
+    page = max(1, int(page or 1))
+    page_size = max(1, min(200, int(page_size or 50)))
+    query = str(query or "").strip()
+    statuses = _campaign_summary_statuses(status)
+    campaigns = [
+        *list_campaign_summaries_v2(db, query=query, status=statuses),
+        *legacy_campaign_summaries_readonly(db, query=query, status=statuses),
+    ]
+    campaigns.sort(
+        key=lambda row: (
+            float(row.get("created_at") or 0),
+            int(row.get("schema_version") or 1),
+            int(row.get("id") or 0),
+        ),
+        reverse=True,
+    )
+    total = len(campaigns)
+    page_count = max(1, (total + page_size - 1) // page_size)
+    page = min(page, page_count)
+    start = (page - 1) * page_size
+    return {
+        "campaigns": campaigns[start : start + page_size],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "page_count": page_count,
+        "query": query,
+        "filters": {"status": ",".join(statuses)},
+    }
 
 
 def get_preparation_v2(db: Database, campaign_id: int) -> dict[str, Any] | None:

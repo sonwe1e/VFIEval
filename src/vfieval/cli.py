@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
 
@@ -16,6 +17,55 @@ from vfieval.metrics.health import metrics_health, prepare_metric_asset_manifest
 from vfieval.server import _create_run_from_files, run_server
 from vfieval.runtime_logging import close_runtime_logging, configure_runtime_logging, log_event
 from vfieval.worker import WorkerOptions, run_worker
+
+
+class _ReadOnlyDatabase(Database):
+    """Open an existing workspace database without creating or migrating it."""
+
+    def connect(self) -> sqlite3.Connection:
+        if not self.db_path.is_file():
+            raise FileNotFoundError(f"VFIEval database does not exist: {self.db_path}")
+        uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+
+def _metrics_exit_code(payload: dict) -> int:
+    if payload.get("errors"):
+        return 1
+    health = payload.get("health") if isinstance(payload.get("health"), dict) else payload
+    metrics = health.get("metrics") if isinstance(health, dict) else {}
+    statuses = {
+        str(row.get("status") or "")
+        for row in (metrics or {}).values()
+        if isinstance(row, dict)
+    }
+    if "invalid_assets" in statuses:
+        return 1
+    if any(status != "available" for status in statuses):
+        return 2
+    return 0
+
+
+def _doctor_exit_code(report: dict) -> int:
+    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    if summary.get("errors"):
+        return 1
+    if summary.get("unavailable"):
+        return 2
+    return 0 if report.get("ok") else 1
+
+
+def _tcp_port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("port must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -103,6 +153,23 @@ def main(argv: list[str] | None = None) -> int:
 
     doctor = sub.add_parser("doctor", help="check devices, media tools, metrics, database, and storage")
     doctor.add_argument("--json", action="store_true", dest="json_output")
+    doctor.add_argument("--host", default=os.getenv("VFIEVAL_HOST", "127.0.0.1"))
+    doctor.add_argument(
+        "--port",
+        type=_tcp_port,
+        default=os.getenv("VFIEVAL_PORT", "8765"),
+    )
+    doctor.add_argument(
+        "--device",
+        action="append",
+        dest="devices",
+        default=[
+            value.strip()
+            for value in os.getenv("VFIEVAL_DEVICE", "").split(",")
+            if value.strip()
+        ],
+        help="required target device; repeat for multiple targets (for example cuda:0 or npu:0)",
+    )
 
     diagnostics = sub.add_parser("diagnostics", help="create a sanitized support bundle")
     selection = diagnostics.add_mutually_exclusive_group(required=True)
@@ -112,9 +179,15 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     workspace = WorkspaceConfig.from_root(args.workspace)
-    workspace.ensure()
-    db = Database(workspace.db_path)
-    db.init()
+    db: Database | None
+    if args.command in {"doctor", "diagnostics"}:
+        db = _ReadOnlyDatabase(workspace.db_path)
+    elif args.command in {"prepare-metrics", "smoke-metric"}:
+        db = None
+    else:
+        workspace.ensure()
+        db = Database(workspace.db_path)
+        db.init()
 
     if args.command == "init":
         print(json.dumps({"workspace": str(workspace.root), "db": str(workspace.db_path)}, indent=2))
@@ -191,20 +264,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "prepare-metrics":
         result = metrics_health(workspace) if args.check_only else prepare_metric_asset_manifest(workspace, force=args.force)
         print(json.dumps(result, indent=2, ensure_ascii=False))
-        return 0
+        return _metrics_exit_code(result)
 
     if args.command == "smoke-metric":
         metric = create_metric(args.metric, workspace)
         reference = Path(args.reference).resolve()
         distorted = Path(args.distorted).resolve()
         work_dir = Path(args.work_dir).resolve() if args.work_dir else workspace.tmp_dir / "smoke-metric" / args.metric
+        work_dir.mkdir(parents=True, exist_ok=True)
         try:
             result = metric.evaluate(reference, distorted, work_dir)
             payload = {"status": result.status, "value": result.value, "details": result.details}
-            code = 0
+            code = 2 if result.status == "unavailable" else 1 if result.status == "failed" else 0
         except MetricUnavailable as exc:
             payload = {"status": "unavailable", "value": None, "details": {"reason": str(exc)}}
-            code = 0
+            code = 2
         except Exception as exc:
             payload = {
                 "status": "failed",
@@ -281,27 +355,64 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "doctor":
-        report = run_doctor(db, workspace)
+        assert db is not None
+        try:
+            report = run_doctor(
+                db,
+                workspace,
+                host=args.host,
+                port=args.port,
+                target_devices=args.devices,
+            )
+        except Exception as exc:
+            report = {
+                "ok": False,
+                "checks": {},
+                "summary": {
+                    "errors": ["doctor"],
+                    "unavailable": [],
+                    "warnings": [],
+                },
+                "error": {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            }
+        code = _doctor_exit_code(report)
         if args.json_output:
             print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
         else:
-            status = "PASS" if report["ok"] else "FAIL"
+            status = "PASS" if code == 0 else "UNAVAILABLE" if code == 2 else "FAIL"
             print(f"VFIEval doctor: {status}")
             for name, check in report["checks"].items():
                 check_status = str(check.get("status") or "info").upper() if isinstance(check, dict) else "INFO"
                 reason = str(check.get("reason") or "") if isinstance(check, dict) else ""
                 print(f"  {check_status:7} {name}{': ' + reason if reason else ''}")
             print("Use --json for the complete machine-readable report.")
-        return 0 if report["ok"] else 1
+        return code
 
     if args.command == "diagnostics":
-        bundle = create_diagnostics_bundle(
-            db,
-            workspace,
-            run_id=args.run_id,
-            campaign_id=args.campaign_id,
-            output=args.output,
-        )
+        assert db is not None
+        try:
+            bundle = create_diagnostics_bundle(
+                db,
+                workspace,
+                run_id=args.run_id,
+                campaign_id=args.campaign_id,
+                output=args.output,
+            )
+        except (OSError, sqlite3.Error, KeyError, ValueError) as exc:
+            print(
+                json.dumps(
+                    {
+                        "status": "failed",
+                        "error": {"type": type(exc).__name__, "message": str(exc)},
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            return 1
         print(json.dumps({"diagnostics_bundle": str(bundle)}, indent=2, ensure_ascii=False))
         return 0
 

@@ -17,8 +17,8 @@
         <nav class="nav" aria-label="主导航">
           <button class="nav-item active" data-view="create" type="button">新建任务</button>
           <button class="nav-item" data-view="compare" type="button">视频对比</button>
-          <button class="nav-item" data-view="media" type="button">Media Library</button>
-          <button class="nav-item" data-view="evaluations" type="button">Evaluation Studio</button>
+          <button class="nav-item" data-view="media" type="button">媒体库</button>
+          <button class="nav-item" data-view="evaluations" type="button">评测工作台</button>
           <button class="nav-item" data-view="runs" type="button">运行记录</button>
           <button class="nav-item" data-view="stats" type="button">主观反馈统计</button>
         </nav>
@@ -26,6 +26,7 @@
 
     <main class="shell">
       <div id="deployment-health" class="deployment-health" role="status" aria-live="polite">正在检查服务状态…</div>
+      <section id="request-diagnostic" class="request-diagnostic hidden" role="alert" aria-live="assertive"></section>
       <section id="view-create" class="view active">
         <div class="view-head">
           <h2>新建任务</h2>
@@ -176,6 +177,7 @@
 
           <button id="refresh-files" class="secondary" type="button">刷新文件列表</button>
           <button id="start-run" type="submit" disabled>开始任务</button>
+          <div id="run-submit-status" class="run-submit-status" role="status" aria-live="polite" hidden></div>
         </form>
 
         <section id="video-selection" class="panel video-selection"></section>
@@ -196,7 +198,7 @@
           </fieldset>
           <label class="check-item compare-aspect-confirm">
             <input name="allow_external_aspect_stretch" type="checkbox">
-            <span>External Pred 若需改变宽高比，确认按 Alignment Plan 拉伸并记录该变换</span>
+            <span>外部 Pred 若需改变宽高比，确认按 Alignment Plan 拉伸并记录该变换</span>
           </label>
           <details class="advanced">
             <summary>可选指标</summary>
@@ -206,7 +208,7 @@
           </details>
           <button id="refresh-compare-sources" class="secondary" type="button">刷新对比来源</button>
           <button id="start-compare" type="submit" disabled>开始对比</button>
-          <button id="create-adhoc-evaluation" class="secondary" type="button">带入 Evaluation Studio</button>
+          <button id="create-adhoc-evaluation" class="secondary" type="button" disabled>带入 Evaluation Studio</button>
           <div id="compare-submit-status" class="compare-submit-status" role="status" aria-live="polite" hidden></div>
         </form>
 
@@ -218,7 +220,10 @@
         <section class="panel">
           <div class="panel-head">
             <h2>运行记录</h2>
-            <button id="refresh" class="secondary" type="button">刷新当前结果</button>
+            <div class="actions">
+              <span id="runs-poll-status" class="poll-status muted" role="status" aria-live="polite">正在连接自动刷新…</span>
+              <button id="refresh" class="secondary" type="button">刷新当前结果</button>
+            </div>
           </div>
           <div id="runs-table" class="table"></div>
         </section>
@@ -227,8 +232,8 @@
 
       <section id="view-media" class="view">
         <div class="view-head">
-          <h2>Media Library</h2>
-          <p class="muted">统一管理 videos/、external GT/Pred 与 Run 视频产物。上传路径由服务端生成。</p>
+          <h2>媒体库</h2>
+          <p class="muted">统一管理 videos/、外部 GT/Pred 与 Run 视频产物。文件路径始终由服务端生成。</p>
         </div>
         <form id="collection-form" class="panel field-grid">
           <label><span>新 Collection</span><input name="name" maxlength="200" placeholder="例如 external-benchmark"></label>
@@ -236,10 +241,10 @@
         </form>
         <form id="upload-form" class="panel infer-grid">
           <fieldset class="field-group">
-            <legend>External 上传</legend>
+            <legend>外部媒体上传</legend>
             <div class="field-grid">
               <label><span>Collection</span><select name="collection_id"></select></label>
-              <label><span>角色</span><select name="role"><option value="gt">external GT</option><option value="pred">external Pred</option></select></label>
+              <label><span>角色</span><select name="role"><option value="gt">外部 GT</option><option value="pred">外部 Pred</option></select></label>
               <label><span>类型</span><select name="media_kind"><option value="video">视频</option><option value="frame_sequence">帧序列 ZIP</option></select></label>
               <label><span>显示别名</span><input name="display_name" maxlength="240" required></label>
               <label><span>文件</span><input name="file" type="file" required></label>
@@ -248,22 +253,22 @@
           </fieldset>
           <div id="upload-progress" class="muted"></div>
           <button type="submit">分片上传</button>
-          <button id="pause-upload" class="secondary" type="button">暂停（可重新提交续传）</button>
+          <button id="pause-upload" class="secondary" type="button" disabled>暂停上传</button>
         </form>
         <details id="external-pred-binding" class="panel advanced">
-          <summary>Bind uploaded External Pred to a GT Media Item</summary>
-          <p class="muted">Advanced only: select the canonical GT Collection and Item first, then explicitly bind one uploaded Pred. This never infers identity from filename, label, or hash. The uploaded file remains a physical asset; only the resulting Item Member is reusable.</p>
+          <summary>高级：将上传的外部 Pred 绑定到 GT Media Item</summary>
+          <p class="muted">先选择规范 GT Collection 和 Item，再显式绑定一个已上传 Pred。系统不会根据文件名、标签或哈希猜测身份；只有绑定后生成的 Item Member 可复用。</p>
           <form id="external-pred-binding-form" class="infer-grid">
             <div class="field-grid">
               <label><span>GT Collection</span><select id="external-pred-item-group" name="group_id" required></select></label>
               <label><span>GT Media Item</span><select id="external-pred-item" name="item_id" required></select></label>
-              <label><span>Uploaded Pred</span><select id="external-pred-asset" name="asset_id" required></select></label>
-              <label><span>Method key</span><input name="method_key" maxlength="240" required placeholder="e.g. external:model-a"></label>
+              <label><span>已上传 Pred</span><select id="external-pred-asset" name="asset_id" required></select></label>
+              <label><span>方法标识</span><input name="method_key" maxlength="240" required placeholder="例如 external:model-a"></label>
             </div>
             <div id="external-pred-item-pager" class="pager"></div>
             <details class="advanced">
-              <summary>Temporal / spatial provenance (advanced)</summary>
-              <p class="muted">Use a JSON object only when this Pred has an explicit source-frame mapping or known spatial origin. Without a mapping, strict exact temporal validation still applies.</p>
+              <summary>时间 / 空间来源（高级）</summary>
+              <p class="muted">仅在 Pred 具有明确源帧映射或已知空间来源时填写 JSON；留空仍执行严格时间一致性校验。</p>
               <div class="field-grid">
                 <label><span>Temporal mapping JSON</span><textarea name="temporal_mapping" rows="3" placeholder='{"source_frame_indices":[0,1,2],"timestamps":[0.0,0.04,0.08]}'></textarea></label>
                 <label><span>Spatial origin JSON</span><textarea name="spatial_origin" rows="3" placeholder='{"width":1920,"height":1080}'></textarea></label>
@@ -271,10 +276,10 @@
             </details>
             <label class="check-item compare-aspect-confirm">
               <input name="aspect_stretch_confirmed" type="checkbox">
-              <span>Confirm that this External Pred may undergo an aspect-ratio-changing Alignment Plan. The confirmation is recorded on its Item Member.</span>
+              <span>确认此外部 Pred 可执行改变宽高比的 Alignment Plan；该确认会记录到 Item Member。</span>
             </label>
             <div id="external-pred-binding-status" class="muted"></div>
-            <button id="bind-external-pred" type="submit" disabled>Bind External Pred</button>
+            <button id="bind-external-pred" type="submit" disabled>绑定外部 Pred</button>
           </form>
         </details>
         <section class="panel">
@@ -282,11 +287,11 @@
           <div id="media-content"></div>
         </section>
         <section class="panel">
-          <div class="panel-head"><div><h2>Derived Runs</h2><p class="muted">只展示完成、未删除、未清理的 Run 输出；按 Run → 视频 → Track 懒展开。</p></div></div>
+          <div class="panel-head"><div><h2>Run 派生产物</h2><p class="muted">只展示完成、未删除、未清理的 Run 输出；按 Run → 视频 → Track 懒展开。</p></div></div>
           <div id="media-derived-content"><p class="muted">打开 Media 后加载。</p></div>
         </section>
         <section class="panel">
-          <div class="panel-head"><div><h2>Evaluation Packages</h2><p class="muted">发布时冻结的评测包独立于 Run 生命周期。</p></div></div>
+          <div class="panel-head"><div><h2>冻结评测包</h2><p class="muted">发布时冻结的评测包独立于 Run 生命周期。</p></div></div>
           <div id="media-packages-content"><p class="muted">还没有可显示的评测包。</p></div>
         </section>
         <section class="panel">
@@ -310,13 +315,18 @@
 
       <section id="view-evaluations" class="view">
         <div class="view-head">
-          <h2>Evaluation Studio</h2>
+          <h2>评测工作台</h2>
           <p class="muted">先从一个 GT 文件夹选择评测视频，再选择完整覆盖这些 Media Item 的两种方法；参与者通过独立匿名链接投票。</p>
         </div>
         <section class="studio-layout">
           <div class="panel">
             <div class="panel-head"><div><h3>Campaign</h3><p class="muted">v2 可管理；v1 历史只读。</p></div><button id="studio-refresh" class="secondary" type="button">刷新</button></div>
+            <div class="studio-campaign-filters">
+              <label><span>搜索</span><input id="studio-campaign-query" type="search" placeholder="名称、公开标题或编号"></label>
+              <label><span>状态</span><select id="studio-campaign-status"><option value="">全部状态</option><option value="draft">草稿</option><option value="preparing">准备中</option><option value="published">已发布</option><option value="failed">失败</option><option value="closed">已关闭</option><option value="archived">已归档</option></select></label>
+            </div>
             <div id="studio-campaign-list"></div>
+            <div id="studio-campaign-pager" class="pager compact-pager" aria-live="polite"></div>
           </div>
           <div id="studio-campaign-detail" class="panel"><p class="muted">选择 Campaign 查看准备进度、分享链接和结果。</p></div>
         </section>
@@ -341,17 +351,17 @@
           <fieldset class="field-group">
             <legend>两份 Pred 方法</legend>
             <div class="field-grid">
-              <label><span>方法 A 来源</span><select id="studio-method-a-source"><option value="run" selected>模型 Run</option><option value="external">External Pred（高级）</option></select></label>
-              <label><span>方法 A</span><select id="studio-method-a" required></select></label>
-              <label><span>方法 B 来源</span><select id="studio-method-b-source"><option value="run" selected>模型 Run</option><option value="external">External Pred（高级）</option></select></label>
-              <label><span>方法 B</span><select id="studio-method-b" required></select></label>
+              <label><span>Pred 1 来源</span><select id="studio-method-a-source"><option value="run" selected>模型 Run</option><option value="external">外部 Pred（高级）</option></select></label>
+              <label><span>Pred 1</span><select id="studio-method-a" required></select></label>
+              <label><span>Pred 2 来源</span><select id="studio-method-b-source"><option value="run" selected>模型 Run</option><option value="external">外部 Pred（高级）</option></select></label>
+              <label><span>Pred 2</span><select id="studio-method-b" required></select></label>
             </div>
             <details id="studio-upload-advanced" class="advanced studio-upload-advanced">
-              <summary>External Pred（高级）</summary>
-              <p class="muted">External Pred 必须先显式绑定到上方选中的每个 Media Item；这里不会按文件名、标签或哈希猜测 GT。缺少任一 Item 的方法不可发布。</p>
+              <summary>外部 Pred（高级）</summary>
+              <p class="muted">外部 Pred 必须先显式绑定到上方选中的每个 Media Item；这里不会按文件名、标签或哈希猜测 GT。缺少任一 Item 的方法不可发布。</p>
               <label class="check-item compare-aspect-confirm">
                 <input id="studio-allow-external-aspect-stretch" type="checkbox">
-                <span>确认允许 External Pred 按 Alignment Plan 改变宽高比；每个变换会写入冻结报告</span>
+                <span>确认允许外部 Pred 按 Alignment Plan 改变宽高比；每个变换会写入冻结报告</span>
               </label>
             </details>
             <button id="studio-preview" class="secondary" type="button">检查覆盖与对齐</button>
@@ -360,24 +370,20 @@
             <legend>视频覆盖与对齐报告</legend>
             <div id="studio-coverage"><p class="muted">选择视频和两份方法后检查覆盖与对齐。</p></div>
           </fieldset>
-          <button type="submit">创建并发布冻结评测包</button>
+          <button id="studio-create-campaign" type="submit" disabled>创建并发布冻结评测包</button>
+          <div id="studio-submit-status" class="run-submit-status" role="status" aria-live="polite" hidden></div>
         </form>
 
-        <div hidden aria-hidden="true">
-          <form id="evaluator-form"><input name="display_name"></form>
-          <form id="campaign-form"><input name="name"><input name="target_votes"></form>
-          <form id="candidate-form"><select name="campaign_id"></select><select name="reference_asset_id"></select><select name="asset_id"></select><input name="video_name"><input name="label"></form>
-          <button id="refresh-evaluations" type="button"></button>
-          <div id="campaign-list"></div>
-          <section id="evaluation-task"></section>
-          <section id="campaign-analysis"></section>
-        </div>
       </section>
     </main>
     </div>
 
     <div id="toast" role="status"></div>
+    <script src="/shared.js"></script>
     <script src="/app.js"></script>
+    <script src="/compare.js"></script>
+    <script src="/run-detail.js"></script>
+    <script src="/media.js"></script>
     <script src="/studio.js"></script>
   </body>
 </html>

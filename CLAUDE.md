@@ -12,7 +12,7 @@ Before reading source files to locate a change, consult `NAVIGATION.md`. It is a
 
 VFIEval is a local video frame interpolation (VFI) evaluation platform. It runs inference on user-provided model files against video datasets, performs post-processing (warp/blend/pred from flow+mask outputs), computes quality metrics, and serves results through a web UI. It does not train models and does not implement PSNR.
 
-Compare is a first-class evaluation surface: GT and Pred are picked from server-resident resources (Media Items, `videos/` groups, completed-run pred artifacts, uploaded media), one GT can be compared against up to two Pred tracks (`predA`, `predB`), and `flow`/`mask`/`warp` layers can be shown side-by-side. Sample/video APIs read only the rows they need; the full-run timeline endpoint exists only for compatibility/debug. Linux NPU and CUDA servers are the only supported deployment targets; Windows-specific hardening is deferred.
+Compare is a first-class evaluation surface: the primary flow selects one GT Media Item and one or two reusable Pred Members bound to that exact Item, while legacy descriptors remain compatibility-only. Ordered source-frame indices, frame counts, FPS, and available timestamps stay strict; spatial differences use an explicit fingerprinted LANCZOS Alignment Plan. `flow`/`mask`/`warp` layers can be shown side-by-side. Sample/video APIs read only the rows they need; the full-run timeline endpoint exists only for compatibility/debug. Linux NPU and CUDA servers are the only supported deployment targets; Windows-specific hardening is deferred.
 
 ## Commands
 
@@ -31,7 +31,7 @@ python -m unittest tests.test_run_feedback
 
 # Start the server (main development workflow)
 $env:PYTHONPATH='src'
-python -m vfieval.cli init --workspace .vfieval
+python -m vfieval.cli --workspace .vfieval init
 python -m vfieval.cli --workspace .vfieval serve --host 127.0.0.1 --port 8765
 
 # Check metric asset status

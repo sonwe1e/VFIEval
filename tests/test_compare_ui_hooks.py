@@ -5,11 +5,19 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+WEB = ROOT / "src" / "vfieval" / "web"
+
+
+def frontend_source() -> str:
+    return "\n".join(
+        (WEB / name).read_text(encoding="utf-8")
+        for name in ("app.js", "compare.js", "run-detail.js", "media.js")
+    )
 
 
 class CompareUiHookTests(unittest.TestCase):
     def test_compare_layers_and_master_video_controls_are_wired(self) -> None:
-        app_js = (ROOT / "src" / "vfieval" / "web" / "app.js").read_text(encoding="utf-8")
+        app_js = frontend_source()
         styles = (ROOT / "src" / "vfieval" / "web" / "styles.css").read_text(encoding="utf-8")
 
         self.assertIn("compare_layers", app_js)
@@ -24,7 +32,7 @@ class CompareUiHookTests(unittest.TestCase):
         self.assertIn("grid-auto-flow: column", styles)
 
     def test_metric_health_video_tiles_and_chart_are_compact_but_readable(self) -> None:
-        app_js = (ROOT / "src" / "vfieval" / "web" / "app.js").read_text(encoding="utf-8")
+        app_js = frontend_source()
         styles = (ROOT / "src" / "vfieval" / "web" / "styles.css").read_text(encoding="utf-8")
 
         self.assertIn("<details class=\"metric-health-details\">", app_js)
@@ -41,7 +49,7 @@ class CompareUiHookTests(unittest.TestCase):
         self.assertIn(".chart-scale", styles)
 
     def test_usability_controls_are_wired_without_legacy_compare_path_copy(self) -> None:
-        app_js = (ROOT / "src" / "vfieval" / "web" / "app.js").read_text(encoding="utf-8")
+        app_js = frontend_source()
 
         self.assertIn('api("/api/video-groups?summary=1")', app_js)
         refresh_catalog_body = app_js.split("async function refreshCatalog()", 1)[1].split("document.querySelectorAll", 1)[0]
@@ -69,9 +77,9 @@ class CompareUiHookTests(unittest.TestCase):
         self.assertNotIn("distorted_path ||", app_js)
 
     def test_gt_first_picker_never_loads_global_pred_catalog(self) -> None:
-        app_js = (ROOT / "src" / "vfieval" / "web" / "app.js").read_text(encoding="utf-8")
+        app_js = frontend_source()
         loader = app_js.split("async function loadCompareSources", 1)[1].split(
-            "function renderGroupVideoTable", 1
+            "function comparePayloadFromForm", 1
         )[0]
         self.assertIn("/api/media/item-groups?role=gt", loader)
         self.assertIn("/api/media/items?group_id=", loader)
@@ -81,7 +89,7 @@ class CompareUiHookTests(unittest.TestCase):
 
     def test_alignment_report_uses_the_real_plan_and_external_confirmation(self) -> None:
         web = ROOT / "src" / "vfieval" / "web"
-        app_js = (web / "app.js").read_text(encoding="utf-8")
+        app_js = frontend_source()
         index_html = (web / "index.html").read_text(encoding="utf-8")
         styles = (web / "styles.css").read_text(encoding="utf-8")
 
@@ -96,7 +104,7 @@ class CompareUiHookTests(unittest.TestCase):
         self.assertIn(".compare-aspect-confirm", styles)
 
     def test_item_picker_exposes_member_temporal_mapping_and_slots(self) -> None:
-        app_js = (ROOT / "src" / "vfieval" / "web" / "app.js").read_text(encoding="utf-8")
+        app_js = frontend_source()
 
         self.assertIn("function compareTemporalSummary(row)", app_js)
         self.assertIn("mapping.source_frame_indices", app_js)
@@ -106,7 +114,7 @@ class CompareUiHookTests(unittest.TestCase):
 
     def test_compare_input_tiles_can_switch_between_original_and_aligned_media(self) -> None:
         web = ROOT / "src" / "vfieval" / "web"
-        app_js = (web / "app.js").read_text(encoding="utf-8")
+        app_js = frontend_source()
         styles = (web / "styles.css").read_text(encoding="utf-8")
 
         self.assertIn("function compareInputSlotLabel(slot)", app_js)
@@ -119,7 +127,7 @@ class CompareUiHookTests(unittest.TestCase):
 
     def test_external_pred_binding_is_an_explicit_item_scoped_advanced_action(self) -> None:
         web = ROOT / "src" / "vfieval" / "web"
-        app_js = (web / "app.js").read_text(encoding="utf-8")
+        app_js = frontend_source()
         index_html = (web / "index.html").read_text(encoding="utf-8")
 
         self.assertIn('id="external-pred-binding-form"', index_html)
@@ -135,19 +143,36 @@ class CompareUiHookTests(unittest.TestCase):
 
     def test_compare_submission_is_single_flight_and_immediately_visible(self) -> None:
         web = ROOT / "src" / "vfieval" / "web"
-        app_js = (web / "app.js").read_text(encoding="utf-8")
+        app_js = frontend_source()
         index_html = (web / "index.html").read_text(encoding="utf-8")
 
         self.assertIn('id="compare-submit-status"', index_html)
-        self.assertIn("if (state.compareSubmitting)", app_js)
+        self.assertIn("compareCreationFlight.isLocked()", app_js)
+        self.assertIn("compareCreationFlight.tryLock()", app_js)
         self.assertIn('state.compareSubmitPhase = "preflight"', app_js)
         self.assertIn('state.compareSubmitPhase = "creating"', app_js)
         self.assertIn('state.compareSubmitPhase = "opening"', app_js)
         self.assertIn('form.setAttribute("aria-busy"', app_js)
         self.assertIn("请勿重复点击", app_js)
 
+    def test_evaluation_studio_handoff_requires_exactly_two_predictions(self) -> None:
+        web = ROOT / "src" / "vfieval" / "web"
+        app_js = frontend_source()
+        index_html = (web / "index.html").read_text(encoding="utf-8")
+        state_render = app_js.split("function renderCompareSubmissionState", 1)[1].split(
+            "async function startCompareRun", 1
+        )[0]
+
+        self.assertRegex(
+            index_html,
+            r'id="create-adhoc-evaluation"[^>]*disabled',
+        )
+        self.assertIn("selectedComparePredRows().length === 2", state_render)
+        self.assertIn("handoff.disabled = state.compareSubmitting || !handoffReady", state_render)
+        self.assertIn("请选择一个 GT Media Item 和恰好两份 Pred", state_render)
+
     def test_video_player_keeps_a_diagnostic_link_on_media_error(self) -> None:
-        app_js = (ROOT / "src" / "vfieval" / "web" / "app.js").read_text(encoding="utf-8")
+        app_js = frontend_source()
 
         self.assertIn("function handleVideoPlaybackError(video)", app_js)
         self.assertIn("打开原始视频", app_js)
@@ -160,7 +185,7 @@ class CompareUiHookTests(unittest.TestCase):
 
 
     def test_single_run_delete_and_artifact_cleanup_require_preview_confirmation(self) -> None:
-        app_js = (ROOT / "src" / "vfieval" / "web" / "app.js").read_text(encoding="utf-8")
+        app_js = frontend_source()
         delete_source = app_js.split("async function deleteRun", 1)[1].split(
             "async function renameRun", 1
         )[0]

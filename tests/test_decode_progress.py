@@ -179,7 +179,7 @@ class DecodeProgressTests(unittest.TestCase):
 
     def test_decode_backend_capabilities_include_missing_reasons(self) -> None:
         with (
-            patch("vfieval.worker.shutil.which", return_value=None),
+            patch("vfieval.ffmpeg_exe.resolve_ffmpeg", return_value=None),
             patch("vfieval.worker._module_available", side_effect=lambda name: name == "cv2"),
             patch("vfieval.worker._module_error", side_effect=lambda name: None if name == "cv2" else "missing"),
         ):
@@ -323,7 +323,7 @@ class DecodeProgressTests(unittest.TestCase):
             self.assertNotEqual(auto_opencv, explicit_opencv)
 
     def test_run_detail_contains_decode_cache_reuse_copy(self) -> None:
-        app_js = (ROOT / "src" / "vfieval" / "web" / "app.js").read_text(encoding="utf-8")
+        app_js = (ROOT / "src" / "vfieval" / "web" / "run-detail.js").read_text(encoding="utf-8")
 
         self.assertIn("Reusing decoded cache", app_js)
         self.assertIn("rebuilding this Run's sample index", app_js)

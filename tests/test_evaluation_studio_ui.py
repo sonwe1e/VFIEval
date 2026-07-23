@@ -13,7 +13,19 @@ class EvaluationStudioUiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.index_html = (WEB / "index.html").read_text(encoding="utf-8")
-        cls.app_js = (WEB / "app.js").read_text(encoding="utf-8")
+        cls.shared_js = (WEB / "shared.js").read_text(encoding="utf-8")
+        cls.app_entry_js = (WEB / "app.js").read_text(encoding="utf-8")
+        cls.compare_js = (WEB / "compare.js").read_text(encoding="utf-8")
+        cls.run_detail_js = (WEB / "run-detail.js").read_text(encoding="utf-8")
+        cls.media_js = (WEB / "media.js").read_text(encoding="utf-8")
+        cls.app_js = "\n".join(
+            (
+                cls.app_entry_js,
+                cls.compare_js,
+                cls.run_detail_js,
+                cls.media_js,
+            )
+        )
         cls.studio_js = (WEB / "studio.js").read_text(encoding="utf-8")
         cls.studio_css = (WEB / "studio.css").read_text(encoding="utf-8")
         cls.blind_html = (WEB / "blind.html").read_text(encoding="utf-8")
@@ -63,6 +75,7 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertEqual(blind_script_ids - blind_ids, set())
 
     def test_blind_page_is_independent_and_uses_only_opaque_task_urls(self) -> None:
+        self.assertIn('<script src="/shared.js"', self.blind_html)
         self.assertIn('<script src="/blind.js"', self.blind_html)
         self.assertNotIn('/app.js', self.blind_html)
         self.assertNotIn('class="nav-item', self.blind_html)
@@ -347,6 +360,87 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn("blindState.mediaReloadPending", submit)
         self.assertIn("blindState.frameSequencePending", submit)
 
+    def test_blind_video_vote_waits_for_metadata_first_frame_and_sync_readiness(self) -> None:
+        self.assertIn('mediaReadiness: "idle"', self.blind_js)
+        render = self._function_source("renderTask")
+        self.assertIn('blindState.mediaReadiness = task ? "media_pending" : "idle"', render)
+        self.assertIn("beginTaskVideoReadiness()", render)
+        self.assertNotIn("三路视频已就绪", render)
+
+        create_media = self._function_source("createMediaNode")
+        self.assertIn('addEventListener("loadedmetadata", handleMediaMetadata)', create_media)
+        self.assertIn('addEventListener("loadeddata", handleMediaFirstFrame)', create_media)
+        self.assertLess(
+            create_media.index('addEventListener("loadeddata"'),
+            create_media.index("configureVideoSource(video, url)"),
+        )
+
+        ready = self._function_source("finishTaskVideoReadinessIfReady")
+        for contract in (
+            'blindState.mediaReadiness !== "media_pending"',
+            'video.dataset.metadataReady === "true"',
+            'video.dataset.firstFrameReady === "true"',
+            "videoDurationCompatibility(videos)",
+            "Math.abs(Number(video.currentTime || 0) - anchor) <= threshold",
+            'setMediaReadiness("media_ready")',
+        ):
+            self.assertIn(contract, ready)
+        self.assertLess(
+            ready.index('video.dataset.metadataReady === "true"'),
+            ready.index('setMediaReadiness("media_ready")'),
+        )
+        self.assertLess(
+            ready.index('video.dataset.firstFrameReady === "true"'),
+            ready.index('setMediaReadiness("media_ready")'),
+        )
+
+        submit = self._function_source("submitVote")
+        self.assertIn('blindState.mediaReadiness !== "media_ready"', submit)
+        self.assertIn("setVoteMediaBlocked", submit)
+        self.assertIn('setMediaReadiness("media_pending")', self._function_source("reloadTaskMedia"))
+
+    def test_frontend_request_errors_keep_copyable_request_and_support_ids(self) -> None:
+        self.assertIn('id="request-diagnostic"', self.index_html)
+        self.assertIn('id="request-diagnostic"', self.blind_html)
+
+        studio_request = self._studio_function_source("request")
+        self.assertIn("Shared.request(path", studio_request)
+        self.assertIn("fetchOptions", studio_request)
+        self.assertIn("reportRequestFailure(error)", studio_request)
+        self.assertIn("window.showRequestDiagnostic", self.studio_js)
+
+        blind_request = self._function_source("blindApi")
+        self.assertIn("Shared.request(path", blind_request)
+        self.assertIn("timeoutMs: 15_000", blind_request)
+        self.assertIn("requireJsonSuccess: true", blind_request)
+        self.assertIn("showRequestDiagnostic(error)", blind_request)
+        diagnostic = self._function_source("showRequestDiagnostic")
+        self.assertIn("request_id:", diagnostic)
+        self.assertIn("support_id:", diagnostic)
+        self.assertIn("Shared.copyText", diagnostic)
+        self.assertIn("recovery_suggestion", diagnostic)
+        for field in ("code", "message", "request_id", "support_id", "details"):
+            self.assertIn(field, self.shared_js)
+
+    def test_campaign_creation_is_single_flight_and_disables_the_form(self) -> None:
+        self.assertRegex(
+            self.index_html,
+            r'id="studio-create-campaign"[^>]*disabled',
+        )
+        self.assertIn('id="studio-submit-status"', self.index_html)
+        create = self._studio_function_source("createCampaign")
+        self.assertIn("campaignCreationFlight.isLocked()", create)
+        self.assertIn("campaignCreationFlight.tryLock()", create)
+        self.assertIn("campaignCreationFlight.release()", create)
+        self.assertIn("studioState.campaignSubmitting = true", create)
+        self.assertIn('studioState.campaignSubmitPhase = "creating"', create)
+        self.assertIn('studioState.campaignSubmitPhase = "publishing"', create)
+        self.assertIn("studioState.campaignSubmitting = false", create)
+        render = self._studio_function_source("renderCampaignSubmissionState")
+        self.assertIn('form.setAttribute("aria-busy"', render)
+        self.assertIn("submit.disabled = studioState.campaignSubmitting", render)
+        self.assertIn("请勿重复点击", render)
+
     def test_blind_integer_frame_timeline_previews_then_commits_frame_midpoints(self) -> None:
         for hook in ("master-prev", "master-next", "master-frame-label", "frame-prev", "frame-next"):
             self.assertIn(f'id="{hook}"', self.blind_html)
@@ -470,7 +564,7 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn("markTaskMediaFatal(message)", load_error)
         start = self._function_source("startFrameSequenceRequest")
         self.assertIn("frameSequencePending = true", start)
-        self.assertIn("setVoteMediaBlocked(true)", start)
+        self.assertIn('setMediaReadiness("media_pending")', start)
         self.assertIn("armFrameSequenceWatchdog()", start)
         watchdog = self._function_source("armFrameSequenceWatchdog")
         self.assertIn("STREAM_NO_PROGRESS_RELOAD_MS", watchdog)
@@ -478,7 +572,7 @@ class EvaluationStudioUiTests(unittest.TestCase):
         finish_request = self._function_source("finishFrameSequenceRequestIfReady")
         self.assertIn("images.length !== 3", finish_request)
         self.assertIn("frameSequenceRequestToken", finish_request)
-        self.assertIn("setVoteMediaBlocked(false)", finish_request)
+        self.assertIn('setMediaReadiness("media_ready")', finish_request)
 
         reload_media = self._function_source("reloadTaskMedia")
         self.assertIn("allFrameSequenceImages()", reload_media)
@@ -534,7 +628,9 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn("selectedCampaignKey", self.studio_js)
         self.assertIn("function campaignKey(campaign)", self.studio_js)
         self.assertIn("campaignKey(row) === requestedKey", self.studio_js)
-        self.assertIn("media_item_ids: ids", self.studio_js)
+        self.assertIn("function campaignItemSelectionPayload()", self.studio_js)
+        self.assertIn("selection_token: studioState.itemSelectionToken", self.studio_js)
+        self.assertIn("...campaignItemSelectionPayload()", self.studio_js)
         self.assertIn("method_a: methodA", self.studio_js)
         self.assertIn("method_b: methodB", self.studio_js)
         self.assertIn("spatial_policy: spatialPolicy()", self.studio_js)
@@ -592,6 +688,32 @@ class EvaluationStudioUiTests(unittest.TestCase):
         no_completed_index = render_chart.index("if (!completed.length)")
         self.assertLess(reason_index, no_completed_index)
 
+    def test_v2_lpips_curve_has_keyboard_readout_and_equivalent_table(self) -> None:
+        render_chart = self._studio_function_source("renderObjectiveCurveChart")
+        render_table = self._studio_function_source(
+            "renderObjectiveCurveDataTable"
+        )
+
+        self.assertIn("data-objective-curve-point", render_chart)
+        self.assertIn("data-objective-curve-order", render_chart)
+        self.assertIn("data-objective-curve-label", render_chart)
+        self.assertIn('aria-label="${safe(label)}"', render_chart)
+        self.assertIn("data-objective-curve-readout", render_chart)
+        self.assertIn('role="status"', render_chart)
+        self.assertIn("renderObjectiveCurveDataTable(curve, pointRows)", render_chart)
+        self.assertIn("objective-curve-data-table", render_table)
+        self.assertIn("<thead>", render_table)
+        self.assertIn("<tbody>${rows}</tbody>", render_table)
+        self.assertIn('scope="row"', render_table)
+        self.assertIn('document.addEventListener("focusin"', self.studio_js)
+        self.assertIn("point.dataset.objectiveCurveLabel", self.studio_js)
+        self.assertIn('document.addEventListener("keydown"', self.studio_js)
+        self.assertIn("ArrowLeft: current - 1", self.studio_js)
+        self.assertIn("ArrowRight: current + 1", self.studio_js)
+        self.assertIn("].focus();", self.studio_js)
+        self.assertIn(".objective-curve-readout", self.studio_css)
+        self.assertIn(".objective-curve-data-table", self.studio_css)
+
     def test_v2_campaign_permanent_delete_and_dependency_entry_are_exposed(self) -> None:
         self.assertIn("data-studio-delete", self.studio_js)
         self.assertIn('method: "DELETE"', self.studio_js)
@@ -610,15 +732,16 @@ class EvaluationStudioUiTests(unittest.TestCase):
 
     def test_blind_page_generates_an_evaluator_id_without_secure_random_uuid(self) -> None:
         self.assertIn("function newEvaluatorId()", self.blind_js)
-        self.assertIn('typeof window.crypto.randomUUID === "function"', self.blind_js)
-        self.assertIn("browser-${Date.now()}-${Math.random().toString(16).slice(2)}", self.blind_js)
-        self.assertIn('readLocalValue("vfieval-evaluator-id") || newEvaluatorId()', self.blind_js)
-        self.assertNotIn('|| crypto.randomUUID()', self.blind_js)
+        self.assertIn('Shared.createSubmissionId("browser")', self.blind_js)
+        self.assertIn('Shared.storageGet("vfieval-evaluator-id", "") || newEvaluatorId()', self.blind_js)
+        self.assertIn('typeof root.crypto.randomUUID === "function"', self.shared_js)
+        self.assertIn("Math.random()", self.shared_js)
 
     def test_blind_page_survives_restricted_storage_and_surfaces_startup_errors(self) -> None:
-        self.assertIn("function readLocalValue(key)", self.blind_js)
-        self.assertIn("function writeLocalValue(key, value)", self.blind_js)
-        self.assertIn("function removeLocalValue(key)", self.blind_js)
+        self.assertIn("function storageGet(key, fallbackValue)", self.shared_js)
+        self.assertIn("function storageSet(key, value)", self.shared_js)
+        self.assertIn("function storageRemove(key)", self.shared_js)
+        self.assertIn("catch (_error)", self.shared_js)
         self.assertIn("function initializeBlindPage()", self.blind_js)
         self.assertIn("initializeBlindPage();", self.blind_js)
         self.assertRegex(
@@ -629,10 +752,13 @@ class EvaluationStudioUiTests(unittest.TestCase):
     def test_blind_page_avoids_newer_syntax_and_reports_script_boot_failures(self) -> None:
         self.assertNotIn("?.", self.blind_js)
         self.assertNotIn("??", self.blind_js)
+        self.assertNotIn("?.", self.shared_js)
+        self.assertNotIn("??", self.shared_js)
         self.assertNotIn("Promise.allSettled", self.blind_js)
         self.assertIn("function replaceContent(element, ...nodes)", self.blind_js)
         self.assertIn("window.__vfievalBlindReady = true;", self.blind_js)
         self.assertIn("盲评页面脚本未能加载", self.blind_html)
+        self.assertIn("无法加载 /shared.js", self.blind_html)
         self.assertIn("无法加载 /blind.js", self.blind_html)
         self.assertIn("window.__vfievalBlindBootError", self.blind_html)
         self.assertIn("连接盲评服务超时", self.blind_js)
@@ -646,7 +772,7 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn("submitButton.disabled = true;", handler)
         self.assertIn("finally {", handler)
         self.assertIn("submitButton.disabled = false;", handler)
-        self.assertIn('writeLocalValue("vfieval-evaluator-name", displayName);', handler)
+        self.assertIn('Shared.storageSet("vfieval-evaluator-name", displayName);', handler)
 
     def test_blind_vote_captures_its_form_before_await(self) -> None:
         start = self.blind_js.index("async function submitVote(event)")
@@ -682,7 +808,9 @@ class EvaluationStudioUiTests(unittest.TestCase):
         start_poll = self._studio_function_source("startPreparationPoll")
         stop_poll = self._studio_function_source("stopPreparationPoll")
 
-        self.assertIn("setTimeout(pollOnce, 2000)", start_poll)
+        self.assertIn("setTimeout(pollOnce, delay)", start_poll)
+        self.assertIn("PREPARATION_POLL_BASE_MS", start_poll)
+        self.assertIn("PREPARATION_POLL_MAX_MS", start_poll)
         self.assertNotIn("setInterval", start_poll)
         self.assertIn("const pollOnce = async () =>", start_poll)
         self.assertIn("await request(`/api/evaluation-campaigns/v2/", start_poll)
@@ -691,7 +819,8 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn("stillCurrent()", start_poll)
         self.assertIn("clearTimeout(studioState.preparationPoll)", stop_poll)
         self.assertIn("studioState.preparationPollGeneration += 1", stop_poll)
-        self.assertIn('window.addEventListener("pagehide", stopPreparationPoll)', self.studio_js)
+        self.assertIn('window.addEventListener("pagehide", () => {', self.studio_js)
+        self.assertIn("stopPreparationPoll();", self.studio_js)
         self.assertIn('window.addEventListener("pageshow", (event) => {', self.studio_js)
         self.assertIn("if (!event.persisted || !studioState.selectedCampaignKey) return", self.studio_js)
         self.assertIn("openCampaign(studioState.selectedCampaignKey, false)", self.studio_js)
@@ -702,7 +831,7 @@ class EvaluationStudioUiTests(unittest.TestCase):
         committed = self._studio_function_source("campaignPublishCommitted")
         create = self._studio_function_source("createCampaign")
 
-        self.assertIn("error.status = response.status", request_source)
+        self.assertIn("Shared.request(path", request_source)
         self.assertIn("if (publishError.status != null) throw publishError", publish_request)
         self.assertIn("await readCampaignTruth(campaignId)", publish_request)
         self.assertIn("campaignPublishCommitted(campaign)", publish_request)
@@ -710,8 +839,11 @@ class EvaluationStudioUiTests(unittest.TestCase):
             self.assertIn(f'"{status}"', committed)
         publish = self._studio_function_source("publishCampaign")
         poll_start = publish.index("startPreparationPoll(key, campaignId)")
-        best_effort_refresh = publish.index("await loadCampaigns({ preserveMissingKey: key })")
+        best_effort_refresh = publish.index(
+            "loadCampaigns({ preserveMissingKey: key })"
+        )
         self.assertLess(poll_start, best_effort_refresh)
+        self.assertIn("loadPackages({ page: 1 })", publish)
         self.assertIn("The publish result is authoritative", publish)
         selection = 'studioState.selectedCampaignKey = `v2:${campaignId}`'
         self.assertIn(selection, create)
@@ -733,7 +865,10 @@ class EvaluationStudioUiTests(unittest.TestCase):
         local_removal = delete_campaign.index(
             "studioState.campaigns = studioState.campaigns.filter((row) => campaignKey(row) !== deletingKey)",
         )
-        confirmed_refresh = delete_campaign.index("await loadCampaigns();", local_removal)
+        confirmed_refresh = delete_campaign.index(
+            "await Promise.all([loadCampaigns(), loadPackages()])",
+            local_removal,
+        )
         self.assertLess(local_removal, confirmed_refresh)
         self.assertIn("DELETE response or reconciliation GET already confirmed deletion", delete_campaign)
         self.assertLess(confirmed_refresh, delete_campaign.index("notify(result.cleanup_pending"))
@@ -765,7 +900,7 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn("? participantShareUrl(payload.share_url || campaign.share_url, campaign)", self.studio_js)
         self.assertIn('value="${safe(shareUrl)}"', self.studio_js)
         self.assertIn('data-copy-share="${safe(shareUrl)}"', self.studio_js)
-        self.assertIn("navigator.clipboard.writeText(copy.dataset.copyShare)", self.studio_js)
+        self.assertIn("Shared.copyText(copy.dataset.copyShare)", self.studio_js)
         self.assertIn("function isLoopbackOrigin()", self.studio_js)
         self.assertIn('host === "0.0.0.0"', self.studio_js)
         self.assertIn("shareUrl && isLoopbackOrigin()", self.studio_js)
@@ -812,7 +947,7 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn('/api/media/items?group_id=', self.studio_js)
         self.assertIn('/api/media/methods?', self.studio_js)
         self.assertIn('return { kind: "external", method_key:', self.studio_js)
-        self.assertIn("External Pred 必须先显式绑定", self.index_html)
+        self.assertIn("外部 Pred 必须先显式绑定", self.index_html)
         self.assertNotIn("reference_asset_id", self.studio_js)
         self.assertNotIn("video_name: videoName", self.studio_js)
         self.assertNotIn("storage_path", self.studio_js)
@@ -836,6 +971,18 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn("data-studio-item-page", pager)
         self.assertIn("翻页和搜索不会取消已选视频", render)
 
+    def test_select_all_filtered_uses_a_persisted_server_selection_token(self) -> None:
+        select_all = self._studio_function_source("selectAllFilteredItems")
+        load_methods = self._studio_function_source("loadMethodsForSelection")
+        draft = self._studio_function_source("campaignDraftPayload")
+
+        self.assertIn('request("/api/media/item-selections"', select_all)
+        self.assertIn("payload.selection_token", select_all)
+        self.assertNotIn("for (let page =", select_all)
+        self.assertIn("selection_token=", load_methods)
+        self.assertIn("selection_token:", draft)
+        self.assertIn("selection_expires_at:", draft)
+
     def test_coverage_matrix_surfaces_spatial_alignment_without_weakening_time(self) -> None:
         self.assertIn("时间映射严格验证", self.studio_js)
         self.assertIn("alignment_plan", self.studio_js)
@@ -845,7 +992,7 @@ class EvaluationStudioUiTests(unittest.TestCase):
         self.assertIn("lanczos", self.studio_js)
 
     def test_compare_prefill_and_external_policy_follow_the_item_contract(self) -> None:
-        app_js = (WEB / "app.js").read_text(encoding="utf-8")
+        app_js = self.compare_js
         self.assertIn("prefillFromCompare({", app_js)
         self.assertIn("async function prefillFromCompare(selection)", self.studio_js)
         self.assertIn("selection.predictions", self.studio_js)

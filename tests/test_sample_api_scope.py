@@ -171,6 +171,12 @@ class SampleApiScopeTests(unittest.TestCase):
                 return conn
 
             server, thread, base_url = start_server(db, workspace)
+            cleanup_stop = getattr(server, "vfieval_cleanup_stop", None)
+            cleanup_thread = getattr(server, "vfieval_cleanup_thread", None)
+            if cleanup_stop is not None:
+                cleanup_stop.set()
+            if cleanup_thread is not None:
+                cleanup_thread.join(timeout=5)
             try:
                 with patch.object(db, "connect", side_effect=traced_connect):
                     payload = get_json(base_url, f"/api/runs/{run_id}/videos/clip/timeline?window_size=5")
@@ -184,7 +190,7 @@ class SampleApiScopeTests(unittest.TestCase):
                     if "FROM artifacts" in query and "sample_id IN" in query
                 ]
                 self.assertEqual(len(payload["samples"]), 5)
-                self.assertLessEqual(select_count, 16)
+                self.assertLessEqual(select_count, 16, "\n".join(queries))
                 self.assertEqual(per_sample_artifact_queries, [])
                 self.assertEqual(len(artifact_window_queries), 1)
                 artifact_query = artifact_window_queries[0]

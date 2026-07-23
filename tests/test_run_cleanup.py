@@ -555,6 +555,7 @@ class RunCleanupTests(unittest.TestCase):
             (run_dir / "old.bin").write_bytes(b"old")
             db.soft_delete_run(run_id)
             service = RunCleanupService(db, workspace, cache_grace_seconds=0)
+            service.ensure_backfilled()
 
             preview = service.gc_preview()
             row = next(item for item in preview["runs"] if item["run_id"] == run_id)

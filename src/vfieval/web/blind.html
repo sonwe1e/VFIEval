@@ -127,6 +127,7 @@
         <div id="live-results"></div>
       </section>
 
+      <section id="request-diagnostic" class="panel request-diagnostic hidden" role="alert" aria-live="assertive"></section>
       <section id="message-panel" class="panel hidden" role="alert"></section>
     </main>
     <div id="toast" role="status"></div>
@@ -150,6 +151,7 @@
         panel.classList.remove("hidden");
       }, 3000);
     </script>
+    <script src="/shared.js" onerror="window.__vfievalBlindBootError('无法加载 /shared.js')"></script>
     <script src="/blind.js" onerror="window.__vfievalBlindBootError('无法加载 /blind.js')"></script>
   </body>
 </html>

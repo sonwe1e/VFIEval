@@ -24,8 +24,9 @@ CACHE_BUILD_LOCK_WAIT_SECONDS = 15 * 60.0
 CACHE_BUILD_LOCK_POLL_SECONDS = 0.1
 PURGE_CLAIM_STALE_SECONDS = 5 * 60
 RUN_PURGE_PREVIEW_TTL_SECONDS = 5 * 60
+CACHE_CATALOG_COORDINATION_VERSION = "maintenance:cache-catalog-v1"
+CACHE_COORDINATION_RETRY_SECONDS = 5.0
 _BACKFILL_LOCK = threading.Lock()
-_BACKFILLED_DATABASES: set[str] = set()
 _SAFE_SNAPSHOT_SLOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 
 
@@ -35,6 +36,19 @@ class RunPurgePreviewError(ValueError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = str(code)
+
+
+class CacheCoordinationUnavailable(RuntimeError):
+    """Cache GC cannot be trusted until the historical catalog scan finishes."""
+
+    code = "cache_catalog_not_ready"
+
+    def __init__(self, state: str, message: str | None = None) -> None:
+        self.state = str(state or "pending")
+        super().__init__(
+            message
+            or "storage GC is unavailable while the historical cache catalog is being coordinated"
+        )
 
 
 class DecodeCacheBuildLock:
@@ -623,20 +637,102 @@ class RunCleanupService:
         self._gc_preview_tokens: dict[str, dict[str, Any]] = {}
         self._run_purge_preview_lock = threading.Lock()
         self._run_purge_preview_tokens: dict[str, dict[str, Any]] = {}
+        self._cache_coordination_lock = threading.Lock()
+        self._cache_coordination_done = threading.Event()
+        self._cache_coordination_thread: threading.Thread | None = None
+        self._cache_coordination: dict[str, Any] = {
+            "state": "pending",
+            "ready": False,
+            "version": CACHE_CATALOG_COORDINATION_VERSION,
+            "attempt": 0,
+            "started_at": None,
+            "completed_at": None,
+            "duration_seconds": None,
+            "next_retry_at": None,
+            "skipped": False,
+            "report": {},
+            "error": None,
+        }
+
+    def cache_coordination_status(self) -> dict[str, Any]:
+        """Return a cheap in-memory status snapshot for health and diagnostics."""
+        with self._cache_coordination_lock:
+            return dict(self._cache_coordination)
+
+    def start_cache_coordination(self, *, retry_failed: bool = False) -> dict[str, Any]:
+        """Start the historical cache scan asynchronously and return immediately."""
+        now = utc_ts()
+        with self._cache_coordination_lock:
+            state = str(self._cache_coordination["state"])
+            if state in {"running", "ready"}:
+                return dict(self._cache_coordination)
+            next_retry_at = self._cache_coordination.get("next_retry_at")
+            if (
+                state == "failed"
+                and not retry_failed
+                and next_retry_at is not None
+                and float(next_retry_at) > now
+            ):
+                return dict(self._cache_coordination)
+            self._cache_coordination_done.clear()
+            self._cache_coordination.update(
+                {
+                    "state": "running",
+                    "ready": False,
+                    "attempt": int(self._cache_coordination["attempt"]) + 1,
+                    "started_at": now,
+                    "completed_at": None,
+                    "duration_seconds": None,
+                    "next_retry_at": None,
+                    "skipped": False,
+                    "report": {},
+                    "error": None,
+                }
+            )
+            thread = threading.Thread(
+                target=self._coordinate_cache_catalog,
+                name="vfieval-cache-catalog",
+                daemon=True,
+            )
+            self._cache_coordination_thread = thread
+            thread.start()
+            return dict(self._cache_coordination)
+
+    def retry_cache_coordination(self) -> dict[str, Any]:
+        """Request an immediate retry after a failed historical scan."""
+        return self.start_cache_coordination(retry_failed=True)
+
+    def wait_for_cache_coordination(self, timeout: float | None = None) -> dict[str, Any]:
+        self.start_cache_coordination()
+        self._cache_coordination_done.wait(timeout)
+        return self.cache_coordination_status()
 
     def ensure_backfilled(self) -> dict[str, int]:
-        key = str(self.db.db_path.resolve())
-        with _BACKFILL_LOCK:
-            if key in _BACKFILLED_DATABASES:
-                return {"physical_entries": 0, "run_refs": 0, "released_refs": 0}
-            report = self.backfill_cache_catalog()
-            _BACKFILLED_DATABASES.add(key)
-            return report
+        """Wait for exact cache accounting before Run purge or cleanup work."""
+        status = self.wait_for_cache_coordination()
+        if not status.get("ready"):
+            error = status.get("error") if isinstance(status.get("error"), dict) else {}
+            message = str(error.get("message") or "historical cache coordination failed")
+            raise CacheCoordinationUnavailable(str(status.get("state") or "failed"), message)
+        report = status.get("report")
+        if not isinstance(report, dict):
+            return {"physical_entries": 0, "run_refs": 0, "released_refs": 0}
+        return {
+            "physical_entries": int(report.get("physical_entries") or 0),
+            "run_refs": int(report.get("run_refs") or 0),
+            "released_refs": int(report.get("released_refs") or 0),
+        }
 
     def run_forever(self, stop_event: threading.Event, poll_interval: float = 1.0) -> None:
         """Resume persistent purge requests until the server asks the loop to stop."""
-        self.ensure_backfilled()
+        self.start_cache_coordination()
         while not stop_event.is_set():
+            coordination = self.cache_coordination_status()
+            if not coordination.get("ready"):
+                if coordination.get("state") == "failed":
+                    self.start_cache_coordination()
+                stop_event.wait(max(0.1, float(poll_interval)))
+                continue
             try:
                 self.process_pending(limit=100)
             except Exception as exc:
@@ -651,8 +747,119 @@ class RunCleanupService:
                     },
                 )
             stop_event.wait(max(0.1, float(poll_interval)))
+        coordination_thread = self._cache_coordination_thread
+        if coordination_thread is not None and coordination_thread.is_alive():
+            coordination_thread.join()
 
     def backfill_cache_catalog(self) -> dict[str, int]:
+        """Synchronously coordinate legacy caches for maintenance callers/tests."""
+        with _BACKFILL_LOCK:
+            if self._cache_catalog_marker_exists():
+                report = {"physical_entries": 0, "run_refs": 0, "released_refs": 0}
+                self._mark_cache_coordination_ready(report, skipped=True)
+                return report
+            report = self._scan_cache_catalog()
+            self._record_cache_catalog_marker()
+        self._mark_cache_coordination_ready(report, skipped=False)
+        return report
+
+    def _coordinate_cache_catalog(self) -> None:
+        try:
+            with _BACKFILL_LOCK:
+                if self._cache_catalog_marker_exists():
+                    report = {"physical_entries": 0, "run_refs": 0, "released_refs": 0}
+                    skipped = True
+                else:
+                    report = self._scan_cache_catalog()
+                    self._record_cache_catalog_marker()
+                    skipped = False
+            self._mark_cache_coordination_ready(report, skipped=skipped)
+        except Exception as exc:
+            completed_at = utc_ts()
+            with self._cache_coordination_lock:
+                started_at = self._cache_coordination.get("started_at")
+                attempt = int(self._cache_coordination["attempt"])
+                self._cache_coordination.update(
+                    {
+                        "state": "failed",
+                        "ready": False,
+                        "completed_at": completed_at,
+                        "duration_seconds": (
+                            max(0.0, completed_at - float(started_at))
+                            if started_at is not None
+                            else None
+                        ),
+                        "next_retry_at": completed_at + CACHE_COORDINATION_RETRY_SECONDS,
+                        "error": {
+                            "type": type(exc).__name__,
+                            "message": str(exc) or "historical cache coordination failed",
+                        },
+                    }
+                )
+                self._cache_coordination_done.set()
+            runtime_logger().exception(
+                "historical cache catalog coordination failed",
+                extra={
+                    "event": "run_cleanup.cache_coordination_failed",
+                    "details": {
+                        "version": CACHE_CATALOG_COORDINATION_VERSION,
+                        "attempt": attempt,
+                        "error_type": type(exc).__name__,
+                    },
+                },
+            )
+
+    def _cache_catalog_marker_exists(self) -> bool:
+        row = self.db.get(
+            "SELECT 1 FROM schema_migrations WHERE version = ?",
+            (CACHE_CATALOG_COORDINATION_VERSION,),
+        )
+        return row is not None
+
+    def _record_cache_catalog_marker(self) -> None:
+        with self.db.connection() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (CACHE_CATALOG_COORDINATION_VERSION, utc_ts()),
+            )
+
+    def _mark_cache_coordination_ready(
+        self,
+        report: dict[str, int],
+        *,
+        skipped: bool,
+    ) -> None:
+        completed_at = utc_ts()
+        with self._cache_coordination_lock:
+            started_at = self._cache_coordination.get("started_at")
+            self._cache_coordination.update(
+                {
+                    "state": "ready",
+                    "ready": True,
+                    "completed_at": completed_at,
+                    "duration_seconds": (
+                        max(0.0, completed_at - float(started_at))
+                        if started_at is not None
+                        else 0.0
+                    ),
+                    "next_retry_at": None,
+                    "skipped": bool(skipped),
+                    "report": dict(report),
+                    "error": None,
+                }
+            )
+            self._cache_coordination_done.set()
+
+    def _require_cache_coordination_ready(self) -> None:
+        status = self.cache_coordination_status()
+        if not status.get("ready") and self._cache_catalog_marker_exists():
+            report = {"physical_entries": 0, "run_refs": 0, "released_refs": 0}
+            self._mark_cache_coordination_ready(report, skipped=True)
+            return
+        if not status.get("ready"):
+            raise CacheCoordinationUnavailable(str(status.get("state") or "pending"))
+
+    def _scan_cache_catalog(self) -> dict[str, int]:
         physical_entries = 0
         for cache_type in ("decode_cache", "compare_cache"):
             root = _cache_root(self.workspace, cache_type)
@@ -1309,13 +1516,19 @@ class RunCleanupService:
         run = self.db.get_run(int(run_id))
         if str(run.get("status") or "") in TERMINAL_RUN_STATUSES:
             self.db.cancel_queued_run_jobs(int(run_id), "Run artifacts are being cleaned")
+        self.assert_artifact_cleanup_eligible(int(run_id))
+        request = self.db.request_run_purge(int(run_id), "cleanup_artifacts")
+        return request
+
+    def assert_artifact_cleanup_eligible(self, run_id: int) -> None:
+        """Validate cleanup eligibility without consuming a preview or mutating state."""
+
+        run = self.db.get_run(int(run_id))
         active_jobs = self._active_jobs(int(run_id))
         if str(run.get("status") or "") not in TERMINAL_RUN_STATUSES or active_jobs:
             raise ValueError(
                 "cleanup-artifacts is only allowed after a run is completed, failed, or canceled and all workers have stopped"
             )
-        request = self.db.request_run_purge(int(run_id), "cleanup_artifacts")
-        return request
 
     def process_pending(self, limit: int = 100) -> list[dict[str, Any]]:
         self.ensure_backfilled()
@@ -1864,7 +2077,7 @@ class RunCleanupService:
         entry_ids: Iterable[int] | None = None,
         run_ids: Iterable[int] | None = None,
     ) -> dict[str, Any]:
-        self.ensure_backfilled()
+        self._require_cache_coordination_ready()
         selected = {int(value) for value in entry_ids} if entry_ids is not None else None
         selected_runs = {int(value) for value in run_ids} if run_ids is not None else None
         now = utc_ts()
@@ -1988,6 +2201,7 @@ class RunCleanupService:
         preview_token: str | None = None,
         require_preview_token: bool = False,
     ) -> dict[str, Any]:
+        self._require_cache_coordination_ready()
         if not confirmed:
             raise ValueError("storage GC requires an explicit preview and confirm=true")
         if require_preview_token:

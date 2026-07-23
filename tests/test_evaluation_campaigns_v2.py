@@ -41,6 +41,7 @@ from vfieval.evaluations_v2 import (
     close_campaign_v2,
     create_campaign_v2,
     delete_campaign_v2,
+    ensure_v2_schema,
     get_campaign_v2,
     get_preparation_v2,
     list_run_outputs,
@@ -69,6 +70,8 @@ from vfieval.media_items import (
 )
 from vfieval.run_cleanup import RunCleanupService
 from vfieval.pipeline.evaluation_freeze import FreezeBackendUnavailable, FreezeCancelled
+from vfieval.selection_tokens import create_selection_snapshot
+from vfieval.submissions import SubmissionConflict
 
 from v13_test_utils import add_completed_pred_run, make_workspace, write_mp4
 
@@ -2792,6 +2795,96 @@ class EvaluationCampaignV2Tests(unittest.TestCase):
                 list(pool.map(vote, assigned))
             count = db.get("SELECT COUNT(*) AS count FROM evaluation_votes_v2")
             self.assertEqual(int(count["count"]), 2)
+
+    def test_campaign_submission_recovers_resource_after_completion_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _item, body, _paths = self._item_campaign(workspace, db)
+            body["submission_id"] = "campaign-crash-0001"
+
+            with (
+                patch.object(db, "complete_submission", return_value=False),
+                self.assertRaises(SubmissionConflict) as raised,
+            ):
+                create_campaign_v2(db, workspace, body)
+
+            self.assertEqual(raised.exception.code, "submission_claim_lost")
+            campaigns = db.query(
+                "SELECT id, config_json FROM evaluation_campaigns_v2 ORDER BY id"
+            )
+            self.assertEqual(len(campaigns), 1)
+            marker = json.loads(campaigns[0]["config_json"])["_submission"]
+            self.assertEqual(marker["submission_id"], "campaign-crash-0001")
+            self.assertTrue(marker["request_fingerprint"])
+            with db.connection() as conn:
+                conn.execute(
+                    """
+                    UPDATE submission_keys
+                    SET lease_expires_at = 0, updated_at = 0
+                    WHERE scope = 'campaign'
+                      AND submission_id = 'campaign-crash-0001'
+                    """
+                )
+
+            recovered = create_campaign_v2(db, workspace, body)
+
+            self.assertTrue(recovered["idempotent_replay"])
+            self.assertEqual(recovered["id"], int(campaigns[0]["id"]))
+            self.assertEqual(
+                int(
+                    db.get(
+                        "SELECT COUNT(*) AS count FROM evaluation_campaigns_v2"
+                    )["count"]
+                ),
+                1,
+            )
+            self.assertEqual(
+                db.get_submission("campaign", "campaign-crash-0001")["status"],
+                "completed",
+            )
+
+    def test_completed_campaign_replay_ignores_expired_selection_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            item, body, _paths = self._item_campaign(workspace, db)
+            item_row = db.get(
+                "SELECT collection_id FROM media_items WHERE id = ?",
+                (int(item["id"]),),
+            )
+            ensure_v2_schema(db)
+            snapshot = create_selection_snapshot(
+                db,
+                group_id=int(item_row["collection_id"]),
+            )
+            body.pop("media_item_ids")
+            body["selection_token"] = snapshot["selection_token"]
+            body["submission_id"] = "campaign-token-0001"
+
+            first = create_campaign_v2(db, workspace, body)
+            with db.connection() as conn:
+                conn.execute(
+                    "UPDATE media_item_selection_snapshots SET expires_at = 0"
+                )
+
+            replay = create_campaign_v2(db, workspace, body)
+
+            self.assertTrue(replay["idempotent_replay"])
+            self.assertEqual(first["id"], replay["id"])
+            self.assertEqual(
+                int(
+                    db.get(
+                        "SELECT COUNT(*) AS count FROM evaluation_campaigns_v2"
+                    )["count"]
+                ),
+                1,
+            )
+            with self.assertRaises(SubmissionConflict) as raised:
+                create_campaign_v2(
+                    db,
+                    workspace,
+                    {**body, "public_title": "Conflicting title"},
+                )
+            self.assertEqual(raised.exception.code, "submission_payload_conflict")
 
 
 if __name__ == "__main__":

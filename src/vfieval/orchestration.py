@@ -21,6 +21,7 @@ _WORKER_ADMISSION_OPEN = True
 _WORKER_LIFECYCLE_GENERATION = 0
 _WORKER_LIFECYCLE_STOP_EVENT = threading.Event()
 _WORKER_THREAD_CONTEXT = threading.local()
+_JOB_SUPERVISORS: dict[str, "JobSupervisor"] = {}
 
 
 def create_inference_jobs_for_run(
@@ -118,10 +119,16 @@ def create_inference_jobs_for_run(
 
 
 def start_decode_worker(db: Database, workspace: WorkspaceConfig) -> None:
+    if wake_job_supervisor(db):
+        return
     _start_local_worker(db, workspace, role="decode", count=1)
 
 
 def start_workers_for_run(db: Database, workspace: WorkspaceConfig, run_id: int) -> list[subprocess.Popen]:
+    supervisor = active_job_supervisor(db)
+    if supervisor is not None:
+        supervisor.wake()
+        return []
     run = db.get_run(run_id)
     metadata = run.get("metadata") or {}
     execution_mode = str(metadata.get("execution_mode") or run.get("device") or "single")
@@ -204,6 +211,248 @@ def worker_process_command(
     if idle_timeout is not None:
         command.extend(["--idle-timeout", str(float(idle_timeout))])
     return command
+
+
+class JobSupervisor:
+    """Maintain one reusable local Worker per queued role/device slot."""
+
+    def __init__(
+        self,
+        db: Database,
+        workspace: WorkspaceConfig,
+        *,
+        scan_interval: float = 1.0,
+    ) -> None:
+        self.db = db
+        self.workspace = workspace
+        self.scan_interval = max(0.1, float(scan_interval))
+        self._stop_event = threading.Event()
+        self._wake_event = threading.Event()
+        self._lock = threading.RLock()
+        self._threads: dict[tuple[str, str], tuple[threading.Thread, threading.Event]] = {}
+        self._processes: dict[tuple[str, str], subprocess.Popen] = {}
+        self._coordinator: threading.Thread | None = None
+        self._started = False
+        self._last_scan_at: float | None = None
+        self._last_error: str | None = None
+
+    @property
+    def registry_key(self) -> str:
+        return str(self.db.db_path.resolve())
+
+    def start(self) -> None:
+        with self._lock:
+            if self._started:
+                self.wake()
+                return
+            self._stop_event.clear()
+            self._wake_event.clear()
+            self._started = True
+            with _WORKER_LIFECYCLE_LOCK:
+                existing = _JOB_SUPERVISORS.get(self.registry_key)
+                if existing is not None and existing is not self:
+                    self._started = False
+                    raise RuntimeError(
+                        f"Job supervisor already active for {self.registry_key}"
+                    )
+                _JOB_SUPERVISORS[self.registry_key] = self
+            self._coordinator = threading.Thread(
+                target=self._run,
+                name="vfieval-job-supervisor",
+                daemon=True,
+            )
+            self._coordinator.start()
+        self.wake()
+
+    def stop(self, timeout: float = 5.0) -> None:
+        with self._lock:
+            if not self._started:
+                return
+            self._started = False
+            self._stop_event.set()
+            self._wake_event.set()
+            for _thread, wake_event in self._threads.values():
+                wake_event.set()
+            coordinator = self._coordinator
+            threads = [thread for thread, _wake in self._threads.values()]
+            processes = list(self._processes.values())
+            with _WORKER_LIFECYCLE_LOCK:
+                if _JOB_SUPERVISORS.get(self.registry_key) is self:
+                    _JOB_SUPERVISORS.pop(self.registry_key, None)
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        if coordinator is not None and coordinator is not threading.current_thread():
+            coordinator.join(timeout=max(0.0, deadline - time.monotonic()))
+        for thread in threads:
+            if thread is threading.current_thread():
+                continue
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        for process in processes:
+            if _process_exited(process):
+                continue
+            try:
+                process.terminate()
+            except (ChildProcessError, ProcessLookupError):
+                continue
+            except Exception:
+                pass
+        for process in processes:
+            if _process_exited(process):
+                continue
+            _wait_for_worker_process(
+                process,
+                max(0.0, deadline - time.monotonic()),
+            )
+        with self._lock:
+            self._coordinator = None
+            self._threads = {
+                key: slot for key, slot in self._threads.items() if slot[0].is_alive()
+            }
+            self._processes = {
+                key: process
+                for key, process in self._processes.items()
+                if not _process_exited(process)
+            }
+
+    def wake(self) -> None:
+        self._wake_event.set()
+        with self._lock:
+            for _thread, wake_event in self._threads.values():
+                wake_event.set()
+
+    def run_once(self) -> int:
+        started = 0
+        try:
+            requirements = self.db.queued_job_requirements()
+            for requirement in requirements:
+                role = str(requirement["role"])
+                raw_device = requirement.get("device")
+                device = str(raw_device) if raw_device is not None else ""
+                if role in {"decode", "finalize"}:
+                    device = ""
+                if self._ensure_slot(role, device):
+                    started += 1
+            self._last_error = None
+        except Exception as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+        self._last_scan_at = time.time()
+        return started
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            thread_slots = {
+                f"{role}:{device or 'default'}": thread.is_alive()
+                for (role, device), (thread, _wake) in self._threads.items()
+            }
+            process_slots = {
+                f"{role}:{device or 'default'}": not _process_exited(process)
+                for (role, device), process in self._processes.items()
+            }
+        return {
+            "running": self._started,
+            "thread_slots": thread_slots,
+            "process_slots": process_slots,
+            "last_scan_at": self._last_scan_at,
+            "last_error": self._last_error,
+        }
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            self.run_once()
+            self._wake_event.wait(self.scan_interval)
+            self._wake_event.clear()
+
+    def _ensure_slot(self, role: str, device: str) -> bool:
+        key = (role, device)
+        accelerator = device.startswith(("cuda:", "npu:"))
+        with self._lock:
+            if accelerator:
+                existing = self._processes.get(key)
+                if existing is not None and not _process_exited(existing):
+                    return False
+                if existing is not None:
+                    self._processes.pop(key, None)
+                command = worker_process_command(
+                    self.workspace,
+                    role=role,
+                    device_filter=device,
+                    worker_id=self._worker_id(role, device),
+                    once=False,
+                    idle_timeout=None,
+                )
+                log_path = (
+                    self.workspace.root
+                    / "logs"
+                    / "workers"
+                    / f"{role}-{device.replace(':', '-')}.log"
+                )
+                try:
+                    self._processes[key] = _spawn_worker_process(command, log_path)
+                except _WorkerAdmissionClosed:
+                    return False
+                return True
+
+            existing_thread = self._threads.get(key)
+            if existing_thread is not None and existing_thread[0].is_alive():
+                existing_thread[1].set()
+                return False
+            worker_wake = threading.Event()
+            thread = threading.Thread(
+                target=self._run_thread_worker,
+                args=(key, worker_wake),
+                name=f"vfieval-supervisor-{role}-{device or 'default'}",
+                daemon=True,
+            )
+            self._threads[key] = (thread, worker_wake)
+            thread.start()
+            return True
+
+    def _run_thread_worker(
+        self,
+        key: tuple[str, str],
+        wake_event: threading.Event,
+    ) -> None:
+        role, device = key
+        try:
+            from vfieval.worker import WorkerOptions, run_worker
+
+            run_worker(
+                self.db,
+                self.workspace,
+                WorkerOptions(
+                    role=role,
+                    once=False,
+                    poll_interval=self.scan_interval,
+                    worker_id=self._worker_id(role, device),
+                    device_filter=device or None,
+                    stop_event=self._stop_event,
+                    wake_event=wake_event,
+                ),
+            )
+        finally:
+            with self._lock:
+                current = self._threads.get(key)
+                if current is not None and current[0] is threading.current_thread():
+                    self._threads.pop(key, None)
+
+    @staticmethod
+    def _worker_id(role: str, device: str) -> str:
+        suffix = (device or "default").replace(":", "-")
+        return f"local-supervisor-{role}-{suffix}-{os.getpid()}"
+
+
+def active_job_supervisor(db: Database) -> JobSupervisor | None:
+    key = str(db.db_path.resolve())
+    with _WORKER_LIFECYCLE_LOCK:
+        supervisor = _JOB_SUPERVISORS.get(key)
+    return supervisor
+
+
+def wake_job_supervisor(db: Database) -> bool:
+    supervisor = active_job_supervisor(db)
+    if supervisor is None:
+        return False
+    supervisor.wake()
+    return True
 
 
 def _create_inference_shards(

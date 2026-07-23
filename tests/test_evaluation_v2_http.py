@@ -168,6 +168,59 @@ class EvaluationCampaignV2HttpTests(unittest.TestCase):
         self.assertNotIn("://", str(detail["share_url"]))
         return detail
 
+    def test_campaign_submission_payload_conflict_is_http_409(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace, db = make_workspace(tmp)
+            _run_a, _run_b, body = self._campaign_fixture(
+                workspace,
+                db,
+                prefix="submission-conflict",
+            )
+            body["submission_id"] = "campaign-http-0001"
+            server, thread, base_url = start_server(db, workspace)
+            try:
+                first_status, first = _json_request(
+                    base_url,
+                    "/api/evaluation-campaigns/v2",
+                    method="POST",
+                    payload=body,
+                )
+                replay_status, replay = _json_request(
+                    base_url,
+                    "/api/evaluation-campaigns/v2",
+                    method="POST",
+                    payload=body,
+                )
+                conflict_status, conflict = _json_request(
+                    base_url,
+                    "/api/evaluation-campaigns/v2",
+                    method="POST",
+                    payload={**body, "public_title": "Conflicting title"},
+                )
+
+                self.assertEqual(first_status, 201, first)
+                self.assertEqual(replay_status, 201, replay)
+                self.assertEqual(
+                    first["campaign"]["id"],
+                    replay["campaign"]["id"],
+                )
+                self.assertTrue(replay["campaign"]["idempotent_replay"])
+                self.assertEqual(conflict_status, 409, conflict)
+                self.assertEqual(
+                    conflict["error"]["code"],
+                    "submission_payload_conflict",
+                )
+                self.assertEqual(
+                    int(
+                        db.get(
+                            "SELECT COUNT(*) AS count FROM evaluation_campaigns_v2"
+                        )["count"]
+                    ),
+                    1,
+                )
+            finally:
+                stop_server(server, thread)
+
     def test_unpublished_blind_link_returns_wait_state_without_reviews(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace, db = make_workspace(tmp)

@@ -9,6 +9,7 @@ from vfieval.config import WorkspaceConfig
 from vfieval.metrics.base import MetricResult, MetricUnavailable
 from vfieval.metrics.health import metric_health
 from vfieval.metrics.vmaf import VIDEO_SUFFIXES
+from vfieval.process_control import CancelCheck, run_cancellable
 
 
 CGVQM_PATCH_SCALE = 4
@@ -30,9 +31,16 @@ class CgvqmMetricFailed(RuntimeError):
 class CgvqmMetric:
     name = "cgvqm"
 
-    def __init__(self, workspace: WorkspaceConfig | None = None, device: str | None = None):
+    def __init__(
+        self,
+        workspace: WorkspaceConfig | None = None,
+        device: str | None = None,
+        *,
+        cancel_check: CancelCheck | None = None,
+    ):
         self.workspace = workspace or WorkspaceConfig.from_root()
         self.device_name = device or "cpu"
+        self.cancel_check = cancel_check
 
     def evaluate(self, reference: Path, distorted: Path, work_dir: Path) -> MetricResult:
         if reference.suffix.lower() not in VIDEO_SUFFIXES or distorted.suffix.lower() not in VIDEO_SUFFIXES:
@@ -52,6 +60,7 @@ class CgvqmMetric:
             work_dir,
             int(health.get("video_eval_long_edge") or 720),
             alignment=CGVQM_PATCH_SCALE,
+            cancel_check=self.cancel_check,
         )
         payload = {
             "metric_name": self.name,
@@ -82,16 +91,26 @@ class CgvqmMetric:
             **resize_details,
         }
         try:
-            completed = subprocess.run(
-                command,
-                input=json.dumps(payload),
-                capture_output=True,
-                text=True,
-                timeout=600,
-                check=False,
-                env=env,
-                cwd=str(work_dir),
-            )
+            if self.cancel_check is None:
+                completed = subprocess.run(
+                    command,
+                    input=json.dumps(payload),
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                    check=False,
+                    env=env,
+                    cwd=str(work_dir),
+                )
+            else:
+                completed = run_cancellable(
+                    command,
+                    input_text=json.dumps(payload),
+                    timeout=600,
+                    cancel_check=self.cancel_check,
+                    env=env,
+                    cwd=str(work_dir),
+                )
         except subprocess.TimeoutExpired as exc:
             stdout = _coerce_process_output(exc.stdout)
             stderr = _coerce_process_output(exc.stderr)
@@ -252,12 +271,15 @@ def _prepare_eval_videos(
     long_edge: int,
     *,
     alignment: int = CGVQM_PATCH_SCALE,
+    cancel_check: CancelCheck | None = None,
 ) -> tuple[Path, Path, dict]:
+    if cancel_check is not None:
+        cancel_check()
     ref_info = _video_info(reference)
     dist_info = _video_info(distorted)
     if ref_info is None or dist_info is None:
-        reference_frames = _count_decodable_frames(reference)
-        distorted_frames = _count_decodable_frames(distorted)
+        reference_frames = _count_decodable_frames(reference, cancel_check=cancel_check)
+        distorted_frames = _count_decodable_frames(distorted, cancel_check=cancel_check)
         _validate_eval_frame_counts(reference_frames, distorted_frames)
         return reference, distorted, {
             "resize_status": "skipped_unreadable_video_metadata",
@@ -268,8 +290,8 @@ def _prepare_eval_videos(
     width, height, fps = ref_info
     target_width, target_height = _bounded_aligned_size(width, height, long_edge, alignment)
     if (target_width, target_height) == (width, height) and dist_info[:2] == (width, height):
-        reference_frames = _count_decodable_frames(reference)
-        distorted_frames = _count_decodable_frames(distorted)
+        reference_frames = _count_decodable_frames(reference, cancel_check=cancel_check)
+        distorted_frames = _count_decodable_frames(distorted, cancel_check=cancel_check)
         _validate_eval_frame_counts(reference_frames, distorted_frames)
         return reference, distorted, {
             "resize_status": "not_needed",
@@ -282,10 +304,24 @@ def _prepare_eval_videos(
         }
     eval_reference = work_dir / "cgvqm_ref_eval.mp4"
     eval_distorted = work_dir / "cgvqm_dist_eval.mp4"
-    _resize_video(reference, eval_reference, target_width, target_height, fps)
-    _resize_video(distorted, eval_distorted, target_width, target_height, fps)
-    reference_frames = _count_decodable_frames(eval_reference)
-    distorted_frames = _count_decodable_frames(eval_distorted)
+    _resize_video(
+        reference,
+        eval_reference,
+        target_width,
+        target_height,
+        fps,
+        cancel_check=cancel_check,
+    )
+    _resize_video(
+        distorted,
+        eval_distorted,
+        target_width,
+        target_height,
+        fps,
+        cancel_check=cancel_check,
+    )
+    reference_frames = _count_decodable_frames(eval_reference, cancel_check=cancel_check)
+    distorted_frames = _count_decodable_frames(eval_distorted, cancel_check=cancel_check)
     _validate_eval_frame_counts(reference_frames, distorted_frames)
     return eval_reference, eval_distorted, {
         "resize_status": "resized",
@@ -333,7 +369,15 @@ def _aligned_floor(value: int, alignment: int) -> int:
     return max(alignment, int(value) - (int(value) % alignment))
 
 
-def _resize_video(source: Path, target: Path, width: int, height: int, fps: float) -> None:
+def _resize_video(
+    source: Path,
+    target: Path,
+    width: int,
+    height: int,
+    fps: float,
+    *,
+    cancel_check: CancelCheck | None = None,
+) -> None:
     import cv2
 
     capture = cv2.VideoCapture(str(source))
@@ -345,6 +389,8 @@ def _resize_video(source: Path, target: Path, width: int, height: int, fps: floa
         raise MetricUnavailable(f"CGVQM could not create resized evaluation video: {target}")
     try:
         while True:
+            if cancel_check is not None:
+                cancel_check()
             ok, frame = capture.read()
             if not ok:
                 break
@@ -355,7 +401,11 @@ def _resize_video(source: Path, target: Path, width: int, height: int, fps: floa
         writer.release()
 
 
-def _count_decodable_frames(path: Path) -> int:
+def _count_decodable_frames(
+    path: Path,
+    *,
+    cancel_check: CancelCheck | None = None,
+) -> int:
     try:
         import cv2
 
@@ -365,6 +415,8 @@ def _count_decodable_frames(path: Path) -> int:
         count = 0
         try:
             while True:
+                if cancel_check is not None:
+                    cancel_check()
                 ok, _frame = capture.read()
                 if not ok:
                     break

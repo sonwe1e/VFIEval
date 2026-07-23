@@ -19,6 +19,7 @@ dependencies = [
 npu = ["torch-npu>=2.1"]
 dev = ["ruff", "mypy"]
 test = ["Pillow"]
+release = ["build>=1.2"]
 
 [project.scripts]
 vfieval = "vfieval.cli:main"
@@ -27,7 +28,7 @@ vfieval = "vfieval.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-vfieval = ["web/*"]
+vfieval = ["_build_info.json", "web/*"]
 
 [tool.ruff]
 target-version = "py310"

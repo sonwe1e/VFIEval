@@ -26,6 +26,24 @@ PRODUCER_KINDS = {
     "evaluation_package",
 }
 BINDING_ROLES = {"source", "pred_output", "compare_gt", "compare_pred"}
+MEMBER_ASSET_ROLES = {
+    "canonical_gt": "gt",
+    "evaluation_gt": "gt",
+    "model_pred": "pred",
+    "external_pred": "pred",
+    "compare_snapshot": "pred",
+    "evaluation_pred": "pred",
+}
+INITIAL_BINDING_MEMBER_ROLES = {
+    "source": {"canonical_gt"},
+    "pred_output": {"model_pred"},
+    "compare_gt": {"canonical_gt"},
+    "compare_pred": {"model_pred", "external_pred"},
+}
+ACTIVE_BINDING_MEMBER_ROLES = {
+    **INITIAL_BINDING_MEMBER_ROLES,
+    "compare_pred": {"model_pred", "external_pred", "compare_snapshot"},
+}
 
 
 def _json(data: Any) -> str:
@@ -47,6 +65,40 @@ def _run_type(run: dict[str, Any]) -> str:
     if metadata is None:
         metadata = _loads(run.get("metadata_json"))
     return str((metadata or {}).get("run_type") or "model_inference")
+
+
+def _require_member_asset_role(member_role: str, asset_role: str) -> None:
+    expected = MEMBER_ASSET_ROLES.get(str(member_role))
+    if expected is None:
+        raise ValueError(f"unsupported media item member role: {member_role}")
+    if str(asset_role) != expected:
+        raise ValueError(f"{member_role} requires an asset with role {expected}")
+
+
+def _require_binding_slot(binding_role: str, slot: str) -> None:
+    normalized = str(slot or "")
+    if binding_role == "pred_output" and normalized:
+        raise ValueError("Pred output bindings require an empty slot")
+    if binding_role in {"compare_gt", "compare_pred"} and not normalized.strip():
+        raise ValueError("Compare input bindings require a non-empty alignment slot")
+
+
+def _require_binding_member_role(
+    binding_role: str,
+    member_role: str,
+    *,
+    active: bool,
+) -> None:
+    role_map = ACTIVE_BINDING_MEMBER_ROLES if active else INITIAL_BINDING_MEMBER_ROLES
+    allowed = role_map.get(str(binding_role))
+    if allowed is None:
+        raise ValueError(f"unsupported Run media item binding role: {binding_role}")
+    if str(member_role) not in allowed:
+        position = "active" if active else "original"
+        allowed_text = ", ".join(sorted(allowed))
+        raise ValueError(
+            f"{position} {binding_role} binding member must have role {allowed_text}"
+        )
 
 
 def _decode_item(row: dict[str, Any]) -> dict[str, Any]:
@@ -432,9 +484,7 @@ def _upsert_member(
         raise KeyError(f"media asset {asset_id} not found")
     if str(asset.get("state") or "") != "ready":
         raise ValueError(f"media asset {asset_id} is not ready")
-    if member_role in {"model_pred", "external_pred", "compare_snapshot", "evaluation_pred"}:
-        if str(asset.get("role") or "") != "pred":
-            raise ValueError(f"{member_role} requires an asset with role pred")
+    _require_member_asset_role(member_role, str(asset.get("role") or ""))
     if reusable_as_pred and not (
         (member_role == "model_pred" and producer_kind == "model_inference")
         or (member_role == "external_pred" and producer_kind == "external")
@@ -521,6 +571,12 @@ def _upsert_binding(
     member = get_media_item_member(db, int(member_id))
     if int(member["item_id"]) != int(item["id"]):
         raise ValueError("Run binding member must belong to the selected media item")
+    _require_binding_member_role(
+        binding_role,
+        str(member.get("member_role") or ""),
+        active=False,
+    )
+    _require_binding_slot(binding_role, str(slot or ""))
     now = utc_ts()
     with db.connection() as conn:
         conn.execute(
@@ -808,6 +864,7 @@ def register_compare_snapshot(
         raise ValueError("Compare snapshot source must belong to the selected media item")
     snapshot_metadata = dict(metadata or {})
     snapshot_metadata["source_member_id"] = int(source_member_id)
+    snapshot_metadata["slot"] = str(slot or "")
     member = _upsert_member(
         db,
         item_id=int(item_id),
@@ -846,8 +903,36 @@ def replace_active_binding_member(
     member = get_media_item_member(db, int(new_member_id))
     if int(member["item_id"]) != int(item_id):
         raise ValueError("replacement member must belong to the bound media item")
-    if binding_role == "compare_pred" and member["member_role"] != "compare_snapshot":
-        raise ValueError("Compare Pred replacement must be an immutable Compare snapshot")
+    _require_binding_member_role(
+        str(binding_role),
+        str(member.get("member_role") or ""),
+        active=True,
+    )
+    _require_binding_slot(str(binding_role), str(slot or ""))
+    binding = db.get(
+        """
+        SELECT original_member_id
+        FROM run_media_item_bindings
+        WHERE run_id = ? AND item_id = ? AND binding_role = ? AND slot = ?
+        """,
+        (int(run_id), int(item_id), str(binding_role), str(slot or "")),
+    )
+    if binding is None:
+        raise ValueError("Compare input binding changed or no longer exists")
+    if str(member.get("member_role") or "") != "compare_snapshot":
+        if int(member["id"]) != int(binding["original_member_id"]):
+            raise ValueError("replacement member must preserve the original binding identity")
+    else:
+        metadata = member.get("metadata") or {}
+        if (
+            str(member.get("producer_kind") or "") != "video_compare"
+            or member.get("producer_run_id") is None
+            or int(member["producer_run_id"]) != int(run_id)
+            or not isinstance(metadata, dict)
+            or int(metadata.get("source_member_id") or 0)
+            != int(binding["original_member_id"])
+        ):
+            raise ValueError("Compare Pred replacement is not a snapshot of the original member")
     clauses = [
         "run_id = ?",
         "item_id = ?",

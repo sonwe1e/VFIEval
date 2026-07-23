@@ -10,9 +10,20 @@ ROOT = Path(__file__).resolve().parents[1]
 class ExperimentExperienceUiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.app_js = (ROOT / "src" / "vfieval" / "web" / "app.js").read_text(
-            encoding="utf-8"
+        web = ROOT / "src" / "vfieval" / "web"
+        cls.app_entry_js = (web / "app.js").read_text(encoding="utf-8")
+        cls.compare_js = (web / "compare.js").read_text(encoding="utf-8")
+        cls.run_detail_js = (web / "run-detail.js").read_text(encoding="utf-8")
+        cls.media_js = (web / "media.js").read_text(encoding="utf-8")
+        cls.app_js = "\n".join(
+            (
+                cls.app_entry_js,
+                cls.compare_js,
+                cls.run_detail_js,
+                cls.media_js,
+            )
         )
+        cls.shared_js = (web / "shared.js").read_text(encoding="utf-8")
         cls.styles = (ROOT / "src" / "vfieval" / "web" / "styles.css").read_text(
             encoding="utf-8"
         )
@@ -138,8 +149,46 @@ class ExperimentExperienceUiTests(unittest.TestCase):
             "function escapeHtml", 1
         )[0]
 
-        self.assertIn("error.status = response.status", api_source)
-        self.assertIn("error.payload = data", api_source)
+        self.assertIn("Shared.request(path", api_source)
+        self.assertIn("messageFormatter:", api_source)
+        self.assertIn("_formatStorageCapacityError(data)", api_source)
+        self.assertIn("showRequestDiagnostic(error", api_source)
+
+        parser = self.shared_js.split("async function readResponse", 1)[1].split(
+            "function errorMessage", 1
+        )[0]
+        self.assertIn("await response.text()", parser)
+        self.assertIn("JSON.parse(text)", parser)
+        self.assertIn("raw_text", parser)
+        creator = self.shared_js.split("function createError", 1)[1].split(
+            "function networkError", 1
+        )[0]
+        for field in ("status", "payload", "request_id", "support_id", "details"):
+            self.assertIn(field, creator)
+        self.assertIn('id="request-diagnostic"', self.index_html)
+        self.assertIn("data-copy-request-diagnostic", self.app_js)
+
+    def test_standard_inference_submission_is_single_flight_and_accessible(self) -> None:
+        start = self.app_js.split("async function startRun", 1)[1].split(
+            "function statusBadge", 1
+        )[0]
+        render = self.app_js.split("function renderRunSubmissionState", 1)[1].split(
+            "async function startRun", 1
+        )[0]
+
+        self.assertIn('id="run-submit-status"', self.index_html)
+        self.assertIn("runCreationFlight.isLocked()", start)
+        self.assertIn("runCreationFlight.tryLock()", start)
+        self.assertIn("runCreationFlight.release()", start)
+        self.assertIn("state.runSubmitting = true", start)
+        self.assertIn('state.runSubmitPhase = "selection"', start)
+        self.assertIn('state.runSubmitPhase = "preflight"', start)
+        self.assertIn('state.runSubmitPhase = "creating"', start)
+        self.assertIn('state.runSubmitPhase = "opening"', start)
+        self.assertIn("state.runSubmitting = false", start)
+        self.assertIn('form.setAttribute("aria-busy"', render)
+        self.assertIn("start.disabled = state.runSubmitting", render)
+        self.assertIn("请勿重复点击", render)
 
     def test_impossible_accelerator_default_falls_back_to_detected_hardware(self) -> None:
         resolver = self.app_js.split("function resolveInitialExecutionDefaults", 1)[1].split(
@@ -259,7 +308,7 @@ class ExperimentExperienceUiTests(unittest.TestCase):
         self.assertIn("mediaAssetsPage", render)
         self.assertIn("data-media-load-more", render)
         self.assertIn("已显示 ${state.mediaAssets.length}/${mediaTotal}", render)
-        self.assertIn("/api/media/sources?page=${nextPage}", load_more)
+        self.assertIn("mediaAssetsPath(nextPage)", load_more)
         self.assertIn("new Map(state.mediaAssets.map", load_more)
 
     def test_external_prediction_item_binding_reads_one_server_page(self) -> None:

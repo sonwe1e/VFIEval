@@ -1,22 +1,64 @@
 (function () {
+  const Shared = window.VFIEvalShared;
+  if (!Shared) throw new Error("VFIEval shared frontend primitives failed to load");
+
+  const CAMPAIGN_DRAFT_KEY = "vfieval:campaign-draft:v1";
+  const CAMPAIGN_DRAFT_VERSION = 1;
+  const MAX_DRAFT_RECONCILE_PAGES = 50;
+  const BULK_ITEM_PAGE_SIZE = 200;
+  const METHOD_ITEM_CHUNK_SIZE = 80;
+  const PREPARATION_POLL_BASE_MS = 2000;
+  const PREPARATION_POLL_MAX_MS = 30000;
+
   const studioState = {
     campaigns: [],
+    campaignQuery: "",
+    campaignStatus: "",
+    campaignPage: 1,
+    campaignPageSize: 30,
+    campaignPageCount: 1,
+    campaignTotal: 0,
+    campaignListRequestGeneration: 0,
+    campaignQueryTimer: null,
+    packageCampaigns: [],
+    packagePage: 1,
+    packagePageSize: 30,
+    packagePageCount: 1,
+    packageTotal: 0,
+    packageRequestGeneration: 0,
     runOutputs: [],
     itemGroups: [],
     items: [],
     methods: [],
     selectedGroupId: "",
     selectedItemIds: new Set(),
+    itemSelectionToken: "",
+    itemSelectionTokenTotal: 0,
+    itemSelectionTokenExpiresAt: 0,
     itemQuery: "",
     itemPage: 1,
     itemPageSize: 100,
     itemPageCount: 1,
     itemTotal: 0,
+    itemCache: new Map(),
+    itemOnlySelected: false,
+    selectedItemPage: 1,
+    itemBulkController: null,
+    itemBulkProgress: null,
+    draftHydrated: false,
+    draftRestoring: false,
+    draftSaveTimer: null,
+    draftNotice: "",
+    draftCommitted: false,
     preview: null,
     selectedCampaignKey: null,
     preparationPoll: null,
     preparationPollKey: null,
     preparationPollGeneration: 0,
+    preparationLastSuccessAt: 0,
+    preparationPollFailures: 0,
+    preparationPollError: "",
+    preparationNextDelayMs: PREPARATION_POLL_BASE_MS,
     campaignRequestGeneration: 0,
     objectiveCurveRequestGeneration: 0,
     campaignDetail: null,
@@ -31,23 +73,30 @@
     itemQueryTimer: null,
     storagePreview: null,
     cleanupRequests: [],
+    campaignSubmitting: false,
+    campaignSubmitPhase: "",
+    campaignSubmitError: "",
+    campaignSubmissionId: "",
+    campaignSubmissionFingerprint: "",
   };
 
   const el = (id) => document.getElementById(id);
+  const campaignCreationFlight = Shared.createSingleFlight();
+
+  function reportRequestFailure(error, context = "Evaluation Studio 请求") {
+    if (typeof window.showRequestDiagnostic === "function") {
+      window.showRequestDiagnostic(error, context);
+    }
+  }
 
   async function request(path, options = {}) {
-    const response = await fetch(path, {
-      ...options,
-      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    const { suppressDiagnostic = false, ...fetchOptions } = options;
+    return Shared.request(path, {
+      fetchOptions,
+      suppressDiagnostic,
+      networkMessage: "无法连接 VFIEval 服务",
+      onDiagnostic: (error) => reportRequestFailure(error),
     });
-    const data = await response.json();
-    if (!response.ok) {
-      const error = new Error(data.error?.message || response.statusText);
-      error.status = response.status;
-      error.payload = data;
-      throw error;
-    }
-    return data;
   }
 
   function safe(value) {
@@ -105,6 +154,161 @@
     return Array.from(studioState.selectedItemIds).map(Number).sort((left, right) => left - right);
   }
 
+  function usesItemSelectionToken() {
+    return Boolean(studioState.itemSelectionToken);
+  }
+
+  function selectedItemCount() {
+    return usesItemSelectionToken()
+      ? Number(studioState.itemSelectionTokenTotal || 0)
+      : studioState.selectedItemIds.size;
+  }
+
+  function itemIsSelected(id) {
+    return usesItemSelectionToken() || studioState.selectedItemIds.has(Number(id));
+  }
+
+  function campaignItemSelectionPayload() {
+    if (usesItemSelectionToken()) {
+      return { selection_token: studioState.itemSelectionToken };
+    }
+    return { media_item_ids: selectedItemIds() };
+  }
+
+  function campaignItemSelectionSignature() {
+    return JSON.stringify(campaignItemSelectionPayload());
+  }
+
+  function resetCampaignSubmissionIdentity() {
+    studioState.campaignSubmissionId = "";
+    studioState.campaignSubmissionFingerprint = "";
+  }
+
+  function campaignSubmissionIdFor(payload) {
+    const fingerprint = JSON.stringify(payload);
+    if (!studioState.campaignSubmissionId
+        || studioState.campaignSubmissionFingerprint !== fingerprint) {
+      studioState.campaignSubmissionId = Shared.createSubmissionId("studio");
+      studioState.campaignSubmissionFingerprint = fingerprint;
+    }
+    return studioState.campaignSubmissionId;
+  }
+
+  function campaignDraftPayload() {
+    const form = el("studio-wizard-form");
+    return {
+      version: CAMPAIGN_DRAFT_VERSION,
+      saved_at: new Date().toISOString(),
+      group_id: String(studioState.selectedGroupId || ""),
+      item_ids: selectedItemIds(),
+      selection_token: String(studioState.itemSelectionToken || ""),
+      selection_total: Number(studioState.itemSelectionTokenTotal || 0),
+      selection_expires_at: Number(studioState.itemSelectionTokenExpiresAt || 0),
+      item_query: String(studioState.itemQuery || ""),
+      only_selected: Boolean(studioState.itemOnlySelected),
+      name: String(form?.elements?.name?.value || ""),
+      public_title: String(form?.elements?.public_title?.value || ""),
+      target_votes: Number(form?.elements?.target_votes?.value || 3),
+      method_a_source: methodSourceMode("a"),
+      method_a_key: String(el("studio-method-a")?.value || ""),
+      method_b_source: methodSourceMode("b"),
+      method_b_key: String(el("studio-method-b")?.value || ""),
+      allow_external_aspect_stretch: Boolean(el("studio-allow-external-aspect-stretch")?.checked),
+    };
+  }
+
+  function readCampaignDraft() {
+    const parsed = Shared.storageJsonGet(CAMPAIGN_DRAFT_KEY, null);
+    if (!parsed) return null;
+    if (Number(parsed.version) !== CAMPAIGN_DRAFT_VERSION) {
+      Shared.storageRemove(CAMPAIGN_DRAFT_KEY);
+      return null;
+    }
+    return parsed;
+  }
+
+  function saveCampaignDraft() {
+    if (studioState.draftRestoring || studioState.draftCommitted) return;
+    if (!Shared.storageJsonSet(CAMPAIGN_DRAFT_KEY, campaignDraftPayload())) {
+      studioState.draftNotice = "浏览器无法保存 Campaign 草稿；本次填写只在当前页面保留。";
+      updateItemSelectionUi();
+    }
+  }
+
+  function queueCampaignDraftSave() {
+    if (studioState.draftRestoring || studioState.draftCommitted) return;
+    clearTimeout(studioState.draftSaveTimer);
+    studioState.draftSaveTimer = setTimeout(saveCampaignDraft, 120);
+  }
+
+  function markCampaignDraftDirty() {
+    studioState.draftCommitted = false;
+    queueCampaignDraftSave();
+  }
+
+  function clearCampaignDraft() {
+    clearTimeout(studioState.draftSaveTimer);
+    studioState.draftSaveTimer = null;
+    studioState.draftNotice = "";
+    studioState.draftCommitted = true;
+    Shared.storageRemove(CAMPAIGN_DRAFT_KEY);
+  }
+
+  function primeCampaignDraft(draft) {
+    if (!draft) return;
+    studioState.draftRestoring = true;
+    studioState.selectedGroupId = String(draft.group_id || "");
+    studioState.selectedItemIds = new Set(
+      (Array.isArray(draft.item_ids) ? draft.item_ids : [])
+        .map(Number)
+        .filter((id) => Number.isInteger(id) && id > 0),
+    );
+    studioState.itemSelectionToken = String(draft.selection_token || "");
+    studioState.itemSelectionTokenTotal = Math.max(0, Number(draft.selection_total || 0));
+    studioState.itemSelectionTokenExpiresAt = Math.max(
+      0,
+      Number(draft.selection_expires_at || 0),
+    );
+    studioState.itemQuery = String(draft.item_query || "");
+    studioState.itemOnlySelected = Boolean(draft.only_selected)
+      && !studioState.itemSelectionToken;
+    studioState.selectedItemPage = 1;
+    const query = el("studio-item-query");
+    if (query) query.value = studioState.itemQuery;
+  }
+
+  function applyCampaignDraftControls(draft) {
+    if (!draft) return [];
+    const reconciled = [];
+    const form = el("studio-wizard-form");
+    if (form?.elements?.name) form.elements.name.value = String(draft.name || "");
+    if (form?.elements?.public_title) {
+      form.elements.public_title.value = String(draft.public_title || "匿名视频质量评测");
+    }
+    if (form?.elements?.target_votes) {
+      const requestedVotes = Number(draft.target_votes);
+      form.elements.target_votes.value = String(
+        Number.isFinite(requestedVotes) ? Math.min(1000, Math.max(1, requestedVotes)) : 3,
+      );
+    }
+    for (const slot of ["a", "b"]) {
+      const source = el(`studio-method-${slot}-source`);
+      const select = el(`studio-method-${slot}`);
+      const sourceValue = draft[`method_${slot}_source`] === "external" ? "external" : "run";
+      const requestedKey = String(draft[`method_${slot}_key`] || "");
+      if (source) source.value = sourceValue;
+      fillMethodSelects();
+      if (select && requestedKey && [...select.options].some((option) => option.value === requestedKey)) {
+        select.value = requestedKey;
+      } else if (requestedKey) {
+        reconciled.push(`方法 ${slot.toUpperCase()} 已不可用`);
+      }
+    }
+    const allowStretch = el("studio-allow-external-aspect-stretch");
+    if (allowStretch) allowStretch.checked = Boolean(draft.allow_external_aspect_stretch);
+    return reconciled;
+  }
+
   function spatialPolicy() {
     return {
       mode: "smallest_pred",
@@ -117,6 +321,7 @@
   function invalidateCoveragePreview() {
     studioState.previewGeneration += 1;
     studioState.preview = null;
+    if (!studioState.campaignSubmitting) studioState.campaignSubmitError = "";
     renderCoverage();
   }
 
@@ -140,14 +345,99 @@
     ].filter(Boolean).join(" · ");
   }
 
-  function itemPagerMarkup() {
-    const page = Math.max(1, Number(studioState.itemPage || 1));
-    const pageCount = Math.max(1, Number(studioState.itemPageCount || 1));
-    return `<div class="pager">
-      <span class="muted">共 ${Number(studioState.itemTotal || 0)} 个匹配 Item · 第 ${page}/${pageCount} 页</span>
-      <button class="secondary" data-studio-item-page="${page - 1}" type="button" ${page <= 1 ? "disabled" : ""}>上一页</button>
-      <button class="secondary" data-studio-item-page="${page + 1}" type="button" ${page >= pageCount ? "disabled" : ""}>下一页</button>
+  function cacheItems(items) {
+    for (const item of items || []) {
+      const id = itemId(item);
+      if (id) studioState.itemCache.set(id, item);
+    }
+  }
+
+  function selectedCachedItems() {
+    return selectedItemIds()
+      .map((id) => studioState.itemCache.get(id))
+      .filter(Boolean)
+      .sort((left, right) => String(left.display_name || left.item_key || "").localeCompare(
+        String(right.display_name || right.item_key || ""),
+      ));
+  }
+
+  function itemView() {
+    if (!studioState.itemOnlySelected) {
+      return {
+        items: studioState.items,
+        page: Math.max(1, Number(studioState.itemPage || 1)),
+        pageCount: Math.max(1, Number(studioState.itemPageCount || 1)),
+        total: Math.max(0, Number(studioState.itemTotal || 0)),
+      };
+    }
+    if (usesItemSelectionToken()) {
+      return {
+        items: studioState.items,
+        page: Math.max(1, Number(studioState.selectedItemPage || 1)),
+        pageCount: Math.max(1, Number(studioState.itemPageCount || 1)),
+        total: selectedItemCount(),
+      };
+    }
+    const allItems = selectedCachedItems();
+    const pageCount = Math.max(1, Math.ceil(allItems.length / studioState.itemPageSize));
+    const page = Math.min(pageCount, Math.max(1, Number(studioState.selectedItemPage || 1)));
+    studioState.selectedItemPage = page;
+    const start = (page - 1) * studioState.itemPageSize;
+    return {
+      items: allItems.slice(start, start + studioState.itemPageSize),
+      page,
+      pageCount,
+      total: selectedItemCount(),
+    };
+  }
+
+  function itemPagerMarkup(view = itemView()) {
+    return `<div class="pager" data-studio-item-pager>
+      <span class="muted" data-studio-pager-summary>${studioState.itemOnlySelected ? "仅看已选" : "当前筛选"} · 共 ${Number(view.total || 0)} 个 Item · 第 ${view.page}/${view.pageCount} 页</span>
+      <button class="secondary" data-studio-item-page="${view.page - 1}" type="button" ${view.page <= 1 ? "disabled" : ""}>上一页</button>
+      <button class="secondary" data-studio-item-page="${view.page + 1}" type="button" ${view.page >= view.pageCount ? "disabled" : ""}>下一页</button>
     </div>`;
+  }
+
+  function itemCardsMarkup(items) {
+    if (!items.length) {
+      return `<p class="muted">${studioState.itemOnlySelected ? "尚未选择任何视频。" : "当前文件夹中没有匹配的 GT Media Item。"}</p>`;
+    }
+    return items.map((item) => {
+      const id = itemId(item);
+      return `<label class="studio-item-card ${itemIsSelected(id) ? "selected" : ""}">
+        <input type="checkbox" data-studio-item="${id}" ${itemIsSelected(id) ? "checked" : ""}>
+        <span><strong>${safe(item.display_name || item.item_key || `Media Item #${id}`)}</strong><small>${safe(itemMetadata(item))}</small><small>GT asset #${Number(item.canonical_gt_asset_id || 0)}</small></span>
+      </label>`;
+    }).join("");
+  }
+
+  function createItemCardElement(item) {
+    const id = itemId(item);
+    const label = document.createElement("label");
+    label.className = `studio-item-card${itemIsSelected(id) ? " selected" : ""}`;
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.dataset.studioItem = String(id);
+    input.checked = itemIsSelected(id);
+    const body = document.createElement("span");
+    const title = document.createElement("strong");
+    title.textContent = String(item.display_name || item.item_key || `Media Item #${id}`);
+    const metadata = document.createElement("small");
+    metadata.textContent = itemMetadata(item);
+    const asset = document.createElement("small");
+    asset.textContent = `GT asset #${Number(item.canonical_gt_asset_id || 0)}`;
+    body.append(title, metadata, asset);
+    label.append(input, body);
+    return label;
+  }
+
+  function bulkSelectionStatus() {
+    const progress = studioState.itemBulkProgress;
+    if (!progress) return "";
+    if (progress.error) return progress.error;
+    if (progress.message) return progress.message;
+    return `正在读取筛选结果：${Number(progress.page || 0)}/${Number(progress.pageCount || 0)} 页 · 已发现 ${Number(progress.found || 0)} 个 Item`;
   }
 
   function renderItems() {
@@ -157,20 +447,131 @@
       host.innerHTML = "<p class=\"muted\">没有可用的 GT 文件夹。</p>";
       return;
     }
-    if (!studioState.items.length) {
-      host.innerHTML = `<p class="muted">当前文件夹中没有匹配的 GT Media Item。</p>${itemPagerMarkup()}`;
-      return;
-    }
+    const view = itemView();
     host.innerHTML = `
-      <div class="coverage-summary"><strong>已选 ${studioState.selectedItemIds.size} 个视频</strong><span class="muted">每个 Item 都绑定精确 canonical GT；翻页和搜索不会取消已选视频。</span></div>
-      <div class="studio-item-grid">${studioState.items.map((item) => {
-        const id = itemId(item);
-        return `<label class="studio-item-card ${studioState.selectedItemIds.has(id) ? "selected" : ""}">
-          <input type="checkbox" data-studio-item="${id}" ${studioState.selectedItemIds.has(id) ? "checked" : ""}>
-          <span><strong>${safe(item.display_name || item.item_key || `Media Item #${id}`)}</strong><small>${safe(itemMetadata(item))}</small><small>GT asset #${Number(item.canonical_gt_asset_id || 0)}</small></span>
-        </label>`;
-      }).join("")}</div>
-      ${itemPagerMarkup()}`;
+      <div class="studio-item-toolbar">
+        <div><strong data-studio-selected-count>已选 ${selectedItemCount()} 个视频</strong><span class="muted">每个 Item 都绑定精确 canonical GT；翻页和搜索不会取消已选视频。</span></div>
+        <div class="studio-item-actions">
+          <button class="secondary" data-studio-select-page type="button" ${studioState.itemOnlySelected || !studioState.items.length ? "disabled" : ""}>选择当前页</button>
+          <button class="secondary" data-studio-select-filtered type="button" ${studioState.itemOnlySelected || !studioState.itemTotal || studioState.itemBulkController || usesItemSelectionToken() ? "disabled" : ""}>${usesItemSelectionToken() ? "已全选当前筛选" : "选择全部筛选结果"}</button>
+          <button class="secondary" data-studio-clear-selection type="button" ${selectedItemCount() ? "" : "disabled"}>清空选择</button>
+          <button class="secondary" data-studio-only-selected type="button" aria-pressed="${studioState.itemOnlySelected ? "true" : "false"}">${studioState.itemOnlySelected ? "显示筛选结果" : "仅看已选"}</button>
+        </div>
+        <div class="studio-bulk-progress" data-studio-bulk-progress ${studioState.itemBulkProgress ? "" : "hidden"}>
+          <span role="status" aria-live="polite">${safe(bulkSelectionStatus())}</span>
+          <button class="secondary" data-studio-cancel-bulk type="button" ${studioState.itemBulkController ? "" : "hidden"}>取消</button>
+        </div>
+        <p class="studio-draft-notice muted" data-studio-draft-notice ${studioState.draftNotice ? "" : "hidden"}>${safe(studioState.draftNotice)}</p>
+      </div>
+      <div class="studio-item-grid" data-studio-item-grid>${itemCardsMarkup(view.items)}</div>
+      ${itemPagerMarkup(view)}`;
+  }
+
+  function updateItemSelectionUi() {
+    const host = el("studio-items");
+    if (!host) return;
+    const count = host.querySelector("[data-studio-selected-count]");
+    if (count) count.textContent = `已选 ${selectedItemCount()} 个视频`;
+    for (const input of host.querySelectorAll("[data-studio-item]")) {
+      const selected = itemIsSelected(Number(input.dataset.studioItem));
+      input.checked = selected;
+      input.closest(".studio-item-card")?.classList.toggle("selected", selected);
+      if (studioState.itemOnlySelected && !selected) input.closest(".studio-item-card")?.remove();
+    }
+    if (studioState.itemOnlySelected) {
+      const grid = host.querySelector("[data-studio-item-grid]");
+      if (grid && !grid.querySelector(".studio-item-card")) {
+        const visible = itemView().items;
+        if (visible.length) {
+          grid.replaceChildren(...visible.map(createItemCardElement));
+        } else {
+          const empty = document.createElement("p");
+          empty.className = "muted";
+          empty.textContent = "尚未选择任何视频。";
+          grid.replaceChildren(empty);
+        }
+      }
+      const view = itemView();
+      const pager = host.querySelector("[data-studio-item-pager]");
+      const summary = pager?.querySelector("[data-studio-pager-summary]");
+      if (summary) summary.textContent = `仅看已选 · 共 ${view.total} 个 Item · 第 ${view.page}/${view.pageCount} 页`;
+      const buttons = pager?.querySelectorAll("[data-studio-item-page]") || [];
+      if (buttons[0]) {
+        buttons[0].dataset.studioItemPage = String(view.page - 1);
+        buttons[0].disabled = view.page <= 1;
+      }
+      if (buttons[1]) {
+        buttons[1].dataset.studioItemPage = String(view.page + 1);
+        buttons[1].disabled = view.page >= view.pageCount;
+      }
+    }
+    const clear = host.querySelector("[data-studio-clear-selection]");
+    if (clear) clear.disabled = !selectedItemCount();
+    const selectPage = host.querySelector("[data-studio-select-page]");
+    if (selectPage) selectPage.disabled = studioState.itemOnlySelected || !studioState.items.length;
+    const selectFiltered = host.querySelector("[data-studio-select-filtered]");
+    if (selectFiltered) {
+      selectFiltered.disabled = studioState.itemOnlySelected
+        || !studioState.itemTotal
+        || Boolean(studioState.itemBulkController)
+        || usesItemSelectionToken();
+      selectFiltered.textContent = usesItemSelectionToken()
+        ? "已全选当前筛选"
+        : "选择全部筛选结果";
+    }
+    const progress = host.querySelector("[data-studio-bulk-progress]");
+    if (progress) {
+      progress.hidden = !studioState.itemBulkProgress;
+      const status = progress.querySelector("[role=status]");
+      if (status) status.textContent = bulkSelectionStatus();
+      const cancel = progress.querySelector("[data-studio-cancel-bulk]");
+      if (cancel) cancel.hidden = !studioState.itemBulkController;
+    }
+    const notice = host.querySelector("[data-studio-draft-notice]");
+    if (notice) {
+      notice.hidden = !studioState.draftNotice;
+      notice.textContent = studioState.draftNotice;
+    }
+    renderCampaignSubmissionState();
+  }
+
+  function cancelBulkItemSelection() {
+    if (!studioState.itemBulkController) return;
+    studioState.itemBulkController.abort();
+    studioState.itemBulkController = null;
+    studioState.itemBulkProgress = {
+      ...(studioState.itemBulkProgress || {}),
+      error: "已取消选择全部筛选结果；原有选择保持不变。",
+    };
+    updateItemSelectionUi();
+  }
+
+  function clearItemSelectionToken({ preserveVisible = false, notice = "" } = {}) {
+    if (!usesItemSelectionToken()) return;
+    studioState.selectedItemIds = preserveVisible
+      ? new Set(studioState.items.map(itemId).filter((id) => id > 0))
+      : new Set();
+    studioState.itemSelectionToken = "";
+    studioState.itemSelectionTokenTotal = 0;
+    studioState.itemSelectionTokenExpiresAt = 0;
+    studioState.selectedItemPage = 1;
+    if (notice) studioState.draftNotice = notice;
+  }
+
+  async function fetchItemPage(page, options = {}) {
+    const pageSize = Math.min(BULK_ITEM_PAGE_SIZE, Math.max(1, Number(options.pageSize || studioState.itemPageSize)));
+    const path = `/api/media/items?group_id=${encodeURIComponent(studioState.selectedGroupId)}&q=${encodeURIComponent(options.query ?? studioState.itemQuery)}&page=${Math.max(1, Number(page || 1))}&page_size=${pageSize}`;
+    return request(path, options.signal ? { signal: options.signal } : {});
+  }
+
+  async function fetchSelectionTokenPage(page, options = {}) {
+    if (!usesItemSelectionToken()) throw new Error("筛选选择令牌已失效");
+    const pageSize = Math.min(
+      BULK_ITEM_PAGE_SIZE,
+      Math.max(1, Number(options.pageSize || studioState.itemPageSize)),
+    );
+    const path = `/api/media/item-selections/${encodeURIComponent(studioState.itemSelectionToken)}?page=${Math.max(1, Number(page || 1))}&page_size=${pageSize}`;
+    return request(path, options.signal ? { signal: options.signal } : {});
   }
 
   async function loadItemGroups() {
@@ -178,8 +579,10 @@
     studioState.itemGroups = payload.groups || payload.item_groups || [];
     const ids = new Set(studioState.itemGroups.map(groupId));
     if (!ids.has(String(studioState.selectedGroupId))) {
+      if (studioState.selectedGroupId) studioState.draftNotice = "草稿中的 GT 文件夹已不可用，已切换到当前首个可用文件夹。";
       studioState.selectedGroupId = groupId(studioState.itemGroups[0]);
       studioState.selectedItemIds.clear();
+      clearItemSelectionToken();
       studioState.itemPage = 1;
     }
     renderItemGroupOptions();
@@ -197,17 +600,164 @@
       await loadMethodsForSelection();
       return;
     }
-    const requestedPage = Math.max(1, Number(options.page || studioState.itemPage || 1));
-    const path = `/api/media/items?group_id=${encodeURIComponent(studioState.selectedGroupId)}&q=${encodeURIComponent(studioState.itemQuery)}&page=${requestedPage}&page_size=${studioState.itemPageSize}`;
-    const payload = await request(path);
+    const tokenPage = usesItemSelectionToken() && studioState.itemOnlySelected;
+    const requestedPage = Math.max(
+      1,
+      Number(
+        options.page
+        || (tokenPage ? studioState.selectedItemPage : studioState.itemPage)
+        || 1,
+      ),
+    );
+    const payload = tokenPage
+      ? await fetchSelectionTokenPage(requestedPage)
+      : await fetchItemPage(requestedPage);
     if (generation !== studioState.itemRequestGeneration) return;
     const pageCount = Math.max(1, Number(payload.page_count || payload.total_pages || 1));
     if (requestedPage > pageCount) return loadItems({ page: pageCount });
     studioState.items = payload.items || [];
-    studioState.itemPage = Math.max(1, Number(payload.page || requestedPage));
+    if (tokenPage) studioState.selectedItemPage = Math.max(1, Number(payload.page || requestedPage));
+    else studioState.itemPage = Math.max(1, Number(payload.page || requestedPage));
     studioState.itemPageCount = pageCount;
-    studioState.itemTotal = Math.max(0, Number(payload.total || 0));
+    if (tokenPage) {
+      studioState.itemSelectionTokenTotal = Math.max(0, Number(payload.total || 0));
+      studioState.itemSelectionTokenExpiresAt = Number(payload.expires_at || 0);
+    } else {
+      studioState.itemTotal = Math.max(0, Number(payload.total || 0));
+    }
+    cacheItems(studioState.items);
     renderItems();
+  }
+
+  function currentItemFilterSignature() {
+    return JSON.stringify([String(studioState.selectedGroupId), String(studioState.itemQuery)]);
+  }
+
+  async function applyItemSelectionChange() {
+    resetCampaignSubmissionIdentity();
+    updateItemSelectionUi();
+    invalidateCoveragePreview();
+    markCampaignDraftDirty();
+    await loadMethodsForSelection();
+  }
+
+  async function selectCurrentItemPage() {
+    for (const item of studioState.items) {
+      const id = itemId(item);
+      if (id) studioState.selectedItemIds.add(id);
+    }
+    await applyItemSelectionChange();
+  }
+
+  async function clearSelectedItems() {
+    studioState.selectedItemIds.clear();
+    clearItemSelectionToken();
+    studioState.selectedItemPage = 1;
+    await applyItemSelectionChange();
+  }
+
+  async function selectAllFilteredItems() {
+    if (studioState.itemBulkController) return;
+    const controller = new AbortController();
+    const signature = currentItemFilterSignature();
+    studioState.itemBulkController = controller;
+    studioState.itemBulkProgress = {
+      message: `正在保存 ${studioState.itemTotal} 个筛选结果的选择快照…`,
+    };
+    updateItemSelectionUi();
+    try {
+      const payload = await request("/api/media/item-selections", {
+        method: "POST",
+        signal: controller.signal,
+        body: JSON.stringify({
+          group_id: Number(studioState.selectedGroupId),
+          q: studioState.itemQuery,
+        }),
+      });
+      if (signature !== currentItemFilterSignature()) return;
+      if (studioState.itemBulkController === controller) studioState.itemBulkController = null;
+      studioState.selectedItemIds.clear();
+      studioState.itemSelectionToken = String(payload.selection_token || "");
+      studioState.itemSelectionTokenTotal = Math.max(0, Number(payload.total || 0));
+      studioState.itemSelectionTokenExpiresAt = Number(payload.expires_at || 0);
+      studioState.itemBulkProgress = {
+        message: `已选择全部 ${studioState.itemSelectionTokenTotal} 个筛选结果。`,
+      };
+      await applyItemSelectionChange();
+    } catch (error) {
+      if (error?.name !== "AbortError") {
+        studioState.itemBulkProgress = {
+          ...(studioState.itemBulkProgress || {}),
+          error: `选择筛选结果失败：${error.message || String(error)}`,
+        };
+        reportRequestFailure(error, "选择全部筛选结果");
+      }
+    } finally {
+      if (studioState.itemBulkController === controller) studioState.itemBulkController = null;
+      updateItemSelectionUi();
+    }
+  }
+
+  async function reconcileDraftItems(draft) {
+    if (studioState.itemSelectionToken) {
+      try {
+        const payload = await fetchSelectionTokenPage(1, { pageSize: studioState.itemPageSize });
+        if (String(payload.group_id || "") !== String(studioState.selectedGroupId)) {
+          throw new Error("草稿选择快照不属于当前 GT 文件夹");
+        }
+        if (String(payload.q || "") !== String(studioState.itemQuery || "")) {
+          throw new Error("草稿选择快照的筛选条件已变化");
+        }
+        studioState.itemSelectionTokenTotal = Math.max(0, Number(payload.total || 0));
+        studioState.itemSelectionTokenExpiresAt = Number(payload.expires_at || 0);
+        cacheItems(payload.items || []);
+        if (draft?.only_selected) {
+          studioState.itemOnlySelected = true;
+          studioState.items = payload.items || [];
+          studioState.selectedItemPage = Math.max(1, Number(payload.page || 1));
+          studioState.itemPageCount = Math.max(1, Number(payload.page_count || 1));
+        }
+        return [];
+      } catch (_error) {
+        clearItemSelectionToken();
+        return ["草稿中的筛选选择已过期或失效，已安全清空"];
+      }
+    }
+    const requestedIds = new Set(
+      (Array.isArray(draft?.item_ids) ? draft.item_ids : [])
+        .map(Number)
+        .filter((id) => Number.isInteger(id) && id > 0),
+    );
+    if (!requestedIds.size || !studioState.selectedGroupId) {
+      studioState.selectedItemIds.clear();
+      return [];
+    }
+    const foundIds = new Set();
+    let pageCount = 1;
+    let truncated = false;
+    for (let page = 1; page <= pageCount; page += 1) {
+      if (page > MAX_DRAFT_RECONCILE_PAGES) {
+        truncated = true;
+        break;
+      }
+      const payload = await fetchItemPage(page, { pageSize: BULK_ITEM_PAGE_SIZE, query: "" });
+      pageCount = Math.max(1, Number(payload.page_count || payload.total_pages || 1));
+      const items = payload.items || [];
+      cacheItems(items);
+      for (const item of items) {
+        const id = itemId(item);
+        if (requestedIds.has(id)) foundIds.add(id);
+      }
+      if (foundIds.size === requestedIds.size) break;
+    }
+    studioState.selectedItemIds = foundIds;
+    const removed = [...requestedIds].filter((id) => !foundIds.has(id));
+    const reconciled = [];
+    if (removed.length) reconciled.push(`${removed.length} 个已删除或失效的 Item 已从草稿移除`);
+    if (truncated) {
+      reconciled.push(`GT 文件夹超过 ${MAX_DRAFT_RECONCILE_PAGES * BULK_ITEM_PAGE_SIZE} 个 Item，未验证到的草稿选择已安全移除`);
+    }
+    return reconciled;
   }
 
   function methodOptions(slot, selected = "") {
@@ -216,7 +766,7 @@
     const placeholder = mode === "run" ? "选择模型 Run" : "选择已绑定的 External 方法";
     return `<option value="">${placeholder}</option>${methods.map((method) => {
       const key = methodKey(method);
-      const coverage = `${Number(method.covered_count || (method.covered_item_ids || []).length || 0)}/${Number(method.total_items || studioState.selectedItemIds.size || 0)}`;
+      const coverage = `${Number(method.covered_count || (method.covered_item_ids || []).length || 0)}/${Number(method.total_items || selectedItemCount() || 0)}`;
       const label = method.label || method.run_name || method.method_key || key;
       return `<option value="${safe(key)}" ${key === selected ? "selected" : ""}>${safe(label)} · 覆盖 ${coverage}${method.complete ? " · 完整" : " · 有缺失"}</option>`;
     }).join("")}`;
@@ -237,15 +787,65 @@
   async function loadMethodsForSelection() {
     const generation = ++studioState.methodRequestGeneration;
     const ids = selectedItemIds();
-    if (!ids.length) {
+    if (!selectedItemCount()) {
       studioState.methods = [];
       fillMethodSelects();
       return;
     }
-    const query = ids.map((id) => `item_id=${encodeURIComponent(id)}`).join("&");
-    const payload = await request(`/api/media/methods?${query}`);
+    if (usesItemSelectionToken()) {
+      const payload = await request(
+        `/api/media/methods?selection_token=${encodeURIComponent(studioState.itemSelectionToken)}`,
+      );
+      if (generation !== studioState.methodRequestGeneration) return;
+      studioState.methods = (payload.methods || []).sort((left, right) => (
+        Number(right.covered_count || 0) - Number(left.covered_count || 0)
+        || String(left.label || "").localeCompare(String(right.label || ""))
+      ));
+      fillMethodSelects();
+      return;
+    }
+    const grouped = new Map();
+    for (let start = 0; start < ids.length; start += METHOD_ITEM_CHUNK_SIZE) {
+      const chunk = ids.slice(start, start + METHOD_ITEM_CHUNK_SIZE);
+      const query = chunk.map((id) => `item_id=${encodeURIComponent(id)}`).join("&");
+      const payload = await request(`/api/media/methods?${query}`);
+      if (generation !== studioState.methodRequestGeneration) return;
+      for (const method of payload.methods || []) {
+        const key = methodKey(method);
+        if (!key) continue;
+        const aggregate = grouped.get(key) || {
+          ...method,
+          bindings: [],
+          covered_item_ids: [],
+        };
+        const covered = new Set((aggregate.covered_item_ids || []).map(Number));
+        for (const id of method.covered_item_ids || []) covered.add(Number(id));
+        const bindings = new Map(
+          (aggregate.bindings || []).map((binding) => [Number(binding.item_id), binding]),
+        );
+        for (const binding of method.bindings || []) {
+          bindings.set(Number(binding.item_id), binding);
+        }
+        aggregate.covered_item_ids = [...covered].sort((left, right) => left - right);
+        aggregate.bindings = [...bindings.values()];
+        grouped.set(key, aggregate);
+      }
+    }
     if (generation !== studioState.methodRequestGeneration) return;
-    studioState.methods = payload.methods || [];
+    studioState.methods = [...grouped.values()].map((method) => {
+      const covered = new Set((method.covered_item_ids || []).map(Number));
+      const missing = ids.filter((id) => !covered.has(id));
+      return {
+        ...method,
+        covered_count: covered.size,
+        total_items: ids.length,
+        missing_item_ids: missing,
+        complete: !missing.length,
+      };
+    }).sort((left, right) => (
+      Number(right.covered_count || 0) - Number(left.covered_count || 0)
+      || String(left.label || "").localeCompare(String(right.label || ""))
+    ));
     fillMethodSelects();
   }
 
@@ -295,47 +895,93 @@
     const rows = matrixRows(studioState.preview);
     if (!rows.length) {
       host.innerHTML = "<p class=\"muted\">选择视频和两份方法后检查覆盖与对齐。</p>";
+      renderCampaignSubmissionState();
       return;
     }
     const readyCount = rows.filter(rowReady).length;
     host.innerHTML = `
       <div class="coverage-summary">
-        <strong>${readyCount}/${studioState.selectedItemIds.size} 个 Media Item 可发布</strong>
+        <strong>${readyCount}/${selectedItemCount()} 个 Media Item 可发布</strong>
         <span class="muted">时间映射严格验证；空间尺寸会按每个 Item 的较小 Pred 规范化并写入报告。</span>
       </div>
       <div class="coverage-table"><table>
-        <thead><tr><th>GT Item</th><th>方法 A</th><th>方法 B</th><th>空间规范化</th><th>状态</th></tr></thead>
+        <thead><tr><th>GT Item</th><th>Pred 1</th><th>Pred 2</th><th>空间规范化</th><th>状态</th></tr></thead>
         <tbody>${rows.map((row) => {
           const ready = rowReady(row);
           const reason = row.reason || row.error || row.alignment_reason || (Array.isArray(row.reasons) ? row.reasons.join("；") : "") || (ready ? "时间严格对齐" : "缺失或不兼容");
           const item = row.item || row.reference || {};
           const a = row.method_a || row.methods?.a || row.binding_a;
           const b = row.method_b || row.methods?.b || row.binding_b;
-          return `<tr class="${ready ? "ready" : "blocked"}"><td><strong>${safe(item.display_name || row.display_name || row.item_key || `Media Item #${itemId(row)}`)}</strong><br><small>${safe(outputSummary(item, "GT"))}</small></td><td>${safe(outputSummary(a, "Pred A"))}</td><td>${safe(outputSummary(b, "Pred B"))}</td><td>${safe(alignmentPlanSummary(row.alignment_plan || row.alignment))}</td><td><span class="studio-status ${ready ? "ok" : "warn"}">${safe(reason)}</span></td></tr>`;
+          return `<tr class="${ready ? "ready" : "blocked"}"><td><strong>${safe(item.display_name || row.display_name || row.item_key || `Media Item #${itemId(row)}`)}</strong><br><small>${safe(outputSummary(item, "GT"))}</small></td><td>${safe(outputSummary(a, "Pred 1"))}</td><td>${safe(outputSummary(b, "Pred 2"))}</td><td>${safe(alignmentPlanSummary(row.alignment_plan || row.alignment))}</td><td><span class="studio-status ${ready ? "ok" : "warn"}">${safe(reason)}</span></td></tr>`;
         }).join("")}</tbody>
       </table></div>`;
+    renderCampaignSubmissionState();
+  }
+
+  function campaignReadyForCreation() {
+    const rows = matrixRows(studioState.preview);
+    return Boolean(
+      studioState.preview
+      && selectedItemCount()
+      && selectedMethod("a")
+      && selectedMethod("b")
+      && rows.length === selectedItemCount()
+      && rows.every((row) => rowReady(row)),
+    );
+  }
+
+  function renderCampaignSubmissionState() {
+    const form = el("studio-wizard-form");
+    const submit = el("studio-create-campaign");
+    const status = el("studio-submit-status");
+    if (!form || !submit || !status) return;
+    const labels = {
+      creating: "正在创建 Campaign…",
+      publishing: "Campaign 已创建，正在发布冻结评测包…",
+    };
+    form.setAttribute("aria-busy", studioState.campaignSubmitting ? "true" : "false");
+    submit.disabled = studioState.campaignSubmitting || !campaignReadyForCreation();
+    submit.textContent = studioState.campaignSubmitting
+      ? (labels[studioState.campaignSubmitPhase] || "正在处理…")
+      : "创建并发布冻结评测包";
+    if (studioState.campaignSubmitting) {
+      status.hidden = false;
+      status.className = "run-submit-status message";
+      status.textContent = `${labels[studioState.campaignSubmitPhase] || "正在处理…"} 请勿重复点击。`;
+    } else if (studioState.campaignSubmitError) {
+      status.hidden = false;
+      status.className = "run-submit-status message error";
+      status.textContent = `Campaign 创建失败：${studioState.campaignSubmitError}`;
+    } else {
+      status.hidden = true;
+      status.className = "run-submit-status";
+      status.textContent = "";
+    }
   }
 
   async function previewCoverage() {
-    const ids = selectedItemIds();
     const methodA = selectedMethod("a");
     const methodB = selectedMethod("b");
-    if (!ids.length) throw new Error("请至少选择一个 GT Media Item");
+    if (!selectedItemCount()) throw new Error("请至少选择一个 GT Media Item");
     if (!methodA || !methodB) throw new Error("请选择两份 Pred 方法");
     if (JSON.stringify(methodA) === JSON.stringify(methodB)) throw new Error("两份 Pred 方法必须不同");
     const generation = ++studioState.previewGeneration;
-    const signature = JSON.stringify([ids, methodA, methodB]);
+    const signature = JSON.stringify([campaignItemSelectionSignature(), methodA, methodB]);
     const preview = await request("/api/evaluation-campaigns/v2/preview", {
       method: "POST",
       body: JSON.stringify({
-        media_item_ids: ids,
+        ...campaignItemSelectionPayload(),
         method_a: methodA,
         method_b: methodB,
         spatial_policy: spatialPolicy(),
       }),
     });
     if (generation !== studioState.previewGeneration
-        || signature !== JSON.stringify([selectedItemIds(), selectedMethod("a"), selectedMethod("b")])) return;
+        || signature !== JSON.stringify([
+          campaignItemSelectionSignature(),
+          selectedMethod("a"),
+          selectedMethod("b"),
+        ])) return;
     studioState.preview = preview;
     renderCoverage();
   }
@@ -404,31 +1050,50 @@
 
   function renderCampaignList() {
     const host = el("studio-campaign-list");
+    const pager = el("studio-campaign-pager");
     if (!host) return;
     const cleanupMarkup = cleanupRequestsMarkup();
     if (!studioState.campaigns.length) {
-      host.innerHTML = `${cleanupMarkup}<p class="muted">还没有 Campaign。</p>`;
+      host.innerHTML = `${cleanupMarkup}<p class="muted">${studioState.campaignTotal ? "当前页没有 Campaign。" : "没有符合条件的 Campaign。"}</p>`;
+      if (pager) {
+        pager.innerHTML = `<span>共 ${Number(studioState.campaignTotal || 0)} 项</span>`;
+      }
       return;
     }
     host.innerHTML = cleanupMarkup + studioState.campaigns.map((campaign) => `
       <button class="studio-campaign-row ${campaignKey(campaign) === studioState.selectedCampaignKey ? "active" : ""}" data-studio-campaign="${safe(campaignKey(campaign))}" type="button">
-        <span><strong>${safe(campaign.name)}</strong><small>${safe(campaign.public_title || campaign.metadata?.public_title || "匿名视频质量评测")}</small></span>
+        <span><strong>${safe(campaign.name)}</strong><small>${safe(campaign.public_title || campaign.metadata?.public_title || "匿名视频质量评测")}</small><small>${Number(campaign.item_count || campaign.candidates || 0)} 视频 · ${Number(campaign.vote_count || campaign.votes || 0)} 票</small></span>
         <span class="studio-status">${safe(campaignStatus(campaign))}</span>
       </button>`).join("");
+    if (pager) {
+      pager.innerHTML = `
+        <button class="secondary" type="button" data-studio-campaign-page="${studioState.campaignPage - 1}" ${studioState.campaignPage <= 1 ? "disabled" : ""}>上一页</button>
+        <span>第 ${Number(studioState.campaignPage)} / ${Number(studioState.campaignPageCount)} 页 · 共 ${Number(studioState.campaignTotal)} 项</span>
+        <button class="secondary" type="button" data-studio-campaign-page="${studioState.campaignPage + 1}" ${studioState.campaignPage >= studioState.campaignPageCount ? "disabled" : ""}>下一页</button>`;
+    }
   }
 
   function renderPackages() {
     const host = el("media-packages-content");
     if (!host) return;
-    const packages = studioState.campaigns.filter((campaign) =>
+    const packages = studioState.packageCampaigns.filter((campaign) =>
       Number(campaign.schema_version || 1) >= 2
       && ["published", "closed", "archived"].includes(String(campaign.status || "")),
     );
-    host.innerHTML = packages.length ? packages.map((campaign) => `
+    const cards = packages.length ? packages.map((campaign) => `
       <div class="derived-video">
         <span><strong>${safe(campaign.name)}</strong><small class="muted">${safe(campaign.public_title || campaign.metadata?.public_title || "匿名视频质量评测")}</small></span>
         <div><span class="studio-status">${safe(campaign.status)}</span><span class="studio-status">${Number(campaign.item_count || 0)} 视频</span></div>
-      </div>`).join("") : "<p class=\"muted\">还没有已发布的冻结评测包。</p>";
+      </div>`).join("") : studioState.packageTotal
+      ? "<p class=\"muted\">本页没有可显示的 V2 冻结评测包，可继续翻页。</p>"
+      : "<p class=\"muted\">还没有已发布的冻结评测包。</p>";
+    const pager = studioState.packagePageCount > 1 ? `
+      <div class="pager compact-pager" aria-label="冻结评测包分页">
+        <button class="secondary" type="button" data-studio-package-page="${studioState.packagePage - 1}" ${studioState.packagePage <= 1 ? "disabled" : ""}>上一页</button>
+        <span>第 ${Number(studioState.packagePage)} / ${Number(studioState.packagePageCount)} 页</span>
+        <button class="secondary" type="button" data-studio-package-page="${studioState.packagePage + 1}" ${studioState.packagePage >= studioState.packagePageCount ? "disabled" : ""}>下一页</button>
+      </div>` : "";
+    host.innerHTML = cards + pager;
   }
 
   function analysisRanking(analysis) {
@@ -516,6 +1181,60 @@
     return segments;
   }
 
+  function objectiveCurvePointRows(curve) {
+    return curve.series.flatMap((series, seriesIndex) =>
+      (series.points || []).map((point) => ({ point, series, seriesIndex })))
+      .sort((left, right) =>
+        Number(left.point.ordinal) - Number(right.point.ordinal)
+        || left.seriesIndex - right.seriesIndex)
+      .map((row, pointOrder) => ({ ...row, pointOrder }));
+  }
+
+  function objectiveCurvePointLabel(metricName, series, point) {
+    const status = String(point.status || "missing");
+    const value = Number(point.value);
+    const measurement = status === "completed"
+      && point.value != null
+      && Number.isFinite(value)
+      ? `${metricName} ${value.toFixed(6)}`
+      : status;
+    return [
+      String(series.method_label || "方法"),
+      `frame ${Number(point.frame_index)}`,
+      measurement,
+      point.reason ? String(point.reason) : "",
+    ].filter(Boolean).join(" · ");
+  }
+
+  function renderObjectiveCurveDataTable(curve, pointRows) {
+    const rows = pointRows.map(({ point, series }) => {
+      const status = String(point.status || "missing");
+      const value = Number(point.value);
+      const valueText = status === "completed"
+        && point.value != null
+        && Number.isFinite(value)
+        ? value.toFixed(6)
+        : "—";
+      return `<tr>
+        <th scope="row">${safe(series.method_label || "方法")}</th>
+        <td>${Number(point.frame_index)}</td>
+        <td>${safe(status)}</td>
+        <td>${valueText}</td>
+        <td>${safe(point.reason || "—")}</td>
+      </tr>`;
+    }).join("");
+    return `<details class="metric-data-table objective-curve-data-table">
+      <summary>等价数据表（${Number(pointRows.length)} 个点）</summary>
+      <div class="table compact-table">
+        <table>
+          <caption>${safe(curve.metric_name)} 逐帧数据</caption>
+          <thead><tr><th scope="col">方法</th><th scope="col">帧</th><th scope="col">状态</th><th scope="col">数值</th><th scope="col">原因</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </details>`;
+  }
+
   function renderObjectiveCurveChart(curve) {
     if (!curve?.series?.length) return "<p class=\"muted\">该 Item 没有可用的 LPIPS 曲线数据。</p>";
     const reasons = Array.from(new Set(curve.series.flatMap((series) => [
@@ -531,30 +1250,47 @@
     const maxOrdinal = Math.max(0, Number(curve.frame_count || 1) - 1);
     const minValue = Math.min(...values);
     const maxValue = Math.max(...values);
+    const pointRows = objectiveCurvePointRows(curve);
     const lines = curve.series.map((series, index) => objectiveCurveSegments(
       series.points, 0, maxOrdinal, minValue, maxValue,
     ).map((points) => `<polyline class="objective-curve-line series-${index === 0 ? "a" : "b"}" points="${points}" fill="none"></polyline>`).join("")).join("");
-    const dots = curve.series.map((series, index) => (series.points || []).filter((point) =>
-      point.status === "completed" && point.value != null && Number.isFinite(Number(point.value))).map((point) => {
+    const dots = pointRows.filter(({ point }) =>
+      point.status === "completed" && point.value != null && Number.isFinite(Number(point.value))).map(({
+      point, pointOrder, series, seriesIndex,
+    }) => {
       const ordinal = Number(point.ordinal);
-      const frame = Number(point.frame_index);
       const value = Number(point.value);
       const x = maxOrdinal === 0 ? 50 : 4 + (ordinal / maxOrdinal) * 92;
       const y = maxValue === minValue ? 26 : 44 - ((value - minValue) / (maxValue - minValue)) * 36;
-      return `<circle tabindex="0" class="objective-curve-dot series-${index === 0 ? "a" : "b"}" cx="${x.toFixed(3)}" cy="${y.toFixed(3)}" r="0.75"><title>${safe(series.method_label)} · frame ${frame} · ${value.toFixed(6)}</title></circle>`;
-    }).join("")).join("");
-    const unavailable = curve.series.flatMap((series) => (series.points || []).filter((point) => point.status !== "completed"));
-    const unavailableDots = curve.series.map((series, index) => (series.points || []).filter((point) => point.status !== "completed").map((point) => {
+      const label = objectiveCurvePointLabel(curve.metric_name, series, point);
+      return `<circle tabindex="0" data-objective-curve-point data-objective-curve-order="${pointOrder}" data-objective-curve-label="${safe(label)}" aria-label="${safe(label)}" class="objective-curve-dot series-${seriesIndex === 0 ? "a" : "b"}" cx="${x.toFixed(3)}" cy="${y.toFixed(3)}" r="0.75"><title>${safe(label)}</title></circle>`;
+    }).join("");
+    const unavailableDots = pointRows.filter(({ point }) => point.status !== "completed").map(({
+      point, pointOrder, series, seriesIndex,
+    }) => {
       const ordinal = Number(point.ordinal);
       const x = maxOrdinal === 0 ? 50 : 4 + (ordinal / maxOrdinal) * 92;
-      const y = index === 0 ? 47 : 49;
-      return `<circle tabindex="0" class="objective-curve-missing series-${index === 0 ? "a" : "b"}" cx="${x.toFixed(3)}" cy="${y}" r="0.8"><title>${safe(series.method_label)} · frame ${Number(point.frame_index)} · ${safe(point.status)}${point.reason ? ` · ${safe(point.reason)}` : ""}</title></circle>`;
-    }).join("")).join("");
+      const y = seriesIndex === 0 ? 47 : 49;
+      const label = objectiveCurvePointLabel(curve.metric_name, series, point);
+      return `<circle tabindex="0" data-objective-curve-point data-objective-curve-order="${pointOrder}" data-objective-curve-label="${safe(label)}" aria-label="${safe(label)}" class="objective-curve-missing series-${seriesIndex === 0 ? "a" : "b"}" cx="${x.toFixed(3)}" cy="${y}" r="0.8"><title>${safe(label)}</title></circle>`;
+    }).join("");
+    const initialPoint = pointRows.find(({ point }) =>
+      point.status !== "completed"
+      || (point.value != null && Number.isFinite(Number(point.value))));
+    const initialReadout = initialPoint
+      ? objectiveCurvePointLabel(
+          curve.metric_name,
+          initialPoint.series,
+          initialPoint.point,
+        )
+      : "聚焦曲线数据点后显示读数";
     return `
       <div class="objective-curve-legend">${curve.series.map((series, index) => `<span><i class="series-${index === 0 ? "a" : "b"}"></i>${safe(series.method_label)} · ${objectiveMetricStatuses(series.status_counts)}</span>`).join("")}</div>
       <div class="objective-curve-plot"><svg viewBox="0 0 100 52" preserveAspectRatio="xMidYMid meet" role="img" aria-label="${safe(curve.metric_name)} 双曲线对比"><g class="objective-curve-grid"><line x1="4" x2="96" y1="8" y2="8"></line><line x1="4" x2="96" y1="26" y2="26"></line><line x1="4" x2="96" y1="44" y2="44"></line></g>${lines}${dots}${unavailableDots}</svg></div>
       <div class="objective-curve-scale"><span>frame ${Number(curve.series[0]?.points?.[0]?.frame_index ?? 0)}</span><span>LPIPS ${minValue.toFixed(6)} – ${maxValue.toFixed(6)}</span><span>frame ${Number((curve.series[0]?.points || [])[(curve.series[0]?.points || []).length - 1]?.frame_index ?? 0)}</span></div>
-      <p class="muted">双方 completed 重合帧 ${Number(curve.completed_overlap || 0)}。数值越低越好；断线表示缺失或不可用。${reasons.length ? ` 原因：${safe(reasons.slice(0, 3).join("；"))}` : ""}</p>`;
+      <p class="objective-curve-readout" data-objective-curve-readout role="status" aria-live="polite">当前读数：${safe(initialReadout)}</p>
+      <p class="muted">双方 completed 重合帧 ${Number(curve.completed_overlap || 0)}。数值越低越好；断线表示缺失或不可用。${reasons.length ? ` 原因：${safe(reasons.slice(0, 3).join("；"))}` : ""}</p>
+      ${renderObjectiveCurveDataTable(curve, pointRows)}`;
   }
 
   function renderObjectiveCurvePanel(analysis, campaign) {
@@ -653,6 +1389,23 @@
     return `<div class="studio-progress studio-progress-detailed"><progress max="1" value="${fraction}"></progress><div class="studio-progress-detail"><span>${current}/${total} · ${safe(phase)}</span><small>${meta.join("")}</small></div></div>`;
   }
 
+  function preparationPollStatusMarkup(campaign) {
+    if (!campaignPreparationActive(campaign) && !studioState.preparationPollError) return "";
+    const refreshedAt = studioState.preparationLastSuccessAt
+      ? new Date(studioState.preparationLastSuccessAt).toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        })
+      : "尚未成功";
+    const error = studioState.preparationPollError;
+    const retrySeconds = Math.max(1, Math.round(studioState.preparationNextDelayMs / 1000));
+    return `<div class="studio-refresh-state ${error ? "stale" : "fresh"}" role="status" aria-live="polite">
+      <span>上次成功刷新：${safe(refreshedAt)}</span>
+      ${error ? `<span>状态可能已过期：${safe(error)}；${retrySeconds} 秒后重试（第 ${Number(studioState.preparationPollFailures)} 次）。</span>` : "<span>准备状态自动刷新中。</span>"}
+    </div>`;
+  }
+
   function renderCampaignDetail(payload) {
     const host = el("studio-campaign-detail");
     if (!host) return;
@@ -681,11 +1434,12 @@
       ${legacy ? "<div class=\"message warn\"><p>旧 schema v1 Campaign 只读保留；可继续导出，不会按标签猜测迁移。</p></div>" : ""}
       ${contractWarnings.length ? `<div class="message warn evaluation-contract-warning"><p>该历史 Campaign 的源 Run 不满足当前 midpoint-triplet-v2 评测契约；现有结果保持只读，请按提示重新运行源实验后再创建新 Campaign。</p><p>${safe(contractWarnings.join("；"))}</p></div>` : ""}
       ${preparationProgressMarkup(progress, campaign)}
+      ${!legacy ? preparationPollStatusMarkup(campaign) : ""}
       ${progress.error?.message || campaign.preparation_error?.message ? `<div class="message error"><p>${safe(progress.error?.message || campaign.preparation_error?.message)}</p></div>` : ""}
       <div class="summary-grid"><div><span>视频</span><strong>${Number(coverage.items || campaign.item_count || 0)}</strong></div><div><span>任务</span><strong>${Number(coverage.tasks || campaign.task_count || 0)}</strong></div><div><span>投票</span><strong>${Number(coverage.votes || campaign.vote_count || 0)}</strong></div><div><span>目标票数/视频</span><strong>${Number(campaign.target_votes || 0)}</strong></div></div>
       ${shareUrl ? `<label class="studio-share"><span>参与链接</span><div><input readonly value="${safe(shareUrl)}"><button data-copy-share="${safe(shareUrl)}" type="button">复制</button></div></label>` : ""}
       ${shareUrl && isLoopbackOrigin() ? `<div class="message warn studio-share-warning"><p>当前链接使用本机回环地址，只能在这台电脑上打开。若要让受控内网参与者访问，请以 <code>--host 0.0.0.0</code> 启动服务，再从 <code>http://&lt;服务器内网 IP&gt;:8765</code> 打开 Studio 并重新复制链接；不要将服务暴露到公网。</p></div>` : ""}
-      <div class="studio-actions">${!legacy && ["draft", "failed"].includes(campaign.status) ? `<button data-studio-publish="${Number(campaign.id)}" type="button">${campaign.status === "failed" ? "重试发布" : "发布并冻结"}</button>` : ""}${!legacy && campaign.status === "published" ? `<button data-studio-close="${Number(campaign.id)}" type="button">关闭</button>` : ""}${!legacy && ["closed", "failed"].includes(campaign.status) ? `<button class="secondary" data-studio-archive="${Number(campaign.id)}" type="button">归档</button>` : ""}${!legacy ? `<button class="danger secondary" data-studio-delete="${Number(campaign.id)}" type="button">永久删除</button>` : ""}${legacy && !campaign.archived ? `<button class="secondary" data-studio-legacy-archive="${Number(campaign.id)}" type="button">归档</button>` : ""}${legacy && campaign.status === "draft" && Number(campaign.vote_count || campaign.votes || 0) === 0 ? `<button class="danger secondary" data-studio-legacy-discard="${Number(campaign.id)}" type="button">丢弃空 Draft</button>` : ""}${legacy ? `<a class="secondary button-link" href="/api/evaluation-campaigns/${Number(campaign.id)}/export">导出</a>` : `<a class="secondary button-link" href="/api/evaluation-campaigns/v2/${Number(campaign.id)}/export">导出</a>`}</div>
+      <div class="studio-actions">${!legacy && ["draft", "failed"].includes(campaign.status) ? `<button data-studio-publish="${Number(campaign.id)}" type="button">${campaign.status === "failed" ? "重试发布" : "发布并冻结"}</button>` : ""}${!legacy && campaign.status === "published" ? `<button data-studio-close="${Number(campaign.id)}" type="button">关闭</button>` : ""}${!legacy && ["closed", "failed"].includes(campaign.status) ? `<button class="secondary" data-studio-archive="${Number(campaign.id)}" type="button">归档</button>` : ""}${!legacy ? `<button class="danger secondary" data-studio-delete="${Number(campaign.id)}" type="button">永久删除</button>` : ""}${legacy && !campaign.archived ? `<button class="secondary" data-studio-legacy-archive="${Number(campaign.id)}" type="button">归档</button>` : ""}${legacy ? `<a class="secondary button-link" href="/api/evaluation-campaigns/${Number(campaign.id)}/export">导出</a>` : `<a class="secondary button-link" href="/api/evaluation-campaigns/v2/${Number(campaign.id)}/export">导出</a>`}</div>
       ${ranking.length ? `<section class="stats-block studio-human-results" data-analysis-section="human"><h3>人工排名</h3><div class="coverage-table"><table><thead><tr><th>排名</th><th>方法</th><th>得分</th><th>95% CI</th></tr></thead><tbody>${ranking.map((row, index) => `<tr><td>${index + 1}</td><td>${safe(row.label || row.name)}</td><td>${Number(row.score || 0).toFixed(4)}</td><td>${safe((row.ci95 || []).join(" – ") || "-")}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
       ${!legacy && objective.length ? `<section class="stats-block studio-objective-results" data-analysis-section="objective"><div class="studio-analysis-head"><h3>客观指标</h3><p class="muted">客观指标与人工排名分别展示，不生成合成总分。</p></div><div class="coverage-table"><table><thead><tr><th>指标</th><th>方法</th><th>方向</th><th>状态</th><th>有效样本</th><th>均值 / 中位数</th><th>P10 / P90</th></tr></thead><tbody>${objective.map((row) => `<tr><td>${safe(row.metric_name || "-")}</td><td>${safe(row.method_label || "-")}</td><td>${safe(row.direction || "-")}</td><td>${objectiveMetricStatuses(row.status_counts)}</td><td>${Number(row.count || 0)}</td><td>${objectiveMetricNumber(row.mean)} / ${objectiveMetricNumber(row.median)}</td><td>${objectiveMetricNumber(row.p10)} / ${objectiveMetricNumber(row.p90)}</td></tr>`).join("")}</tbody></table></div></section>` : ""}
       ${!legacy ? renderObjectiveCurvePanel(analysis, campaign) : ""}`;
@@ -725,20 +1479,60 @@
   }
 
   async function loadCampaigns(options = {}) {
-    const payload = await request("/api/evaluation-campaigns");
+    const requestedPage = Math.max(
+      1,
+      Number(options.page || (options.resetPage ? 1 : studioState.campaignPage) || 1),
+    );
+    const params = new URLSearchParams({
+      page: String(requestedPage),
+      page_size: String(studioState.campaignPageSize),
+    });
+    if (studioState.campaignQuery) params.set("q", studioState.campaignQuery);
+    if (studioState.campaignStatus) params.set("status", studioState.campaignStatus);
+    const generation = ++studioState.campaignListRequestGeneration;
+    const payload = await request(`/api/evaluation-campaigns?${params.toString()}`);
+    if (generation !== studioState.campaignListRequestGeneration) return;
     studioState.campaigns = payload.campaigns || [];
+    studioState.campaignPage = Number(payload.page || requestedPage);
+    studioState.campaignPageCount = Number(payload.page_count || 1);
+    studioState.campaignTotal = Number(payload.total || studioState.campaigns.length);
     const preserveMissingKey = String(options.preserveMissingKey || "");
-    if (studioState.selectedCampaignKey
-        && studioState.selectedCampaignKey !== preserveMissingKey
-        && !studioState.campaigns.some((campaign) => campaignKey(campaign) === studioState.selectedCampaignKey)) {
-      stopPreparationPoll();
-      supersedeObjectiveCurveRequest();
-      studioState.selectedCampaignKey = null;
-      renderCampaignDetail(null);
-    }
     renderCampaignList();
+    if (studioState.selectedCampaignKey && options.refreshSelected) {
+      try {
+        await openCampaign(studioState.selectedCampaignKey, false);
+      } catch (error) {
+        if (Number(error.status) !== 404
+            || studioState.selectedCampaignKey === preserveMissingKey) throw error;
+        stopPreparationPoll();
+        supersedeObjectiveCurveRequest();
+        studioState.selectedCampaignKey = null;
+        renderCampaignDetail(null);
+        renderCampaignList();
+      }
+    }
+  }
+
+  async function loadPackages(options = {}) {
+    const requestedPage = Math.max(
+      1,
+      Number(options.page || studioState.packagePage || 1),
+    );
+    const params = new URLSearchParams({
+      page: String(requestedPage),
+      page_size: String(studioState.packagePageSize),
+      status: "published,closed,archived",
+    });
+    const generation = ++studioState.packageRequestGeneration;
+    const payload = await request(`/api/evaluation-campaigns?${params.toString()}`);
+    if (generation !== studioState.packageRequestGeneration) return;
+    studioState.packageCampaigns = payload.campaigns || [];
+    studioState.packagePage = Number(payload.page || requestedPage);
+    studioState.packagePageCount = Number(payload.page_count || 1);
+    studioState.packageTotal = Number(
+      payload.total || studioState.packageCampaigns.length,
+    );
     renderPackages();
-    if (studioState.selectedCampaignKey) await openCampaign(studioState.selectedCampaignKey, false);
   }
 
   async function loadCleanupRequests() {
@@ -805,6 +1599,10 @@
     const isV2 = requestedKey.startsWith("v2:") || Number(campaign?.schema_version || 1) >= 2;
     const payload = await request(isV2 ? `/api/evaluation-campaigns/v2/${campaignId}` : `/api/evaluation-campaigns/${campaignId}`);
     if (requestGeneration !== studioState.campaignRequestGeneration || studioState.selectedCampaignKey !== requestedKey) return;
+    studioState.preparationLastSuccessAt = Date.now();
+    studioState.preparationPollFailures = 0;
+    studioState.preparationPollError = "";
+    studioState.preparationNextDelayMs = PREPARATION_POLL_BASE_MS;
     renderCampaignDetail(payload);
     if (rerenderList) renderCampaignList();
     if (campaignPreparationActive(payload.campaign || payload)) startPreparationPoll(requestedKey, campaignId);
@@ -815,7 +1613,9 @@
     try {
       return {
         exists: true,
-        payload: await request(`/api/evaluation-campaigns/v2/${Number(campaignId)}`),
+        payload: await request(`/api/evaluation-campaigns/v2/${Number(campaignId)}`, {
+          suppressDiagnostic: true,
+        }),
       };
     } catch (error) {
       if (Number(error.status) === 404) return { exists: false, payload: null };
@@ -866,7 +1666,10 @@
       startPreparationPoll(key, campaignId);
     }
     try {
-      await loadCampaigns({ preserveMissingKey: key });
+      await Promise.all([
+        loadCampaigns({ preserveMissingKey: key }),
+        loadPackages({ page: 1 }),
+      ]);
     } catch (_refreshError) {
       // The publish result is authoritative; polling can refresh the selected detail.
     }
@@ -875,39 +1678,65 @@
 
   async function createCampaign(event) {
     event.preventDefault();
+    if (studioState.campaignSubmitting || campaignCreationFlight.isLocked()) {
+      notify("Campaign 正在创建，请勿重复点击");
+      return;
+    }
     const form = new FormData(event.currentTarget);
-    const ids = selectedItemIds();
     const methodA = selectedMethod("a");
     const methodB = selectedMethod("b");
-    if (!studioState.preview || !ids.length || !methodA || !methodB) throw new Error("请先检查视频覆盖与对齐");
+    if (!studioState.preview || !selectedItemCount() || !methodA || !methodB) throw new Error("请先检查视频覆盖与对齐");
     const rows = matrixRows(studioState.preview);
-    if (rows.length !== ids.length || rows.some((row) => !rowReady(row))) throw new Error("所有已选 Media Item 都必须由两种方法完整覆盖并通过对齐");
-    const created = await request("/api/evaluation-campaigns/v2", {
-      method: "POST",
-      body: JSON.stringify({
+    if (rows.length !== selectedItemCount() || rows.some((row) => !rowReady(row))) throw new Error("所有已选 Media Item 都必须由两种方法完整覆盖并通过对齐");
+    if (!campaignCreationFlight.tryLock()) {
+      notify("Campaign 正在创建，请勿重复点击");
+      return;
+    }
+    studioState.campaignSubmitting = true;
+    studioState.campaignSubmitPhase = "creating";
+    studioState.campaignSubmitError = "";
+    renderCampaignSubmissionState();
+    try {
+      const creationPayload = {
         name: String(form.get("name") || "").trim(),
         public_title: String(form.get("public_title") || "").trim(),
         target_votes: Number(form.get("target_votes") || 3),
-        media_item_ids: ids,
+        ...campaignItemSelectionPayload(),
         method_a: methodA,
         method_b: methodB,
         spatial_policy: spatialPolicy(),
         result_policy: "after_personal_completion",
-      }),
-    });
-    const campaignId = Number(created.campaign?.id || created.id);
-    stopPreparationPoll();
-    studioState.campaignRequestGeneration += 1;
-    supersedeObjectiveCurveRequest();
-    studioState.selectedCampaignKey = `v2:${campaignId}`;
-    studioState.campaignDetail = created.campaign ? created : { campaign: created };
-    studioState.preview = null;
-    renderCoverage();
-    renderCampaignDetail(studioState.campaignDetail);
-    const published = await publishCampaign(campaignId);
-    notify(campaignStatus(published.campaign || published) === "failed"
-      ? "Campaign 准备失败，请查看保留的准备错误后重试"
-      : "Campaign 已进入规范化、校验与冻结队列");
+      };
+      const submissionId = campaignSubmissionIdFor(creationPayload);
+      const created = await request("/api/evaluation-campaigns/v2", {
+        method: "POST",
+        body: JSON.stringify({ ...creationPayload, submission_id: submissionId }),
+      });
+      const campaignId = Number(created.campaign?.id || created.id);
+      resetCampaignSubmissionIdentity();
+      clearCampaignDraft();
+      stopPreparationPoll();
+      studioState.campaignRequestGeneration += 1;
+      supersedeObjectiveCurveRequest();
+      studioState.selectedCampaignKey = `v2:${campaignId}`;
+      studioState.campaignDetail = created.campaign ? created : { campaign: created };
+      studioState.preview = null;
+      studioState.campaignSubmitPhase = "publishing";
+      renderCoverage();
+      renderCampaignDetail(studioState.campaignDetail);
+      const published = await publishCampaign(campaignId);
+      notify(campaignStatus(published.campaign || published) === "failed"
+        ? "Campaign 准备失败，请查看保留的准备错误后重试"
+        : "Campaign 已进入规范化、校验与冻结队列");
+    } catch (error) {
+      studioState.campaignSubmitError = error.message || String(error);
+      throw error;
+    } finally {
+      studioState.campaignSubmitting = false;
+      studioState.campaignSubmitPhase = "";
+      campaignCreationFlight.release();
+      renderCampaignSubmissionState();
+    }
   }
 
   function stopPreparationPoll() {
@@ -922,28 +1751,45 @@
     if (studioState.preparationPollKey === requestedKey) return;
     stopPreparationPoll();
     studioState.preparationPollKey = requestedKey;
+    studioState.preparationPollFailures = 0;
+    studioState.preparationPollError = "";
+    studioState.preparationNextDelayMs = PREPARATION_POLL_BASE_MS;
+    if (!studioState.preparationLastSuccessAt) studioState.preparationLastSuccessAt = Date.now();
     const generation = studioState.preparationPollGeneration;
     const stillCurrent = () => generation === studioState.preparationPollGeneration
       && studioState.preparationPollKey === requestedKey
       && studioState.selectedCampaignKey === requestedKey;
-    const scheduleNext = () => {
+    const scheduleNext = (delay = studioState.preparationNextDelayMs) => {
       if (!stillCurrent()) return;
-      studioState.preparationPoll = setTimeout(pollOnce, 2000);
+      studioState.preparationPoll = setTimeout(pollOnce, delay);
     };
     const pollOnce = async () => {
       if (!stillCurrent()) return;
       studioState.preparationPoll = null;
       try {
-        const payload = await request(`/api/evaluation-campaigns/v2/${Number(campaignId)}`);
+        const payload = await request(`/api/evaluation-campaigns/v2/${Number(campaignId)}`, {
+          suppressDiagnostic: true,
+        });
         if (!stillCurrent()) return;
+        studioState.preparationLastSuccessAt = Date.now();
+        studioState.preparationPollFailures = 0;
+        studioState.preparationPollError = "";
+        studioState.preparationNextDelayMs = PREPARATION_POLL_BASE_MS;
         renderCampaignDetail(payload);
         if (!campaignPreparationActive(payload.campaign || payload)) {
           stopPreparationPoll();
-          await loadCampaigns();
+          await Promise.all([loadCampaigns(), loadPackages({ page: 1 })]);
           return;
         }
-      } catch (_error) {
-        // Keep the last useful state; the serialized next poll can recover.
+      } catch (error) {
+        if (!stillCurrent()) return;
+        studioState.preparationPollFailures += 1;
+        studioState.preparationPollError = error.message || String(error);
+        studioState.preparationNextDelayMs = Math.min(
+          PREPARATION_POLL_MAX_MS,
+          PREPARATION_POLL_BASE_MS * (2 ** Math.max(0, studioState.preparationPollFailures - 1)),
+        );
+        if (studioState.campaignDetail) renderCampaignDetail(studioState.campaignDetail);
       }
       scheduleNext();
     };
@@ -956,13 +1802,21 @@
       return;
     }
     await request(`/api/evaluation-campaigns/v2/${Number(campaignId)}/${action}`, { method: "POST", body: "{}" });
-    await loadCampaigns();
+    await Promise.all([loadCampaigns(), loadPackages({ page: 1 })]);
     await openCampaign(`v2:${Number(campaignId)}`);
   }
 
   async function deleteCampaign(campaignId) {
+    const detailCampaign = studioState.campaignDetail?.campaign
+      || studioState.campaignDetail;
     const campaign = studioState.campaigns.find((row) =>
-      Number(row.schema_version || 1) >= 2 && Number(row.id) === Number(campaignId));
+      Number(row.schema_version || 1) >= 2 && Number(row.id) === Number(campaignId))
+      || (
+        Number(detailCampaign?.schema_version || 1) >= 2
+        && Number(detailCampaign?.id) === Number(campaignId)
+        ? detailCampaign
+        : null
+      );
     if (!campaign) throw new Error("Campaign V2 不存在或已经删除");
     if (!window.confirm(`永久删除盲测记录“${campaign.name || campaign.id}”？此操作不可撤销。`)) return;
     const destructive = ["preparing", "published", "closed", "archived"].includes(String(campaign.status || ""))
@@ -1025,9 +1879,12 @@
     studioState.campaigns = studioState.campaigns.filter((row) => campaignKey(row) !== deletingKey);
     rememberCleanupRequest(result, campaignId);
     renderCampaignList();
+    studioState.packageCampaigns = studioState.packageCampaigns.filter(
+      (row) => campaignKey(row) !== deletingKey,
+    );
     renderPackages();
     try {
-      await loadCampaigns();
+      await Promise.all([loadCampaigns(), loadPackages()]);
     } catch (_refreshError) {
       // The DELETE response or reconciliation GET already confirmed deletion.
     }
@@ -1049,20 +1906,38 @@
     await openCampaign(`v1:${Number(campaignId)}`);
   }
 
-  async function legacyCampaignDiscard(campaignId) {
-    if (!window.confirm("确认丢弃这个无投票的历史 Draft？此操作不可撤销。")) return;
-    await request(`/api/evaluation-campaigns/${Number(campaignId)}/discard`, { method: "POST", body: "{}" });
-    studioState.selectedCampaignKey = null;
-    renderCampaignDetail(null);
-    await loadCampaigns();
-  }
-
   async function load() {
-    await Promise.all([loadCampaigns(), loadCleanupRequests(), loadRunOutputs(), loadItemGroups()]);
-    renderItemGroupOptions();
-    renderItems();
-    fillMethodSelects();
-    renderCoverage();
+    const draft = studioState.draftHydrated ? null : readCampaignDraft();
+    studioState.draftHydrated = true;
+    primeCampaignDraft(draft);
+    try {
+      await Promise.all([
+        loadCampaigns({ refreshSelected: true }),
+        loadPackages(),
+        loadCleanupRequests(),
+        loadRunOutputs(),
+        loadItemGroups(),
+      ]);
+      const reconciled = draft && studioState.draftNotice
+        ? [studioState.draftNotice.replace(/[。.]$/, "")]
+        : [];
+      if (draft) reconciled.push(...await reconcileDraftItems(draft));
+      renderItemGroupOptions();
+      renderItems();
+      await loadMethodsForSelection();
+      if (draft) {
+        reconciled.push(...applyCampaignDraftControls(draft));
+        studioState.draftNotice = reconciled.length
+          ? `已恢复 Campaign 草稿并完成校正：${reconciled.join("；")}。`
+          : "已恢复上次未发布的 Campaign 草稿。";
+      }
+      renderItems();
+      fillMethodSelects();
+      renderCoverage();
+    } finally {
+      studioState.draftRestoring = false;
+    }
+    if (draft) queueCampaignDraftSave();
   }
 
   async function prefillFromCompare(selection) {
@@ -1072,6 +1947,7 @@
     if (selection.groupId && String(selection.groupId) !== String(studioState.selectedGroupId)) {
       studioState.selectedGroupId = String(selection.groupId);
       studioState.selectedItemIds.clear();
+      clearItemSelectionToken();
       studioState.itemQuery = "";
       studioState.itemPage = 1;
       const query = el("studio-item-query");
@@ -1087,6 +1963,7 @@
       await loadItems({ page: 1 });
     }
     if (!studioState.items.some((item) => itemId(item) === id)) throw new Error("所选 GT Item 不在当前文件夹或已不可用");
+    clearItemSelectionToken();
     studioState.selectedItemIds = new Set([id]);
     renderItems();
     await loadMethodsForSelection();
@@ -1106,6 +1983,8 @@
     if (name) name.value = `Blind · ${selection.item.display_name || selection.item.item_key || "Compare"}`;
     invalidateCoveragePreview();
     await previewCoverage();
+    resetCampaignSubmissionIdentity();
+    markCampaignDraftDirty();
   }
 
   function formatBytes(value) {
@@ -1153,6 +2032,12 @@
   }
 
   document.addEventListener("change", (event) => {
+    if (event.target.matches?.("#studio-campaign-status")) {
+      studioState.campaignStatus = String(event.target.value || "");
+      studioState.campaignPage = 1;
+      loadCampaigns({ page: 1 }).catch((error) => notify(error.message));
+      return;
+    }
     if (event.target.matches?.("[data-objective-curve-item]")) {
       const detail = studioState.campaignDetail;
       const campaign = detail?.campaign || detail;
@@ -1182,49 +2067,165 @@
       return;
     }
     if (event.target.matches?.("#studio-item-group")) {
+      cancelBulkItemSelection();
+      resetCampaignSubmissionIdentity();
+      studioState.itemBulkProgress = null;
+      clearItemSelectionToken();
       studioState.selectedGroupId = event.target.value || "";
       studioState.selectedItemIds.clear();
       studioState.itemQuery = "";
+      studioState.itemOnlySelected = false;
+      studioState.selectedItemPage = 1;
       studioState.itemPage = 1;
       const query = el("studio-item-query");
       if (query) query.value = "";
       invalidateCoveragePreview();
+      markCampaignDraftDirty();
       loadItems({ page: 1 }).then(loadMethodsForSelection).catch((error) => notify(error.message));
       return;
     }
     const item = event.target.closest?.("[data-studio-item]");
     if (item) {
       const id = Number(item.dataset.studioItem);
+      if (usesItemSelectionToken()) {
+        clearItemSelectionToken({
+          preserveVisible: true,
+          notice: "已取消“全选筛选结果”，并保留当前页选择；请重新检查覆盖。",
+        });
+      }
       if (item.checked) studioState.selectedItemIds.add(id);
       else studioState.selectedItemIds.delete(id);
-      renderItems();
-      invalidateCoveragePreview();
-      loadMethodsForSelection().catch((error) => notify(error.message));
+      applyItemSelectionChange().catch((error) => notify(error.message));
       return;
     }
     if (event.target.matches?.("#studio-method-a-source, #studio-method-b-source")) {
+      resetCampaignSubmissionIdentity();
       fillMethodSelects();
       invalidateCoveragePreview();
+      markCampaignDraftDirty();
       return;
     }
     if (event.target.matches?.("#studio-allow-external-aspect-stretch")) {
+      resetCampaignSubmissionIdentity();
       invalidateCoveragePreview();
+      markCampaignDraftDirty();
       return;
     }
-    if (event.target.matches?.("#studio-method-a, #studio-method-b")) invalidateCoveragePreview();
+    if (event.target.matches?.("#studio-method-a, #studio-method-b")) {
+      resetCampaignSubmissionIdentity();
+      invalidateCoveragePreview();
+      markCampaignDraftDirty();
+    }
   });
 
   el("studio-item-query")?.addEventListener("input", (event) => {
+    cancelBulkItemSelection();
+    studioState.itemBulkProgress = null;
+    const invalidatedToken = usesItemSelectionToken();
+    clearItemSelectionToken({
+      notice: invalidatedToken ? "筛选条件已变化，原“全选筛选结果”已失效。" : "",
+    });
     studioState.itemQuery = event.target.value || "";
+    studioState.itemOnlySelected = false;
+    studioState.selectedItemPage = 1;
     studioState.itemPage = 1;
+    if (invalidatedToken) {
+      resetCampaignSubmissionIdentity();
+      invalidateCoveragePreview();
+      loadMethodsForSelection().catch((error) => notify(error.message));
+    }
+    markCampaignDraftDirty();
     clearTimeout(studioState.itemQueryTimer);
     studioState.itemQueryTimer = setTimeout(() => loadItems({ page: 1 }).catch((error) => notify(error.message)), 250);
   });
 
+  document.addEventListener("focusin", (event) => {
+    const point = event.target.closest?.("[data-objective-curve-point]");
+    if (!point) return;
+    const readout = point.closest(".studio-objective-curve")
+      ?.querySelector("[data-objective-curve-readout]");
+    if (readout) {
+      readout.textContent = `当前读数：${point.dataset.objectiveCurveLabel || "无可用读数"}`;
+    }
+  });
+
+  document.addEventListener("keydown", (event) => {
+    const point = event.target.closest?.("[data-objective-curve-point]");
+    if (!point) return;
+    const plot = point.closest(".objective-curve-plot");
+    const points = Array.from(
+      plot?.querySelectorAll("[data-objective-curve-point]") || [],
+    ).sort((left, right) =>
+      Number(left.dataset.objectiveCurveOrder)
+      - Number(right.dataset.objectiveCurveOrder));
+    const current = points.indexOf(point);
+    const target = {
+      ArrowLeft: current - 1,
+      ArrowDown: current - 1,
+      ArrowRight: current + 1,
+      ArrowUp: current + 1,
+      Home: 0,
+      End: points.length - 1,
+    }[event.key];
+    if (target == null || !points.length) return;
+    event.preventDefault();
+    points[Math.max(0, Math.min(points.length - 1, target))].focus();
+  });
+
   document.addEventListener("click", (event) => {
+    const packagePage = event.target.closest?.("[data-studio-package-page]");
+    if (packagePage) {
+      loadPackages({
+        page: Math.max(1, Number(packagePage.dataset.studioPackagePage || 1)),
+      }).catch((error) => notify(error.message));
+      return;
+    }
+    const campaignPage = event.target.closest?.("[data-studio-campaign-page]");
+    if (campaignPage) {
+      loadCampaigns({
+        page: Math.max(1, Number(campaignPage.dataset.studioCampaignPage || 1)),
+      }).catch((error) => notify(error.message));
+      return;
+    }
     const itemPage = event.target.closest?.("[data-studio-item-page]");
     if (itemPage) {
+      if (studioState.itemOnlySelected) {
+        studioState.selectedItemPage = Math.max(1, Number(itemPage.dataset.studioItemPage || 1));
+        if (usesItemSelectionToken()) {
+          loadItems({ page: studioState.selectedItemPage }).catch((error) => notify(error.message));
+        } else {
+          renderItems();
+        }
+        return;
+      }
       loadItems({ page: Number(itemPage.dataset.studioItemPage || 1) }).catch((error) => notify(error.message));
+      return;
+    }
+    if (event.target.closest?.("[data-studio-select-page]")) {
+      selectCurrentItemPage().catch((error) => notify(error.message));
+      return;
+    }
+    if (event.target.closest?.("[data-studio-select-filtered]")) {
+      selectAllFilteredItems().catch((error) => notify(error.message));
+      return;
+    }
+    if (event.target.closest?.("[data-studio-clear-selection]")) {
+      clearSelectedItems().catch((error) => notify(error.message));
+      return;
+    }
+    if (event.target.closest?.("[data-studio-cancel-bulk]")) {
+      cancelBulkItemSelection();
+      return;
+    }
+    if (event.target.closest?.("[data-studio-only-selected]")) {
+      studioState.itemOnlySelected = !studioState.itemOnlySelected;
+      studioState.selectedItemPage = 1;
+      if (usesItemSelectionToken()) {
+        loadItems({ page: 1 }).catch((error) => notify(error.message));
+      } else {
+        renderItems();
+      }
+      markCampaignDraftDirty();
       return;
     }
     const curveRetry = event.target.closest?.("[data-objective-curve-retry]");
@@ -1246,7 +2247,11 @@
     const campaign = event.target.closest?.("[data-studio-campaign]");
     if (campaign) return openCampaign(campaign.dataset.studioCampaign).catch((error) => notify(error.message));
     const copy = event.target.closest?.("[data-copy-share]");
-    if (copy) return navigator.clipboard.writeText(copy.dataset.copyShare).then(() => notify("参与链接已复制"));
+    if (copy) {
+      return Shared.copyText(copy.dataset.copyShare)
+        .then(() => notify("参与链接已复制"))
+        .catch(() => notify("无法自动复制，请手动选择参与链接"));
+    }
     const publish = event.target.closest?.("[data-studio-publish]");
     if (publish) return campaignAction("publish", publish.dataset.studioPublish).catch((error) => notify(error.message));
     const close = event.target.closest?.("[data-studio-close]");
@@ -1259,8 +2264,6 @@
     if (cleanupRetry) return retryCleanupRequest(cleanupRetry.dataset.evaluationCleanupRetry).catch((error) => notify(error.message));
     const legacyArchive = event.target.closest?.("[data-studio-legacy-archive]");
     if (legacyArchive) return legacyCampaignArchive(legacyArchive.dataset.studioLegacyArchive).catch((error) => notify(error.message));
-    const legacyDiscard = event.target.closest?.("[data-studio-legacy-discard]");
-    if (legacyDiscard) return legacyCampaignDiscard(legacyDiscard.dataset.studioLegacyDiscard).catch((error) => notify(error.message));
   });
 
   window.VFIEvalStudio = {
@@ -1273,11 +2276,30 @@
   };
 
   el("studio-refresh")?.addEventListener("click", () => load().catch((error) => notify(error.message)));
+  el("studio-campaign-query")?.addEventListener("input", (event) => {
+    studioState.campaignQuery = String(event.target.value || "").trim();
+    studioState.campaignPage = 1;
+    clearTimeout(studioState.campaignQueryTimer);
+    studioState.campaignQueryTimer = setTimeout(
+      () => loadCampaigns({ page: 1 }).catch((error) => notify(error.message)),
+      250,
+    );
+  });
   el("studio-preview")?.addEventListener("click", () => previewCoverage().catch((error) => notify(error.message)));
   el("studio-wizard-form")?.addEventListener("submit", (event) => createCampaign(event).catch((error) => notify(error.message)));
+  el("studio-wizard-form")?.addEventListener("input", (event) => {
+    if (event.target.matches?.('[name="name"], [name="public_title"], [name="target_votes"]')) {
+      resetCampaignSubmissionIdentity();
+    }
+    markCampaignDraftDirty();
+  });
   el("storage-gc-preview")?.addEventListener("click", () => previewStorageGc().catch((error) => notify(error.message)));
   el("storage-gc-run")?.addEventListener("click", () => executeStorageGc().catch((error) => notify(error.message)));
-  window.addEventListener("pagehide", stopPreparationPoll);
+  window.addEventListener("pagehide", () => {
+    saveCampaignDraft();
+    cancelBulkItemSelection();
+    stopPreparationPoll();
+  });
   window.addEventListener("pageshow", (event) => {
     if (!event.persisted || !studioState.selectedCampaignKey) return;
     openCampaign(studioState.selectedCampaignKey, false).catch((error) => notify(error.message));
